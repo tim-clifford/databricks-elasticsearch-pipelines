@@ -1,10 +1,9 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # databricks-elasticsearch-pipelines: pipeline runner (v1)
+# MAGIC # databricks-elasticsearch-pipelines: pipeline runner
 # MAGIC
-# MAGIC Bottom-up scaffold. **v1 does one thing:** install the `databricks-es-connector` wheel from a
-# MAGIC configurable UC Volume path, prove it is importable, and validate the export mode the job was
-# MAGIC launched with. Batch/streaming routing and the actual export land in later steps.
+# MAGIC Installs the `databricks-es-connector` wheel from a configurable UC Volume path, proves it is
+# MAGIC importable, and validates the export mode the job was launched with.
 # MAGIC
 # MAGIC Parameters (set by the DAB job as widgets):
 # MAGIC - `wheel_path`: UC Volume path to the connector `.whl` (required).

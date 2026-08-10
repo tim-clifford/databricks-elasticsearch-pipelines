@@ -1,12 +1,11 @@
 # Databricks Asset Bundle: databricks-elasticsearch-pipelines
 #
 # A self-contained framework for exporting Databricks Delta tables to Elasticsearch, deployable to a
-# fresh workspace with `databricks bundle deploy`. Built bottom-up, one small piece at a time.
+# fresh workspace with `databricks bundle deploy`.
 #
-# v1 (this version): deploys a single serverless job whose one notebook task installs the
-# `databricks-es-connector` wheel from a required UC Volume path, then imports it to prove the
-# install is usable. The job carries a `pipeline_mode` (batch|streaming) the runner will branch on
-# in a later step.
+# Deploys a serverless job (`elasticsearch_pipeline`) whose notebook task installs the
+# `databricks-es-connector` wheel from a required UC Volume path, imports it to prove the install is
+# usable, and carries a `pipeline_mode` (batch|streaming) the runner branches on.
 #
 # Quick start (the workspace host comes from your CLI profile; pass -p, and set wheel_path):
 #   databricks bundle validate -t dev -p <profile>
@@ -38,8 +37,7 @@ variables:
       /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
   pipeline_mode:
     description: >-
-      Export mode: 'batch' or 'streaming'. v1 validates it, installs the wheel, and imports it; the
-      runner will branch on it in a later step.
+      Export mode: 'batch' or 'streaming'. Validated at run time; the runner branches on it.
     default: "batch"
 
 # Targets differ only by deployment mode. The workspace HOST is intentionally not hardcoded here:

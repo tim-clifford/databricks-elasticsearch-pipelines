@@ -6,17 +6,13 @@ deploys to a fresh workspace with one command. It builds on the
 [**databricks-es-connector**](https://github.com/tim-clifford/es-databricks-connector) library
 (serverless-safe bulk write/read, gzip, idempotent IDs) rather than re-implementing the transfer.
 
-Built **bottom-up**: small, verifiable pieces, one at a time.
-
-## Status: v1
+## Overview
 
 A single serverless job (`elasticsearch_pipeline`) with one notebook task that:
 
 - installs the `databricks-es-connector` wheel from a **required, configurable** UC Volume path,
 - **imports it** to prove the install is usable (not merely that pip exited 0), and
 - validates the export **mode** (`batch` or `streaming`) the job was launched with.
-
-Batch/streaming routing and the actual Delta -> Elasticsearch export come in later steps.
 
 ## Configuration
 
@@ -56,5 +52,5 @@ The job is granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigg
 ```
 databricks.yml                 bundle: variables + targets (host comes from the CLI profile)
 resources/pipeline.job.yml     the elasticsearch_pipeline job (one serverless notebook task)
-src/run_pipeline.py            the notebook (v1: install wheel, prove import, validate mode)
+src/run_pipeline.py            the notebook (install wheel, prove import, validate mode)
 ```
