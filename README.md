@@ -8,11 +8,30 @@ deploys to a fresh workspace with one command. It builds on the
 
 ## Overview
 
-A single serverless job (`elasticsearch_pipeline`) with one notebook task that:
+Two serverless jobs:
 
-- installs the `databricks-es-connector` wheel from a **required, configurable** UC Volume path,
-- **imports it** to prove the install is usable (not merely that pip exited 0), and
-- validates the export **mode** (`batch` or `streaming`) the job was launched with.
+- **`elasticsearch_pipeline`** — installs the `databricks-es-connector` wheel from a **required,
+  configurable** UC Volume path, **imports it** to prove the install is usable (not merely that pip
+  exited 0), and validates the export **mode** (`batch` or `streaming`) it was launched with.
+- **`deploy_views`** — creates or replaces one Databricks view per Elasticsearch index. Each view is
+  a `.sql` file in [`views/`](views/); the job renders the catalog/schema placeholders and runs every
+  file with `spark.sql`. Adding an index is adding a `.sql` file.
+
+## Views
+
+Each `.sql` file in `views/` defines one view (named `ecs-<index>.sql` for the `ecs-<index>` ES
+index). Object names use `${...}` placeholders substituted from job parameters at deploy time:
+
+| Placeholder | Meaning |
+|---|---|
+| `${view_catalog}` / `${view_schema}` | where the view is created |
+| `${source_catalog}` / `${source_schema}` | where the view's source table(s) are read from |
+
+An unknown `${placeholder}` in a file is a hard error (fail closed), so a typo can't create a view
+pointing at the wrong place.
+
+**Known limitation:** all tables referenced by a single view must share one
+`source_catalog.source_schema`. A view joining tables across different schemas is not supported.
 
 ## Configuration
 
@@ -22,10 +41,12 @@ The bundle carries no environment-specific values. Supply them at deploy time:
 |---|---|---|
 | **Workspace host** | your Databricks CLI profile (`-p <profile>`) or `DATABRICKS_HOST` | yes |
 | `wheel_path` | UC Volume path to the connector `.whl` (`--var`, target override, or `DATABRICKS_BUNDLE_VAR_wheel_path`) | yes, no default |
+| `view_catalog`, `view_schema` | where `deploy_views` creates the views | yes, no default |
+| `source_catalog`, `source_schema` | where the views read their source tables | yes, no default |
 | `pipeline_mode` | `batch` or `streaming` | no (defaults to `batch`) |
 
-`wheel_path` has no default on purpose: the wheel's location is environment-specific, so each
-deployment must state it. The example path shape is
+The required variables have no defaults on purpose: wheel location and catalog/schema names are
+environment-specific, so each deployment must state them. The wheel path shape is
 `/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl`.
 
 ### Environment prerequisites (not created by this bundle)
@@ -35,22 +56,30 @@ deployment must state it. The example path shape is
 
 ## Deploy and run
 
+Every required `--var` is passed as its own flag:
+
 ```bash
-databricks bundle validate -t dev -p <profile>
-
 databricks bundle deploy -t dev -p <profile> \
-  --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
+  --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl" \
+  --var="view_catalog=<catalog>" \
+  --var="view_schema=<schema>" \
+  --var="source_catalog=<catalog>" \
+  --var="source_schema=<schema>"
 
-databricks bundle run elasticsearch_pipeline -t dev -p <profile>
+databricks bundle run deploy_views          -t dev -p <profile>   # plus the same --var flags
+databricks bundle run elasticsearch_pipeline -t dev -p <profile>   # plus the same --var flags
 ```
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
-The job is granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger it on demand.
+Both jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
 ## Layout
 
 ```
-databricks.yml                 bundle: variables + targets (host comes from the CLI profile)
-resources/pipeline.job.yml     the elasticsearch_pipeline job (one serverless notebook task)
-src/run_pipeline.py            the notebook (install wheel, prove import, validate mode)
+databricks.yml                    bundle: variables + targets (host comes from the CLI profile)
+resources/pipeline.job.yml        the elasticsearch_pipeline job
+resources/deploy_views.job.yml    the deploy_views job
+src/run_pipeline.py               notebook: install wheel, prove import, validate mode
+src/deploy_views.py               notebook: render placeholders + CREATE OR REPLACE each view
+views/                            one .sql file per ES index (ecs-<index>.sql)
 ```

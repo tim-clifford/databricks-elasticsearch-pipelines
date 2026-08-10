@@ -40,6 +40,18 @@ variables:
       Export mode: 'batch' or 'streaming'. Validated at run time; the runner branches on it.
     default: "batch"
 
+  # View deployment (deploy_views job). All REQUIRED, no default: catalog/schema names are
+  # environment-specific. view_* is where the views are created; source_* is where their source
+  # tables are read from. The two may differ; all tables in one view must share source_*.
+  view_catalog:
+    description: "REQUIRED, no default. Catalog the views are created in."
+  view_schema:
+    description: "REQUIRED, no default. Schema the views are created in."
+  source_catalog:
+    description: "REQUIRED, no default. Catalog the source tables are read from."
+  source_schema:
+    description: "REQUIRED, no default. Schema the source tables are read from."
+
 # Targets differ only by deployment mode. The workspace HOST is intentionally not hardcoded here:
 # it is taken from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var,
 # so the bundle carries no environment-specific URL and deploys to whatever workspace you point it at.
