@@ -2,8 +2,8 @@
 # MAGIC %md
 # MAGIC # databricks-elasticsearch-pipelines: pipeline runner (v1)
 # MAGIC
-# MAGIC Bottom-up scaffold. **v1 does one thing:** install the `databricks-es-connector` wheel
-# MAGIC (v0.6.1) from a configurable UC Volume path, and validate the export mode the job was
+# MAGIC Bottom-up scaffold. **v1 does one thing:** install the `databricks-es-connector` wheel from a
+# MAGIC configurable UC Volume path, prove it is importable, and validate the export mode the job was
 # MAGIC launched with. Batch/streaming routing and the actual export land in later steps.
 # MAGIC
 # MAGIC Parameters (set by the DAB job as widgets):
@@ -15,7 +15,10 @@
 #
 # %pip cannot expand a widget/parameter inside a literal `%pip install <path>` line, so we read the
 # parameter in Python and invoke the pip magic programmatically, then restart Python so the freshly
-# installed package is importable. restartPython() ends this cell, so it is the last statement.
+# installed package is importable. restartPython() ends this cell, so it is the last statement; the
+# import-proof check therefore lives in the next cell (it can only run after the restart).
+import shlex
+
 dbutils.widgets.text("wheel_path", "", "Connector wheel path (UC Volume .whl)")
 dbutils.widgets.dropdown("pipeline_mode", "batch", ["batch", "streaming"], "Export mode")
 
@@ -28,9 +31,20 @@ if pipeline_mode not in ("batch", "streaming"):
 if not wheel_path:
     raise ValueError(
         "wheel_path is required: the UC Volume path to the databricks_es_connector wheel, e.g. "
-        "/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-0.6.1-py3-none-any.whl"
+        "/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
     )
 
+# shlex.quote so a path with spaces (or a value that could otherwise look like extra pip options)
+# is passed to pip as a single literal argument, not split or parsed as flags.
 print(f"pipeline_mode={pipeline_mode}; installing connector wheel from {wheel_path}")
-get_ipython().run_line_magic("pip", f"install {wheel_path}")
+get_ipython().run_line_magic("pip", f"install {shlex.quote(wheel_path)}")
 dbutils.library.restartPython()
+
+# COMMAND ----------
+# Prove the install is actually USABLE, not merely that pip exited 0: a wheel can install yet fail to
+# import (wrong Python/arch, broken deps). This runs after restartPython(), so it exercises the fresh
+# interpreter. A failed import raises here and fails the job, which is the point.
+import databricks_es_connector
+from databricks_es_connector import EsConfig, bulk_write, make_foreach_batch, read_index  # noqa: F401
+
+print(f"databricks_es_connector import OK: {databricks_es_connector.__file__}")

@@ -12,48 +12,49 @@ Built **bottom-up**: small, verifiable pieces, one at a time.
 
 A single serverless job (`elasticsearch_pipeline`) with one notebook task that:
 
-- installs the `databricks-es-connector` wheel (v0.6.1) from a **configurable** UC Volume path, and
+- installs the `databricks-es-connector` wheel from a **required, configurable** UC Volume path,
+- **imports it** to prove the install is usable (not merely that pip exited 0), and
 - validates the export **mode** (`batch` or `streaming`) the job was launched with.
 
 Batch/streaming routing and the actual Delta -> Elasticsearch export come in later steps.
 
 ## Configuration
 
-Set per environment as bundle variables (override with `--var` or in `databricks.yml`):
+The bundle carries no environment-specific values. Supply them at deploy time:
 
-| Variable | What it is | Default |
+| What | How | Required? |
 |---|---|---|
-| `wheel_path` | UC Volume path to the connector `.whl` | the FEVM `es_poc` volume path |
-| `pipeline_mode` | `batch` or `streaming` | `batch` |
+| **Workspace host** | your Databricks CLI profile (`-p <profile>`) or `DATABRICKS_HOST` | yes |
+| `wheel_path` | UC Volume path to the connector `.whl` (`--var`, target override, or `DATABRICKS_BUNDLE_VAR_wheel_path`) | yes, no default |
+| `pipeline_mode` | `batch` or `streaming` | no (defaults to `batch`) |
 
-The **workspace host** is set per target in `databricks.yml` (`dev` / `prd`).
+`wheel_path` has no default on purpose: the wheel's location is environment-specific, so each
+deployment must state it. The example path shape is
+`/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl`.
 
 ### Environment prerequisites (not created by this bundle)
 
-- The `databricks-es-connector` wheel already present on the `wheel_path` UC Volume.
+- The `databricks-es-connector` wheel already present on the `wheel_path` UC Volume. Build and
+  upload it from the [connector repo](https://github.com/tim-clifford/es-databricks-connector).
 
 ## Deploy and run
 
 ```bash
-databricks bundle validate -t dev
-databricks bundle deploy   -t dev
-databricks bundle run elasticsearch_pipeline -t dev
+databricks bundle validate -t dev -p <profile>
 
-# override a variable at deploy time, e.g. a different wheel location:
-databricks bundle deploy -t dev --var="wheel_path=/Volumes/my_cat/my_schema/vol/databricks_es_connector-0.6.1-py3-none-any.whl"
+databricks bundle deploy -t dev -p <profile> \
+  --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
+
+databricks bundle run elasticsearch_pipeline -t dev -p <profile>
 ```
 
-Add `-p <profile>` if the target workspace is not your default `~/.databrickscfg` profile
-(e.g. `-p fe-vm-tim-clifford-classic-dsl-lite`).
-
-Currently deployed to `https://fevm-tim-clifford-classic-dsl-lite.cloud.databricks.com`
-(job `elasticsearch_pipeline`), verified end to end: a valid run installs the wheel and
-succeeds; an invalid `pipeline_mode` fails the run on the validation guard.
+The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
+The job is granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger it on demand.
 
 ## Layout
 
 ```
-databricks.yml                 bundle: variables + targets
+databricks.yml                 bundle: variables + targets (host comes from the CLI profile)
 resources/pipeline.job.yml     the elasticsearch_pipeline job (one serverless notebook task)
-src/run_pipeline.py            the notebook (v1: installs the wheel, validates mode)
+src/run_pipeline.py            the notebook (v1: install wheel, prove import, validate mode)
 ```
