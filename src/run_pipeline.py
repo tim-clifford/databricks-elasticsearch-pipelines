@@ -10,14 +10,7 @@
 # MAGIC - `pipeline_mode`: `batch` or `streaming`.
 
 # COMMAND ----------
-# Install the connector wheel from a configurable UC Volume path, and validate the export mode.
-#
-# %pip cannot expand a widget/parameter inside a literal `%pip install <path>` line, so we read the
-# parameter in Python and invoke the pip magic programmatically, then restart Python so the freshly
-# installed package is importable. restartPython() ends this cell, so it is the last statement; the
-# import-proof check therefore lives in the next cell (it can only run after the restart).
-import shlex
-
+# Read and validate the job parameters.
 dbutils.widgets.text("wheel_path", "", "Connector wheel path (UC Volume .whl)")
 dbutils.widgets.dropdown("pipeline_mode", "batch", ["batch", "streaming"], "Export mode")
 
@@ -33,8 +26,16 @@ if not wheel_path:
         "/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
     )
 
-# shlex.quote so a path with spaces (or a value that could otherwise look like extra pip options)
-# is passed to pip as a single literal argument, not split or parsed as flags.
+# COMMAND ----------
+# Install the connector wheel and restart Python so the freshly installed package is importable.
+#
+# %pip cannot expand a widget/parameter inside a literal `%pip install <path>` line, so we invoke the
+# pip magic programmatically with the validated path. shlex.quote so a path with spaces (or a value
+# that could otherwise look like extra pip options) is passed to pip as a single literal argument,
+# not split or parsed as flags. restartPython() ends this cell, so the import-proof check lives in
+# the next cell (it can only run after the restart).
+import shlex
+
 print(f"pipeline_mode={pipeline_mode}; installing connector wheel from {wheel_path}")
 get_ipython().run_line_magic("pip", f"install {shlex.quote(wheel_path)}")
 dbutils.library.restartPython()
