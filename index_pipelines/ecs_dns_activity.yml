@@ -1,0 +1,12 @@
+# Pipeline config for one Elasticsearch index. One file here => one deployed job (see
+# scripts/gen_jobs.py, which turns each of these into resources/<name>.job.yml).
+#
+# es_index_name : target Elasticsearch index.
+# source_table  : the Delta table the view reads from (name only; catalog.schema is supplied at
+#                 deploy time, as with the views).
+# view_name     : the Databricks view that defines what gets exported (see views/<view_name>.sql).
+# primary_key   : the view column used as the Elasticsearch document _id.
+es_index_name: ecs-dns-activity
+source_table: dns_activity
+view_name: ecs_dns_activity
+primary_key: dsl_id
