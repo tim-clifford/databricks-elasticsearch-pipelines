@@ -1,0 +1,57 @@
+# Databricks Asset Bundle: databricks-elasticsearch-pipelines
+#
+# A self-contained framework for exporting Databricks Delta tables to Elasticsearch, deployable to a
+# fresh workspace with `databricks bundle deploy`. Built bottom-up, one small piece at a time.
+#
+# v1 (this version): deploys a single serverless job whose one notebook task installs the
+# `databricks-es-connector` wheel (v0.6.1) from a configurable UC Volume path. The job carries a
+# `pipeline_mode` (batch|streaming) that the runner will branch on in a later step.
+#
+# Quick start:
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run elasticsearch_pipeline -t dev
+#
+# Environment prerequisite (NOT created by this bundle): the databricks-es-connector wheel must
+# already exist on the UC Volume path given by `wheel_path`. See the es-databricks-connector repo
+# for building/uploading the wheel.
+
+bundle:
+  name: databricks_elasticsearch_pipelines
+
+# Sync the whole repo so the job notebook (and everything it will grow to import) is available
+# under ${workspace.file_path}. Run bundle commands from the repo root.
+sync:
+  paths:
+    - .
+
+include:
+  - resources/*.yml
+
+variables:
+  wheel_path:
+    description: >-
+      UC Volume path to the databricks-es-connector wheel to install (v0.6.1). This is the one
+      thing v1 needs configured per environment; the wheel is an environment prerequisite, not
+      created by this bundle.
+    default: "/Volumes/tim_clifford_classic_dsl_lite_catalog/es_poc/artifacts/databricks_es_connector-0.6.1-py3-none-any.whl"
+  pipeline_mode:
+    description: >-
+      Export mode: 'batch' or 'streaming'. v1 validates it and installs the wheel; the runner will
+      branch on it in a later step.
+    default: "batch"
+
+targets:
+  # Default target. `mode: development` prefixes deployed resource names and is safe to redeploy.
+  dev:
+    default: true
+    mode: development
+    workspace:
+      # Swap this for your workspace host. Defaulted to the FEVM box the connector was built on.
+      host: https://fevm-tim-clifford-classic-dsl-lite.cloud.databricks.com
+
+  prd:
+    mode: production
+    workspace:
+      host: https://fevm-tim-clifford-classic-dsl-lite.cloud.databricks.com
+      root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}

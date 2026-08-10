@@ -1,0 +1,22 @@
+resources:
+  jobs:
+    elasticsearch_pipeline:
+      name: "[${bundle.target}] databricks-elasticsearch-pipelines: Delta -> Elasticsearch"
+      description: >-
+        v1 scaffold. A single serverless notebook task that installs the databricks-es-connector
+        wheel from a configurable UC Volume path (var.wheel_path) and validates the export mode
+        (var.pipeline_mode: batch|streaming). No cluster block => serverless notebook task.
+
+      tasks:
+        - task_key: run_pipeline
+          notebook_task:
+            notebook_path: ../src/run_pipeline.py
+            base_parameters:
+              # Surfaced to the notebook as widgets.
+              wheel_path: ${var.wheel_path}
+              pipeline_mode: ${var.pipeline_mode}
+
+      # On-demand only for now: invoke via `databricks bundle run elasticsearch_pipeline`.
+      permissions:
+        - level: CAN_VIEW
+          group_name: users
