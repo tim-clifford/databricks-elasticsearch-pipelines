@@ -19,8 +19,10 @@ Two serverless jobs:
 
 ## Views
 
-Each `.sql` file in `views/` defines one view (named `ecs-<index>.sql` for the `ecs-<index>` ES
-index). Object names use `${...}` placeholders substituted from job parameters at deploy time:
+Each `.sql` file in `views/` defines one view. The filename matches the view it creates
+(`ecs_dns_activity.sql` creates the `ecs_dns_activity` view, feeding the `ecs-dns-activity` ES index;
+the view name uses underscores because a Databricks view name can't contain unquoted hyphens). Object
+names use `${...}` placeholders substituted from job parameters at deploy time:
 
 | Placeholder | Meaning |
 |---|---|
@@ -81,5 +83,5 @@ resources/pipeline.job.yml        the elasticsearch_pipeline job
 resources/deploy_views.job.yml    the deploy_views job
 src/run_pipeline.py               notebook: install wheel, prove import, validate mode
 src/deploy_views.py               notebook: render placeholders + CREATE OR REPLACE each view
-views/                            one .sql file per ES index (ecs-<index>.sql)
+views/                            one .sql file per view (filename == view name)
 ```
