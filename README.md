@@ -78,11 +78,12 @@ columns, and any tuning such as a `/*+ BROADCAST(alias) */` hint, written direct
 ## Configuration
 
 The **workspace** is not a bundle variable: it comes from your Databricks CLI profile (`-p <profile>`)
-or `DATABRICKS_HOST`. The only bundle variable is:
+or `DATABRICKS_HOST`. The bundle variables are:
 
 | Variable | What it sets |
 |---|---|
 | `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
+| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel (v0.6.1) that **every** job installs; a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it) |
 
 Everything else is per-pipeline and lives in `pipeline_definitions/<name>.yml`. Each object is fully
 qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
@@ -92,6 +93,7 @@ its `.sql` filename):
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
+pipeline_mode: batch              # export mode for this index's job: batch | streaming (required)
 view:                             # the view this pipeline creates
   catalog: acme_${environment}
   schema: es_poc
@@ -118,6 +120,13 @@ is a column of the **source table**, used by the streaming read to identify a un
 share a value but need not, and neither defaults to the other. When `deploy_views` creates a view it
 verifies `es_id_field` is actually one of that view's output columns (against Spark's resolved schema),
 so a typo fails the deploy rather than surfacing later at export time.
+
+`pipeline_mode` is **per index** (`batch` or `streaming`) because different indices may export
+differently; it is required with no default, and an unrecognized value fails closed at config load.
+The connector `wheel_path`, by contrast, is a single **global** bundle variable (one wheel serves
+every job), so it lives in `databricks.yml`, not per config. Each job's runner installs that wheel and
+verifies the `databricks_es_connector` import succeeds before doing any work, so a bad wheel path
+fails the run immediately rather than deep in the pipeline.
 
 ## Deploy and run
 
@@ -150,14 +159,15 @@ You edit these, one pair per pipeline:
     <view_name>.sql             The view: what gets exported (filename == view.name)
   pipeline_definitions/
     <name>.yml                  The config: view/source/reference locations + es_index_name,
-                                es_id_field, source.primary_key (see Configuration for the schema)
+                                es_id_field, pipeline_mode, source.primary_key (see Configuration)
 
 Shared notebooks (run by the jobs, not edited per pipeline):
   notebooks/
     deploy_views.py             Renders each view's parameters from its config (folding in the
                                 environment), then runs CREATE OR REPLACE
-    run_index_pipeline.py       Run by every per-index job: loads its config by name, resolves the
-                                environment, prints it (export logic lands here later)
+    run_index_pipeline.py       Run by every per-index job: installs the connector wheel (verifying
+                                the import), loads its config by name, resolves the environment, prints
+                                it including pipeline_mode (export logic lands here later)
 
 Shared library + tests (the config schema, used by the generator and both notebooks):
   pipeline_lib/

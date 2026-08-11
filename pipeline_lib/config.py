@@ -8,6 +8,7 @@ Schema (see pipeline_definitions/*.yml for a commented example):
 
     es_index_name: <es index>            # ES index name (hyphens allowed; NOT a SQL identifier)
     es_id_field:   <column>              # view output column passed to the connector as the ES _id
+    pipeline_mode: batch | streaming     # export mode for THIS index's job (required; no default)
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -25,6 +26,13 @@ TWO DISTINCT KEYS, TWO CONTEXTS
 VIEW's output, handed to the ES connector as the document _id. primary_key is a column of the SOURCE
 table, used by the streaming read to identify a unique row. They often share a name but need not, and
 neither defaults to the other. Both are plain column identifiers (no ${environment} token).
+
+PIPELINE MODE (per index) vs WHEEL PATH (global)
+`pipeline_mode` (batch|streaming) is per-index: it lives in each config because different indices
+may export differently, and the runner branches on it. It is required with no default (an
+unrecognized/absent mode fails closed). The connector `wheel_path` is NOT here: it is a single
+global bundle variable (one wheel serves every index), threaded to each generated job by
+job_base_parameters and installed by the runner notebook.
 
 ENVIRONMENT SUBSTITUTION
 A `catalog` or `schema` value may embed the token `${environment}`, folded in at deploy time from the
@@ -62,6 +70,10 @@ _VALID_NAME_TEMPLATE = re.compile(r"^([A-Za-z0-9_]|\$\{environment\})+$")
 _VALID_ES_INDEX = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _ES_INDEX_MAX_BYTES = 255
 
+# Export modes the runner supports. Allow-list: an unrecognized/absent mode is rejected (fail closed),
+# never silently defaulted. Threaded to the runner notebook, which branches on it.
+_VALID_PIPELINE_MODES = ("batch", "streaming")
+
 
 class PipelineConfigError(ValueError):
     """A pipeline definition is invalid. Raised at load/resolve time, never at row time (fail closed)."""
@@ -83,6 +95,15 @@ def _require_identifier(value: object, where: str) -> str:
         raise PipelineConfigError(
             f"{where} must be a legal SQL identifier (letter/underscore, then letters/digits/"
             f"underscores), got {value!r}"
+        )
+    return value
+
+
+def _require_pipeline_mode(value: object, where: str) -> str:
+    """An export mode, restricted to the allow-list (batch|streaming). No default: absent/unknown fails."""
+    if value not in _VALID_PIPELINE_MODES:
+        raise PipelineConfigError(
+            f"{where} must be one of {', '.join(_VALID_PIPELINE_MODES)}, got {value!r}"
         )
     return value
 
@@ -144,17 +165,18 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if not isinstance(raw, dict):
         raise PipelineConfigError(f"{source}: expected a YAML mapping, got {type(raw).__name__}")
 
-    allowed_top = {"es_index_name", "es_id_field", "view", "source", "reference_tables"}
+    allowed_top = {"es_index_name", "es_id_field", "pipeline_mode", "view", "source", "reference_tables"}
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
 
-    for key in ("es_index_name", "es_id_field", "view", "source"):
+    for key in ("es_index_name", "es_id_field", "pipeline_mode", "view", "source"):
         if key not in raw:
             raise PipelineConfigError(f"{source}: missing required key '{key}'")
 
     es_index_name = _require_es_index(raw["es_index_name"], f"{source}: es_index_name")
     es_id_field = _require_identifier(raw["es_id_field"], f"{source}: es_id_field")
+    pipeline_mode = _require_pipeline_mode(raw["pipeline_mode"], f"{source}: pipeline_mode")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
     # source carries primary_key in addition to catalog/schema/table: it is a column of the SOURCE
     # table (unique-row identity for the streaming read), so it lives with the source, not at top level.
@@ -168,6 +190,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     return {
         "es_index_name": es_index_name,
         "es_id_field": es_id_field,
+        "pipeline_mode": pipeline_mode,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
@@ -242,6 +265,7 @@ def resolve_config(cfg: dict, environment: str) -> dict:
     return {
         "es_index_name": cfg["es_index_name"],
         "es_id_field": cfg["es_id_field"],
+        "pipeline_mode": cfg["pipeline_mode"],
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
@@ -288,16 +312,19 @@ def view_substitutions(cfg: dict, environment: str) -> dict:
     return subs
 
 
-def job_base_parameters(config_name: str, environment_ref: str) -> dict:
+def job_base_parameters(config_name: str, environment_ref: str, wheel_path_ref: str) -> dict:
     """The values the generated per-index job passes to run_index_pipeline.py as widgets.
 
-    The generator runs OFFLINE and cannot know `environment` (a deploy-time value), so it cannot bake
-    resolved names into the job. Instead it passes the config's NAME, and the notebook loads and
-    resolves that config itself at runtime. `environment_ref` is threaded through unchanged: the
-    generator passes the DAB variable reference (e.g. "${var.environment}"), which the bundle resolves
-    at deploy. All values are strings, as job base_parameters must be.
+    The generator runs OFFLINE and cannot know `environment` or `wheel_path` (deploy-time values), so
+    it cannot bake them into the job. Instead it passes the config's NAME (the notebook loads and
+    resolves that config itself at runtime, so pipeline_mode and object names come from the config,
+    not from widgets) plus two DAB variable references threaded through unchanged:
+    - `environment_ref` (e.g. "${var.environment}"): folded into ${environment} in the config names.
+    - `wheel_path_ref` (e.g. "${var.wheel_path}"): the ONE global connector wheel every job installs.
+    The bundle resolves both at deploy. All values are strings, as job base_parameters must be.
     """
     return {
         "config_name": config_name,
         "environment": environment_ref,
+        "wheel_path": wheel_path_ref,
     }

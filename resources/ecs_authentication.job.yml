@@ -14,6 +14,7 @@ resources:
           base_parameters:
             config_name: ecs_authentication
             environment: ${var.environment}
+            wheel_path: ${var.wheel_path}
       permissions:
       - level: CAN_MANAGE_RUN
         group_name: users
