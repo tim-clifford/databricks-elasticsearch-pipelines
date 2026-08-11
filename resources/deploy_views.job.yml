@@ -11,7 +11,7 @@ resources:
       tasks:
         - task_key: deploy_views
           notebook_task:
-            notebook_path: ../src/deploy_views.py
+            notebook_path: ../notebooks/deploy_views.py
             base_parameters:
               view_catalog: ${var.view_catalog}
               view_schema: ${var.view_schema}

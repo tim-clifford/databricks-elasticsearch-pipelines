@@ -51,7 +51,7 @@ if illegal:
     )
 
 # COMMAND ----------
-# Locate the views/ folder. This notebook is synced to <bundle files>/src/deploy_views.py; the SQL
+# Locate the views/ folder. This notebook is synced to <bundle files>/notebooks/deploy_views.py; the SQL
 # lives in the sibling <bundle files>/views/. Resolve it from the notebook's own workspace path so
 # it works when run as a DAB job (no hardcoded workspace path).
 import os
