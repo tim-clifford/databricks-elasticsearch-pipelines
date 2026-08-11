@@ -118,9 +118,18 @@ def print_sql(sql: str) -> int:
     first line is always shown -- itself hard-truncated if that single line exceeds the budget -- so
     there is never a case where only the truncation notice prints with no SQL content.
 
-    Returns the number of characters printed, so the caller can enforce a cumulative budget across
-    many views.
+    Returns the ACTUAL number of characters emitted (every printed line, including the indent, the
+    hard-truncated first line, and the truncation notice), so the caller's cumulative budget reflects
+    real output. Returning an undercount here would let the cumulative cap be defeated by exactly the
+    pathological input it exists for.
     """
+    emitted = 0
+
+    def emit(text: str) -> None:
+        nonlocal emitted
+        print(text)
+        emitted += len(text) + 1  # + newline
+
     lines = sql.splitlines()
     per_line_overhead = len(_SQL_PRINT_INDENT) + 1  # indent + newline
     shown, chars, truncated_line = [], 0, False
@@ -137,13 +146,13 @@ def print_sql(sql: str) -> int:
         shown.append(line)
         chars += cost
     for line in shown:
-        print(f"{_SQL_PRINT_INDENT}{line}")
+        emit(f"{_SQL_PRINT_INDENT}{line}")
     if len(shown) < len(lines) or truncated_line:
-        print(
+        emit(
             f"{_SQL_PRINT_INDENT}... [truncated for display: showing "
             f"{len(shown)} of {len(lines)} line(s), {len(sql)} chars total; full SQL is still executed]"
         )
-    return chars
+    return emitted
 
 
 # Best-effort per view: each view is an independent CREATE OR REPLACE, so one view's failure
@@ -160,15 +169,18 @@ for filename in sql_files:
         subs = view_substitutions(configs_by_view[view_name], ENVIRONMENT)
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
             rendered = render(fh.read(), filename, subs)
-        # Print the fully-rendered SQL that is about to run (all ${...} substituted, ${environment}
-        # folded in) so the exact CREATE OR REPLACE is visible in the job output for debugging -- but
-        # only until the cumulative budget is reached, so many views can't flood the cell's output.
-        print(f"    substitutions: {subs}")
+        # Print the substitutions and the fully-rendered SQL that is about to run (all ${...}
+        # substituted, ${environment} folded in) so the exact CREATE OR REPLACE is visible in the job
+        # output for debugging -- but only until the cumulative budget is reached, so many views can't
+        # flood the cell's output. Both prints are gated and counted against the same budget.
         if printed_chars < _SQL_PRINT_TOTAL_BUDGET:
+            subs_line = f"    substitutions: {subs}"
+            print(subs_line)
+            printed_chars += len(subs_line) + 1
             print("    running SQL:")
             printed_chars += print_sql(rendered)
         else:
-            print("    running SQL: [print suppressed: cumulative SQL-print budget reached; view still deploys]")
+            print("    [debug print suppressed: cumulative SQL-print budget reached; view still deploys]")
         # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
         spark.sql(rendered)
         created.append(filename)
