@@ -38,9 +38,16 @@ if FILES_ROOT not in sys.path:
 
 from pipeline_lib.config import load_config, resolve_config  # noqa: E402
 
-config_path = os.path.join(FILES_ROOT, "pipeline_definitions", f"{CONFIG_NAME}.yml")
-if not os.path.exists(config_path):
-    raise ValueError(f"no pipeline definition found at {config_path}")
+# Resolve the config file, accepting either extension: gen_jobs.py and deploy_views.py both discover
+# .yml AND .yaml, so the runner must too, or a .yaml-defined pipeline would deploy fine and then fail
+# here at runtime. Fail closed if neither exists.
+CONFIG_DIR = os.path.join(FILES_ROOT, "pipeline_definitions")
+config_path = next(
+    (p for ext in (".yml", ".yaml") if os.path.exists(p := os.path.join(CONFIG_DIR, f"{CONFIG_NAME}{ext}"))),
+    None,
+)
+if config_path is None:
+    raise ValueError(f"no pipeline definition found for {CONFIG_NAME!r} (.yml/.yaml) in {CONFIG_DIR}")
 
 # load_config validates the schema; resolve_config folds ${environment} in and validates the result
 # (both fail closed). After this, every catalog/schema/name is a concrete identifier.
