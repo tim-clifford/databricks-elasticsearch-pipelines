@@ -112,11 +112,20 @@ def test_leading_digit_template_rejected_at_resolve():
         resolve_config(validated, environment="")
 
 
-@pytest.mark.parametrize("bad", ["Has-Caps", "UPPER", "has space", ".leading", "-leading", ""])
+@pytest.mark.parametrize("bad", ["Has-Caps", "UPPER", "has space", ".leading", "-leading", "_leading", "+leading", "", "bad/name", "trailing."])
 def test_illegal_es_index_rejected(bad):
     cfg = _base()
     cfg["es_index_name"] = bad
     with pytest.raises(PipelineConfigError, match="es_index_name"):
+        validate_config(cfg)
+
+
+def test_es_index_length_bound():
+    cfg = _base()
+    cfg["es_index_name"] = "a" * 255
+    assert validate_config(cfg)["es_index_name"] == "a" * 255  # 255 bytes OK
+    cfg["es_index_name"] = "a" * 256
+    with pytest.raises(PipelineConfigError, match="255 bytes"):
         validate_config(cfg)
 
 

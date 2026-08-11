@@ -45,9 +45,13 @@ _ENV_TOKEN = "${environment}"
 # use this: they must be plain identifiers, so a view name always equals its .sql filename.)
 _VALID_NAME_TEMPLATE = re.compile(r"^([A-Za-z0-9_]|\$\{environment\})+$")
 
-# ES index names are not SQL identifiers: lowercase, may contain hyphens/dots/underscores, must start
-# with an alphanumeric. Conservative subset of Elasticsearch's own rules.
+# ES index names are not SQL identifiers. Per Elasticsearch's rules (verified against the docs):
+# lowercase; the chars \ / * ? " < > | space , # : are forbidden; cannot start with -, _, + (or the
+# deprecated leading .); cannot be "." or ".."; max 255 BYTES. This char class (alphanumeric first,
+# then [a-z0-9._-]) already enforces the lowercase / allowed-char / no-bad-leading-char rules; the
+# length and trailing-dot checks are applied separately in _require_es_index (a regex can't do bytes).
 _VALID_ES_INDEX = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_ES_INDEX_MAX_BYTES = 255
 
 
 class PipelineConfigError(ValueError):
@@ -70,6 +74,23 @@ def _require_identifier(value: object, where: str) -> str:
         raise PipelineConfigError(
             f"{where} must be a legal SQL identifier (letter/underscore, then letters/digits/"
             f"underscores), got {value!r}"
+        )
+    return value
+
+
+def _require_es_index(value: object, where: str) -> str:
+    """A valid Elasticsearch index name. Enforces the char/leading-char rules via the regex, plus the
+    255-BYTE length bound and no-trailing-dot rule (which a single regex can't express well)."""
+    if not isinstance(value, str) or not _VALID_ES_INDEX.match(value):
+        raise PipelineConfigError(
+            f"{where} must be a valid ES index name (lowercase; letters, digits, '.', '-', '_'; "
+            f"leading alphanumeric), got {value!r}"
+        )
+    if value.endswith("."):
+        raise PipelineConfigError(f"{where} must not end with '.', got {value!r}")
+    if len(value.encode("utf-8")) > _ES_INDEX_MAX_BYTES:
+        raise PipelineConfigError(
+            f"{where} must be at most {_ES_INDEX_MAX_BYTES} bytes, got {len(value.encode('utf-8'))}"
         )
     return value
 
@@ -123,13 +144,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         if key not in raw:
             raise PipelineConfigError(f"{source}: missing required key '{key}'")
 
-    es_index_name = raw["es_index_name"]
-    if not isinstance(es_index_name, str) or not _VALID_ES_INDEX.match(es_index_name):
-        raise PipelineConfigError(
-            f"{source}: es_index_name must be a valid ES index name (lowercase; letters, digits, "
-            f"'.', '-', '_'; leading alphanumeric), got {es_index_name!r}"
-        )
-
+    es_index_name = _require_es_index(raw["es_index_name"], f"{source}: es_index_name")
     primary_key = _require_identifier(raw["primary_key"], f"{source}: primary_key")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
     source_map = _validate_object(raw["source"], f"{source}: source", name_key="table", allowed={"catalog", "schema", "table"})
