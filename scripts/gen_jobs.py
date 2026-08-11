@@ -24,6 +24,10 @@ import sys
 import yaml
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Import the shared config schema from the repo root, so validation is not re-implemented here.
+sys.path.insert(0, _REPO_ROOT)
+from pipeline_lib.config import PipelineConfigError, job_base_parameters, load_config  # noqa: E402
+
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "pipeline_definitions")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
 
@@ -35,11 +39,6 @@ _CONFIG_GLOBS = ("*.yml", "*.yaml")
 # `index_pipeline_foo.bar` -- invalid, and it fails at DEPLOY, not generation. Enforce it here so a
 # bad name fails loudly at generation instead.
 _VALID_STEM = re.compile(r"^[A-Za-z0-9_-]+$")
-
-# Required keys in every index config. Allow-list: an unknown key is rejected (a typo'd key would
-# otherwise be silently ignored, e.g. `primary_keys:` leaving primary_key unset), and a missing or
-# non-string/empty value is rejected. Both fail closed.
-_REQUIRED_KEYS = ("es_index_name", "source_table", "view_name", "primary_key")
 
 # First line of every generated file. Doubles as the marker that identifies OUR files in resources/
 # (so hand-authored resources like deploy_views.job.yml are never touched or flagged as orphans).
@@ -53,45 +52,6 @@ _GENERATED_HEADER = (
 def _config_name(path: str) -> str:
     """The stem used for the job key and generated filename (extension-agnostic)."""
     return os.path.splitext(os.path.basename(path))[0]
-
-
-def load_config(path: str) -> dict:
-    """Load and validate one index config. Raises ValueError on any problem (fail closed).
-
-    Returns the config with every required value stripped, so rendering is deterministic and cannot
-    be fed leading/trailing whitespace.
-    """
-    with open(path) as fh:
-        cfg = yaml.safe_load(fh)
-    if not isinstance(cfg, dict):
-        raise ValueError(f"{os.path.basename(path)}: expected a YAML mapping, got {type(cfg).__name__}")
-
-    unknown = sorted(set(cfg) - set(_REQUIRED_KEYS))
-    if unknown:
-        raise ValueError(
-            f"{os.path.basename(path)}: unknown key(s): {', '.join(unknown)}; "
-            f"allowed: {', '.join(_REQUIRED_KEYS)}"
-        )
-
-    result: dict[str, str] = {}
-    problems: list[str] = []
-    for key in _REQUIRED_KEYS:
-        if key not in cfg:
-            problems.append(f"{key} (missing)")
-            continue
-        value = cfg[key]
-        # Must be a non-empty string. A null value (`es_index_name:` with nothing after it) parses to
-        # None, and a bare number/list to int/list; none are valid here. Rejecting them closes the
-        # fail-open hole where str(None) == "None" would sail past an emptiness check and render the
-        # literal "None" into the job. Numeric-looking names must be quoted in the YAML to be strings.
-        if not isinstance(value, str) or not value.strip():
-            problems.append(f"{key} (must be a non-empty string, got {type(value).__name__}: {value!r})")
-            continue
-        result[key] = value.strip()
-
-    if problems:
-        raise ValueError(f"{os.path.basename(path)}: invalid required key(s): " + "; ".join(problems))
-    return result
 
 
 def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
@@ -118,12 +78,10 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                             "task_key": f"index_pipeline_{name}",
                             "notebook_task": {
                                 "notebook_path": "../notebooks/run_index_pipeline.py",
-                                "base_parameters": {
-                                    "es_index_name": cfg["es_index_name"],
-                                    "source_table": cfg["source_table"],
-                                    "view_name": cfg["view_name"],
-                                    "primary_key": cfg["primary_key"],
-                                },
+                                # The notebook loads its own config at runtime (the generator can't
+                                # know the deploy-time environment), so it just needs the config name
+                                # plus the environment threaded from the bundle variable.
+                                "base_parameters": job_base_parameters(name, "${var.environment}"),
                             },
                         }
                     ],
