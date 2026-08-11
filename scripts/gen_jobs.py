@@ -78,8 +78,10 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                             "task_key": f"index_pipeline_{name}",
                             "notebook_task": {
                                 "notebook_path": "../notebooks/run_index_pipeline.py",
-                                # The scalars run_index_pipeline.py needs, from the shared schema.
-                                "base_parameters": job_base_parameters(cfg),
+                                # The notebook loads its own config at runtime (the generator can't
+                                # know the deploy-time environment), so it just needs the config name
+                                # plus the environment threaded from the bundle variable.
+                                "base_parameters": job_base_parameters(name, "${var.environment}"),
                             },
                         }
                     ],

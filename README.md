@@ -45,19 +45,19 @@ forgot to regenerate.
 Each `.sql` file in `views/` defines one view. The filename matches the view it creates
 (`ecs_dns_activity.sql` creates the `ecs_dns_activity` view, feeding the `ecs-dns-activity` ES index;
 the view name uses underscores because a Databricks view name can't contain unquoted hyphens). Object
-names use `${...}` parameters resolved per-view from the config plus the shared `catalog` at deploy
-time:
+names use `${...}` parameters resolved per-view from the config at deploy time:
 
 | Parameter | Resolves to |
 |---|---|
-| `${catalog}` | the shared catalog (bundle variable) |
-| `${view_schema}` / `${view_name}` | where the view is created, and its name |
-| `${source_schema}` / `${source_table}` | the source table the view reads from |
+| `${view}` | the fully-qualified view to create: `catalog.schema.name` |
+| `${source}` | the fully-qualified source table: `catalog.schema.table` |
 | `${ref_<alias>}` | a reference (join) table, aliased: `catalog.schema.table <alias>` |
 | `${broadcast_hint}` | a Spark `/*+ BROADCAST(...) */` hint (empty unless a reference table sets `broadcast: true`); place it right after the top-level `SELECT` |
 
-An unknown `${...}` parameter in a file is a hard error (fail closed), so a typo can't create a view
-pointing at the wrong place.
+Each of those is assembled from the config, with any `${environment}` component already folded in
+(see [Configuration](#configuration)). An unknown `${...}` parameter in a file is a hard error (fail
+closed), so a typo can't create a view pointing at the wrong place. (For the same reason, don't write
+a literal `${...}` in a view's SQL comments unless it's one of the parameters above.)
 
 ### Reference (join) tables
 
@@ -69,16 +69,13 @@ in the SQL as `${ref_<alias>}`:
 SELECT ${broadcast_hint}
     base.dsl_id,
     (validation.dsl_id IS NOT NULL) AS validation_row_exists
-FROM ${catalog}.${source_schema}.${source_table} base
+FROM ${source} base
 LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id
 ```
 
 The config owns *where* each table is and whether to broadcast it; the SQL owns the join itself (type,
 `ON` clause, surfaced columns). Set `broadcast: true` on a reference table to have the framework add a
 broadcast hint naming that join.
-
-**Known limitation:** all tables a view reads (source + reference) must live in the shared `catalog`.
-A cross-catalog join is not supported.
 
 ## Configuration
 
@@ -87,39 +84,46 @@ or `DATABRICKS_HOST`. The only bundle variable is:
 
 | Variable | What it sets |
 |---|---|
-| `catalog` | the one shared catalog every view and source/reference table lives in (required, no default) |
+| `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
 
-Everything else is per-pipeline and lives in `pipeline_definitions/<name>.yml`:
+Everything else is per-pipeline and lives in `pipeline_definitions/<name>.yml`. Each object is fully
+qualified (`catalog`, `schema`, and a name/table), and any part may embed `${environment}`:
 
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 primary_key: dsl_id               # view column used as the ES document _id
 view:                             # the view this pipeline creates
+  catalog: acme_${environment}
   schema: es_poc
   name: ecs_dns_activity
 source:                           # the single source table the view reads from
+  catalog: acme_${environment}
   schema: ocsf
   table: dns_activity
 reference_tables:                 # OPTIONAL: extra tables the view joins (see Views)
   validation:                     # key = the ${ref_validation} join alias in the SQL
-    schema: ocsf_validation
+    catalog: acme_${environment}
+    schema: ocsf_validation_${environment}
     table: dns_activity
     broadcast: false              # true adds a Spark broadcast hint for this join
 ```
 
-`catalog` is deliberately not per-pipeline: it is assumed shared across every pipeline in an
-environment. (Supporting different catalogs per pipeline would be a future change.)
+Names without an `${environment}` token are used verbatim. A name that *uses* the token but is
+deployed with an empty `environment` fails closed at deploy time, as does an environment value that
+would produce an illegal identifier (e.g. one containing a hyphen).
 
 ## Deploy and run
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<name>.job.yml from pipeline_definitions/*.yml
 
-databricks bundle deploy -t dev -p <profile> --var="catalog=<catalog>"
+databricks bundle deploy -t dev -p <profile> --var="environment=<env>"
 
-databricks bundle run deploy_views                -t dev -p <profile> --var="catalog=<catalog>"
-databricks bundle run index_pipeline_<name>       -t dev -p <profile> --var="catalog=<catalog>"
+databricks bundle run deploy_views                -t dev -p <profile> --var="environment=<env>"
+databricks bundle run index_pipeline_<name>       -t dev -p <profile> --var="environment=<env>"
 ```
+
+(Omit `--var="environment=..."` if none of your config names use `${environment}`.)
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
@@ -143,14 +147,15 @@ You edit these, one pair per pipeline:
 
 Shared notebooks (run by the jobs, not edited per pipeline):
   notebooks/
-    deploy_views.py             Renders each view's parameters from its config + the shared catalog,
-                                then runs CREATE OR REPLACE
-    run_index_pipeline.py       Run by every per-index job (reads/validates/prints its config)
+    deploy_views.py             Renders each view's parameters from its config (folding in the
+                                environment), then runs CREATE OR REPLACE
+    run_index_pipeline.py       Run by every per-index job: loads its config by name, resolves the
+                                environment, prints it (export logic lands here later)
 
-Shared library + tests (the config schema, used by the generator and deploy_views):
+Shared library + tests (the config schema, used by the generator and both notebooks):
   pipeline_lib/
-    config.py                   Loads/validates a pipeline definition; derives view substitutions
-                                and job parameters (single source of truth for the schema)
+    config.py                   Loads/validates a pipeline definition; resolves ${environment} and
+                                derives view substitutions + job parameters (single source of truth)
   tests/
     test_config.py              Offline unit tests for pipeline_lib.config (plain pytest)
 

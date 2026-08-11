@@ -5,17 +5,17 @@
 -- reference table to surface a validation flag. This is the slot where the OCSF -> ECS projection
 -- will live later.
 --
--- Parameters (${...}) are substituted by the deploy_views notebook from the pipeline definition:
---   catalog                        the shared catalog (bundle variable)
---   view_schema / view_name        where this view is created, and its name
---   source_schema / source_table   where the source table is read from
+-- Parameters (${...}) are substituted by the deploy_views notebook from the pipeline definition
+-- (with any environment component already folded into each object name):
+--   view                           the fully-qualified view to create (catalog.schema.name)
+--   source                         the fully-qualified source table (catalog.schema.table)
 --   broadcast_hint                 Spark broadcast hint for any reference table with broadcast: true
 --   ref_<alias>                    a reference table, aliased, e.g. `catalog.schema.table alias`
 -- The ref_<alias> name matches the reference_tables key in pipeline_definitions/ecs_dns_activity.yml.
 --
 -- Known limitation: the single source table plus any reference tables are what this view reads;
 -- there is exactly one source table per pipeline.
-CREATE OR REPLACE VIEW ${catalog}.${view_schema}.${view_name} AS
+CREATE OR REPLACE VIEW ${view} AS
 SELECT ${broadcast_hint}
     base.dsl_id,
     base.time,
@@ -58,5 +58,7 @@ SELECT ${broadcast_hint}
     base.unmapped,
     -- Surfaced from the reference join: does a validation row exist for this event?
     (validation.dsl_id IS NOT NULL) AS validation_row_exists
-FROM ${catalog}.${source_schema}.${source_table} base
+FROM ${source} base
+-- dsl_id is a unique key in BOTH tables, so this join is 1:1 and cannot fan out (no duplicate
+-- primary_key / ES _id). A reference join that is not 1:1 on the key would need de-duplication.
 LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id

@@ -2,36 +2,66 @@
 # MAGIC %md
 # MAGIC # databricks-elasticsearch-pipelines: per-index pipeline runner
 # MAGIC
-# MAGIC The shared notebook run by every per-index job. Each index has a config file in
-# MAGIC `pipeline_definitions/<name>.yml`; the generated job passes that file's values in as widgets. For
-# MAGIC now the notebook only reads, validates, and prints them; the actual export is added later.
+# MAGIC The shared notebook run by every per-index job. The generated job passes the config's NAME plus
+# MAGIC the deploy-time `environment`; this notebook loads `pipeline_definitions/<config_name>.yml`,
+# MAGIC resolves `${environment}` into the object names, and (for now) prints the resolved config. The
+# MAGIC actual export is added later.
 # MAGIC
-# MAGIC Parameters (set by the generated per-index job as widgets, from `job_base_parameters`):
-# MAGIC - `es_index_name`: target Elasticsearch index.
-# MAGIC - `primary_key`: the view column used as the Elasticsearch document `_id`.
-# MAGIC - `view_schema`, `view_name`: the Databricks view that defines what gets exported.
-# MAGIC - `source_schema`, `source_table`: the Delta table the view reads from.
+# MAGIC Why load the config here rather than receive resolved values: the job resources are generated
+# MAGIC offline by scripts/gen_jobs.py, which cannot know the deploy-time environment, so it cannot bake
+# MAGIC resolved catalog/schema names into the job. The notebook resolves them at runtime instead.
+# MAGIC
+# MAGIC Parameters (set by the generated per-index job as widgets):
+# MAGIC - `config_name`: the pipeline definition to load (`pipeline_definitions/<config_name>.yml`).
+# MAGIC - `environment`: folded into any `${environment}` in the config's object names (may be empty).
 
 # COMMAND ----------
-# Read and validate the job parameters. Every one is required with no default: they come from the
-# index's config YAML via the generated job, so a missing value means the job was wired up wrong and
-# must fail loudly (fail closed) rather than run against a blank. This list must match the keys the
-# generator emits (pipeline_lib.config.job_base_parameters).
-PARAM_NAMES = ("es_index_name", "primary_key", "view_schema", "view_name", "source_schema", "source_table")
-for name in PARAM_NAMES:
-    dbutils.widgets.text(name, "", name)
-
-params = {name: dbutils.widgets.get(name).strip() for name in PARAM_NAMES}
-
-missing = [name for name, value in params.items() if not value]
-if missing:
-    raise ValueError(f"missing required parameter(s): {', '.join(missing)}")
+# Read the parameters. config_name is required; environment may be empty (a config that uses no
+# ${environment} token needs none, and one that does fails closed later in resolve_config).
+dbutils.widgets.text("config_name", "", "Pipeline definition name (pipeline_definitions/<name>.yml)")
+dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
+CONFIG_NAME = dbutils.widgets.get("config_name").strip()
+ENVIRONMENT = dbutils.widgets.get("environment").strip()
+if not CONFIG_NAME:
+    raise ValueError("missing required parameter: config_name")
 
 # COMMAND ----------
-# For now, just print what this job was configured with. This is the placeholder for the export
-# logic; keeping it a pure echo makes the generated-job wiring verifiable on its own.
-print("per-index pipeline configuration:")
-for name in PARAM_NAMES:
-    print(f"  {name} = {params[name]}")
+# Resolve the synced bundle root and make pipeline_lib importable. This notebook is synced to
+# <bundle files>/notebooks/run_index_pipeline.py; pipeline_definitions/ is a sibling of notebooks/.
+import os
+import sys
 
-dbutils.notebook.exit("; ".join(f"{name}={params[name]}" for name in PARAM_NAMES))
+_nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+FILES_ROOT = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # .../files
+if FILES_ROOT not in sys.path:
+    sys.path.insert(0, FILES_ROOT)
+
+from pipeline_lib.config import load_config, resolve_config  # noqa: E402
+
+config_path = os.path.join(FILES_ROOT, "pipeline_definitions", f"{CONFIG_NAME}.yml")
+if not os.path.exists(config_path):
+    raise ValueError(f"no pipeline definition found at {config_path}")
+
+# load_config validates the schema; resolve_config folds ${environment} in and validates the result
+# (both fail closed). After this, every catalog/schema/name is a concrete identifier.
+cfg = resolve_config(load_config(config_path), ENVIRONMENT)
+
+# COMMAND ----------
+# For now, just print the resolved configuration. This is the placeholder for the export logic;
+# keeping it a pure echo makes the generated-job wiring + environment resolution verifiable on its own.
+view = cfg["view"]
+source = cfg["source"]
+print(f"config_name        = {CONFIG_NAME}")
+print(f"environment        = {ENVIRONMENT!r}")
+print(f"es_index_name      = {cfg['es_index_name']}")
+print(f"primary_key        = {cfg['primary_key']}")
+print(f"view               = {view['catalog']}.{view['schema']}.{view['name']}")
+print(f"source             = {source['catalog']}.{source['schema']}.{source['table']}")
+for alias, spec in cfg["reference_tables"].items():
+    print(f"reference[{alias}]  = {spec['catalog']}.{spec['schema']}.{spec['table']} (broadcast={spec['broadcast']})")
+
+dbutils.notebook.exit(
+    f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; "
+    f"view={view['catalog']}.{view['schema']}.{view['name']}; "
+    f"source={source['catalog']}.{source['schema']}.{source['table']}"
+)

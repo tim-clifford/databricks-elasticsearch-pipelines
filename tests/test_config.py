@@ -1,7 +1,7 @@
 """Offline unit tests for pipeline_lib.config. No Spark, no cluster, no live ES: plain pytest.
 
-Covers the validation contract (every fail-closed branch) and the two derivation functions
-(view_substitutions, job_base_parameters), including the reference-table + broadcast-hint logic.
+Covers the validation contract (every fail-closed branch), the ${environment} template + resolution
+logic, and the derivations (view_substitutions, job_base_parameters).
 """
 import copy
 
@@ -10,26 +10,36 @@ import pytest
 from pipeline_lib.config import (
     PipelineConfigError,
     job_base_parameters,
+    resolve_config,
+    resolve_name,
     validate_config,
     view_substitutions,
 )
 
 
 def _base():
-    """A minimal valid config (no reference tables)."""
+    """A minimal valid config (no reference tables, no environment tokens)."""
     return {
         "es_index_name": "ecs-dns-activity",
         "primary_key": "dsl_id",
-        "view": {"schema": "es_poc", "name": "ecs_dns_activity"},
-        "source": {"schema": "ocsf", "table": "dns_activity"},
+        "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
+        "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity"},
     }
 
 
-def _with_refs():
+def _with_env():
+    """A config using ${environment} in catalog and a reference schema."""
     cfg = _base()
+    cfg["view"]["catalog"] = "acme_${environment}"
+    cfg["source"]["catalog"] = "acme_${environment}"
     cfg["reference_tables"] = {
-        "validation": {"schema": "ocsf_validation", "table": "dns_activity", "broadcast": False},
-        "geo": {"schema": "ref", "table": "geoip", "broadcast": True},
+        "validation": {
+            "catalog": "acme_${environment}",
+            "schema": "ocsf_validation_${environment}",
+            "table": "dns_activity",
+            "broadcast": False,
+        },
+        "geo": {"catalog": "acme_${environment}", "schema": "ref", "table": "geoip", "broadcast": True},
     }
     return cfg
 
@@ -39,19 +49,18 @@ def _with_refs():
 
 def test_minimal_valid():
     out = validate_config(_base())
-    assert out["view"] == {"schema": "es_poc", "name": "ecs_dns_activity"}
-    assert out["source"] == {"schema": "ocsf", "table": "dns_activity"}
-    assert out["reference_tables"] == {}  # defaulted
+    assert out["view"] == {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"}
+    assert out["reference_tables"] == {}
 
 
-def test_reference_tables_defaults_broadcast_false():
-    cfg = _base()
-    cfg["reference_tables"] = {"validation": {"schema": "ocsf_validation", "table": "dns_activity"}}
-    out = validate_config(cfg)
-    assert out["reference_tables"]["validation"]["broadcast"] is False
+def test_environment_token_accepted_as_template():
+    # validate_config accepts the template; it does NOT resolve it.
+    out = validate_config(_with_env())
+    assert out["source"]["catalog"] == "acme_${environment}"
+    assert out["reference_tables"]["validation"]["schema"] == "ocsf_validation_${environment}"
 
 
-# --------------------------------------------------------------------------- fail-closed branches
+# --------------------------------------------------------------------------- fail-closed: structure
 
 
 @pytest.mark.parametrize("missing", ["es_index_name", "primary_key", "view", "source"])
@@ -64,8 +73,15 @@ def test_missing_required_key(missing):
 
 def test_unknown_top_level_key():
     cfg = _base()
-    cfg["source_table"] = "oops"  # a plausible legacy/typo key
+    cfg["source_table"] = "oops"  # a plausible legacy key from the old flat schema
     with pytest.raises(PipelineConfigError, match="unknown key"):
+        validate_config(cfg)
+
+
+def test_object_missing_catalog():
+    cfg = _base()
+    del cfg["view"]["catalog"]
+    with pytest.raises(PipelineConfigError, match="view.catalog"):
         validate_config(cfg)
 
 
@@ -76,17 +92,24 @@ def test_unknown_nested_key():
         validate_config(cfg)
 
 
-@pytest.mark.parametrize("bad", ["my-schema", "my schema", "cat.schema", "1abc", "", "select", None, 5])
-def test_illegal_identifier_rejected(bad):
-    # 'select' is a legal identifier lexically (the DDL would fail loudly at spark.sql, not here),
-    # so it is intentionally NOT in this list except to note it: it passes the regex. Everything else
-    # here must be rejected.
-    if bad == "select":
-        return
+# --------------------------------------------------------------------------- fail-closed: templates
+
+
+@pytest.mark.parametrize("bad", ["my-schema", "my schema", "cat.schema", "", "${env}", "a${environ}b", None, 5])
+def test_illegal_name_template_rejected(bad):
     cfg = _base()
     cfg["source"]["schema"] = bad
     with pytest.raises(PipelineConfigError):
         validate_config(cfg)
+
+
+def test_leading_digit_template_rejected_at_resolve():
+    # "1abc" matches the template char class but is not a legal identifier; caught at resolve.
+    cfg = _base()
+    cfg["source"]["schema"] = "1abc"
+    validated = validate_config(cfg)  # template chars are legal
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        resolve_config(validated, environment="")
 
 
 @pytest.mark.parametrize("bad", ["Has-Caps", "UPPER", "has space", ".leading", "-leading", ""])
@@ -97,84 +120,93 @@ def test_illegal_es_index_rejected(bad):
         validate_config(cfg)
 
 
-def test_es_index_allows_hyphen():
-    cfg = _base()
-    cfg["es_index_name"] = "ecs-dns-activity"
-    assert validate_config(cfg)["es_index_name"] == "ecs-dns-activity"
-
-
 def test_reference_broadcast_must_be_bool():
     cfg = _base()
-    cfg["reference_tables"] = {"v": {"schema": "s", "table": "t", "broadcast": "yes"}}
+    cfg["reference_tables"] = {"v": {"catalog": "c", "schema": "s", "table": "t", "broadcast": "yes"}}
     with pytest.raises(PipelineConfigError, match="broadcast"):
         validate_config(cfg)
 
 
-def test_reference_alias_must_be_identifier():
+def test_reference_alias_rejects_environment_token():
+    # An alias is internal; it must be a bare identifier, not a template.
     cfg = _base()
-    cfg["reference_tables"] = {"bad-alias": {"schema": "s", "table": "t"}}
+    cfg["reference_tables"] = {"a_${environment}": {"catalog": "c", "schema": "s", "table": "t"}}
     with pytest.raises(PipelineConfigError):
         validate_config(cfg)
 
 
-def test_reference_unknown_key():
-    cfg = _base()
-    cfg["reference_tables"] = {"v": {"schema": "s", "table": "t", "brodcast": True}}
-    with pytest.raises(PipelineConfigError, match="unknown key"):
-        validate_config(cfg)
+# --------------------------------------------------------------------------- resolve_name
+
+
+def test_resolve_name_no_token_passthrough():
+    assert resolve_name("ocsf", environment="", where="x") == "ocsf"
+    assert resolve_name("ocsf", environment="prod", where="x") == "ocsf"
+
+
+def test_resolve_name_folds_environment():
+    assert resolve_name("ocsf_${environment}", environment="prod", where="x") == "ocsf_prod"
+    assert resolve_name("acme_${environment}", environment="catalog", where="x") == "acme_catalog"
+
+
+def test_resolve_name_missing_environment_fails():
+    with pytest.raises(PipelineConfigError, match="no environment"):
+        resolve_name("ocsf_${environment}", environment="", where="x")
+
+
+@pytest.mark.parametrize("env", ["has-hyphen", "has space", "has.dot"])
+def test_resolve_name_illegal_environment_fails(env):
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        resolve_name("ocsf_${environment}", environment=env, where="x")
+
+
+# --------------------------------------------------------------------------- resolve_config
+
+
+def test_resolve_config_folds_everywhere():
+    out = resolve_config(validate_config(_with_env()), environment="prod")
+    assert out["view"]["catalog"] == "acme_prod"
+    assert out["source"]["catalog"] == "acme_prod"
+    assert out["reference_tables"]["validation"]["schema"] == "ocsf_validation_prod"
+    assert out["reference_tables"]["geo"]["schema"] == "ref"  # no token -> unchanged
 
 
 # --------------------------------------------------------------------------- view_substitutions
 
 
-def test_view_substitutions_no_refs():
-    subs = view_substitutions(validate_config(_base()), catalog="mycat")
-    assert subs["catalog"] == "mycat"
-    assert subs["view_schema"] == "es_poc"
-    assert subs["source_table"] == "dns_activity"
-    assert subs["broadcast_hint"] == ""  # no broadcast refs
+def test_view_substitutions_fqn_and_no_refs():
+    subs = view_substitutions(validate_config(_base()), environment="")
+    assert subs["view"] == "cat.es_poc.ecs_dns_activity"
+    assert subs["source"] == "cat.ocsf.dns_activity"
+    assert subs["broadcast_hint"] == ""
     assert not any(k.startswith("ref_") for k in subs)
 
 
-def test_view_substitutions_ref_alias_and_broadcast():
-    subs = view_substitutions(validate_config(_with_refs()), catalog="mycat")
-    # ref_<alias> expands to an aliased fully-qualified table
-    assert subs["ref_validation"] == "mycat.ocsf_validation.dns_activity validation"
-    assert subs["ref_geo"] == "mycat.ref.geoip geo"
-    # only the broadcast=true ref lands in the hint, naming its alias
+def test_view_substitutions_env_ref_alias_and_broadcast():
+    subs = view_substitutions(validate_config(_with_env()), environment="catalog")
+    assert subs["view"] == "acme_catalog.es_poc.ecs_dns_activity"
+    assert subs["source"] == "acme_catalog.ocsf.dns_activity"
+    # ref_<alias> is the aliased FQN, with environment folded into catalog + schema
+    assert subs["ref_validation"] == "acme_catalog.ocsf_validation_catalog.dns_activity validation"
+    assert subs["ref_geo"] == "acme_catalog.ref.geoip geo"
+    # only broadcast=true ref in the hint
     assert subs["broadcast_hint"] == "/*+ BROADCAST(geo) */"
 
 
-def test_view_substitutions_multiple_broadcast():
-    cfg = _with_refs()
-    cfg["reference_tables"]["validation"]["broadcast"] = True
-    subs = view_substitutions(validate_config(cfg), catalog="c")
-    # both aliases, order-stable (insertion order)
-    assert subs["broadcast_hint"] == "/*+ BROADCAST(validation, geo) */"
-
-
-def test_view_substitutions_rejects_bad_catalog():
-    with pytest.raises(PipelineConfigError):
-        view_substitutions(validate_config(_base()), catalog="bad-catalog")
+def test_view_substitutions_missing_env_fails():
+    with pytest.raises(PipelineConfigError, match="no environment"):
+        view_substitutions(validate_config(_with_env()), environment="")
 
 
 # --------------------------------------------------------------------------- job_base_parameters
 
 
-def test_job_base_parameters_excludes_reference_tables():
-    params = job_base_parameters(validate_config(_with_refs()))
-    assert params == {
-        "es_index_name": "ecs-dns-activity",
-        "primary_key": "dsl_id",
-        "view_schema": "es_poc",
-        "view_name": "ecs_dns_activity",
-        "source_schema": "ocsf",
-        "source_table": "dns_activity",
-    }
+def test_job_base_parameters():
+    params = job_base_parameters("ecs_dns_activity", environment_ref="${var.environment}")
+    assert params == {"config_name": "ecs_dns_activity", "environment": "${var.environment}"}
 
 
 def test_validate_does_not_mutate_input():
-    cfg = _with_refs()
+    cfg = _with_env()
     before = copy.deepcopy(cfg)
     validate_config(cfg)
     assert cfg == before

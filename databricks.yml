@@ -10,7 +10,7 @@
 # Quick start (the workspace host comes from your CLI profile; pass -p):
 #   python scripts/gen_jobs.py                 # regenerate resources/<name>.job.yml from configs
 #   databricks bundle validate -t dev -p <profile>
-#   databricks bundle deploy   -t dev -p <profile> --var="catalog=<catalog>"
+#   databricks bundle deploy   -t dev -p <profile> --var="environment=<env>"
 
 bundle:
   name: databricks_elasticsearch_pipelines
@@ -25,10 +25,13 @@ include:
   - resources/*.yml
 
 variables:
-  # The one shared, environment-specific value (REQUIRED, no default). Everything else per pipeline
-  # (view schema/name, source schema/table, reference tables) lives in pipeline_definitions/<name>.yml.
-  catalog:
-    description: "REQUIRED, no default. The shared catalog that views and source tables live in."
+  # Folded into any config name that contains ${environment} (e.g. ocsf_${environment} -> ocsf_prod).
+  # Defaults to empty: not every deployment has an environment component, and a config that uses the
+  # token but gets an empty value fails closed at resolve time. All other object naming (catalog,
+  # schema, table, view name) lives per pipeline in pipeline_definitions/<name>.yml.
+  environment:
+    description: "Environment folded into ${environment} in config names. Empty if unused."
+    default: ""
 
 # Targets differ only by deployment mode. The workspace HOST is intentionally not hardcoded here:
 # it is taken from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var,

@@ -1,23 +1,28 @@
 # Pipeline definition for one Elasticsearch index. One file here => one deployed job (see
 # scripts/gen_jobs.py) and one view (see views/<view.name>.sql, deployed by the deploy_views job).
 #
-# `catalog` is NOT set here: it is one shared value per environment, supplied as a bundle variable
-# at deploy time. Everything below is per-pipeline.
+# Any catalog/schema/table/name may embed ${environment}, folded in at deploy time from the
+# `environment` bundle variable (e.g. ocsf_${environment} -> ocsf_prod). A value with no token is
+# used as-is.
 es_index_name: ecs-dns-activity   # target Elasticsearch index (hyphens allowed)
 primary_key: dsl_id               # view column used as the Elasticsearch document _id
 
 view:                             # the view this pipeline creates and exports
+  catalog: tim_clifford_classic_dsl_lite_${environment}
   schema: es_poc
   name: ecs_dns_activity
 
 source:                           # the single source table the view reads from
+  catalog: tim_clifford_classic_dsl_lite_${environment}
   schema: ocsf
   table: dns_activity
 
 reference_tables:                 # OPTIONAL: extra tables the view joins
   # The key (`validation`) is YOUR choice: it is the SQL alias the view joins against and must match
-  # the ${ref_validation} token used in views/ecs_dns_activity.sql.
+  # the ${ref_validation} token used in views/ecs_dns_activity.sql. This one uses an
+  # environment-specific schema to exercise ${environment} on a reference table.
   validation:
-    schema: ocsf_validation
+    catalog: tim_clifford_classic_dsl_lite_${environment}
+    schema: ocsf_validation_${environment}
     table: dns_activity
     broadcast: false              # true adds a Spark BROADCAST hint for this join

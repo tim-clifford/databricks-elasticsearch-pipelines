@@ -3,23 +3,21 @@
 # MAGIC # databricks-elasticsearch-pipelines: deploy views
 # MAGIC
 # MAGIC Creates or replaces one Databricks view per Elasticsearch index. Each view is a `.sql` file in
-# MAGIC `views/`, paired with a `pipeline_definitions/<name>.yml` that says where its view and source
-# MAGIC live and which reference tables it joins. This notebook renders each view's `${...}` parameters
-# MAGIC from its config and the shared `catalog`, then runs it with `spark.sql`.
+# MAGIC `views/`, paired with a `pipeline_definitions/<name>.yml` that says where its view, source, and
+# MAGIC reference tables live (fully qualified, with an optional `${environment}` component). This
+# MAGIC notebook renders each view's `${...}` parameters from its config and runs it with `spark.sql`.
 # MAGIC
 # MAGIC Parameter (set by the DAB job as a widget):
-# MAGIC - `catalog`: the one shared catalog every view and source table lives in (required).
-# MAGIC
-# MAGIC Everything else (view schema/name, source schema/table, reference tables) comes from each
-# MAGIC pipeline definition, so adding an index is adding a `.sql` file plus its config.
+# MAGIC - `environment`: folded into any config name that contains `${environment}` (e.g.
+# MAGIC   `ocsf_${environment}` -> `ocsf_prod`). May be empty when no config name uses the token.
 
 # COMMAND ----------
-# Read the one shared parameter. catalog has no default: it is environment-specific, so a missing
-# value must fail loudly (fail closed) rather than deploy views into a blank catalog.
-dbutils.widgets.text("catalog", "", "Shared catalog (where views and source tables live)")
-CATALOG = dbutils.widgets.get("catalog").strip()
-if not CATALOG:
-    raise ValueError("missing required parameter: catalog")
+# Read the environment. Unlike catalog/schema (which now live in each config), environment MAY be
+# empty: not every deployment has one, and a config whose names use no ${environment} token needs
+# none. A config that DOES use the token but gets an empty environment fails closed later, in
+# resolve_name -- so we do not reject empty here.
+dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
+ENVIRONMENT = dbutils.widgets.get("environment").strip()
 
 # COMMAND ----------
 # Resolve the synced bundle root so we can read both views/ and pipeline_definitions/, and add it to
@@ -93,7 +91,7 @@ def render(sql: str, filename: str, subs: dict) -> str:
 created = []
 for filename in sql_files:
     view_name = os.path.splitext(filename)[0]
-    subs = view_substitutions(configs_by_view[view_name], CATALOG)
+    subs = view_substitutions(configs_by_view[view_name], ENVIRONMENT)
     with open(os.path.join(VIEWS_DIR, filename)) as fh:
         rendered = render(fh.read(), filename, subs)
     print(f"--- {filename} ---")

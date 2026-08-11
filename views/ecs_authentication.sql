@@ -4,11 +4,11 @@
 -- rather than SELECT *, so the view's output schema is an explicit, reviewable contract). This is
 -- the slot where the OCSF -> ECS projection will live later. No reference-table joins here.
 --
--- Parameters (${...}) are substituted by the deploy_views notebook from the pipeline definition:
---   catalog                        the shared catalog (bundle variable)
---   view_schema / view_name        where this view is created, and its name
---   source_schema / source_table   where the source table is read from
-CREATE OR REPLACE VIEW ${catalog}.${view_schema}.${view_name} AS
+-- Parameters (${...}) are substituted by the deploy_views notebook from the pipeline definition
+-- (with any environment component already folded into each object name):
+--   view      the fully-qualified view to create (catalog.schema.name)
+--   source    the fully-qualified source table (catalog.schema.table)
+CREATE OR REPLACE VIEW ${view} AS
 SELECT
     dsl_id,
     time,
@@ -53,4 +53,4 @@ SELECT
     type_uid,
     unmapped,
     user
-FROM ${catalog}.${source_schema}.${source_table}
+FROM ${source}
