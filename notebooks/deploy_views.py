@@ -76,12 +76,22 @@ import re
 
 _TOKEN = re.compile(r"\$\{(\w+)\}")
 
-# Caps for the debug print of rendered SQL. A view is a single CREATE OR REPLACE VIEW statement, so
-# these are never hit in normal use; they exist only so that a pathologically large view can't make
-# this diagnostic logging itself blow the notebook's output size limit and fail an otherwise-good
-# deploy. spark.sql still runs the FULL SQL regardless -- only the printed copy is capped.
-_SQL_PRINT_MAX_LINES = 200
-_SQL_PRINT_MAX_CHARS = 20_000
+# Caps for the debug print of rendered SQL. These are deliberately set FAR above any realistic view
+# (even a view listing 1000+ columns one-per-line is well under both) and exist only as a backstop so
+# a pathologically large view can't make this diagnostic logging itself blow the notebook's output
+# size limit (10 MB/cell) and fail an otherwise-good deploy. The char cap is the real guard (bytes are
+# what the notebook limit measures); the line cap is a secondary proxy. At ~200 KB the printed SQL is
+# still ~50x under the cell limit. spark.sql always runs the FULL SQL regardless -- only the printed
+# copy is capped.
+_SQL_PRINT_MAX_LINES = 2_000
+_SQL_PRINT_MAX_CHARS = 200_000
+
+# Cumulative cap across ALL views in this run. deploy_views prints every view's SQL into ONE cell, so
+# the per-view cap above bounds a single runaway view but not the sum: e.g. 100 views each near the
+# per-view cap would be ~20 MB, over the 10 MB cell limit (and toward the 30 MB job-notebook limit
+# that fails the run). Once total printed SQL crosses this budget, later views' SQL is suppressed (a
+# one-line notice prints instead); every view still deploys. Set well under the 10 MB cell limit.
+_SQL_PRINT_TOTAL_BUDGET = 4_000_000
 
 
 def render(sql: str, filename: str, subs: dict) -> str:
@@ -96,27 +106,44 @@ def render(sql: str, filename: str, subs: dict) -> str:
     return _TOKEN.sub(_sub, sql)
 
 
-def print_sql(sql: str) -> None:
+_SQL_PRINT_INDENT = "      "  # each printed SQL line is indented by this
+
+
+def print_sql(sql: str) -> int:
     """Print the rendered SQL for debugging, capped so a huge view can't flood notebook output.
 
     Truncates by whichever limit hits first (lines or characters) and prints a clear notice with the
-    full size, so it's obvious the display was clipped and by how much.
+    full size, so it's obvious the display was clipped and by how much. The character budget counts
+    the printed form (indent included), since it exists to bound actual notebook output. At least the
+    first line is always shown -- itself hard-truncated if that single line exceeds the budget -- so
+    there is never a case where only the truncation notice prints with no SQL content.
+
+    Returns the number of characters printed, so the caller can enforce a cumulative budget across
+    many views.
     """
     lines = sql.splitlines()
-    clipped = lines[:_SQL_PRINT_MAX_LINES]
-    shown, chars = [], 0
-    for line in clipped:
-        if chars + len(line) + 1 > _SQL_PRINT_MAX_CHARS:
+    per_line_overhead = len(_SQL_PRINT_INDENT) + 1  # indent + newline
+    shown, chars, truncated_line = [], 0, False
+    for line in lines[:_SQL_PRINT_MAX_LINES]:
+        cost = len(line) + per_line_overhead
+        if chars + cost > _SQL_PRINT_MAX_CHARS:
+            if not shown:
+                # A single first line larger than the whole budget: show it, hard-truncated, so some
+                # SQL is always visible rather than only the notice.
+                budget = max(0, _SQL_PRINT_MAX_CHARS - per_line_overhead)
+                shown.append(line[:budget])
+                truncated_line = True
             break
         shown.append(line)
-        chars += len(line) + 1
+        chars += cost
     for line in shown:
-        print(f"      {line}")
-    if len(shown) < len(lines):
+        print(f"{_SQL_PRINT_INDENT}{line}")
+    if len(shown) < len(lines) or truncated_line:
         print(
-            f"      ... [truncated for display: showing {len(shown)} of {len(lines)} lines, "
-            f"{len(sql)} chars total; full SQL is still executed]"
+            f"{_SQL_PRINT_INDENT}... [truncated for display: showing "
+            f"{len(shown)} of {len(lines)} line(s), {len(sql)} chars total; full SQL is still executed]"
         )
+    return chars
 
 
 # Best-effort per view: each view is an independent CREATE OR REPLACE, so one view's failure
@@ -125,6 +152,7 @@ def print_sql(sql: str) -> None:
 # partial deploy must never report green (fail closed).
 created = []
 failed = []
+printed_chars = 0  # cumulative SQL chars printed so far, to bound total cell output across all views
 for filename in sql_files:
     view_name = os.path.splitext(filename)[0]
     print(f"--- {filename} ---")
@@ -133,10 +161,14 @@ for filename in sql_files:
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
             rendered = render(fh.read(), filename, subs)
         # Print the fully-rendered SQL that is about to run (all ${...} substituted, ${environment}
-        # folded in) so the exact CREATE OR REPLACE is visible in the job output for debugging.
+        # folded in) so the exact CREATE OR REPLACE is visible in the job output for debugging -- but
+        # only until the cumulative budget is reached, so many views can't flood the cell's output.
         print(f"    substitutions: {subs}")
-        print("    running SQL:")
-        print_sql(rendered)
+        if printed_chars < _SQL_PRINT_TOTAL_BUDGET:
+            print("    running SQL:")
+            printed_chars += print_sql(rendered)
+        else:
+            print("    running SQL: [print suppressed: cumulative SQL-print budget reached; view still deploys]")
         # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
         spark.sql(rendered)
         created.append(filename)
