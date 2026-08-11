@@ -1,0 +1,6 @@
+# Off-cluster tooling dependencies (the generator, scripts/gen_jobs.py).
+# pyyaml is PINNED, not floated: gen_jobs.py --check byte-compares committed resources/*.job.yml
+# against fresh yaml.safe_dump output, and safe_dump's line-wrapping/quoting can differ across
+# pyyaml versions. An unpinned pyyaml in CI would produce false "stale" failures even when no config
+# changed. Bump this pin and regenerate in the same commit.
+pyyaml==6.0.3
