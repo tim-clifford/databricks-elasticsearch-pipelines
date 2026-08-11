@@ -3,7 +3,7 @@
 # MAGIC # databricks-elasticsearch-pipelines: per-index pipeline runner
 # MAGIC
 # MAGIC The shared notebook run by every per-index job. Each index has a config file in
-# MAGIC `index_pipelines/<name>.yml`; the generated job passes that file's values in as widgets. For
+# MAGIC `pipeline_definitions/<name>.yml`; the generated job passes that file's values in as widgets. For
 # MAGIC now the notebook only reads, validates, and prints them; the actual export is added later.
 # MAGIC
 # MAGIC Parameters (set by the generated per-index job as widgets):

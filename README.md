@@ -1,25 +1,23 @@
 # databricks-elasticsearch-pipelines
 
 A framework for exporting data from Databricks Delta tables into Elasticsearch, packaged as
-[Databricks Asset Bundles](https://docs.databricks.com/dev-tools/bundles/) so the whole thing
-deploys to a fresh workspace with one command. It builds on the
-[**databricks-es-connector**](https://github.com/tim-clifford/es-databricks-connector) library
-(serverless-safe bulk write/read, gzip, idempotent IDs) rather than re-implementing the transfer.
+[Databricks Asset Bundles](https://docs.databricks.com/dev-tools/bundles/). It uses the
+[**databricks-es-connector**](https://github.com/tim-clifford/es-databricks-connector) library for the
+transfer.
 
 ## Overview
 
 Every Elasticsearch index is fed by its own pipeline, and each pipeline is described by two files:
 
 - a view `views/<view_name>.sql` defining what gets exported, and
-- a config file `index_pipelines/<name>.yml` (`es_index_name`, `source_table`, `view_name`,
-  `primary_key`) that points a pipeline at that view.
+- a config file `pipeline_definitions/<name>.yml` that points a pipeline at that view.
 
 The bundle deploys:
 
-- **`deploy_views`** — creates or replaces one Databricks view per index. Each view is a `.sql` file
-  in [`views/`](views/); the job renders the catalog/schema parameters and runs every file with
-  `spark.sql`.
-- **one job per index** (`index_pipeline_<name>`) — all run the same shared notebook
+- **One `deploy_views` job**: creates or replaces one Databricks view per index. Each view is a
+  `.sql` file in [`views/`](views/). The job renders the catalog/schema parameters and runs every
+  file with `spark.sql`.
+- **One job per index** (`index_pipeline_<name>`): all run the same shared notebook
   [`notebooks/run_index_pipeline.py`](notebooks/run_index_pipeline.py) with that index's config. These
   job resources are **generated** by [`scripts/gen_jobs.py`](scripts/gen_jobs.py) from the config
   files (see [Adding a new pipeline for an ES index](#adding-a-new-pipeline-for-an-es-index)).
@@ -27,14 +25,18 @@ The bundle deploys:
 ## Adding a new pipeline for an ES index
 
 1. Add `views/<view_name>.sql`.
-2. Add `index_pipelines/<name>.yml` with `es_index_name`, `source_table`, `view_name`, `primary_key`.
+2. Add `pipeline_definitions/<name>.yml` with `es_index_name`, `source_table`, `view_name`, `primary_key`.
 3. Regenerate the job resources: `python scripts/gen_jobs.py`.
 4. Deploy.
 
-Step 3 is what keeps the generated `resources/<name>.job.yml` files in sync with the configs; the
-generator writes one per config. To catch a config that was changed but not regenerated, run
-`python scripts/gen_jobs.py --check` (e.g. in CI): it fails if any generated file is missing, stale,
-or orphaned (left behind by a deleted or renamed config).
+The config's filename stem becomes the job's resource key (`index_pipeline_<stem>`), so it must
+contain only letters, digits, `_`, and `-` (the generator rejects anything else, e.g. a dotted name).
+
+Step 3 writes one `resources/<name>.job.yml` per config, keeping the generated jobs in sync. If you
+run it, you're covered. `python scripts/gen_jobs.py --check` is the separate verification that step 3
+was actually run: it makes no changes and fails if any generated file is missing, stale, or orphaned
+(left behind by a deleted or renamed config). Run it in CI to catch a commit that edited a config but
+forgot to regenerate.
 
 ## Views
 
@@ -59,7 +61,7 @@ pointing at the wrong place.
 The bundle carries no environment-specific values; every one is supplied at deploy time and has no
 default, because catalog/schema names and the target workspace differ per environment.
 
-The **workspace** is not a bundle variable — it comes from your Databricks CLI profile (`-p <profile>`)
+The **workspace** is not a bundle variable: it comes from your Databricks CLI profile (`-p <profile>`)
 or `DATABRICKS_HOST`. The bundle variables, all passed with `--var`, are:
 
 | Variable | What it sets |
@@ -70,12 +72,12 @@ or `DATABRICKS_HOST`. The bundle variables, all passed with `--var`, are:
 | `source_schema` | schema the views read their source tables from |
 
 The per-pipeline values (`es_index_name`, `source_table`, `view_name`, `primary_key`) are not bundle
-variables — each comes from its `index_pipelines/<name>.yml`.
+variables. Each comes from its `pipeline_definitions/<name>.yml`.
 
 ## Deploy and run
 
 ```bash
-python scripts/gen_jobs.py   # regenerate resources/<name>.job.yml from index_pipelines/*.yml
+python scripts/gen_jobs.py   # regenerate resources/<name>.job.yml from pipeline_definitions/*.yml
 
 databricks bundle deploy -t dev -p <profile> \
   --var="view_catalog=<catalog>" \
@@ -90,34 +92,33 @@ databricks bundle run index_pipeline_<name>       -t dev -p <profile>   # plus t
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
-The generator needs `pyyaml`, pinned in `requirements.txt` (`pip install -r requirements.txt`).
-The pin matters: `--check` byte-compares against `yaml.safe_dump` output, whose formatting can drift
-across pyyaml versions. A config's filename stem becomes the job's resource key
-(`index_pipeline_<stem>`), so it must contain only letters, digits, `_`, and `-` (the generator
-rejects anything else, e.g. a dotted name, at generation time).
+Running the generator needs `pyyaml`, pinned in `requirements.txt` (`pip install -r requirements.txt`).
+The pin matters because `--check` byte-compares against `yaml.safe_dump` output, whose formatting can
+drift across pyyaml versions.
 
 ## Layout
 
 ```
-databricks.yml                  Bundle definition: variables + targets (host comes from the CLI profile)
+databricks.yml                  Bundle definition: variables + targets
 requirements.txt                Off-cluster tooling deps (pinned pyyaml for the generator)
 
-You edit these — one pair per pipeline:
+You edit these, one pair per pipeline:
   views/
     <view_name>.sql             The view: what gets exported (filename == view name)
-  index_pipelines/
+  pipeline_definitions/
     <name>.yml                  The config: points a pipeline at a view (es_index_name,
                                 source_table, view_name, primary_key)
 
 Shared notebooks (run by the jobs, not edited per pipeline):
   notebooks/
-    deploy_views.py             Renders view parameters + CREATE OR REPLACE each view
+    deploy_views.py             Substitutes the catalog/schema parameters into each view's SQL
+                                and runs CREATE OR REPLACE
     run_index_pipeline.py       Run by every per-index job (reads/validates/prints its config)
 
-Generated / tooling — do not hand-edit the generated jobs:
+Generated / tooling (do not hand-edit the generated jobs):
   scripts/
     gen_jobs.py                 Generates resources/<name>.job.yml from the configs (--check guards drift)
   resources/
     deploy_views.job.yml        The deploy_views job (hand-authored)
-    <name>.job.yml              GENERATED per-index job (one per index_pipelines config)
+    <name>.job.yml              GENERATED per-index job (one per pipeline_definitions config)
 ```
