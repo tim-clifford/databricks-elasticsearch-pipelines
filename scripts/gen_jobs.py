@@ -140,18 +140,25 @@ def generated_path(name: str) -> str:
     return os.path.join(_RESOURCES_DIR, f"{name}.job.yml")
 
 
+def is_generated(path: str) -> bool:
+    """True if the file at `path` carries our generated-marker header (so we own it)."""
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        return fh.readline().startswith(_GENERATED_MARKER)
+
+
 def existing_generated_files() -> list[str]:
     """Every resources/*.job.yml this generator authored, identified by the marker header.
 
     Used to spot orphans: a generated file whose config was deleted or renamed. Hand-authored
     resources (no marker) are excluded, so they are never removed or flagged.
     """
-    out = []
-    for path in sorted(glob.glob(os.path.join(_RESOURCES_DIR, "*.job.yml"))):
-        with open(path) as fh:
-            if fh.readline().startswith(_GENERATED_MARKER):
-                out.append(path)
-    return out
+    return [
+        path
+        for path in sorted(glob.glob(os.path.join(_RESOURCES_DIR, "*.job.yml")))
+        if is_generated(path)
+    ]
 
 
 def discover_configs() -> list[str]:
@@ -190,6 +197,24 @@ def main(argv: list[str] | None = None) -> int:
 
     expected = {generated_path(_config_name(p)) for p in config_paths}
     orphans = [p for p in existing_generated_files() if p not in expected]
+
+    # Refuse to write over a hand-authored resource. The orphan logic guards DELETION by marker; this
+    # is the symmetric guard on WRITE: a config named e.g. `deploy_views` would target the existing
+    # hand-authored resources/deploy_views.job.yml, which has no marker. Checked up front so we never
+    # clobber one file before erroring on another. Applies in --check too (it is a real deploy hazard).
+    collisions = [
+        _config_name(p)
+        for p in config_paths
+        if os.path.exists(generated_path(_config_name(p))) and not is_generated(generated_path(_config_name(p)))
+    ]
+    if collisions:
+        for name in collisions:
+            print(
+                f"refusing to overwrite hand-authored {os.path.relpath(generated_path(name), _REPO_ROOT)} "
+                f"(no generated marker); rename the config '{name}'",
+                file=sys.stderr,
+            )
+        return 1
 
     stale = []
     for path in config_paths:
