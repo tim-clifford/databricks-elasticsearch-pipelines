@@ -37,9 +37,8 @@ def _with_env():
             "catalog": "acme_${environment}",
             "schema": "ocsf_validation_${environment}",
             "table": "dns_activity",
-            "broadcast": False,
         },
-        "geo": {"catalog": "acme_${environment}", "schema": "ref", "table": "geoip", "broadcast": True},
+        "geo": {"catalog": "acme_${environment}", "schema": "ref", "table": "geoip"},
     }
     return cfg
 
@@ -129,10 +128,12 @@ def test_es_index_length_bound():
         validate_config(cfg)
 
 
-def test_reference_broadcast_must_be_bool():
+def test_reference_broadcast_key_now_unknown():
+    # broadcast was removed: join tuning is the view author's job, written in SQL. A leftover
+    # `broadcast` key must be rejected as unknown rather than silently accepted.
     cfg = _base()
-    cfg["reference_tables"] = {"v": {"catalog": "c", "schema": "s", "table": "t", "broadcast": "yes"}}
-    with pytest.raises(PipelineConfigError, match="broadcast"):
+    cfg["reference_tables"] = {"v": {"catalog": "c", "schema": "s", "table": "t", "broadcast": True}}
+    with pytest.raises(PipelineConfigError, match="unknown key"):
         validate_config(cfg)
 
 
@@ -210,19 +211,17 @@ def test_view_substitutions_fqn_and_no_refs():
     subs = view_substitutions(validate_config(_base()), environment="")
     assert subs["view"] == "cat.es_poc.ecs_dns_activity"
     assert subs["source"] == "cat.ocsf.dns_activity"
-    assert subs["broadcast_hint"] == ""
     assert not any(k.startswith("ref_") for k in subs)
+    assert "broadcast_hint" not in subs  # broadcast is no longer a framework concern
 
 
-def test_view_substitutions_env_ref_alias_and_broadcast():
+def test_view_substitutions_env_ref_alias():
     subs = view_substitutions(validate_config(_with_env()), environment="catalog")
     assert subs["view"] == "acme_catalog.es_poc.ecs_dns_activity"
     assert subs["source"] == "acme_catalog.ocsf.dns_activity"
     # ref_<alias> is the aliased FQN, with environment folded into catalog + schema
     assert subs["ref_validation"] == "acme_catalog.ocsf_validation_catalog.dns_activity validation"
     assert subs["ref_geo"] == "acme_catalog.ref.geoip geo"
-    # only broadcast=true ref in the hint
-    assert subs["broadcast_hint"] == "/*+ BROADCAST(geo) */"
 
 
 def test_view_substitutions_missing_env_fails():

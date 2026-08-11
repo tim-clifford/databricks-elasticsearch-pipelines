@@ -52,7 +52,6 @@ names use `${...}` parameters resolved per-view from the config at deploy time:
 | `${view}` | the fully-qualified view to create: `catalog.schema.name` |
 | `${source}` | the fully-qualified source table: `catalog.schema.table` |
 | `${ref_<alias>}` | a reference (join) table, aliased: `catalog.schema.table <alias>` |
-| `${broadcast_hint}` | a Spark `/*+ BROADCAST(...) */` hint (empty unless a reference table sets `broadcast: true`); place it right after the top-level `SELECT` |
 
 Each of those is assembled from the config, with any `${environment}` component already folded in
 (see [Configuration](#configuration)). An unknown `${...}` parameter in a file is a hard error (fail
@@ -66,16 +65,15 @@ tables). Declare each under `reference_tables` in the config; the key is the joi
 in the SQL as `${ref_<alias>}`:
 
 ```sql
-SELECT ${broadcast_hint}
+SELECT
     base.dsl_id,
     (validation.dsl_id IS NOT NULL) AS validation_row_exists
 FROM ${source} base
 LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id
 ```
 
-The config owns *where* each table is and whether to broadcast it; the SQL owns the join itself (type,
-`ON` clause, surfaced columns). Set `broadcast: true` on a reference table to have the framework add a
-broadcast hint naming that join.
+The config owns *where* each table is; the SQL owns the join itself (type, `ON` clause, surfaced
+columns, and any tuning such as a `/*+ BROADCAST(alias) */` hint, written directly in the SQL).
 
 ## Configuration
 
@@ -107,7 +105,6 @@ reference_tables:                 # OPTIONAL: extra tables the view joins (see V
     catalog: acme_${environment}
     schema: ocsf_validation_${environment}
     table: dns_activity
-    broadcast: false              # true adds a Spark broadcast hint for this join
 ```
 
 A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token

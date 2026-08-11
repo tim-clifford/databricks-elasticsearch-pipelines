@@ -100,16 +100,7 @@ for filename in sql_files:
     try:
         subs = view_substitutions(configs_by_view[view_name], ENVIRONMENT)
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
-            sql = fh.read()
-        # Fail closed on a silently-dropped broadcast: if the config requested a broadcast (non-empty
-        # hint) but the SQL never references ${broadcast_hint}, the hint would be computed and thrown
-        # away -- the user asked for a broadcast and would get none, with no error. Catch it here.
-        if subs["broadcast_hint"] and "${broadcast_hint}" not in sql:
-            raise ValueError(
-                f"{filename}: a reference table sets broadcast: true, but the SQL does not use "
-                f"${{broadcast_hint}} (place it right after the top-level SELECT)"
-            )
-        rendered = render(sql, filename, subs)
+            rendered = render(fh.read(), filename, subs)
         # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
         spark.sql(rendered)
         created.append(filename)

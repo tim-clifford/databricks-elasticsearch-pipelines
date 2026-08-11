@@ -9,14 +9,15 @@
 -- (with any environment component already folded into each object name):
 --   view                           the fully-qualified view to create (catalog.schema.name)
 --   source                         the fully-qualified source table (catalog.schema.table)
---   broadcast_hint                 Spark broadcast hint for any reference table with broadcast: true
 --   ref_<alias>                    a reference table, aliased, e.g. `catalog.schema.table alias`
 -- The ref_<alias> name matches the reference_tables key in pipeline_definitions/ecs_dns_activity.yml.
+-- Join tuning (a /*+ BROADCAST(alias) */ hint, etc.) is written directly here by the view author,
+-- like the rest of the join.
 --
 -- Known limitation: the single source table plus any reference tables are what this view reads;
 -- there is exactly one source table per pipeline.
 CREATE OR REPLACE VIEW ${view} AS
-SELECT ${broadcast_hint}
+SELECT
     base.dsl_id,
     base.time,
     base.action,

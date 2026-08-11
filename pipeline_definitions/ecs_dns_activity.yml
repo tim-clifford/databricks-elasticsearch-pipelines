@@ -25,4 +25,3 @@ reference_tables:                 # OPTIONAL: extra tables the view joins
     catalog: tim_clifford_classic_dsl_lite_${environment}
     schema: ocsf_validation_${environment}
     table: dns_activity
-    broadcast: false              # true adds a Spark BROADCAST hint for this join

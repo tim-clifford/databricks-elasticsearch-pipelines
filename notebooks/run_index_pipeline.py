@@ -65,7 +65,7 @@ print(f"primary_key        = {cfg['primary_key']}")
 print(f"view               = {view['catalog']}.{view['schema']}.{view['name']}")
 print(f"source             = {source['catalog']}.{source['schema']}.{source['table']}")
 for alias, spec in cfg["reference_tables"].items():
-    print(f"reference[{alias}]  = {spec['catalog']}.{spec['schema']}.{spec['table']} (broadcast={spec['broadcast']})")
+    print(f"reference[{alias}]  = {spec['catalog']}.{spec['schema']}.{spec['table']}")
 
 dbutils.notebook.exit(
     f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; "

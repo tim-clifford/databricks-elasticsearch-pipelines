@@ -15,7 +15,6 @@ Schema (see pipeline_definitions/*.yml for a commented example):
         catalog: <c>
         schema:  <s>
         table:   <t>
-        broadcast: <bool>                # optional, default false; adds a Spark BROADCAST hint
 
 ENVIRONMENT SUBSTITUTION
 A `catalog` or `schema` value may embed the token `${environment}`, folded in at deploy time from the
@@ -120,7 +119,7 @@ def load_config(path: str) -> dict:
     """Load one config file, validate its structure, and return a normalized dict. Fail closed.
 
     Names are validated as identifier templates here; ${environment} is folded in later by
-    resolve_config. Defaults applied: reference_tables -> {}, each reference table's broadcast -> False.
+    resolve_config. Defaults applied: reference_tables -> {}.
     """
     import yaml
 
@@ -191,17 +190,13 @@ def _validate_reference_tables(node: object, source: str) -> dict:
         _require_identifier(alias, f"{source}: reference_tables key {alias!r}")
         if not isinstance(spec, dict):
             raise PipelineConfigError(f"{where} must be a mapping with catalog, schema, table, got {type(spec).__name__}")
-        spec_unknown = sorted(set(spec) - {"catalog", "schema", "table", "broadcast"})
+        spec_unknown = sorted(set(spec) - {"catalog", "schema", "table"})
         if spec_unknown:
-            raise PipelineConfigError(f"{where} has unknown key(s): {', '.join(spec_unknown)}; allowed: broadcast, catalog, schema, table")
-        broadcast = spec.get("broadcast", False)
-        if not isinstance(broadcast, bool):
-            raise PipelineConfigError(f"{where}.broadcast must be true or false, got {broadcast!r}")
+            raise PipelineConfigError(f"{where} has unknown key(s): {', '.join(spec_unknown)}; allowed: catalog, schema, table")
         result[alias] = {
             "catalog": _require_name_template(spec.get("catalog"), f"{where}.catalog"),
             "schema": _require_name_template(spec.get("schema"), f"{where}.schema"),
             "table": _require_identifier(spec.get("table"), f"{where}.table"),
-            "broadcast": broadcast,
         }
     return result
 
@@ -224,10 +219,7 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source"),
         "reference_tables": {
-            alias: {
-                **obj(spec, "table", f"reference_tables.{alias}"),
-                "broadcast": spec["broadcast"],
-            }
+            alias: obj(spec, "table", f"reference_tables.{alias}")
             for alias, spec in cfg["reference_tables"].items()
         },
     }
@@ -243,21 +235,17 @@ def view_substitutions(cfg: dict, environment: str) -> dict:
     - view / source: the fully-qualified object, e.g. `catalog.schema.name`.
     - ref_<alias>: the aliased, fully-qualified reference table, e.g. `catalog.schema.table alias`, so
       the SQL writes `LEFT JOIN ${ref_alias} ON ...` and refers to columns via the alias.
-    - broadcast_hint: a Spark hint naming every reference table with broadcast=true (or '' if none).
-      A Spark broadcast hint must sit immediately after the top-level SELECT and name the join alias;
-      the framework owns the alias, so the hint always resolves to a real relation.
+
+    Join tuning (a broadcast hint, etc.) is the view author's responsibility, written directly in the
+    SQL like the rest of the join -- the framework only resolves table locations.
     """
     resolved = resolve_config(cfg, environment)
     subs = {
         "view": _fqn(resolved["view"], "name"),
         "source": _fqn(resolved["source"], "table"),
     }
-    broadcast_aliases = []
     for alias, spec in resolved["reference_tables"].items():
         subs[f"ref_{alias}"] = f"{_fqn(spec, 'table')} {alias}"
-        if spec["broadcast"]:
-            broadcast_aliases.append(alias)
-    subs["broadcast_hint"] = f"/*+ BROADCAST({', '.join(broadcast_aliases)}) */" if broadcast_aliases else ""
     return subs
 
 
