@@ -67,6 +67,10 @@ print(f"source             = {source['catalog']}.{source['schema']}.{source['tab
 for alias, spec in cfg["reference_tables"].items():
     print(f"reference[{alias}]  = {spec['catalog']}.{spec['schema']}.{spec['table']}")
 
+# COMMAND ----------
+# dbutils.notebook.exit() must be the ONLY statement in its cell: its return value becomes the cell's
+# rendered output, visually replacing any print() output from the same cell. Keeping it separate
+# leaves the resolved-config prints above visible in their own completed cell.
 dbutils.notebook.exit(
     f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; "
     f"view={view['catalog']}.{view['schema']}.{view['name']}; "
