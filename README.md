@@ -87,7 +87,9 @@ or `DATABRICKS_HOST`. The only bundle variable is:
 | `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
 
 Everything else is per-pipeline and lives in `pipeline_definitions/<name>.yml`. Each object is fully
-qualified (`catalog`, `schema`, and a name/table), and any part may embed `${environment}`:
+qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
+`${environment}`; the view name and table names are plain identifiers (so a view's name always equals
+its `.sql` filename):
 
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
@@ -108,9 +110,9 @@ reference_tables:                 # OPTIONAL: extra tables the view joins (see V
     broadcast: false              # true adds a Spark broadcast hint for this join
 ```
 
-Names without an `${environment}` token are used verbatim. A name that *uses* the token but is
-deployed with an empty `environment` fails closed at deploy time, as does an environment value that
-would produce an illegal identifier (e.g. one containing a hyphen).
+A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token
+but is deployed with an empty `environment` fails closed at deploy time, as does an environment value
+that would produce an illegal identifier (e.g. one containing a hyphen).
 
 ## Deploy and run
 

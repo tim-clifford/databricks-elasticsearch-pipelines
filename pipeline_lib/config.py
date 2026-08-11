@@ -18,12 +18,14 @@ Schema (see pipeline_definitions/*.yml for a commented example):
         broadcast: <bool>                # optional, default false; adds a Spark BROADCAST hint
 
 ENVIRONMENT SUBSTITUTION
-Any catalog/schema/table/name value may embed the token `${environment}`, which is folded in at
-deploy time from the `environment` bundle variable, e.g. `ocsf_${environment}` -> `ocsf_prod`. A value
-with no token is used as-is. This is validated in two phases: at load, each name is a legal identifier
-*template* (identifier characters plus optional ${environment} tokens); at resolve, the token is
-substituted and the RESULT must be a legal bare identifier. So a bad environment value (a hyphen,
-say) fails closed at resolve time rather than producing invalid SQL.
+A `catalog` or `schema` value may embed the token `${environment}`, folded in at deploy time from the
+`environment` bundle variable, e.g. `ocsf_${environment}` -> `ocsf_prod`. A value with no token is used
+as-is. The environment component only ever belongs at the catalog/schema level, so table/view NAMES
+are plain identifiers and may NOT contain the token (this also guarantees a view's name always equals
+its `.sql` filename). Validated in two phases: at load, a catalog/schema is a legal identifier
+*template* (identifier characters plus optional ${environment} tokens) and a name/table is a plain
+identifier; at resolve, the token is substituted and the RESULT must be a legal bare identifier, so a
+bad environment value (a hyphen, say) fails closed at resolve time rather than producing invalid SQL.
 """
 from __future__ import annotations
 
@@ -33,14 +35,14 @@ import re
 # letters, digits, underscores. Rejects a hyphen, space, dot, quote, or reserved punctuation.
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# The ${environment} substitution token, the only token allowed inside a name template.
+# The ${environment} substitution token, the only token allowed inside a catalog/schema template.
 _ENV_TOKEN = "${environment}"
-_ENV_TOKEN_RE = re.compile(r"\$\{environment\}")
 
-# A name TEMPLATE (pre-resolution): identifier characters and/or ${environment} tokens, nothing else.
-# `${environment}` may appear anywhere (prefix/infix/suffix). After the tokens are removed, only
-# identifier characters may remain, and the template must be non-empty. Rejects stray `${...}`,
-# dots, spaces, hyphens up front, so a malformed template fails at load, not at SQL time.
+# A catalog/schema TEMPLATE (pre-resolution): identifier characters and/or ${environment} tokens,
+# nothing else. The token may appear anywhere (prefix/infix/suffix); after the tokens, only identifier
+# characters may remain, and the template must be non-empty. Rejects stray `${...}`, dots, spaces, and
+# leading hyphens, so a malformed template fails at load, not at SQL time. (Table/view NAMES do not
+# use this: they must be plain identifiers, so a view name always equals its .sql filename.)
 _VALID_NAME_TEMPLATE = re.compile(r"^([A-Za-z0-9_]|\$\{environment\})+$")
 
 # ES index names are not SQL identifiers: lowercase, may contain hyphens/dots/underscores, must start
@@ -82,7 +84,9 @@ def resolve_name(template: str, environment: str, where: str) -> str:
         raise PipelineConfigError(
             f"{where} uses ${{environment}} but no environment was provided"
         )
-    resolved = _ENV_TOKEN_RE.sub(environment, template)
+    # str.replace, NOT re.sub: re.sub treats `environment` as a replacement template, so a value
+    # containing a backslash or group reference would raise re.error instead of failing closed here.
+    resolved = template.replace(_ENV_TOKEN, environment)
     if not _VALID_IDENTIFIER.match(resolved):
         raise PipelineConfigError(
             f"{where} resolved to {resolved!r} (from {template!r} with environment={environment!r}), "
@@ -141,7 +145,11 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
 
 
 def _validate_object(node: object, where: str, name_key: str, allowed: set) -> dict:
-    """Validate a {catalog, schema, <name_key>} object; each part is a name template."""
+    """Validate a {catalog, schema, <name_key>} object.
+
+    catalog and schema are name TEMPLATES (may contain ${environment}); the name/table is a plain
+    identifier (no token), so an object's name is fixed and, for a view, always equals its filename.
+    """
     if not isinstance(node, dict):
         raise PipelineConfigError(f"{where} must be a mapping with catalog, schema, and {name_key}, got {type(node).__name__}")
     node_unknown = sorted(set(node) - allowed)
@@ -150,7 +158,7 @@ def _validate_object(node: object, where: str, name_key: str, allowed: set) -> d
     return {
         "catalog": _require_name_template(node.get("catalog"), f"{where}.catalog"),
         "schema": _require_name_template(node.get("schema"), f"{where}.schema"),
-        name_key: _require_name_template(node.get(name_key), f"{where}.{name_key}"),
+        name_key: _require_identifier(node.get(name_key), f"{where}.{name_key}"),
     }
 
 
@@ -177,7 +185,7 @@ def _validate_reference_tables(node: object, source: str) -> dict:
         result[alias] = {
             "catalog": _require_name_template(spec.get("catalog"), f"{where}.catalog"),
             "schema": _require_name_template(spec.get("schema"), f"{where}.schema"),
-            "table": _require_name_template(spec.get("table"), f"{where}.table"),
+            "table": _require_identifier(spec.get("table"), f"{where}.table"),
             "broadcast": broadcast,
         }
     return result

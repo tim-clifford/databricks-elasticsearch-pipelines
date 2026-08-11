@@ -159,6 +159,30 @@ def test_resolve_name_illegal_environment_fails(env):
         resolve_name("ocsf_${environment}", environment=env, where="x")
 
 
+@pytest.mark.parametrize("env", ["back\\slash", "\\1", "a\\g<0>b"])
+def test_resolve_name_backslash_environment_fails_closed(env):
+    # str.replace (not re.sub): a backslash/group-ref in the env value must raise PipelineConfigError
+    # (illegal identifier), never an uncaught re.error.
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        resolve_name("ocsf_${environment}", environment=env, where="x")
+
+
+def test_name_and_table_reject_environment_token():
+    # ${environment} belongs only in catalog/schema, never in a view name or table name.
+    for key, obj in (("name", "view"), ("table", "source")):
+        cfg = _base()
+        cfg[obj][key] = "thing_${environment}"
+        with pytest.raises(PipelineConfigError, match=f"{obj}.{key}"):
+            validate_config(cfg)
+
+
+def test_reference_table_rejects_environment_token():
+    cfg = _base()
+    cfg["reference_tables"] = {"v": {"catalog": "c", "schema": "s_${environment}", "table": "t_${environment}"}}
+    with pytest.raises(PipelineConfigError, match="table"):
+        validate_config(cfg)
+
+
 # --------------------------------------------------------------------------- resolve_config
 
 

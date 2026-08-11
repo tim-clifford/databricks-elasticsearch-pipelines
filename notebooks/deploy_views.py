@@ -88,16 +88,31 @@ def render(sql: str, filename: str, subs: dict) -> str:
     return _TOKEN.sub(_sub, sql)
 
 
+# Best-effort per view: each view is an independent CREATE OR REPLACE, so one view's failure
+# (a bad environment resolution, a missing source table, a SQL error) must NOT stop the others.
+# We attempt every view, collect failures, then FAIL the job at the end if any view failed -- a
+# partial deploy must never report green (fail closed).
 created = []
+failed = []
 for filename in sql_files:
     view_name = os.path.splitext(filename)[0]
-    subs = view_substitutions(configs_by_view[view_name], ENVIRONMENT)
-    with open(os.path.join(VIEWS_DIR, filename)) as fh:
-        rendered = render(fh.read(), filename, subs)
     print(f"--- {filename} ---")
-    # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
-    spark.sql(rendered)
-    created.append(filename)
+    try:
+        subs = view_substitutions(configs_by_view[view_name], ENVIRONMENT)
+        with open(os.path.join(VIEWS_DIR, filename)) as fh:
+            rendered = render(fh.read(), filename, subs)
+        # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
+        spark.sql(rendered)
+        created.append(filename)
+        print(f"    created {view_name}")
+    except Exception as exc:  # noqa: BLE001 -- deliberately continue to the next view
+        failed.append((filename, exc))
+        print(f"    FAILED {view_name}: {type(exc).__name__}: {exc}")
 
-print(f"deployed {len(created)} view(s): {', '.join(created)}")
+print(f"deployed {len(created)} view(s): {', '.join(created) or '(none)'}")
+if failed:
+    summary = "; ".join(f"{f}: {type(e).__name__}: {e}" for f, e in failed)
+    # Raise so the job run fails: the successful views are already deployed, but a partial run is
+    # not a green run.
+    raise RuntimeError(f"{len(failed)} view(s) failed to deploy: {summary}")
 dbutils.notebook.exit(f"deployed {len(created)} view(s): {', '.join(created)}")
