@@ -13,9 +13,11 @@ resources:
           notebook_path: ../notebooks/run_index_pipeline.py
           base_parameters:
             es_index_name: ecs-authentication
-            source_table: authentication
-            view_name: ecs_authentication
             primary_key: dsl_id
+            view_schema: es_poc
+            view_name: ecs_authentication
+            source_schema: ocsf
+            source_table: authentication
       permissions:
       - level: CAN_MANAGE_RUN
         group_name: users

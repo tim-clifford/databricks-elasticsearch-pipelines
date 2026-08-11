@@ -4,19 +4,16 @@ resources:
       name: "[${bundle.target}] databricks-elasticsearch-pipelines: deploy views"
       description: >-
         A serverless notebook task that creates or replaces one Databricks view per Elasticsearch
-        index. Each view is a .sql file in views/; the notebook renders the catalog/schema
-        placeholders from the parameters below and runs every file with spark.sql. No cluster block
-        => serverless notebook task.
+        index. Each view is a .sql file in views/ paired with a pipeline_definitions/<name>.yml; the
+        notebook renders each view's parameters from its config plus the shared catalog and runs every
+        file with spark.sql. No cluster block => serverless notebook task.
 
       tasks:
         - task_key: deploy_views
           notebook_task:
             notebook_path: ../notebooks/deploy_views.py
             base_parameters:
-              view_catalog: ${var.view_catalog}
-              view_schema: ${var.view_schema}
-              source_catalog: ${var.source_catalog}
-              source_schema: ${var.source_schema}
+              catalog: ${var.catalog}
 
       # On-demand: invoke via `databricks bundle run deploy_views`. CAN_MANAGE_RUN so any teammate in
       # `users` can trigger it, matching that framing.

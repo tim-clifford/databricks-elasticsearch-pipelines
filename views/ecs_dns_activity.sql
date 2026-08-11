@@ -1,53 +1,62 @@
 -- View feeding the ecs-dns-activity Elasticsearch index.
 --
--- Currently a passthrough wrapper over the source OCSF dns_activity table (every column listed
--- explicitly rather than SELECT *, so the view's output schema is an explicit, reviewable contract).
--- This is the slot where the OCSF -> ECS projection will live later.
+-- A wrapper over the source OCSF dns_activity table (every column listed explicitly rather than
+-- SELECT *, so the view's output schema is an explicit, reviewable contract), left-joined to a
+-- reference table to surface a validation flag. This is the slot where the OCSF -> ECS projection
+-- will live later.
 --
--- Placeholders (${...}) are substituted by the deploy_views notebook from job parameters:
---   view_catalog / view_schema     where this view is created
---   source_catalog / source_schema where the source table is read from
--- Known limitation: all tables referenced by a single view must share one catalog.schema
--- (source_catalog.source_schema); a view joining tables across schemas is not supported.
-CREATE OR REPLACE VIEW ${view_catalog}.${view_schema}.ecs_dns_activity AS
-SELECT
-    dsl_id,
-    time,
-    action,
-    action_id,
-    activity,
-    activity_id,
-    activity_name,
-    answers,
-    app_name,
-    category_name,
-    category_uid,
-    class_name,
-    class_uid,
-    connection_info,
-    disposition,
-    disposition_id,
-    dst_endpoint,
-    enrichments,
-    message,
-    metadata,
-    observables,
-    policy,
-    query,
-    osint,
-    raw_data,
-    rcode,
-    rcode_id,
-    severity,
-    severity_id,
-    src_endpoint,
-    status,
-    status_code,
-    status_detail,
-    status_id,
-    timezone_offset,
-    traffic,
-    type_name,
-    type_uid,
-    unmapped
-FROM ${source_catalog}.${source_schema}.dns_activity
+-- Parameters (${...}) are substituted by the deploy_views notebook from the pipeline definition:
+--   catalog                        the shared catalog (bundle variable)
+--   view_schema / view_name        where this view is created, and its name
+--   source_schema / source_table   where the source table is read from
+--   broadcast_hint                 Spark broadcast hint for any reference table with broadcast: true
+--   ref_<alias>                    a reference table, aliased, e.g. `catalog.schema.table alias`
+-- The ref_<alias> name matches the reference_tables key in pipeline_definitions/ecs_dns_activity.yml.
+--
+-- Known limitation: the single source table plus any reference tables are what this view reads;
+-- there is exactly one source table per pipeline.
+CREATE OR REPLACE VIEW ${catalog}.${view_schema}.${view_name} AS
+SELECT ${broadcast_hint}
+    base.dsl_id,
+    base.time,
+    base.action,
+    base.action_id,
+    base.activity,
+    base.activity_id,
+    base.activity_name,
+    base.answers,
+    base.app_name,
+    base.category_name,
+    base.category_uid,
+    base.class_name,
+    base.class_uid,
+    base.connection_info,
+    base.disposition,
+    base.disposition_id,
+    base.dst_endpoint,
+    base.enrichments,
+    base.message,
+    base.metadata,
+    base.observables,
+    base.policy,
+    base.query,
+    base.osint,
+    base.raw_data,
+    base.rcode,
+    base.rcode_id,
+    base.severity,
+    base.severity_id,
+    base.src_endpoint,
+    base.status,
+    base.status_code,
+    base.status_detail,
+    base.status_id,
+    base.timezone_offset,
+    base.traffic,
+    base.type_name,
+    base.type_uid,
+    base.unmapped,
+    -- Surfaced from the reference join: does a validation row exist for this event?
+    (validation.dsl_id IS NOT NULL) AS validation_row_exists
+FROM ${catalog}.${source_schema}.${source_table} base
+LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id

@@ -1,12 +1,23 @@
-# Pipeline config for one Elasticsearch index. One file here => one deployed job (see
-# scripts/gen_jobs.py, which turns each of these into resources/<name>.job.yml).
+# Pipeline definition for one Elasticsearch index. One file here => one deployed job (see
+# scripts/gen_jobs.py) and one view (see views/<view.name>.sql, deployed by the deploy_views job).
 #
-# es_index_name : target Elasticsearch index.
-# source_table  : the Delta table the view reads from (name only; catalog.schema is supplied at
-#                 deploy time, as with the views).
-# view_name     : the Databricks view that defines what gets exported (see views/<view_name>.sql).
-# primary_key   : the view column used as the Elasticsearch document _id.
-es_index_name: ecs-dns-activity
-source_table: dns_activity
-view_name: ecs_dns_activity
-primary_key: dsl_id
+# `catalog` is NOT set here: it is one shared value per environment, supplied as a bundle variable
+# at deploy time. Everything below is per-pipeline.
+es_index_name: ecs-dns-activity   # target Elasticsearch index (hyphens allowed)
+primary_key: dsl_id               # view column used as the Elasticsearch document _id
+
+view:                             # the view this pipeline creates and exports
+  schema: es_poc
+  name: ecs_dns_activity
+
+source:                           # the single source table the view reads from
+  schema: ocsf
+  table: dns_activity
+
+reference_tables:                 # OPTIONAL: extra tables the view joins
+  # The key (`validation`) is YOUR choice: it is the SQL alias the view joins against and must match
+  # the ${ref_validation} token used in views/ecs_dns_activity.sql.
+  validation:
+    schema: ocsf_validation
+    table: dns_activity
+    broadcast: false              # true adds a Spark BROADCAST hint for this join

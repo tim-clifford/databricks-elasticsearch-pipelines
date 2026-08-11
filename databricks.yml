@@ -10,9 +10,7 @@
 # Quick start (the workspace host comes from your CLI profile; pass -p):
 #   python scripts/gen_jobs.py                 # regenerate resources/<name>.job.yml from configs
 #   databricks bundle validate -t dev -p <profile>
-#   databricks bundle deploy   -t dev -p <profile> \
-#       --var="view_catalog=<cat>" --var="view_schema=<schema>" \
-#       --var="source_catalog=<cat>" --var="source_schema=<schema>"
+#   databricks bundle deploy   -t dev -p <profile> --var="catalog=<catalog>"
 
 bundle:
   name: databricks_elasticsearch_pipelines
@@ -27,17 +25,10 @@ include:
   - resources/*.yml
 
 variables:
-  # View deployment (deploy_views job). All REQUIRED, no default: catalog/schema names are
-  # environment-specific. view_* is where the views are created; source_* is where their source
-  # tables are read from. The two may differ; all tables in one view must share source_*.
-  view_catalog:
-    description: "REQUIRED, no default. Catalog the views are created in."
-  view_schema:
-    description: "REQUIRED, no default. Schema the views are created in."
-  source_catalog:
-    description: "REQUIRED, no default. Catalog the source tables are read from."
-  source_schema:
-    description: "REQUIRED, no default. Schema the source tables are read from."
+  # The one shared, environment-specific value (REQUIRED, no default). Everything else per pipeline
+  # (view schema/name, source schema/table, reference tables) lives in pipeline_definitions/<name>.yml.
+  catalog:
+    description: "REQUIRED, no default. The shared catalog that views and source tables live in."
 
 # Targets differ only by deployment mode. The workspace HOST is intentionally not hardcoded here:
 # it is taken from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var,

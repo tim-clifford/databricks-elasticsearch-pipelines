@@ -1,15 +1,14 @@
 -- View feeding the ecs-authentication Elasticsearch index.
 --
--- Currently a passthrough wrapper over the source OCSF authentication table (every column listed
--- explicitly rather than SELECT *, so the view's output schema is an explicit, reviewable contract).
--- This is the slot where the OCSF -> ECS projection will live later.
+-- A passthrough wrapper over the source OCSF authentication table (every column listed explicitly
+-- rather than SELECT *, so the view's output schema is an explicit, reviewable contract). This is
+-- the slot where the OCSF -> ECS projection will live later. No reference-table joins here.
 --
--- Placeholders (${...}) are substituted by the deploy_views notebook from job parameters:
---   view_catalog / view_schema     where this view is created
---   source_catalog / source_schema where the source table is read from
--- Known limitation: all tables referenced by a single view must share one catalog.schema
--- (source_catalog.source_schema); a view joining tables across schemas is not supported.
-CREATE OR REPLACE VIEW ${view_catalog}.${view_schema}.ecs_authentication AS
+-- Parameters (${...}) are substituted by the deploy_views notebook from the pipeline definition:
+--   catalog                        the shared catalog (bundle variable)
+--   view_schema / view_name        where this view is created, and its name
+--   source_schema / source_table   where the source table is read from
+CREATE OR REPLACE VIEW ${catalog}.${view_schema}.${view_name} AS
 SELECT
     dsl_id,
     time,
@@ -54,4 +53,4 @@ SELECT
     type_uid,
     unmapped,
     user
-FROM ${source_catalog}.${source_schema}.authentication
+FROM ${catalog}.${source_schema}.${source_table}

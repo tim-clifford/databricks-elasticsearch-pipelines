@@ -10,7 +10,8 @@ transfer.
 Every Elasticsearch index is fed by its own pipeline, and each pipeline is described by two files:
 
 - a view `views/<view_name>.sql` defining what gets exported, and
-- a config file `pipeline_definitions/<name>.yml` that points a pipeline at that view.
+- a config file `pipeline_definitions/<name>.yml` that points a pipeline at that view and says where
+  its view, source table, and any reference (join) tables live.
 
 The bundle deploys:
 
@@ -25,7 +26,8 @@ The bundle deploys:
 ## Adding a new pipeline for an ES index
 
 1. Add `views/<view_name>.sql`.
-2. Add `pipeline_definitions/<name>.yml` with `es_index_name`, `source_table`, `view_name`, `primary_key`.
+2. Add `pipeline_definitions/<name>.yml` (see the schema under [Configuration](#configuration)). The
+   view's filename must match the config's `view.name`.
 3. Regenerate the job resources: `python scripts/gen_jobs.py`.
 4. Deploy.
 
@@ -43,50 +45,80 @@ forgot to regenerate.
 Each `.sql` file in `views/` defines one view. The filename matches the view it creates
 (`ecs_dns_activity.sql` creates the `ecs_dns_activity` view, feeding the `ecs-dns-activity` ES index;
 the view name uses underscores because a Databricks view name can't contain unquoted hyphens). Object
-names use `${...}` parameters substituted from job parameters at deploy time:
+names use `${...}` parameters resolved per-view from the config plus the shared `catalog` at deploy
+time:
 
-| Parameter | Meaning |
+| Parameter | Resolves to |
 |---|---|
-| `${view_catalog}` / `${view_schema}` | where the view is created |
-| `${source_catalog}` / `${source_schema}` | where the view's source table(s) are read from |
+| `${catalog}` | the shared catalog (bundle variable) |
+| `${view_schema}` / `${view_name}` | where the view is created, and its name |
+| `${source_schema}` / `${source_table}` | the source table the view reads from |
+| `${ref_<alias>}` | a reference (join) table, aliased: `catalog.schema.table <alias>` |
+| `${broadcast_hint}` | a Spark `/*+ BROADCAST(...) */` hint (empty unless a reference table sets `broadcast: true`); place it right after the top-level `SELECT` |
 
 An unknown `${...}` parameter in a file is a hard error (fail closed), so a typo can't create a view
 pointing at the wrong place.
 
-**Known limitation:** all tables referenced by a single view must share one
-`source_catalog.source_schema`. A view joining tables across different schemas is not supported.
+### Reference (join) tables
+
+A view has exactly one source table, but may join **reference tables** (e.g. dimension or lookup
+tables). Declare each under `reference_tables` in the config; the key is the join alias you reference
+in the SQL as `${ref_<alias>}`:
+
+```sql
+SELECT ${broadcast_hint}
+    base.dsl_id,
+    (validation.dsl_id IS NOT NULL) AS validation_row_exists
+FROM ${catalog}.${source_schema}.${source_table} base
+LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id
+```
+
+The config owns *where* each table is and whether to broadcast it; the SQL owns the join itself (type,
+`ON` clause, surfaced columns). Set `broadcast: true` on a reference table to have the framework add a
+broadcast hint naming that join.
+
+**Known limitation:** all tables a view reads (source + reference) must live in the shared `catalog`.
+A cross-catalog join is not supported.
 
 ## Configuration
 
-The bundle carries no environment-specific values; every one is supplied at deploy time and has no
-default, because catalog/schema names and the target workspace differ per environment.
-
 The **workspace** is not a bundle variable: it comes from your Databricks CLI profile (`-p <profile>`)
-or `DATABRICKS_HOST`. The bundle variables, all passed with `--var`, are:
+or `DATABRICKS_HOST`. The only bundle variable is:
 
 | Variable | What it sets |
 |---|---|
-| `view_catalog` | catalog where `deploy_views` creates the views |
-| `view_schema` | schema where `deploy_views` creates the views |
-| `source_catalog` | catalog the views read their source tables from |
-| `source_schema` | schema the views read their source tables from |
+| `catalog` | the one shared catalog every view and source/reference table lives in (required, no default) |
 
-The per-pipeline values (`es_index_name`, `source_table`, `view_name`, `primary_key`) are not bundle
-variables. Each comes from its `pipeline_definitions/<name>.yml`.
+Everything else is per-pipeline and lives in `pipeline_definitions/<name>.yml`:
+
+```yaml
+es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
+primary_key: dsl_id               # view column used as the ES document _id
+view:                             # the view this pipeline creates
+  schema: es_poc
+  name: ecs_dns_activity
+source:                           # the single source table the view reads from
+  schema: ocsf
+  table: dns_activity
+reference_tables:                 # OPTIONAL: extra tables the view joins (see Views)
+  validation:                     # key = the ${ref_validation} join alias in the SQL
+    schema: ocsf_validation
+    table: dns_activity
+    broadcast: false              # true adds a Spark broadcast hint for this join
+```
+
+`catalog` is deliberately not per-pipeline: it is assumed shared across every pipeline in an
+environment. (Supporting different catalogs per pipeline would be a future change.)
 
 ## Deploy and run
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<name>.job.yml from pipeline_definitions/*.yml
 
-databricks bundle deploy -t dev -p <profile> \
-  --var="view_catalog=<catalog>" \
-  --var="view_schema=<schema>" \
-  --var="source_catalog=<catalog>" \
-  --var="source_schema=<schema>"
+databricks bundle deploy -t dev -p <profile> --var="catalog=<catalog>"
 
-databricks bundle run deploy_views                -t dev -p <profile>   # plus the same --var flags
-databricks bundle run index_pipeline_<name>       -t dev -p <profile>   # plus the same --var flags
+databricks bundle run deploy_views                -t dev -p <profile> --var="catalog=<catalog>"
+databricks bundle run index_pipeline_<name>       -t dev -p <profile> --var="catalog=<catalog>"
 ```
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
@@ -104,16 +136,23 @@ requirements.txt                Off-cluster tooling deps (pinned pyyaml for the 
 
 You edit these, one pair per pipeline:
   views/
-    <view_name>.sql             The view: what gets exported (filename == view name)
+    <view_name>.sql             The view: what gets exported (filename == view.name)
   pipeline_definitions/
-    <name>.yml                  The config: points a pipeline at a view (es_index_name,
-                                source_table, view_name, primary_key)
+    <name>.yml                  The config: view/source/reference locations + es_index_name,
+                                primary_key (see Configuration for the schema)
 
 Shared notebooks (run by the jobs, not edited per pipeline):
   notebooks/
-    deploy_views.py             Substitutes the catalog/schema parameters into each view's SQL
-                                and runs CREATE OR REPLACE
+    deploy_views.py             Renders each view's parameters from its config + the shared catalog,
+                                then runs CREATE OR REPLACE
     run_index_pipeline.py       Run by every per-index job (reads/validates/prints its config)
+
+Shared library + tests (the config schema, used by the generator and deploy_views):
+  pipeline_lib/
+    config.py                   Loads/validates a pipeline definition; derives view substitutions
+                                and job parameters (single source of truth for the schema)
+  tests/
+    test_config.py              Offline unit tests for pipeline_lib.config (plain pytest)
 
 Generated / tooling (do not hand-edit the generated jobs):
   scripts/
