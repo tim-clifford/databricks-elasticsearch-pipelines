@@ -31,9 +31,11 @@ The bundle deploys:
 3. Regenerate the job resources: `python scripts/gen_jobs.py`.
 4. Deploy.
 
-`scripts/gen_jobs.py --check` fails if any generated `resources/<name>.job.yml` is missing or stale,
-so run it in CI to catch a config edit that wasn't regenerated. Generated files carry a
-`DO NOT EDIT` header; edits belong in the config or the generator template.
+`scripts/gen_jobs.py --check` fails if any generated `resources/<name>.job.yml` is missing, stale, or
+orphaned (left behind by a deleted/renamed config), so run it in CI to catch a config change that
+wasn't regenerated. Generated files carry a `DO NOT EDIT` header; edits belong in the config or the
+generator template. Config files may use `.yml` or `.yaml`, and each required value must be a
+non-empty string (a null or non-string value is rejected, not silently rendered).
 
 ## Views
 
