@@ -122,4 +122,9 @@ if failed:
     # Raise so the job run fails: the successful views are already deployed, but a partial run is
     # not a green run.
     raise RuntimeError(f"{len(failed)} view(s) failed to deploy: {summary}")
+
+# COMMAND ----------
+# dbutils.notebook.exit() must be the ONLY statement in its cell: its return value becomes the cell's
+# rendered output, visually replacing any print() output from the same cell. Keeping it separate
+# leaves the per-view SQL / substitution prints above visible in their own completed cell.
 dbutils.notebook.exit(f"deployed {len(created)} view(s): {', '.join(created)}")
