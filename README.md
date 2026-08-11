@@ -122,3 +122,11 @@ Generated / tooling (do not hand-edit the generated jobs):
     deploy_views.job.yml        The deploy_views job (hand-authored)
     <name>.job.yml              GENERATED per-index job (one per pipeline_definitions config)
 ```
+
+## License & Attribution
+
+**Copyright © Databricks, Inc.** — Developed and maintained by Databricks Forward Deployed Engineering. Available to support customers and the broader community in building Elasticsearch export pipelines on Databricks. For production support and customization, contact your Databricks account team.
+
+---
+
+**Built with 💜 by Databricks Forward Deployed Engineering**
