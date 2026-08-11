@@ -87,7 +87,11 @@ databricks bundle run index_pipeline_<name>       -t dev -p <profile>   # plus t
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
-The generator needs `pyyaml` (`pip install pyyaml`); nothing else runs off-cluster.
+The generator needs `pyyaml`, pinned in `requirements-dev.txt` (`pip install -r requirements-dev.txt`).
+The pin matters: `--check` byte-compares against `yaml.safe_dump` output, whose formatting can drift
+across pyyaml versions. A config's filename stem becomes the job's resource key
+(`index_pipeline_<stem>`), so it must contain only letters, digits, `_`, and `-` (the generator
+rejects anything else, e.g. a dotted name, at generation time).
 
 ## Layout
 

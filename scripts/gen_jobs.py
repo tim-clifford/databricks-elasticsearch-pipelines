@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import sys
 
 import yaml
@@ -28,6 +29,12 @@ _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
 
 # Config files may use either extension; both are treated identically.
 _CONFIG_GLOBS = ("*.yml", "*.yaml")
+
+# A config's stem becomes the Databricks bundle resource key `index_pipeline_<stem>`, which must be
+# [A-Za-z0-9_-]+. A dotted name like `foo.bar.yml` (splitext strips only `.yml`) would yield the key
+# `index_pipeline_foo.bar` -- invalid, and it fails at DEPLOY, not generation. Enforce it here so a
+# bad name fails loudly at generation instead.
+_VALID_STEM = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Required keys in every index config. Allow-list: an unknown key is rejected (a typo'd key would
 # otherwise be silently ignored, e.g. `primary_keys:` leaving primary_key unset), and a missing or
@@ -157,6 +164,11 @@ def discover_configs() -> list[str]:
     seen: dict[str, str] = {}
     for path in paths:
         name = _config_name(path)
+        if not _VALID_STEM.match(name):
+            raise ValueError(
+                f"{os.path.basename(path)}: config name '{name}' is not a valid resource key; "
+                f"use only letters, digits, '_' and '-' (no dots or other characters)"
+            )
         if name in seen:
             raise ValueError(
                 f"config name collision: {os.path.basename(seen[name])} and "
