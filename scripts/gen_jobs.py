@@ -191,22 +191,31 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config_paths = discover_configs()
-    if not config_paths:
+    orphans = [
+        p for p in existing_generated_files() if p not in {generated_path(_config_name(c)) for c in config_paths}
+    ]
+
+    # An empty config dir is only an error if there is also no orphan cleanup to do -- otherwise we
+    # still need to run so a deleted last config's stale generated job gets removed/flagged. (Orphan
+    # handling below runs regardless of whether any configs remain.)
+    if not config_paths and not orphans:
         print(f"no index configs found in {_CONFIG_DIR}", file=sys.stderr)
         return 1
 
-    expected = {generated_path(_config_name(p)) for p in config_paths}
-    orphans = [p for p in existing_generated_files() if p not in expected]
-
-    # Refuse to write over a hand-authored resource. The orphan logic guards DELETION by marker; this
-    # is the symmetric guard on WRITE: a config named e.g. `deploy_views` would target the existing
-    # hand-authored resources/deploy_views.job.yml, which has no marker. Checked up front so we never
-    # clobber one file before erroring on another. Applies in --check too (it is a real deploy hazard).
-    collisions = [
-        _config_name(p)
-        for p in config_paths
-        if os.path.exists(generated_path(_config_name(p))) and not is_generated(generated_path(_config_name(p)))
-    ]
+    # Validate and render EVERYTHING before touching disk, so generation is all-or-nothing: an invalid
+    # config aborts here with nothing written, never leaving resources/ half-regenerated. Also refuse
+    # up front to write over a hand-authored resource -- the symmetric guard to orphan deletion: a
+    # config named e.g. `deploy_views` targets the existing resources/deploy_views.job.yml (no marker).
+    rendered: dict[str, str] = {}
+    collisions = []
+    for path in config_paths:
+        name = _config_name(path)
+        out_path = generated_path(name)
+        if os.path.exists(out_path) and not is_generated(out_path):
+            collisions.append(name)
+            continue
+        cfg = load_config(path)  # raises ValueError on any invalid config (fail closed)
+        rendered[name] = render_job_yaml(os.path.basename(path), name, cfg)
     if collisions:
         for name in collisions:
             print(
@@ -216,37 +225,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 1
 
-    stale = []
-    for path in config_paths:
-        name = _config_name(path)
-        cfg = load_config(path)
-        content = render_job_yaml(os.path.basename(path), name, cfg)
-        out_path = generated_path(name)
-
-        if args.check:
+    if args.check:
+        stale = []
+        for name, content in rendered.items():
+            out_path = generated_path(name)
             existing = None
             if os.path.exists(out_path):
                 with open(out_path) as fh:
                     existing = fh.read()
             if existing != content:
                 stale.append(name)
-        else:
-            with open(out_path, "w") as fh:
-                fh.write(content)
-            print(f"wrote {os.path.relpath(out_path, _REPO_ROOT)}")
 
-    if not args.check:
-        for path in orphans:
-            os.remove(path)
-            print(f"removed orphaned {os.path.relpath(path, _REPO_ROOT)}")
-
-    if args.check:
         problem = False
         if stale:
-            print(
-                "stale/missing generated job file(s) for: " + ", ".join(stale),
-                file=sys.stderr,
-            )
+            print("stale/missing generated job file(s) for: " + ", ".join(sorted(stale)), file=sys.stderr)
             problem = True
         if orphans:
             print(
@@ -258,7 +250,18 @@ def main(argv: list[str] | None = None) -> int:
         if problem:
             print("run: python scripts/gen_jobs.py", file=sys.stderr)
             return 1
-        print(f"all {len(config_paths)} generated job file(s) up to date; no orphans")
+        print(f"all {len(rendered)} generated job file(s) up to date; no orphans")
+        return 0
+
+    # Write pass: everything already validated and rendered, so this cannot abort partway on a bad config.
+    for name, content in rendered.items():
+        out_path = generated_path(name)
+        with open(out_path, "w") as fh:
+            fh.write(content)
+        print(f"wrote {os.path.relpath(out_path, _REPO_ROOT)}")
+    for path in orphans:
+        os.remove(path)
+        print(f"removed orphaned {os.path.relpath(path, _REPO_ROOT)}")
 
     return 0
 
