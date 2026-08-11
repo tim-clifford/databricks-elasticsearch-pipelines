@@ -76,6 +76,13 @@ import re
 
 _TOKEN = re.compile(r"\$\{(\w+)\}")
 
+# Caps for the debug print of rendered SQL. A view is a single CREATE OR REPLACE VIEW statement, so
+# these are never hit in normal use; they exist only so that a pathologically large view can't make
+# this diagnostic logging itself blow the notebook's output size limit and fail an otherwise-good
+# deploy. spark.sql still runs the FULL SQL regardless -- only the printed copy is capped.
+_SQL_PRINT_MAX_LINES = 200
+_SQL_PRINT_MAX_CHARS = 20_000
+
 
 def render(sql: str, filename: str, subs: dict) -> str:
     def _sub(m: "re.Match") -> str:
@@ -87,6 +94,29 @@ def render(sql: str, filename: str, subs: dict) -> str:
         return subs[key]
 
     return _TOKEN.sub(_sub, sql)
+
+
+def print_sql(sql: str) -> None:
+    """Print the rendered SQL for debugging, capped so a huge view can't flood notebook output.
+
+    Truncates by whichever limit hits first (lines or characters) and prints a clear notice with the
+    full size, so it's obvious the display was clipped and by how much.
+    """
+    lines = sql.splitlines()
+    clipped = lines[:_SQL_PRINT_MAX_LINES]
+    shown, chars = [], 0
+    for line in clipped:
+        if chars + len(line) + 1 > _SQL_PRINT_MAX_CHARS:
+            break
+        shown.append(line)
+        chars += len(line) + 1
+    for line in shown:
+        print(f"      {line}")
+    if len(shown) < len(lines):
+        print(
+            f"      ... [truncated for display: showing {len(shown)} of {len(lines)} lines, "
+            f"{len(sql)} chars total; full SQL is still executed]"
+        )
 
 
 # Best-effort per view: each view is an independent CREATE OR REPLACE, so one view's failure
@@ -106,8 +136,7 @@ for filename in sql_files:
         # folded in) so the exact CREATE OR REPLACE is visible in the job output for debugging.
         print(f"    substitutions: {subs}")
         print("    running SQL:")
-        for line in rendered.splitlines():
-            print(f"      {line}")
+        print_sql(rendered)
         # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
         spark.sql(rendered)
         created.append(filename)
