@@ -147,7 +147,14 @@ def print_sql(sql: str) -> int:
         chars += cost
     for line in shown:
         emit(f"{_SQL_PRINT_INDENT}{line}")
-    if len(shown) < len(lines) or truncated_line:
+    if truncated_line:
+        # The one shown line was itself hard-truncated (a single line bigger than the whole budget),
+        # so a "1 of 1 lines" count would misleadingly imply nothing was clipped.
+        emit(
+            f"{_SQL_PRINT_INDENT}... [truncated for display: first line hard-truncated; "
+            f"{len(sql)} chars total; full SQL is still executed]"
+        )
+    elif len(shown) < len(lines):
         emit(
             f"{_SQL_PRINT_INDENT}... [truncated for display: showing "
             f"{len(shown)} of {len(lines)} line(s), {len(sql)} chars total; full SQL is still executed]"
