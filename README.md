@@ -75,9 +75,7 @@ LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id
 
 The config owns *where* each table is and whether to broadcast it; the SQL owns the join itself (type,
 `ON` clause, surfaced columns). Set `broadcast: true` on a reference table to have the framework add a
-broadcast hint naming that join. When any reference table sets `broadcast: true`, the view SQL **must**
-include `${broadcast_hint}` (right after the top-level `SELECT`); `deploy_views` fails closed if it
-doesn't, rather than silently dropping the broadcast.
+broadcast hint naming that join.
 
 ## Configuration
 
