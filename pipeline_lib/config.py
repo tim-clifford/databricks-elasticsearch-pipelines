@@ -255,6 +255,19 @@ def _fqn(obj: dict, name_key: str) -> str:
     return f"{obj['catalog']}.{obj['schema']}.{obj[name_key]}"
 
 
+def column_present(column: str, columns: list) -> bool:
+    """Is `column` among `columns`, matching Spark's default column resolution?
+
+    Spark/Databricks resolves column names case-INSENSITIVELY by default
+    (spark.sql.caseSensitive=false), so a view emitting `DSL_ID` genuinely satisfies a config value
+    of `dsl_id` and the connector resolves _id fine. A case-sensitive membership test would
+    false-reject that and fail an otherwise-good deploy. deploy_views uses this to check es_id_field
+    against a created view's actual output columns; it lives here so the semantics have a unit test
+    (the notebook has no offline test harness of its own).
+    """
+    return column.lower() in {c.lower() for c in columns}
+
+
 def view_substitutions(cfg: dict, environment: str) -> dict:
     """The ${...} tokens a view .sql may reference, with ${environment} folded in.
 

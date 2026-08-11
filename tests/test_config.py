@@ -9,6 +9,7 @@ import pytest
 
 from pipeline_lib.config import (
     PipelineConfigError,
+    column_present,
     job_base_parameters,
     resolve_config,
     resolve_name,
@@ -284,3 +285,29 @@ def test_validate_does_not_mutate_input():
     before = copy.deepcopy(cfg)
     validate_config(cfg)
     assert cfg == before
+
+
+# --------------------------------------------------------------------------- column_present
+
+
+def test_column_present_exact_match():
+    assert column_present("dsl_id", ["dsl_id", "time", "action"])
+    assert not column_present("missing", ["dsl_id", "time", "action"])
+
+
+@pytest.mark.parametrize(
+    "field,columns",
+    [
+        ("dsl_id", ["DSL_ID", "time"]),        # view column upper-cased
+        ("DSL_ID", ["dsl_id", "time"]),        # config value upper-cased
+        ("Dsl_Id", ["dSL_id", "time"]),        # mixed casing on both sides
+    ],
+)
+def test_column_present_case_insensitive(field, columns):
+    # Spark resolves column names case-insensitively by default, so the es_id_field check must too:
+    # a case-only difference is a real, resolvable column, not a missing one.
+    assert column_present(field, columns)
+
+
+def test_column_present_empty_columns():
+    assert not column_present("dsl_id", [])

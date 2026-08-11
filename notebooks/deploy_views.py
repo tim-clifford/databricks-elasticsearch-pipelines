@@ -36,7 +36,7 @@ VIEWS_DIR = os.path.join(FILES_ROOT, "views")
 CONFIG_DIR = os.path.join(FILES_ROOT, "pipeline_definitions")
 print("files root:", FILES_ROOT)
 
-from pipeline_lib.config import load_config, view_substitutions  # noqa: E402
+from pipeline_lib.config import column_present, load_config, view_substitutions  # noqa: E402
 
 # COMMAND ----------
 # Load every pipeline definition and key it by the view name it declares, so a view .sql file can be
@@ -199,7 +199,10 @@ for filename in sql_files:
         fqn = subs["view"]  # catalog.schema.name, ${environment} already folded in
         es_id_field = cfg["es_id_field"]
         view_columns = spark.table(fqn).columns
-        if es_id_field not in view_columns:
+        # column_present matches Spark's default (case-INSENSITIVE) column resolution, so a view
+        # emitting e.g. `DSL_ID` for a config `dsl_id` is not false-rejected. Original casing is kept
+        # in the error text. See pipeline_lib.config.column_present (unit-tested there).
+        if not column_present(es_id_field, view_columns):
             raise ValueError(
                 f"es_id_field '{es_id_field}' is not an output column of view {fqn}; "
                 f"available columns: {view_columns}"
