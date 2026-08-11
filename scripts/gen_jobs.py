@@ -3,7 +3,7 @@
 
 Adding an Elasticsearch index to the framework is: add index_pipelines/<name>.yml (and its
 views/<view_name>.sql), then rerun this generator. It writes resources/<name>.job.yml, one per
-config, all pointing at the shared notebook src/run_index_pipeline.py.
+config, all pointing at the shared notebook notebooks/run_index_pipeline.py.
 
 Usage:
   python scripts/gen_jobs.py            # (re)generate resources/<name>.job.yml files
@@ -110,14 +110,14 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                     "name": f"[${{bundle.target}}] databricks-elasticsearch-pipelines: {cfg['es_index_name']}",
                     "description": (
                         f"Export pipeline for the {cfg['es_index_name']} Elasticsearch index. Runs "
-                        "the shared notebook src/run_index_pipeline.py with this index's config. No "
+                        "the shared notebook notebooks/run_index_pipeline.py with this index's config. No "
                         "cluster block => serverless notebook task."
                     ),
                     "tasks": [
                         {
                             "task_key": f"index_pipeline_{name}",
                             "notebook_task": {
-                                "notebook_path": "../src/run_index_pipeline.py",
+                                "notebook_path": "../notebooks/run_index_pipeline.py",
                                 "base_parameters": {
                                     "es_index_name": cfg["es_index_name"],
                                     "source_table": cfg["source_table"],

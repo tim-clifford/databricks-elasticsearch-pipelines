@@ -5,11 +5,12 @@ resources:
     index_pipeline_ecs_dns_activity:
       name: '[${bundle.target}] databricks-elasticsearch-pipelines: ecs-dns-activity'
       description: Export pipeline for the ecs-dns-activity Elasticsearch index. Runs the shared notebook
-        src/run_index_pipeline.py with this index's config. No cluster block => serverless notebook task.
+        notebooks/run_index_pipeline.py with this index's config. No cluster block => serverless notebook
+        task.
       tasks:
       - task_key: index_pipeline_ecs_dns_activity
         notebook_task:
-          notebook_path: ../src/run_index_pipeline.py
+          notebook_path: ../notebooks/run_index_pipeline.py
           base_parameters:
             es_index_name: ecs-dns-activity
             source_table: dns_activity

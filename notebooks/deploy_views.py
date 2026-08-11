@@ -16,6 +16,8 @@
 # COMMAND ----------
 # Read and validate the job parameters. Every one is required with no default: catalog/schema names
 # are environment-specific, so each deployment must supply them (fail closed on a missing value).
+import re
+
 dbutils.widgets.text("view_catalog", "", "View catalog (where views are created)")
 dbutils.widgets.text("view_schema", "", "View schema (where views are created)")
 dbutils.widgets.text("source_catalog", "", "Source catalog (where source tables live)")
@@ -33,12 +35,26 @@ missing = [k for k, v in PARAMS.items() if not v]
 if missing:
     raise ValueError(f"missing required parameter(s): {', '.join(missing)}")
 
+# These values are substituted verbatim into the view DDL as bare SQL identifiers (catalog.schema.name),
+# so restrict them to a legal unquoted identifier: a letter or underscore first, then letters, digits,
+# and underscores. A leading digit is rejected too, because an unquoted identifier cannot start with
+# one. Rejecting anything else (a hyphen, space, dot, quote, or SQL-reserved punctuation) fails closed
+# at deploy time instead of producing invalid SQL, or worse, binding to the wrong object. Allow-list,
+# not deny-list. A name that legitimately needs backtick-quoting is out of scope and must be rejected
+# here rather than silently mishandled.
+_VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+illegal = {k: v for k, v in PARAMS.items() if not _VALID_IDENTIFIER.match(v)}
+if illegal:
+    detail = "; ".join(f"{k}={v!r}" for k, v in illegal.items())
+    raise ValueError(
+        "parameter(s) are not a legal SQL identifier (letters, digits, underscore only): " + detail
+    )
+
 # COMMAND ----------
-# Locate the views/ folder. This notebook is synced to <bundle files>/src/deploy_views.py; the SQL
+# Locate the views/ folder. This notebook is synced to <bundle files>/notebooks/deploy_views.py; the SQL
 # lives in the sibling <bundle files>/views/. Resolve it from the notebook's own workspace path so
 # it works when run as a DAB job (no hardcoded workspace path).
 import os
-import re
 
 _nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
 _files_root = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # .../files
