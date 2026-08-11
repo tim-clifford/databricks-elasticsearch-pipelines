@@ -61,9 +61,10 @@ source = cfg["source"]
 print(f"config_name        = {CONFIG_NAME}")
 print(f"environment        = {ENVIRONMENT!r}")
 print(f"es_index_name      = {cfg['es_index_name']}")
-print(f"primary_key        = {cfg['primary_key']}")
+print(f"es_id_field        = {cfg['es_id_field']}")
 print(f"view               = {view['catalog']}.{view['schema']}.{view['name']}")
 print(f"source             = {source['catalog']}.{source['schema']}.{source['table']}")
+print(f"source primary_key = {source['primary_key']}")
 for alias, spec in cfg["reference_tables"].items():
     print(f"reference[{alias}]  = {spec['catalog']}.{spec['schema']}.{spec['table']}")
 
@@ -72,7 +73,7 @@ for alias, spec in cfg["reference_tables"].items():
 # rendered output, visually replacing any print() output from the same cell. Keeping it separate
 # leaves the resolved-config prints above visible in their own completed cell.
 dbutils.notebook.exit(
-    f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; "
+    f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; es_id_field={cfg['es_id_field']}; "
     f"view={view['catalog']}.{view['schema']}.{view['name']}; "
     f"source={source['catalog']}.{source['schema']}.{source['table']}"
 )

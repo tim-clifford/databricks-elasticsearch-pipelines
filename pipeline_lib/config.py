@@ -7,14 +7,24 @@ on-cluster notebooks (deploy_views.py, run_index_pipeline.py) import it, so vali
 Schema (see pipeline_definitions/*.yml for a commented example):
 
     es_index_name: <es index>            # ES index name (hyphens allowed; NOT a SQL identifier)
-    primary_key:   <column>              # view column used as the ES document _id
+    es_id_field:   <column>              # view output column passed to the connector as the ES _id
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
-    source: { catalog: <c>, schema: <s>, table: <t> }   # the one source table the view reads from
+    source:                              # the one source table the view reads from
+      catalog: <c>
+      schema:  <s>
+      table:   <t>
+      primary_key: <column>              # source-table column identifying a unique row (streaming read)
     reference_tables:                    # OPTIONAL: extra tables the view joins
       <alias>:                           # key is caller-chosen; matches ${ref_<alias>} in the SQL
         catalog: <c>
         schema:  <s>
         table:   <t>
+
+TWO DISTINCT KEYS, TWO CONTEXTS
+`es_id_field` and `source.primary_key` are deliberately separate. es_id_field is a column of the
+VIEW's output, handed to the ES connector as the document _id. primary_key is a column of the SOURCE
+table, used by the streaming read to identify a unique row. They often share a name but need not, and
+neither defaults to the other. Both are plain column identifiers (no ${environment} token).
 
 ENVIRONMENT SUBSTITUTION
 A `catalog` or `schema` value may embed the token `${environment}`, folded in at deploy time from the
@@ -134,46 +144,57 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if not isinstance(raw, dict):
         raise PipelineConfigError(f"{source}: expected a YAML mapping, got {type(raw).__name__}")
 
-    allowed_top = {"es_index_name", "primary_key", "view", "source", "reference_tables"}
+    allowed_top = {"es_index_name", "es_id_field", "view", "source", "reference_tables"}
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
 
-    for key in ("es_index_name", "primary_key", "view", "source"):
+    for key in ("es_index_name", "es_id_field", "view", "source"):
         if key not in raw:
             raise PipelineConfigError(f"{source}: missing required key '{key}'")
 
     es_index_name = _require_es_index(raw["es_index_name"], f"{source}: es_index_name")
-    primary_key = _require_identifier(raw["primary_key"], f"{source}: primary_key")
+    es_id_field = _require_identifier(raw["es_id_field"], f"{source}: es_id_field")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
-    source_map = _validate_object(raw["source"], f"{source}: source", name_key="table", allowed={"catalog", "schema", "table"})
+    # source carries primary_key in addition to catalog/schema/table: it is a column of the SOURCE
+    # table (unique-row identity for the streaming read), so it lives with the source, not at top level.
+    source_map = _validate_object(
+        raw["source"], f"{source}: source", name_key="table",
+        allowed={"catalog", "schema", "table", "primary_key"},
+        extra_identifiers=("primary_key",),
+    )
     reference_tables = _validate_reference_tables(raw.get("reference_tables"), source)
 
     return {
         "es_index_name": es_index_name,
-        "primary_key": primary_key,
+        "es_id_field": es_id_field,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
     }
 
 
-def _validate_object(node: object, where: str, name_key: str, allowed: set) -> dict:
-    """Validate a {catalog, schema, <name_key>} object.
+def _validate_object(node: object, where: str, name_key: str, allowed: set, extra_identifiers: tuple = ()) -> dict:
+    """Validate a {catalog, schema, <name_key>} object, plus any `extra_identifiers` columns.
 
     catalog and schema are name TEMPLATES (may contain ${environment}); the name/table is a plain
     identifier (no token), so an object's name is fixed and, for a view, always equals its filename.
+    `extra_identifiers` are additional REQUIRED plain-identifier keys (e.g. source.primary_key): they
+    are column names, not object names, so they carry no ${environment} token.
     """
     if not isinstance(node, dict):
         raise PipelineConfigError(f"{where} must be a mapping with catalog, schema, and {name_key}, got {type(node).__name__}")
     node_unknown = sorted(set(node) - allowed)
     if node_unknown:
         raise PipelineConfigError(f"{where} has unknown key(s): {', '.join(node_unknown)}; allowed: {', '.join(sorted(allowed))}")
-    return {
+    result = {
         "catalog": _require_name_template(node.get("catalog"), f"{where}.catalog"),
         "schema": _require_name_template(node.get("schema"), f"{where}.schema"),
         name_key: _require_identifier(node.get(name_key), f"{where}.{name_key}"),
     }
+    for key in extra_identifiers:
+        result[key] = _require_identifier(node.get(key), f"{where}.{key}")
+    return result
 
 
 def _validate_reference_tables(node: object, source: str) -> dict:
@@ -206,18 +227,23 @@ def resolve_config(cfg: dict, environment: str) -> dict:
 
     Every catalog/schema/table/name becomes a concrete bare identifier. Raises if any resolves to an
     illegal identifier, or if a template needs an environment that was not supplied (fail closed)."""
-    def obj(o: dict, name_key: str, where: str) -> dict:
-        return {
+    def obj(o: dict, name_key: str, where: str, passthrough: tuple = ()) -> dict:
+        resolved = {
             "catalog": resolve_name(o["catalog"], environment, f"{where}.catalog"),
             "schema": resolve_name(o["schema"], environment, f"{where}.schema"),
             name_key: resolve_name(o[name_key], environment, f"{where}.{name_key}"),
         }
+        # `passthrough` keys (e.g. source.primary_key) are plain column identifiers, not object names:
+        # they carry no ${environment} token, so they are copied through unchanged, not resolved.
+        for key in passthrough:
+            resolved[key] = o[key]
+        return resolved
 
     return {
         "es_index_name": cfg["es_index_name"],
-        "primary_key": cfg["primary_key"],
+        "es_id_field": cfg["es_id_field"],
         "view": obj(cfg["view"], "name", "view"),
-        "source": obj(cfg["source"], "table", "source"),
+        "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
             alias: obj(spec, "table", f"reference_tables.{alias}")
             for alias, spec in cfg["reference_tables"].items()

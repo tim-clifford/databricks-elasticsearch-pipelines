@@ -91,7 +91,7 @@ its `.sql` filename):
 
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
-primary_key: dsl_id               # view column used as the ES document _id
+es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
 view:                             # the view this pipeline creates
   catalog: acme_${environment}
   schema: es_poc
@@ -100,6 +100,7 @@ source:                           # the single source table the view reads from
   catalog: acme_${environment}
   schema: ocsf
   table: dns_activity
+  primary_key: dsl_id             # source-table column identifying a unique row (for the streaming read)
 reference_tables:                 # OPTIONAL: extra tables the view joins (see Views)
   validation:                     # key = the ${ref_validation} join alias in the SQL
     catalog: acme_${environment}
@@ -110,6 +111,13 @@ reference_tables:                 # OPTIONAL: extra tables the view joins (see V
 A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token
 but is deployed with an empty `environment` fails closed at deploy time, as does an environment value
 that would produce an illegal identifier (e.g. one containing a hyphen).
+
+`es_id_field` and `source.primary_key` are two distinct keys for two distinct contexts: `es_id_field`
+is a column of the **view's** output, handed to the connector as the ES document `_id`; `primary_key`
+is a column of the **source table**, used by the streaming read to identify a unique row. They often
+share a value but need not, and neither defaults to the other. When `deploy_views` creates a view it
+verifies `es_id_field` is actually one of that view's output columns (against Spark's resolved schema),
+so a typo fails the deploy rather than surfacing later at export time.
 
 ## Deploy and run
 
@@ -142,7 +150,7 @@ You edit these, one pair per pipeline:
     <view_name>.sql             The view: what gets exported (filename == view.name)
   pipeline_definitions/
     <name>.yml                  The config: view/source/reference locations + es_index_name,
-                                primary_key (see Configuration for the schema)
+                                es_id_field, source.primary_key (see Configuration for the schema)
 
 Shared notebooks (run by the jobs, not edited per pipeline):
   notebooks/

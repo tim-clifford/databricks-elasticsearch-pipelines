@@ -21,9 +21,9 @@ def _base():
     """A minimal valid config (no reference tables, no environment tokens)."""
     return {
         "es_index_name": "ecs-dns-activity",
-        "primary_key": "dsl_id",
+        "es_id_field": "dsl_id",
         "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
-        "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity"},
+        "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity", "primary_key": "dsl_id"},
     }
 
 
@@ -62,11 +62,45 @@ def test_environment_token_accepted_as_template():
 # --------------------------------------------------------------------------- fail-closed: structure
 
 
-@pytest.mark.parametrize("missing", ["es_index_name", "primary_key", "view", "source"])
+@pytest.mark.parametrize("missing", ["es_index_name", "es_id_field", "view", "source"])
 def test_missing_required_key(missing):
     cfg = _base()
     del cfg[missing]
     with pytest.raises(PipelineConfigError, match="missing required key"):
+        validate_config(cfg)
+
+
+def test_missing_source_primary_key():
+    # primary_key now lives inside source; a source without it must fail closed.
+    cfg = _base()
+    del cfg["source"]["primary_key"]
+    with pytest.raises(PipelineConfigError, match="source.primary_key"):
+        validate_config(cfg)
+
+
+def test_source_primary_key_rejects_environment_token():
+    # primary_key is a column identifier, not an object name: no ${environment} token.
+    cfg = _base()
+    cfg["source"]["primary_key"] = "id_${environment}"
+    with pytest.raises(PipelineConfigError, match="source.primary_key"):
+        validate_config(cfg)
+
+
+def test_es_id_field_and_primary_key_independent():
+    # The two keys are distinct contexts and need not share a value.
+    cfg = _base()
+    cfg["es_id_field"] = "event_id"
+    cfg["source"]["primary_key"] = "row_key"
+    out = validate_config(cfg)
+    assert out["es_id_field"] == "event_id"
+    assert out["source"]["primary_key"] == "row_key"
+
+
+@pytest.mark.parametrize("bad", ["has-hyphen", "has space", "1leading", "", None, 5])
+def test_illegal_es_id_field_rejected(bad):
+    cfg = _base()
+    cfg["es_id_field"] = bad
+    with pytest.raises(PipelineConfigError, match="es_id_field"):
         validate_config(cfg)
 
 
@@ -202,6 +236,14 @@ def test_resolve_config_folds_everywhere():
     assert out["source"]["catalog"] == "acme_prod"
     assert out["reference_tables"]["validation"]["schema"] == "ocsf_validation_prod"
     assert out["reference_tables"]["geo"]["schema"] == "ref"  # no token -> unchanged
+
+
+def test_resolve_config_carries_source_primary_key():
+    # primary_key is a column identifier: resolve must pass it through unchanged, not drop it or
+    # try to fold ${environment} into it.
+    out = resolve_config(validate_config(_with_env()), environment="prod")
+    assert out["source"]["primary_key"] == "dsl_id"
+    assert out["es_id_field"] == "dsl_id"
 
 
 # --------------------------------------------------------------------------- view_substitutions
