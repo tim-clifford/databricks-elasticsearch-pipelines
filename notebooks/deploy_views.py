@@ -18,6 +18,7 @@
 # resolve_name -- so we do not reject empty here.
 dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
+print(f"environment = {ENVIRONMENT!r}")
 
 # COMMAND ----------
 # Resolve the synced bundle root so we can read both views/ and pipeline_definitions/, and add it to
@@ -101,6 +102,12 @@ for filename in sql_files:
         subs = view_substitutions(configs_by_view[view_name], ENVIRONMENT)
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
             rendered = render(fh.read(), filename, subs)
+        # Print the fully-rendered SQL that is about to run (all ${...} substituted, ${environment}
+        # folded in) so the exact CREATE OR REPLACE is visible in the job output for debugging.
+        print(f"    substitutions: {subs}")
+        print("    running SQL:")
+        for line in rendered.splitlines():
+            print(f"      {line}")
         # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
         spark.sql(rendered)
         created.append(filename)
