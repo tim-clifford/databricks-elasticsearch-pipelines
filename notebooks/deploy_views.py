@@ -36,7 +36,7 @@ VIEWS_DIR = os.path.join(FILES_ROOT, "views")
 CONFIG_DIR = os.path.join(FILES_ROOT, "pipeline_definitions")
 print("files root:", FILES_ROOT)
 
-from pipeline_lib.config import load_config, view_substitutions  # noqa: E402
+from pipeline_lib.config import column_present, load_config, view_substitutions  # noqa: E402
 
 # COMMAND ----------
 # Load every pipeline definition and key it by the view name it declares, so a view .sql file can be
@@ -173,7 +173,8 @@ for filename in sql_files:
     view_name = os.path.splitext(filename)[0]
     print(f"--- {filename} ---")
     try:
-        subs = view_substitutions(configs_by_view[view_name], ENVIRONMENT)
+        cfg = configs_by_view[view_name]
+        subs = view_substitutions(cfg, ENVIRONMENT)
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
             rendered = render(fh.read(), filename, subs)
         # Print the substitutions and the fully-rendered SQL that is about to run (all ${...}
@@ -190,8 +191,24 @@ for filename in sql_files:
             print("    [debug print suppressed: cumulative SQL-print budget reached; view still deploys]")
         # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
         spark.sql(rendered)
+        # Verify the config's es_id_field is an actual output column of the view just created. This
+        # is the ground-truth check (Spark's own resolved schema, not a parse of the .sql), and it
+        # runs here rather than in the offline generator because the generator has no Spark. A typo'd
+        # es_id_field or a view that renamed the column would otherwise only surface much later, when
+        # the connector is handed a nonexistent _id column. Fail closed per-view (collected below).
+        fqn = subs["view"]  # catalog.schema.name, ${environment} already folded in
+        es_id_field = cfg["es_id_field"]
+        view_columns = spark.table(fqn).columns
+        # column_present matches Spark's default (case-INSENSITIVE) column resolution, so a view
+        # emitting e.g. `DSL_ID` for a config `dsl_id` is not false-rejected. Original casing is kept
+        # in the error text. See pipeline_lib.config.column_present (unit-tested there).
+        if not column_present(es_id_field, view_columns):
+            raise ValueError(
+                f"es_id_field '{es_id_field}' is not an output column of view {fqn}; "
+                f"available columns: {view_columns}"
+            )
         created.append(filename)
-        print(f"    created {view_name}")
+        print(f"    created {view_name} (es_id_field '{es_id_field}' present)")
     except Exception as exc:  # noqa: BLE001 -- deliberately continue to the next view
         failed.append((filename, exc))
         print(f"    FAILED {view_name}: {type(exc).__name__}: {exc}")

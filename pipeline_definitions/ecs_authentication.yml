@@ -5,7 +5,7 @@
 # `environment` bundle variable (e.g. ocsf_${environment} -> ocsf_prod). A value with no token is
 # used as-is.
 es_index_name: ecs-authentication   # target Elasticsearch index (hyphens allowed)
-primary_key: dsl_id                 # view column used as the Elasticsearch document _id
+es_id_field: dsl_id                 # view output column passed to the connector as the ES document _id
 
 view:                               # the view this pipeline creates and exports
   catalog: tim_clifford_classic_dsl_lite_${environment}
@@ -16,5 +16,6 @@ source:                             # the single source table the view reads fro
   catalog: tim_clifford_classic_dsl_lite_${environment}
   schema: ocsf
   table: authentication
+  primary_key: dsl_id               # source-table column identifying a unique row (for the streaming read)
 
 # No reference_tables: this view is a straight passthrough over its source table.
