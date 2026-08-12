@@ -5,8 +5,8 @@
 # MAGIC The shared notebook run by every per-index job. The generated job passes the config's NAME, the
 # MAGIC deploy-time `environment`, and the global connector `wheel_path`; this notebook installs the
 # MAGIC connector wheel (and verifies the import succeeds), loads `pipeline_definitions/<config_name>.yml`,
-# MAGIC resolves `${environment}` into the object names, and (for now) prints the resolved config
-# MAGIC (including its per-index `pipeline_mode`). The actual export is added later.
+# MAGIC resolves `${environment}` into the object names, and (for now) prints the resolved config.
+# MAGIC The actual export is added later.
 # MAGIC
 # MAGIC Why load the config here rather than receive resolved values: the job resources are generated
 # MAGIC offline by scripts/gen_jobs.py, which cannot know the deploy-time environment, so it cannot bake

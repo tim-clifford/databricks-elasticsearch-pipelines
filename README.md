@@ -103,7 +103,8 @@ source:                           # the single source table the view reads from
   schema: ocsf
   table: dns_activity
   primary_key: dsl_id             # source-table column identifying a unique row (for the streaming read)
-reference_tables:                 # OPTIONAL: one entry per joined table (add as many as needed)
+reference_tables:                 # OPTIONAL: holds one alias entry per joined table (add as many
+                                  # alias entries below as you have reference tables)
   validation:                     # 'validation' is an EXAMPLE alias you choose; it is the
                                   # ${ref_validation} join alias used in the SQL
     catalog: acme_${environment}
@@ -163,8 +164,8 @@ Shared notebooks (run by the jobs, not edited per pipeline):
     deploy_views.py             Renders each view's parameters from its config (folding in the
                                 environment), then runs CREATE OR REPLACE
     run_index_pipeline.py       Run by every per-index job: installs the connector wheel (verifying
-                                the import), loads its config by name, resolves the environment, prints
-                                it including pipeline_mode (export logic lands here later)
+                                the import), loads its config by name, resolves the environment, and
+                                prints the resolved config (export logic lands here later)
 
 Shared library + tests (the config schema, used by the generator and both notebooks):
   pipeline_lib/
