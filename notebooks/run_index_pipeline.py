@@ -24,6 +24,11 @@
 # is therefore deferred to after the restart. %pip can't expand a widget inside a literal
 # `%pip install <path>`, so we read wheel_path in Python and invoke the pip magic programmatically.
 # restartPython() MUST be the last statement in the cell (it ends the cell).
+#
+# FOLLOW-UP (not this PR): on serverless, the wheel could instead be declared as a task-level
+# `environment` dependency (job `environments[].spec.dependencies`, referenced via `environment_key`),
+# resolved once at environment setup rather than reinstalled per run. That is a separate refactor of
+# the install mechanism; this in-notebook %pip approach is intentional and verified for now.
 import shlex
 
 dbutils.widgets.text("wheel_path", "", "Connector wheel path (UC Volume .whl)")
@@ -45,7 +50,10 @@ dbutils.library.restartPython()
 # run HERE, before any export work, rather than surfacing as a cryptic error deep in the pipeline.
 import databricks_es_connector  # noqa: E402
 
-print(f"connector installed: databricks_es_connector {databricks_es_connector.__version__}")
+# getattr fallback: the successful import above is the real install-succeeds signal; a build that
+# happens not to expose __version__ shouldn't turn a good install into an AttributeError here.
+_connector_version = getattr(databricks_es_connector, "__version__", "unknown")
+print(f"connector installed: databricks_es_connector {_connector_version}")
 
 # COMMAND ----------
 # Now read the remaining parameters (the restart above cleared any earlier Python state, so this is
