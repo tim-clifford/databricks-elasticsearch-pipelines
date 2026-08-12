@@ -125,19 +125,22 @@ so a typo fails the deploy rather than surfacing later at export time.
 
 ## Deploy and run
 
+`wheel_path` has no default, so every `bundle` command below (both `deploy` AND `run`, since DAB
+resolves all variables for either) must be given it. Set it once and reuse:
+
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from pipeline_definitions/*.yml
 
-databricks bundle deploy -t dev -p <profile> \
-  --var="environment=<env>" \
-  --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
+WHEEL="/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
 
-databricks bundle run deploy_views          -t dev -p <profile> --var="environment=<env>"
-databricks bundle run index_pipeline_<config_name> -t dev -p <profile> --var="environment=<env>"
+databricks bundle deploy -t dev -p <profile> --var="environment=<env>" --var="wheel_path=$WHEEL"
+
+databricks bundle run deploy_views          -t dev -p <profile> --var="environment=<env>" --var="wheel_path=$WHEEL"
+databricks bundle run index_pipeline_<config_name> -t dev -p <profile> --var="environment=<env>" --var="wheel_path=$WHEEL"
 ```
 
-(Omit `--var="environment=..."` if none of your config names use `${environment}`. `wheel_path` has
-no default; pass it at deploy as above, or set a default in your fork's `databricks.yml`.)
+(Omit `--var="environment=..."` if none of your config names use `${environment}`. `wheel_path` is
+always required unless you set a default in your fork's `databricks.yml`.)
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.

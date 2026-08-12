@@ -24,6 +24,8 @@
 # is therefore deferred to after the restart. %pip can't expand a widget inside a literal
 # `%pip install <path>`, so we read wheel_path in Python and invoke the pip magic programmatically.
 # restartPython() MUST be the last statement in the cell (it ends the cell).
+import shlex
+
 dbutils.widgets.text("wheel_path", "", "Connector wheel path (UC Volume .whl)")
 WHEEL_PATH = dbutils.widgets.get("wheel_path").strip()
 if not WHEEL_PATH:
@@ -32,7 +34,9 @@ if not WHEEL_PATH:
         "/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
     )
 print(f"installing connector wheel from {WHEEL_PATH}")
-get_ipython().run_line_magic("pip", f"install {WHEEL_PATH}")
+# shlex.quote the path so a UC Volume filename containing a space (or any pip-meaningful token) is
+# passed to pip as ONE argument, not split or interpreted as extra pip options.
+get_ipython().run_line_magic("pip", f"install {shlex.quote(WHEEL_PATH)}")
 dbutils.library.restartPython()
 
 # COMMAND ----------

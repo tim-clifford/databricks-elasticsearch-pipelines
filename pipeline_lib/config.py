@@ -64,7 +64,8 @@ _VALID_ES_INDEX = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _ES_INDEX_MAX_BYTES = 255
 
 # Export modes the runner supports. Allow-list: an unrecognized/absent mode is rejected (fail closed),
-# never silently defaulted. Threaded to the runner notebook, which branches on it.
+# never silently defaulted. Threaded to the runner notebook (which currently just prints it; the
+# batch/streaming branch lands with the export logic in a later step).
 _VALID_PIPELINE_MODES = ("batch", "streaming")
 
 
