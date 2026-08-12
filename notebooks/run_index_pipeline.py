@@ -61,10 +61,19 @@ print(f"connector installed: databricks_es_connector {_connector_version}")
 # Now read the remaining parameters (the restart above cleared any earlier Python state, so this is
 # their first and only read). config_name is required; environment may be empty (a config that uses no
 # ${environment} token needs none, and one that does fails closed later in resolve_config).
+#
+# pipeline_mode is a JOB PARAMETER (not a deploy-time base_parameter): the generated job sets its
+# default from the config, and it can be overridden per run with `--params pipeline_mode=streaming`.
+# The job passes it here as a widget of the same name. We read it as the EFFECTIVE mode (default or
+# override) and validate it below, so this widget, not the config value, is the source of truth at
+# run time. Widget default is empty so an unset value fails closed at validation rather than silently
+# assuming a mode.
 dbutils.widgets.text("config_name", "", "Pipeline definition name (pipeline_definitions/<config_name>.yml)")
 dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
+dbutils.widgets.text("pipeline_mode", "", "Export mode: batch | streaming (job parameter; overridable per run)")
 CONFIG_NAME = dbutils.widgets.get("config_name").strip()
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
+PIPELINE_MODE = dbutils.widgets.get("pipeline_mode").strip()
 if not CONFIG_NAME:
     raise ValueError("missing required parameter: config_name")
 
@@ -79,7 +88,7 @@ FILES_ROOT = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # .../fi
 if FILES_ROOT not in sys.path:
     sys.path.insert(0, FILES_ROOT)
 
-from pipeline_lib.config import load_config, resolve_config  # noqa: E402
+from pipeline_lib.config import load_config, require_pipeline_mode, resolve_config  # noqa: E402
 
 # Resolve the config file, accepting either extension: gen_jobs.py and deploy_views.py both discover
 # .yml AND .yaml, so the runner must too, or a .yaml-defined pipeline would deploy fine and then fail
@@ -96,6 +105,11 @@ if config_path is None:
 # (both fail closed). After this, every catalog/schema/name is a concrete identifier.
 cfg = resolve_config(load_config(config_path), ENVIRONMENT)
 
+# Validate the EFFECTIVE pipeline_mode (the job-parameter value: config default unless overridden per
+# run with --params). require_pipeline_mode is the same allow-list check the config uses, so a bad
+# override (e.g. --params pipeline_mode=turbo) fails closed here rather than running an unknown mode.
+PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
+
 # COMMAND ----------
 # For now, just print the resolved configuration. This is the placeholder for the export logic;
 # keeping it a pure echo makes the generated-job wiring + environment resolution verifiable on its own.
@@ -105,7 +119,7 @@ print(f"config_name        = {CONFIG_NAME}")
 print(f"environment        = {ENVIRONMENT!r}")
 print(f"es_index_name      = {cfg['es_index_name']}")
 print(f"es_id_field        = {cfg['es_id_field']}")
-print(f"pipeline_mode      = {cfg['pipeline_mode']}")
+print(f"pipeline_mode      = {PIPELINE_MODE}")
 print(f"view               = {view['catalog']}.{view['schema']}.{view['name']}")
 print(f"source             = {source['catalog']}.{source['schema']}.{source['table']}")
 print(f"source primary_key = {source['primary_key']}")
@@ -118,7 +132,7 @@ for alias, spec in cfg["reference_tables"].items():
 # leaves the resolved-config prints above visible in their own completed cell.
 dbutils.notebook.exit(
     f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; es_id_field={cfg['es_id_field']}; "
-    f"pipeline_mode={cfg['pipeline_mode']}; "
+    f"pipeline_mode={PIPELINE_MODE}; "
     f"view={view['catalog']}.{view['schema']}.{view['name']}; "
     f"source={source['catalog']}.{source['schema']}.{source['table']}"
 )

@@ -26,7 +26,7 @@ import yaml
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Import the shared config schema from the repo root, so validation is not re-implemented here.
 sys.path.insert(0, _REPO_ROOT)
-from pipeline_lib.config import PipelineConfigError, job_base_parameters, load_config  # noqa: E402
+from pipeline_lib.config import PipelineConfigError, job_base_parameters, job_parameters, load_config  # noqa: E402
 
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "pipeline_definitions")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
@@ -73,6 +73,9 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                         "the shared notebook notebooks/run_index_pipeline.py with this index's config. No "
                         "cluster block => serverless notebook task."
                     ),
+                    # Run-time-overridable job parameters (currently just pipeline_mode): default comes
+                    # from the config, override per run with `--params pipeline_mode=streaming`.
+                    "parameters": job_parameters(cfg),
                     "tasks": [
                         {
                             "task_key": f"index_pipeline_{name}",

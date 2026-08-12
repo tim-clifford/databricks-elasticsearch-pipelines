@@ -93,7 +93,7 @@ its `.sql` filename):
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
-pipeline_mode: batch              # export mode for this index's job: batch | streaming (required)
+pipeline_mode: batch              # default export mode: batch | streaming (required; override per run)
 view:                             # the view this pipeline creates
   catalog: acme_${environment}
   schema: es_poc
@@ -125,11 +125,16 @@ so a typo fails the deploy rather than surfacing later at export time.
 
 ## Deploy and run
 
-`wheel_path` is baked into each job's parameters at **deploy** time (that is when `${var.wheel_path}`
-resolves), so supply it on `bundle deploy`, not on `bundle run` (a `--var` on `run` does not override
-the deployed value). It defaults to empty, so a deploy without it still succeeds and `deploy_views`
-runs fine (it needs no connector); only an index job needs a real wheel, and one deployed with an
-empty `wheel_path` fails closed:
+Two different mechanisms carry values into a job, and they resolve at different times:
+
+- **Bundle variables** (`environment`, `wheel_path`) are `--var` values resolved into the job at
+  **deploy** time. A `--var` on `bundle run` is ignored: only what was set at the last `bundle deploy`
+  applies. `wheel_path` is baked in this way, so supply it on `deploy`. It defaults to empty, so a
+  deploy without it still succeeds and `deploy_views` runs fine (it needs no connector); only an index
+  job needs a real wheel, and one deployed with an empty `wheel_path` fails closed.
+- **Job parameters** (`pipeline_mode`) are `--params` values applied at **run** time. Each index job's
+  `pipeline_mode` defaults to its config value, and you can override it for a single run without
+  redeploying (an unknown value fails the run closed).
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from pipeline_definitions/*.yml
@@ -137,13 +142,15 @@ python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from p
 WHEEL="/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
 databricks bundle deploy -t dev -p <profile> --var="environment=<env>" --var="wheel_path=$WHEEL"
 
-databricks bundle run deploy_views                 -t dev -p <profile> --var="environment=<env>"
-databricks bundle run index_pipeline_<config_name> -t dev -p <profile> --var="environment=<env>"
+databricks bundle run deploy_views                 -t dev -p <profile>
+databricks bundle run index_pipeline_<config_name> -t dev -p <profile>
+
+# override the export mode for one run (defaults to the config's pipeline_mode otherwise):
+databricks bundle run index_pipeline_<config_name> -t dev -p <profile> --params pipeline_mode=streaming
 ```
 
-(Omit `--var="environment=..."` if none of your config names use `${environment}`. An index-job run
-needs a `wheel_path` supplied at deploy; set a real default in your fork's `databricks.yml` to avoid
-passing it each time.)
+(`environment`/`wheel_path` come from the last `deploy`, so they are not repeated on `run`. Set a
+real `wheel_path` default in your fork's `databricks.yml` to avoid passing it each deploy.)
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.

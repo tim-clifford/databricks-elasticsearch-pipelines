@@ -8,7 +8,8 @@ Schema (see pipeline_definitions/*.yml for a commented example):
 
     es_index_name: <es index>            # ES index name (hyphens allowed; NOT a SQL identifier)
     es_id_field:   <column>              # view output column passed to the connector as the ES _id
-    pipeline_mode: batch | streaming     # export mode for THIS index's job (required; no default)
+    pipeline_mode: batch | streaming     # THIS index's DEFAULT export mode (required); a job parameter,
+                                         #   so it is overridable per run with --params pipeline_mode=...
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -93,8 +94,12 @@ def _require_identifier(value: object, where: str) -> str:
     return value
 
 
-def _require_pipeline_mode(value: object, where: str) -> str:
-    """An export mode, restricted to the allow-list (batch|streaming). No default: absent/unknown fails."""
+def require_pipeline_mode(value: object, where: str = "pipeline_mode") -> str:
+    """An export mode, restricted to the allow-list (batch|streaming). No default: absent/unknown fails.
+
+    Public because it validates two things: the config's pipeline_mode (the per-index DEFAULT, checked
+    at config load) AND the run-time job-parameter override the runner notebook receives (a bad
+    `--params pipeline_mode=...` must fail closed, not silently run the wrong mode)."""
     if value not in _VALID_PIPELINE_MODES:
         raise PipelineConfigError(
             f"{where} must be one of {', '.join(_VALID_PIPELINE_MODES)}, got {value!r}"
@@ -170,7 +175,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
 
     es_index_name = _require_es_index(raw["es_index_name"], f"{source}: es_index_name")
     es_id_field = _require_identifier(raw["es_id_field"], f"{source}: es_id_field")
-    pipeline_mode = _require_pipeline_mode(raw["pipeline_mode"], f"{source}: pipeline_mode")
+    pipeline_mode = require_pipeline_mode(raw["pipeline_mode"], f"{source}: pipeline_mode")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
     # source carries primary_key in addition to catalog/schema/table: it is a column of the SOURCE
     # table (unique-row identity for the streaming read), so it lives with the source, not at top level.
@@ -307,18 +312,36 @@ def view_substitutions(cfg: dict, environment: str) -> dict:
 
 
 def job_base_parameters(config_name: str, environment_ref: str, wheel_path_ref: str) -> dict:
-    """The values the generated per-index job passes to run_index_pipeline.py as widgets.
+    """The DEPLOY-TIME values the generated per-index job passes to run_index_pipeline.py as widgets.
 
-    The generator runs OFFLINE and cannot know `environment` or `wheel_path` (deploy-time values), so
-    it cannot bake them into the job. Instead it passes the config's NAME (the notebook loads and
-    resolves that config itself at runtime, so pipeline_mode and object names come from the config,
-    not from widgets) plus two DAB variable references threaded through unchanged:
+    These are notebook-task base_parameters: fixed at deploy, not meant to change per run. The
+    generator runs OFFLINE and cannot know `environment` or `wheel_path` (deploy-time values), so it
+    passes the config's NAME (the notebook loads/resolves that config at runtime, so object names come
+    from the config) plus two DAB variable references threaded through unchanged:
     - `environment_ref` (e.g. "${var.environment}"): folded into ${environment} in the config names.
     - `wheel_path_ref` (e.g. "${var.wheel_path}"): the ONE global connector wheel every job installs.
     The bundle resolves both at deploy. All values are strings, as job base_parameters must be.
+
+    pipeline_mode is deliberately NOT here: it is a run-time-overridable job parameter (see
+    job_parameters), so it can be toggled per run with `--params pipeline_mode=...`.
     """
     return {
         "config_name": config_name,
         "environment": environment_ref,
         "wheel_path": wheel_path_ref,
     }
+
+
+def job_parameters(cfg: dict) -> list:
+    """The RUN-TIME-overridable job-level parameters for a per-index job, as JobParameterDefinitions.
+
+    Unlike base_parameters (fixed at deploy), a job parameter can be overridden per run with
+    `--params <name>=<value>` and surfaces to the notebook as a widget of the same name. pipeline_mode
+    is such a parameter: its DEFAULT comes from the config (the per-index choice, already allow-list
+    validated by validate_config), and an operator can flip batch<->streaming for a single run without
+    redeploying. The runner re-validates the effective value, so a bad --params override fails closed.
+
+    Returns the list shape DAB expects under a job's `parameters:` key. As more run-time toggles are
+    added later, they join this list.
+    """
+    return [{"name": "pipeline_mode", "default": cfg["pipeline_mode"]}]

@@ -6,7 +6,7 @@
 # used as-is.
 es_index_name: ecs-authentication   # target Elasticsearch index (hyphens allowed)
 es_id_field: dsl_id                 # view output column passed to the connector as the ES document _id
-pipeline_mode: streaming            # export mode for this index's job: batch | streaming (required)
+pipeline_mode: streaming            # default export mode: batch | streaming (override per run with --params)
 
 view:                               # the view this pipeline creates and exports
   catalog: tim_clifford_classic_dsl_lite_${environment}

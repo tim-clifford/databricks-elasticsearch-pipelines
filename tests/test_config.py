@@ -11,6 +11,8 @@ from pipeline_lib.config import (
     PipelineConfigError,
     column_present,
     job_base_parameters,
+    job_parameters,
+    require_pipeline_mode,
     resolve_config,
     resolve_name,
     validate_config,
@@ -308,6 +310,41 @@ def test_job_base_parameters():
         "environment": "${var.environment}",
         "wheel_path": "${var.wheel_path}",
     }
+
+
+def test_job_base_parameters_excludes_pipeline_mode():
+    # pipeline_mode is a run-time job parameter, NOT a deploy-time base_parameter: it must not leak
+    # into base_parameters (which would re-fix it at deploy and defeat the per-run override).
+    params = job_base_parameters("x", environment_ref="${var.environment}", wheel_path_ref="${var.wheel_path}")
+    assert "pipeline_mode" not in params
+
+
+# --------------------------------------------------------------------------- job_parameters
+
+
+@pytest.mark.parametrize("mode", ["batch", "streaming"])
+def test_job_parameters_default_from_config(mode):
+    # The generated job parameter's default is the config's pipeline_mode (the per-index choice).
+    cfg = _base()
+    cfg["pipeline_mode"] = mode
+    assert job_parameters(validate_config(cfg)) == [{"name": "pipeline_mode", "default": mode}]
+
+
+# --------------------------------------------------------------------------- require_pipeline_mode
+
+
+@pytest.mark.parametrize("mode", ["batch", "streaming"])
+def test_require_pipeline_mode_accepts_allowed(mode):
+    # The run-time override validator (used by the notebook on the job-parameter value) accepts the
+    # allow-listed modes and returns them unchanged.
+    assert require_pipeline_mode(mode, "pipeline_mode job parameter") == mode
+
+
+@pytest.mark.parametrize("bad", ["turbo", "Batch", "", None, "streaming ", 5])
+def test_require_pipeline_mode_rejects_bad_override(bad):
+    # A bad --params pipeline_mode=... override must fail closed, not silently run an unknown mode.
+    with pytest.raises(PipelineConfigError, match="pipeline_mode"):
+        require_pipeline_mode(bad, "pipeline_mode job parameter")
 
 
 def test_validate_does_not_mutate_input():
