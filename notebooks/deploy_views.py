@@ -15,7 +15,7 @@
 # Read the environment. Unlike catalog/schema (which now live in each config), environment MAY be
 # empty: not every deployment has one, and a config whose names use no ${environment} token needs
 # none. A config that DOES use the token but gets an empty environment fails closed later, in
-# resolve_name -- so we do not reject empty here.
+# resolve_name - so we do not reject empty here.
 dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
 print(f"environment = {ENVIRONMENT!r}")
@@ -81,7 +81,7 @@ _TOKEN = re.compile(r"\$\{(\w+)\}")
 # a pathologically large view can't make this diagnostic logging itself blow the notebook's output
 # size limit (10 MB/cell) and fail an otherwise-good deploy. The char cap is the real guard (bytes are
 # what the notebook limit measures); the line cap is a secondary proxy. At ~200 KB the printed SQL is
-# still ~50x under the cell limit. spark.sql always runs the FULL SQL regardless -- only the printed
+# still ~50x under the cell limit. spark.sql always runs the FULL SQL regardless - only the printed
 # copy is capped.
 _SQL_PRINT_MAX_LINES = 2_000
 _SQL_PRINT_MAX_CHARS = 200_000
@@ -115,7 +115,7 @@ def print_sql(sql: str) -> int:
     Truncates by whichever limit hits first (lines or characters) and prints a clear notice with the
     full size, so it's obvious the display was clipped and by how much. The character budget counts
     the printed form (indent included), since it exists to bound actual notebook output. At least the
-    first line is always shown -- itself hard-truncated if that single line exceeds the budget -- so
+    first line is always shown - itself hard-truncated if that single line exceeds the budget - so
     there is never a case where only the truncation notice prints with no SQL content.
 
     Returns the ACTUAL number of characters emitted (every printed line, including the indent, the
@@ -164,7 +164,7 @@ def print_sql(sql: str) -> int:
 
 # Best-effort per view: each view is an independent CREATE OR REPLACE, so one view's failure
 # (a bad environment resolution, a missing source table, a SQL error) must NOT stop the others.
-# We attempt every view, collect failures, then FAIL the job at the end if any view failed -- a
+# We attempt every view, collect failures, then FAIL the job at the end if any view failed - a
 # partial deploy must never report green (fail closed).
 created = []
 failed = []
@@ -179,7 +179,7 @@ for filename in sql_files:
             rendered = render(fh.read(), filename, subs)
         # Print the substitutions and the fully-rendered SQL that is about to run (all ${...}
         # substituted, ${environment} folded in) so the exact CREATE OR REPLACE is visible in the job
-        # output for debugging -- but only until the cumulative budget is reached, so many views can't
+        # output for debugging - but only until the cumulative budget is reached, so many views can't
         # flood the cell's output. Both prints are gated and counted against the same budget.
         if printed_chars < _SQL_PRINT_TOTAL_BUDGET:
             subs_line = f"    substitutions: {subs}"
@@ -209,7 +209,7 @@ for filename in sql_files:
             )
         created.append(filename)
         print(f"    created {view_name} (es_id_field '{es_id_field}' present)")
-    except Exception as exc:  # noqa: BLE001 -- deliberately continue to the next view
+    except Exception as exc:  # noqa: BLE001 - deliberately continue to the next view
         failed.append((filename, exc))
         print(f"    FAILED {view_name}: {type(exc).__name__}: {exc}")
 

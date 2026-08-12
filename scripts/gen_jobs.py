@@ -10,7 +10,7 @@ Usage:
   python scripts/gen_jobs.py --check    # exit non-zero if any generated file is missing/stale/orphaned
 
 --check is the drift guard: run it in CI (or before deploy) so a config edit that was not
-regenerated -- or a generated job left behind by a deleted/renamed config -- fails loudly instead of
+regenerated - or a generated job left behind by a deleted/renamed config - fails loudly instead of
 deploying a stale job set.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ import yaml
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Import the shared config schema from the repo root, so validation is not re-implemented here.
 sys.path.insert(0, _REPO_ROOT)
-from pipeline_lib.config import PipelineConfigError, job_base_parameters, load_config  # noqa: E402
+from pipeline_lib.config import PipelineConfigError, job_base_parameters, job_parameters, load_config  # noqa: E402
 
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "pipeline_definitions")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
@@ -36,7 +36,7 @@ _CONFIG_GLOBS = ("*.yml", "*.yaml")
 
 # A config's stem becomes the Databricks bundle resource key `index_pipeline_<stem>`, which must be
 # [A-Za-z0-9_-]+. A dotted name like `foo.bar.yml` (splitext strips only `.yml`) would yield the key
-# `index_pipeline_foo.bar` -- invalid, and it fails at DEPLOY, not generation. Enforce it here so a
+# `index_pipeline_foo.bar` - invalid, and it fails at DEPLOY, not generation. Enforce it here so a
 # bad name fails loudly at generation instead.
 _VALID_STEM = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -61,7 +61,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
     any special characters in the values, so a name/table/key containing a quote, colon, brace, etc.
     can never produce malformed YAML. Deterministic (sort_keys=False preserves this insertion order),
     so --check can compare byte-for-byte. Serverless notebook task (no cluster block), on-demand,
-    CAN_MANAGE_RUN to `users` -- consistent with the other jobs in this bundle.
+    CAN_MANAGE_RUN to `users` - consistent with the other jobs in this bundle.
     """
     job = {
         "resources": {
@@ -73,15 +73,20 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                         "the shared notebook notebooks/run_index_pipeline.py with this index's config. No "
                         "cluster block => serverless notebook task."
                     ),
+                    # Run-time-overridable job parameters (currently just pipeline_mode): default comes
+                    # from the config, override per run with `--params pipeline_mode=streaming`.
+                    "parameters": job_parameters(cfg),
                     "tasks": [
                         {
                             "task_key": f"index_pipeline_{name}",
                             "notebook_task": {
                                 "notebook_path": "../notebooks/run_index_pipeline.py",
                                 # The notebook loads its own config at runtime (the generator can't
-                                # know the deploy-time environment), so it just needs the config name
-                                # plus the environment threaded from the bundle variable.
-                                "base_parameters": job_base_parameters(name, "${var.environment}"),
+                                # know the deploy-time environment or wheel path), so it just needs the
+                                # config name plus the environment and wheel_path bundle-variable refs.
+                                "base_parameters": job_base_parameters(
+                                    name, "${var.environment}", "${var.wheel_path}"
+                                ),
                             },
                         }
                     ],
@@ -153,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         p for p in existing_generated_files() if p not in {generated_path(_config_name(c)) for c in config_paths}
     ]
 
-    # An empty config dir is only an error if there is also no orphan cleanup to do -- otherwise we
+    # An empty config dir is only an error if there is also no orphan cleanup to do - otherwise we
     # still need to run so a deleted last config's stale generated job gets removed/flagged. (Orphan
     # handling below runs regardless of whether any configs remain.)
     if not config_paths and not orphans:
@@ -162,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Validate and render EVERYTHING before touching disk, so generation is all-or-nothing: an invalid
     # config aborts here with nothing written, never leaving resources/ half-regenerated. Also refuse
-    # up front to write over a hand-authored resource -- the symmetric guard to orphan deletion: a
+    # up front to write over a hand-authored resource - the symmetric guard to orphan deletion: a
     # config named e.g. `deploy_views` targets the existing resources/deploy_views.job.yml (no marker).
     rendered: dict[str, str] = {}
     collisions = []

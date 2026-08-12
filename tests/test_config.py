@@ -11,6 +11,8 @@ from pipeline_lib.config import (
     PipelineConfigError,
     column_present,
     job_base_parameters,
+    job_parameters,
+    require_pipeline_mode,
     resolve_config,
     resolve_name,
     validate_config,
@@ -23,6 +25,7 @@ def _base():
     return {
         "es_index_name": "ecs-dns-activity",
         "es_id_field": "dsl_id",
+        "pipeline_mode": "batch",
         "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
         "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity", "primary_key": "dsl_id"},
     }
@@ -63,7 +66,7 @@ def test_environment_token_accepted_as_template():
 # --------------------------------------------------------------------------- fail-closed: structure
 
 
-@pytest.mark.parametrize("missing", ["es_index_name", "es_id_field", "view", "source"])
+@pytest.mark.parametrize("missing", ["es_index_name", "es_id_field", "pipeline_mode", "view", "source"])
 def test_missing_required_key(missing):
     cfg = _base()
     del cfg[missing]
@@ -103,6 +106,29 @@ def test_illegal_es_id_field_rejected(bad):
     cfg["es_id_field"] = bad
     with pytest.raises(PipelineConfigError, match="es_id_field"):
         validate_config(cfg)
+
+
+@pytest.mark.parametrize("mode", ["batch", "streaming"])
+def test_pipeline_mode_allowed_values(mode):
+    cfg = _base()
+    cfg["pipeline_mode"] = mode
+    assert validate_config(cfg)["pipeline_mode"] == mode
+
+
+@pytest.mark.parametrize("bad", ["Batch", "BATCH", "stream", "micro-batch", "", None, 5, True])
+def test_pipeline_mode_rejects_non_allowlisted(bad):
+    # Allow-list: only exactly 'batch'/'streaming'. A near-miss, wrong case, empty, or non-string
+    # must fail closed - never silently defaulted.
+    cfg = _base()
+    cfg["pipeline_mode"] = bad
+    with pytest.raises(PipelineConfigError, match="pipeline_mode"):
+        validate_config(cfg)
+
+
+def test_pipeline_mode_carried_through_resolve():
+    # pipeline_mode is a passthrough (not an object name): resolve must keep it verbatim.
+    out = resolve_config(validate_config(_with_env()), environment="prod")
+    assert out["pipeline_mode"] == "batch"
 
 
 def test_unknown_top_level_key():
@@ -276,8 +302,49 @@ def test_view_substitutions_missing_env_fails():
 
 
 def test_job_base_parameters():
-    params = job_base_parameters("ecs_dns_activity", environment_ref="${var.environment}")
-    assert params == {"config_name": "ecs_dns_activity", "environment": "${var.environment}"}
+    params = job_base_parameters(
+        "ecs_dns_activity", environment_ref="${var.environment}", wheel_path_ref="${var.wheel_path}"
+    )
+    assert params == {
+        "config_name": "ecs_dns_activity",
+        "environment": "${var.environment}",
+        "wheel_path": "${var.wheel_path}",
+    }
+
+
+def test_job_base_parameters_excludes_pipeline_mode():
+    # pipeline_mode is a run-time job parameter, NOT a deploy-time base_parameter: it must not leak
+    # into base_parameters (which would re-fix it at deploy and defeat the per-run override).
+    params = job_base_parameters("x", environment_ref="${var.environment}", wheel_path_ref="${var.wheel_path}")
+    assert "pipeline_mode" not in params
+
+
+# --------------------------------------------------------------------------- job_parameters
+
+
+@pytest.mark.parametrize("mode", ["batch", "streaming"])
+def test_job_parameters_default_from_config(mode):
+    # The generated job parameter's default is the config's pipeline_mode (the per-index choice).
+    cfg = _base()
+    cfg["pipeline_mode"] = mode
+    assert job_parameters(validate_config(cfg)) == [{"name": "pipeline_mode", "default": mode}]
+
+
+# --------------------------------------------------------------------------- require_pipeline_mode
+
+
+@pytest.mark.parametrize("mode", ["batch", "streaming"])
+def test_require_pipeline_mode_accepts_allowed(mode):
+    # The run-time override validator (used by the notebook on the job-parameter value) accepts the
+    # allow-listed modes and returns them unchanged.
+    assert require_pipeline_mode(mode, "pipeline_mode job parameter") == mode
+
+
+@pytest.mark.parametrize("bad", ["turbo", "Batch", "", None, "streaming ", 5])
+def test_require_pipeline_mode_rejects_bad_override(bad):
+    # A bad --params pipeline_mode=... override must fail closed, not silently run an unknown mode.
+    with pytest.raises(PipelineConfigError, match="pipeline_mode"):
+        require_pipeline_mode(bad, "pipeline_mode job parameter")
 
 
 def test_validate_does_not_mutate_input():
