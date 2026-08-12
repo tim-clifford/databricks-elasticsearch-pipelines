@@ -93,12 +93,12 @@ its `.sql` filename):
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
-pipeline_mode: batch              # default export mode: batch | streaming (required; override per run)
-view:                             # the view this pipeline creates
+pipeline_mode: batch              # default export mode: batch | streaming (required; can override per run)
+view:                             # the view this pipeline uses
   catalog: acme_${environment}
   schema: es_poc
   name: ecs_dns_activity
-source:                           # the single source table the view reads from
+source:                           # the single source table the pipeline reads from
   catalog: acme_${environment}
   schema: ocsf
   table: dns_activity

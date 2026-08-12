@@ -40,7 +40,8 @@ if not WHEEL_PATH:
     )
 print(f"installing connector wheel from {WHEEL_PATH}")
 # shlex.quote the path so a UC Volume filename containing a space (or any pip-meaningful token) is
-# passed to pip as ONE argument, not split or interpreted as extra pip options.
+# passed to pip as ONE argument, not split or interpreted as extra pip options. Verified live: a wheel
+# at a path containing a space installs and imports fine, so Databricks' %pip honors the quoting.
 get_ipython().run_line_magic("pip", f"install {shlex.quote(WHEEL_PATH)}")
 dbutils.library.restartPython()
 
@@ -90,6 +91,12 @@ if FILES_ROOT not in sys.path:
 
 from pipeline_lib.config import load_config, require_pipeline_mode, resolve_config  # noqa: E402
 
+# Validate the EFFECTIVE pipeline_mode (the job-parameter value: config default unless overridden per
+# run with --params) FIRST, before the config file I/O below. require_pipeline_mode is the same
+# allow-list check the config uses, so a bad override (e.g. --params pipeline_mode=turbo) fails closed
+# immediately, without wasting the config load/resolve on a run that can't proceed.
+PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
+
 # Resolve the config file, accepting either extension: gen_jobs.py and deploy_views.py both discover
 # .yml AND .yaml, so the runner must too, or a .yaml-defined pipeline would deploy fine and then fail
 # here at runtime. Fail closed if neither exists.
@@ -104,11 +111,6 @@ if config_path is None:
 # load_config validates the schema; resolve_config folds ${environment} in and validates the result
 # (both fail closed). After this, every catalog/schema/name is a concrete identifier.
 cfg = resolve_config(load_config(config_path), ENVIRONMENT)
-
-# Validate the EFFECTIVE pipeline_mode (the job-parameter value: config default unless overridden per
-# run with --params). require_pipeline_mode is the same allow-list check the config uses, so a bad
-# override (e.g. --params pipeline_mode=turbo) fails closed here rather than running an unknown mode.
-PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
 
 # COMMAND ----------
 # For now, just print the resolved configuration. This is the placeholder for the export logic;
