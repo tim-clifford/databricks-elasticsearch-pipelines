@@ -116,7 +116,7 @@ def test_pipeline_mode_allowed_values(mode):
 @pytest.mark.parametrize("bad", ["Batch", "BATCH", "stream", "micro-batch", "", None, 5, True])
 def test_pipeline_mode_rejects_non_allowlisted(bad):
     # Allow-list: only exactly 'batch'/'streaming'. A near-miss, wrong case, empty, or non-string
-    # must fail closed -- never silently defaulted.
+    # must fail closed - never silently defaulted.
     cfg = _base()
     cfg["pipeline_mode"] = bad
     with pytest.raises(PipelineConfigError, match="pipeline_mode"):

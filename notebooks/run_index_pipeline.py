@@ -45,9 +45,11 @@ get_ipython().run_line_magic("pip", f"install {shlex.quote(WHEEL_PATH)}")
 dbutils.library.restartPython()
 
 # COMMAND ----------
-# Verify the wheel actually installed: import the connector and report its version. This is the
-# install-succeeds check (proven, not assumed) -- a bad wheel_path or an incompatible wheel fails the
-# run HERE, before any export work, rather than surfacing as a cryptic error deep in the pipeline.
+# Verify the connector is importable and report its version, before any export work. What each step
+# proves: a nonexistent or broken wheel_path already failed the %pip install above (seen live). This
+# import then catches the case where the install ran but the package still isn't importable. It does
+# NOT prove THIS wheel_path's build is the one loaded (a connector already present on the runtime would
+# also satisfy the import), so it is an importability check, not a version-match assertion.
 import databricks_es_connector  # noqa: E402
 
 # getattr fallback: the successful import above is the real install-succeeds signal; a build that

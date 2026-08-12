@@ -294,7 +294,7 @@ def view_substitutions(cfg: dict, environment: str) -> dict:
       the SQL writes `LEFT JOIN ${ref_alias} ON ...` and refers to columns via the alias.
 
     Join tuning (a broadcast hint, etc.) is the view author's responsibility, written directly in the
-    SQL like the rest of the join -- the framework only resolves table locations.
+    SQL like the rest of the join - the framework only resolves table locations.
     """
     resolved = resolve_config(cfg, environment)
     subs = {
