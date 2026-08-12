@@ -83,7 +83,7 @@ or `DATABRICKS_HOST`. The bundle variables are:
 | Variable | What it sets |
 |---|---|
 | `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
-| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel that **every** job installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). No default: pass `--var="wheel_path=..."` at deploy or set it in your fork |
+| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel each **index job** installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). Defaults to empty; supply it on `bundle deploy` (or set a real default in your fork). An index-job deployed with an empty `wheel_path` fails closed at run; `deploy_views` and `deploy` don't need it |
 
 Everything else is per-pipeline and lives in `pipeline_definitions/<config_name>.yml`. Each object is fully
 qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
@@ -125,22 +125,25 @@ so a typo fails the deploy rather than surfacing later at export time.
 
 ## Deploy and run
 
-`wheel_path` has no default, so every `bundle` command below (both `deploy` AND `run`, since DAB
-resolves all variables for either) must be given it. Set it once and reuse:
+`wheel_path` is baked into each job's parameters at **deploy** time (that is when `${var.wheel_path}`
+resolves), so supply it on `bundle deploy`, not on `bundle run` (a `--var` on `run` does not override
+the deployed value). It defaults to empty, so a deploy without it still succeeds and `deploy_views`
+runs fine (it needs no connector); only an index-job run needs a real wheel, and one deployed with an
+empty `wheel_path` fails closed:
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from pipeline_definitions/*.yml
 
 WHEEL="/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
-
 databricks bundle deploy -t dev -p <profile> --var="environment=<env>" --var="wheel_path=$WHEEL"
 
-databricks bundle run deploy_views          -t dev -p <profile> --var="environment=<env>" --var="wheel_path=$WHEEL"
-databricks bundle run index_pipeline_<config_name> -t dev -p <profile> --var="environment=<env>" --var="wheel_path=$WHEEL"
+databricks bundle run deploy_views                 -t dev -p <profile> --var="environment=<env>"
+databricks bundle run index_pipeline_<config_name> -t dev -p <profile> --var="environment=<env>"
 ```
 
-(Omit `--var="environment=..."` if none of your config names use `${environment}`. `wheel_path` is
-always required unless you set a default in your fork's `databricks.yml`.)
+(Omit `--var="environment=..."` if none of your config names use `${environment}`. An index-job run
+needs a `wheel_path` supplied at deploy; set a real default in your fork's `databricks.yml` to avoid
+passing it each time.)
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.

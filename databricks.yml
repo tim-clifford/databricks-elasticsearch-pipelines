@@ -38,11 +38,15 @@ variables:
   # wheel must already exist at the given UC Volume path (see the es-databricks-connector repo for
   # building/uploading it). Threaded into every generated job; each runner installs it and verifies
   # the import succeeds. The connector VERSION lives only in the wheel filename here, so an upgrade is
-  # a one-line change. No default (the path is environment-specific): pass it at deploy with
+  # a one-line change. Defaults to empty (like environment, and because the path is
+  # environment-specific -- no FEVM path baked in): an empty default lets variable-only commands (e.g.
+  # `bundle run deploy_views`, which needs no connector) resolve without it, while a per-index job run
+  # with an empty wheel_path fails closed in the runner notebook. Pass it at deploy/run with
   # --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
-  # or set a default in your fork.
+  # or set a real default in your fork.
   wheel_path:
-    description: "UC Volume path to the databricks-es-connector wheel every job installs (required; version lives in the filename)."
+    description: "UC Volume path to the databricks-es-connector wheel every index job installs (version lives in the filename). Empty default; required for index-job runs (fails closed if empty)."
+    default: ""
 
 # Targets differ only by deployment mode. The workspace HOST is intentionally not hardcoded here:
 # it is taken from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var,
