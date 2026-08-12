@@ -34,10 +34,12 @@ variables:
     default: ""
 
   # One GLOBAL connector wheel serves every per-index job, so it is a bundle variable, not per-config.
-  # Empty default (the path is environment-specific -- no FEVM path baked in): variable-only commands
-  # like `bundle run deploy_views` resolve without it, while an index-job run with an empty wheel_path
-  # fails closed in the runner. See the README "Configuration" / "Deploy and run" sections for the full
-  # rationale (deploy-time resolution, version-in-filename, forking).
+  # Empty default (the path is environment-specific): variable-only commands like `bundle run
+  # deploy_views` resolve without it, while an index-job run with an empty wheel_path fails closed in
+  # the runner. Supply it at deploy, e.g.
+  #   --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
+  # See the README "Configuration" / "Deploy and run" sections for the full rationale (deploy-time
+  # resolution, version-in-filename, forking).
   wheel_path:
     description: "UC Volume path to the databricks-es-connector wheel every index job installs (version lives in the filename). Empty default; required for index-job runs (fails closed if empty)."
     default: ""

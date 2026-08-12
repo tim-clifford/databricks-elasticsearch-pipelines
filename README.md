@@ -83,7 +83,7 @@ or `DATABRICKS_HOST`. The bundle variables are:
 | Variable | What it sets |
 |---|---|
 | `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
-| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel each **index job** installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). Defaults to empty; supply it on `bundle deploy` (or set a real default in your fork). An index-job deployed with an empty `wheel_path` fails closed at run; `deploy_views` and `deploy` don't need it |
+| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel each **index job** installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). Defaults to empty; supply it on `bundle deploy` (or set a real default in your fork). An index job deployed with an empty `wheel_path` fails closed at run; `deploy_views` doesn't need it |
 
 Everything else is per-pipeline and lives in `pipeline_definitions/<config_name>.yml`. Each object is fully
 qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
@@ -128,7 +128,7 @@ so a typo fails the deploy rather than surfacing later at export time.
 `wheel_path` is baked into each job's parameters at **deploy** time (that is when `${var.wheel_path}`
 resolves), so supply it on `bundle deploy`, not on `bundle run` (a `--var` on `run` does not override
 the deployed value). It defaults to empty, so a deploy without it still succeeds and `deploy_views`
-runs fine (it needs no connector); only an index-job run needs a real wheel, and one deployed with an
+runs fine (it needs no connector); only an index job needs a real wheel, and one deployed with an
 empty `wheel_path` fails closed:
 
 ```bash
