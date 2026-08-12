@@ -10,7 +10,7 @@ transfer.
 Every Elasticsearch index is fed by its own pipeline, and each pipeline is described by two files:
 
 - a view `views/<view_name>.sql` defining what gets exported, and
-- a config file `pipeline_definitions/<name>.yml` that points a pipeline at that view and says where
+- a config file `pipeline_definitions/<config_name>.yml` that points a pipeline at that view and says where
   its view, source table, and any reference (join) tables live.
 
 The bundle deploys:
@@ -18,7 +18,7 @@ The bundle deploys:
 - **One `deploy_views` job**: creates or replaces one Databricks view per index. Each view is a
   `.sql` file in [`views/`](views/). The job renders the catalog/schema parameters and runs every
   file with `spark.sql`.
-- **One job per index** (`index_pipeline_<name>`): all run the same shared notebook
+- **One job per index** (`index_pipeline_<config_name>`): all run the same shared notebook
   [`notebooks/run_index_pipeline.py`](notebooks/run_index_pipeline.py) with that index's config. These
   job resources are **generated** by [`scripts/gen_jobs.py`](scripts/gen_jobs.py) from the config
   files (see [Adding a new pipeline for an ES index](#adding-a-new-pipeline-for-an-es-index)).
@@ -26,7 +26,7 @@ The bundle deploys:
 ## Adding a new pipeline for an ES index
 
 1. Add `views/<view_name>.sql`.
-2. Add `pipeline_definitions/<name>.yml` (see the schema under [Configuration](#configuration)). The
+2. Add `pipeline_definitions/<config_name>.yml` (see the schema under [Configuration](#configuration)). The
    view's filename must match the config's `view.name`.
 3. Regenerate the job resources: `python scripts/gen_jobs.py`.
 4. Deploy.
@@ -34,7 +34,7 @@ The bundle deploys:
 The config's filename stem becomes the job's resource key (`index_pipeline_<stem>`), so it must
 contain only letters, digits, `_`, and `-` (the generator rejects anything else, e.g. a dotted name).
 
-Step 3 writes one `resources/<name>.job.yml` per config, keeping the generated jobs in sync. If you
+Step 3 writes one `resources/<config_name>.job.yml` per config, keeping the generated jobs in sync. If you
 run it, you're covered. `python scripts/gen_jobs.py --check` is the separate verification that step 3
 was actually run: it makes no changes and fails if any generated file is missing, stale, or orphaned
 (left behind by a deleted or renamed config). Run it in CI to catch a commit that edited a config but
@@ -83,9 +83,9 @@ or `DATABRICKS_HOST`. The bundle variables are:
 | Variable | What it sets |
 |---|---|
 | `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
-| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel (v0.6.1) that **every** job installs; a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it) |
+| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel that **every** job installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). No default: pass `--var="wheel_path=..."` at deploy or set it in your fork |
 
-Everything else is per-pipeline and lives in `pipeline_definitions/<name>.yml`. Each object is fully
+Everything else is per-pipeline and lives in `pipeline_definitions/<config_name>.yml`. Each object is fully
 qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
 `${environment}`; the view name and table names are plain identifiers (so a view's name always equals
 its `.sql` filename):
@@ -103,8 +103,9 @@ source:                           # the single source table the view reads from
   schema: ocsf
   table: dns_activity
   primary_key: dsl_id             # source-table column identifying a unique row (for the streaming read)
-reference_tables:                 # OPTIONAL: extra tables the view joins (see Views)
-  validation:                     # key = the ${ref_validation} join alias in the SQL
+reference_tables:                 # OPTIONAL: one entry per joined table (add as many as needed)
+  validation:                     # 'validation' is an EXAMPLE alias you choose; it is the
+                                  # ${ref_validation} join alias used in the SQL
     catalog: acme_${environment}
     schema: ocsf_validation_${environment}
     table: dns_activity
@@ -121,25 +122,21 @@ share a value but need not, and neither defaults to the other. When `deploy_view
 verifies `es_id_field` is actually one of that view's output columns (against Spark's resolved schema),
 so a typo fails the deploy rather than surfacing later at export time.
 
-`pipeline_mode` is **per index** (`batch` or `streaming`) because different indices may export
-differently; it is required with no default, and an unrecognized value fails closed at config load.
-The connector `wheel_path`, by contrast, is a single **global** bundle variable (one wheel serves
-every job), so it lives in `databricks.yml`, not per config. Each job's runner installs that wheel and
-verifies the `databricks_es_connector` import succeeds before doing any work, so a bad wheel path
-fails the run immediately rather than deep in the pipeline.
-
 ## Deploy and run
 
 ```bash
-python scripts/gen_jobs.py   # regenerate resources/<name>.job.yml from pipeline_definitions/*.yml
+python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from pipeline_definitions/*.yml
 
-databricks bundle deploy -t dev -p <profile> --var="environment=<env>"
+databricks bundle deploy -t dev -p <profile> \
+  --var="environment=<env>" \
+  --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
 
-databricks bundle run deploy_views                -t dev -p <profile> --var="environment=<env>"
-databricks bundle run index_pipeline_<name>       -t dev -p <profile> --var="environment=<env>"
+databricks bundle run deploy_views          -t dev -p <profile> --var="environment=<env>"
+databricks bundle run index_pipeline_<config_name> -t dev -p <profile> --var="environment=<env>"
 ```
 
-(Omit `--var="environment=..."` if none of your config names use `${environment}`.)
+(Omit `--var="environment=..."` if none of your config names use `${environment}`. `wheel_path` has
+no default; pass it at deploy as above, or set a default in your fork's `databricks.yml`.)
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
@@ -158,7 +155,7 @@ You edit these, one pair per pipeline:
   views/
     <view_name>.sql             The view: what gets exported (filename == view.name)
   pipeline_definitions/
-    <name>.yml                  The config: view/source/reference locations + es_index_name,
+    <config_name>.yml           The config: view/source/reference locations + es_index_name,
                                 es_id_field, pipeline_mode, source.primary_key (see Configuration)
 
 Shared notebooks (run by the jobs, not edited per pipeline):
@@ -178,10 +175,10 @@ Shared library + tests (the config schema, used by the generator and both notebo
 
 Generated / tooling (do not hand-edit the generated jobs):
   scripts/
-    gen_jobs.py                 Generates resources/<name>.job.yml from the configs (--check guards drift)
+    gen_jobs.py                 Generates resources/<config_name>.job.yml from the configs (--check guards drift)
   resources/
     deploy_views.job.yml        The deploy_views job (hand-authored)
-    <name>.job.yml              GENERATED per-index job (one per pipeline_definitions config)
+    <config_name>.job.yml       GENERATED per-index job (one per pipeline_definitions config)
 ```
 
 ## License & Attribution

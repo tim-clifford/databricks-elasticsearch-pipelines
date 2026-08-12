@@ -15,32 +15,22 @@
 # MAGIC Parameters (set by the generated per-index job as widgets):
 # MAGIC - `config_name`: the pipeline definition to load (`pipeline_definitions/<config_name>.yml`).
 # MAGIC - `environment`: folded into any `${environment}` in the config's object names (may be empty).
-# MAGIC - `wheel_path`: UC Volume path to the connector `.whl` to install (required). Global (one wheel
-# MAGIC   serves every index); `pipeline_mode` is NOT a parameter -- it lives per-index in the config.
+# MAGIC - `wheel_path`: UC Volume path to the connector `.whl` to install (required).
 
 # COMMAND ----------
-# Read the parameters. config_name and wheel_path are required; environment may be empty (a config
-# that uses no ${environment} token needs none, and one that does fails closed later in resolve_config).
-dbutils.widgets.text("config_name", "", "Pipeline definition name (pipeline_definitions/<name>.yml)")
-dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
+# FIRST, install the connector wheel and restart Python. This cell handles ONLY the wheel, because
+# restartPython() discards all Python interpreter state (including any widget values read into
+# variables), so any work done before it would just have to be redone. Reading config_name/environment
+# is therefore deferred to after the restart. %pip can't expand a widget inside a literal
+# `%pip install <path>`, so we read wheel_path in Python and invoke the pip magic programmatically.
+# restartPython() MUST be the last statement in the cell (it ends the cell).
 dbutils.widgets.text("wheel_path", "", "Connector wheel path (UC Volume .whl)")
-CONFIG_NAME = dbutils.widgets.get("config_name").strip()
-ENVIRONMENT = dbutils.widgets.get("environment").strip()
 WHEEL_PATH = dbutils.widgets.get("wheel_path").strip()
-if not CONFIG_NAME:
-    raise ValueError("missing required parameter: config_name")
 if not WHEEL_PATH:
     raise ValueError(
         "wheel_path is required: the UC Volume path to the databricks_es_connector wheel, e.g. "
-        "/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-0.6.1-py3-none-any.whl"
+        "/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
     )
-
-# COMMAND ----------
-# Install the connector wheel from the global wheel_path, then restart Python so the freshly installed
-# package is importable. %pip can't expand a widget inside a literal `%pip install <path>`, so we read
-# the parameter in Python and invoke the pip magic programmatically. restartPython() ends this cell
-# (it discards the Python interpreter state), so it MUST be the last statement -- which is also why the
-# config-loading imports below live in their own later cell, re-run against the restarted interpreter.
 print(f"installing connector wheel from {WHEEL_PATH}")
 get_ipython().run_line_magic("pip", f"install {WHEEL_PATH}")
 dbutils.library.restartPython()
@@ -54,9 +44,15 @@ import databricks_es_connector  # noqa: E402
 print(f"connector installed: databricks_es_connector {databricks_es_connector.__version__}")
 
 # COMMAND ----------
-# restartPython() above cleared the widget-derived Python variables, so re-read them here.
+# Now read the remaining parameters (the restart above cleared any earlier Python state, so this is
+# their first and only read). config_name is required; environment may be empty (a config that uses no
+# ${environment} token needs none, and one that does fails closed later in resolve_config).
+dbutils.widgets.text("config_name", "", "Pipeline definition name (pipeline_definitions/<config_name>.yml)")
+dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
 CONFIG_NAME = dbutils.widgets.get("config_name").strip()
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
+if not CONFIG_NAME:
+    raise ValueError("missing required parameter: config_name")
 
 # COMMAND ----------
 # Resolve the synced bundle root and make pipeline_lib importable. This notebook is synced to

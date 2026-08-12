@@ -27,13 +27,6 @@ VIEW's output, handed to the ES connector as the document _id. primary_key is a 
 table, used by the streaming read to identify a unique row. They often share a name but need not, and
 neither defaults to the other. Both are plain column identifiers (no ${environment} token).
 
-PIPELINE MODE (per index) vs WHEEL PATH (global)
-`pipeline_mode` (batch|streaming) is per-index: it lives in each config because different indices
-may export differently, and the runner branches on it. It is required with no default (an
-unrecognized/absent mode fails closed). The connector `wheel_path` is NOT here: it is a single
-global bundle variable (one wheel serves every index), threaded to each generated job by
-job_base_parameters and installed by the runner notebook.
-
 ENVIRONMENT SUBSTITUTION
 A `catalog` or `schema` value may embed the token `${environment}`, folded in at deploy time from the
 `environment` bundle variable, e.g. `ocsf_${environment}` -> `ocsf_prod`. A value with no token is used

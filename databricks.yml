@@ -35,12 +35,14 @@ variables:
 
   # The connector wheel is a single GLOBAL prerequisite: one wheel serves every per-index job, so it
   # is a bundle variable, not per-config. NOT created by this bundle -- the databricks-es-connector
-  # wheel must already exist at this UC Volume path (see the es-databricks-connector repo for
+  # wheel must already exist at the given UC Volume path (see the es-databricks-connector repo for
   # building/uploading it). Threaded into every generated job; each runner installs it and verifies
-  # the import succeeds. Override per environment with --var="wheel_path=/Volumes/.../<wheel>.whl".
+  # the import succeeds. The connector VERSION lives only in the wheel filename here, so an upgrade is
+  # a one-line change. No default (the path is environment-specific): pass it at deploy with
+  # --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
+  # or set a default in your fork.
   wheel_path:
-    description: "UC Volume path to the databricks-es-connector wheel (v0.6.1) every job installs."
-    default: "/Volumes/tim_clifford_classic_dsl_lite_catalog/es_poc/artifacts/databricks_es_connector-0.6.1-py3-none-any.whl"
+    description: "UC Volume path to the databricks-es-connector wheel every job installs (required; version lives in the filename)."
 
 # Targets differ only by deployment mode. The workspace HOST is intentionally not hardcoded here:
 # it is taken from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var,
