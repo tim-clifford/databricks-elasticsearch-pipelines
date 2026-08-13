@@ -12,12 +12,26 @@ from pipeline_lib.config import (
     column_present,
     job_base_parameters,
     job_parameters,
+    require_filter_condition,
     require_pipeline_mode,
     resolve_config,
     resolve_name,
     validate_config,
     view_substitutions,
+    write_config_overrides,
 )
+
+
+# job_base_parameters grew three connection refs; a tiny helper keeps the call sites readable.
+def _job_base_parameters(config_name):
+    return job_base_parameters(
+        config_name,
+        environment_ref="${var.environment}",
+        wheel_path_ref="${var.wheel_path}",
+        es_host_url_ref="${var.es_host_url}",
+        secret_scope_name_ref="${var.secret_scope_name}",
+        secret_key_name_ref="${var.secret_key_name}",
+    )
 
 
 def _base():
@@ -302,32 +316,139 @@ def test_view_substitutions_missing_env_fails():
 
 
 def test_job_base_parameters():
-    params = job_base_parameters(
-        "ecs_dns_activity", environment_ref="${var.environment}", wheel_path_ref="${var.wheel_path}"
-    )
+    params = _job_base_parameters("ecs_dns_activity")
     assert params == {
         "config_name": "ecs_dns_activity",
         "environment": "${var.environment}",
         "wheel_path": "${var.wheel_path}",
+        "es_host_url": "${var.es_host_url}",
+        "secret_scope_name": "${var.secret_scope_name}",
+        "secret_key_name": "${var.secret_key_name}",
     }
 
 
-def test_job_base_parameters_excludes_pipeline_mode():
-    # pipeline_mode is a run-time job parameter, NOT a deploy-time base_parameter: it must not leak
-    # into base_parameters (which would re-fix it at deploy and defeat the per-run override).
-    params = job_base_parameters("x", environment_ref="${var.environment}", wheel_path_ref="${var.wheel_path}")
-    assert "pipeline_mode" not in params
+def test_job_base_parameters_excludes_run_time_params():
+    # Run-time job parameters (pipeline_mode, filter_condition, and the EsWriteConfig tuning knobs)
+    # must NOT leak into base_parameters, which would re-fix them at deploy and defeat per-run override.
+    params = _job_base_parameters("x")
+    for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "require_existing_index", "verify_certs"):
+        assert run_time not in params
 
 
 # --------------------------------------------------------------------------- job_parameters
 
 
 @pytest.mark.parametrize("mode", ["batch", "streaming"])
-def test_job_parameters_default_from_config(mode):
-    # The generated job parameter's default is the config's pipeline_mode (the per-index choice).
+def test_job_parameters_pipeline_mode_default_from_config(mode):
+    # The pipeline_mode job parameter's default is the config's pipeline_mode (the per-index choice).
     cfg = _base()
     cfg["pipeline_mode"] = mode
-    assert job_parameters(validate_config(cfg)) == [{"name": "pipeline_mode", "default": mode}]
+    params = job_parameters(validate_config(cfg))
+    assert {"name": "pipeline_mode", "default": mode} in params
+
+
+def test_job_parameters_full_shape_and_order():
+    # The generated job exposes exactly these run-time parameters, in this order. filter_condition's
+    # default comes from the config; the tuning knobs default to "" (meaning "use connector default").
+    cfg = _base()
+    cfg["filter_condition"] = "action = 'allowed'"
+    assert job_parameters(validate_config(cfg)) == [
+        {"name": "pipeline_mode", "default": "batch"},
+        {"name": "filter_condition", "default": "action = 'allowed'"},
+        {"name": "chunk_size", "default": ""},
+        {"name": "require_existing_index", "default": ""},
+        {"name": "verify_certs", "default": ""},
+    ]
+
+
+def test_job_parameters_filter_condition_defaults_empty_when_absent():
+    # A config that omits filter_condition yields a "" default for that job parameter.
+    params = job_parameters(validate_config(_base()))
+    assert {"name": "filter_condition", "default": ""} in params
+
+
+# --------------------------------------------------------------------------- filter_condition
+
+
+def test_filter_condition_absent_defaults_empty():
+    assert validate_config(_base())["filter_condition"] == ""
+
+
+def test_filter_condition_present_kept_verbatim():
+    cfg = _base()
+    cfg["filter_condition"] = "action = 'allowed' AND rcode <> 0"
+    assert validate_config(cfg)["filter_condition"] == "action = 'allowed' AND rcode <> 0"
+
+
+@pytest.mark.parametrize("bad", [5, True, ["a"], {"x": 1}])
+def test_filter_condition_non_string_rejected(bad):
+    # df.filter expects a string expression; a YAML number/bool/list must fail closed at validation.
+    cfg = _base()
+    cfg["filter_condition"] = bad
+    with pytest.raises(PipelineConfigError, match="filter_condition"):
+        validate_config(cfg)
+
+
+def test_filter_condition_carried_through_resolve():
+    # A SQL predicate, not an object name: resolve passes it through unchanged (no ${environment}).
+    cfg = _with_env()
+    cfg["filter_condition"] = "catalog_name = 'x'"
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["filter_condition"] == "catalog_name = 'x'"
+
+
+@pytest.mark.parametrize("mode", ["", "col = 'v'"])
+def test_require_filter_condition_accepts_strings(mode):
+    assert require_filter_condition(mode, "filter_condition job parameter") == mode
+
+
+@pytest.mark.parametrize("bad", [5, True, None, ["a"]])
+def test_require_filter_condition_rejects_non_string(bad):
+    with pytest.raises(PipelineConfigError, match="filter_condition"):
+        require_filter_condition(bad, "filter_condition job parameter")
+
+
+# --------------------------------------------------------------------------- write_config_overrides
+
+
+def test_write_config_overrides_all_empty_is_empty():
+    # Every knob unset => omit all, so the connector's own defaults stand untouched.
+    assert write_config_overrides("", "", "") == {}
+    assert write_config_overrides(None, None, None) == {}
+
+
+def test_write_config_overrides_chunk_size_parsed():
+    assert write_config_overrides("1000", "", "") == {"chunk_size": 1000}
+    assert write_config_overrides(" 250 ", "", "") == {"chunk_size": 250}
+
+
+@pytest.mark.parametrize("bad", ["abc", "12.5", "0", "-5", "1e3"])
+def test_write_config_overrides_bad_chunk_size_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="chunk_size"):
+        write_config_overrides(bad, "", "")
+
+
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False), ("True", True), ("FALSE", False), (" true ", True)])
+def test_write_config_overrides_booleans_parsed(value, expected):
+    assert write_config_overrides("", value, "") == {"require_existing_index": expected}
+    assert write_config_overrides("", "", value) == {"verify_certs": expected}
+
+
+@pytest.mark.parametrize("bad", ["maybe", "1", "0", "yes", "no", "T"])
+def test_write_config_overrides_bad_boolean_fails_closed(bad):
+    # Allow-list 'true'/'false' only: never fall back to Python truthiness (bool('false') is True).
+    with pytest.raises(PipelineConfigError, match="require_existing_index"):
+        write_config_overrides("", bad, "")
+    with pytest.raises(PipelineConfigError, match="verify_certs"):
+        write_config_overrides("", "", bad)
+
+
+def test_write_config_overrides_combined():
+    assert write_config_overrides("500", "false", "false") == {
+        "chunk_size": 500,
+        "require_existing_index": False,
+        "verify_certs": False,
+    }
 
 
 # --------------------------------------------------------------------------- require_pipeline_mode

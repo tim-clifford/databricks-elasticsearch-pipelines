@@ -73,8 +73,9 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                         "the shared notebook notebooks/run_index_pipeline.py with this index's config. No "
                         "cluster block => serverless notebook task."
                     ),
-                    # Run-time-overridable job parameters (currently just pipeline_mode): default comes
-                    # from the config, override per run with `--params pipeline_mode=streaming`.
+                    # Run-time-overridable job parameters (pipeline_mode, filter_condition, and the
+                    # EsWriteConfig tuning knobs): defaults come from the config, overridable per run
+                    # with `--params <name>=<value>`.
                     "parameters": job_parameters(cfg),
                     "tasks": [
                         {
@@ -82,10 +83,16 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                             "notebook_task": {
                                 "notebook_path": "../notebooks/run_index_pipeline.py",
                                 # The notebook loads its own config at runtime (the generator can't
-                                # know the deploy-time environment or wheel path), so it just needs the
-                                # config name plus the environment and wheel_path bundle-variable refs.
+                                # know the deploy-time values), so it just needs the config name plus
+                                # the deploy-time bundle-variable refs (environment, wheel_path, and
+                                # the global ES connection settings).
                                 "base_parameters": job_base_parameters(
-                                    name, "${var.environment}", "${var.wheel_path}"
+                                    name,
+                                    "${var.environment}",
+                                    "${var.wheel_path}",
+                                    "${var.es_host_url}",
+                                    "${var.secret_scope_name}",
+                                    "${var.secret_key_name}",
                                 ),
                             },
                         }

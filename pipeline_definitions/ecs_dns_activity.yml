@@ -7,6 +7,7 @@
 es_index_name: ecs-dns-activity   # target Elasticsearch index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
 pipeline_mode: batch              # default export mode: batch | streaming (override per run with --params)
+# filter_condition: "action = 'allowed'"   # OPTIONAL default row filter (Spark SQL); override per run
 
 view:                             # the view this pipeline creates and exports
   catalog: tim_clifford_classic_dsl_lite_${environment}

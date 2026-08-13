@@ -44,6 +44,22 @@ variables:
     description: "UC Volume path to the databricks-es-connector wheel every index job installs (version lives in the filename). Empty default; required for index-job runs (fails closed if empty)."
     default: ""
 
+  # GLOBAL Elasticsearch connection settings, shared by every index job (like wheel_path): the
+  # endpoint, and the Databricks secret scope + key holding the ES api_key the connector authenticates
+  # with. Kept out of per-config YAML because they are workspace-wide, not per-index. Deploy-time
+  # (baked in at deploy, not overridable on run); empty default so variable-only commands like `bundle
+  # run deploy_views` resolve without them, while an index-job run with any of them empty fails closed
+  # in the runner. Supply at deploy, e.g. --var="es_host_url=https://<host>:9200".
+  es_host_url:
+    description: "Elasticsearch endpoint every index job writes to, e.g. https://<host>:9200. Empty default; required for index-job runs."
+    default: ""
+  secret_scope_name:
+    description: "Databricks secret scope holding the ES api_key. Empty default; required for index-job runs."
+    default: ""
+  secret_key_name:
+    description: "Key within secret_scope_name whose value is the ES api_key passed to the connector. Empty default; required for index-job runs."
+    default: ""
+
 # Targets differ only by deployment mode. The workspace HOST is intentionally not hardcoded here:
 # it is taken from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var,
 # so the bundle carries no environment-specific URL and deploys to whatever workspace you point it at.
