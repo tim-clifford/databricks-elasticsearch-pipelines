@@ -225,9 +225,9 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
 
-    for key in ("es_index_name", "es_id_field", "pipeline_mode", "view", "source"):
-        if key not in raw:
-            raise PipelineConfigError(f"{source}: missing required key '{key}'")
+    for required in ("es_index_name", "es_id_field", "pipeline_mode", "view", "source"):
+        if required not in raw:
+            raise PipelineConfigError(f"{source}: missing required key '{required}'")
 
     es_index_name = _require_es_index(raw["es_index_name"], f"{source}: es_index_name")
     es_id_field = _require_identifier(raw["es_id_field"], f"{source}: es_id_field")
@@ -274,8 +274,8 @@ def _validate_object(node: object, where: str, name_key: str, allowed: set, extr
         "schema": _require_name_template(node.get("schema"), f"{where}.schema"),
         name_key: _require_identifier(node.get(name_key), f"{where}.{name_key}"),
     }
-    for key in extra_identifiers:
-        result[key] = _require_identifier(node.get(key), f"{where}.{key}")
+    for field_name in extra_identifiers:
+        result[field_name] = _require_identifier(node.get(field_name), f"{where}.{field_name}")
     return result
 
 
@@ -315,10 +315,10 @@ def resolve_config(cfg: dict, environment: str) -> dict:
             "schema": resolve_name(o["schema"], environment, f"{where}.schema"),
             name_key: resolve_name(o[name_key], environment, f"{where}.{name_key}"),
         }
-        # `passthrough` keys (e.g. source.primary_key) are plain column identifiers, not object names:
-        # they carry no ${environment} token, so they are copied through unchanged, not resolved.
-        for key in passthrough:
-            resolved[key] = o[key]
+        # `passthrough` fields (e.g. source.primary_key) are plain column identifiers, not object
+        # names: they carry no ${environment} token, so they are copied through unchanged, not resolved.
+        for field_name in passthrough:
+            resolved[field_name] = o[field_name]
         return resolved
 
     return {
