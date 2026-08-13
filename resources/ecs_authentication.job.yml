@@ -10,6 +10,14 @@ resources:
       parameters:
       - name: pipeline_mode
         default: streaming
+      - name: filter_condition
+        default: ''
+      - name: chunk_size
+        default: ''
+      - name: require_existing_index
+        default: ''
+      - name: verify_certs
+        default: ''
       tasks:
       - task_key: index_pipeline_ecs_authentication
         notebook_task:
@@ -18,6 +26,9 @@ resources:
             config_name: ecs_authentication
             environment: ${var.environment}
             wheel_path: ${var.wheel_path}
+            es_host_url: ${var.es_host_url}
+            secret_scope_name: ${var.secret_scope_name}
+            secret_key_name: ${var.secret_key_name}
       permissions:
       - level: CAN_MANAGE_RUN
         group_name: users

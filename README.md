@@ -84,6 +84,14 @@ or `DATABRICKS_HOST`. The bundle variables are:
 |---|---|
 | `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
 | `wheel_path` | UC Volume path to the `databricks-es-connector` wheel each **index job** installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). Defaults to empty; supply it on `bundle deploy` (or set a real default in your fork). An index job deployed with an empty `wheel_path` fails closed at run; `deploy_views` doesn't need it |
+| `es_host_url` | the Elasticsearch endpoint every index job writes to, e.g. `https://<host>:9200` |
+| `secret_scope_name` | the Databricks [secret scope](https://docs.databricks.com/security/secrets/) holding the ES **api_key** |
+| `secret_key_name` | the key within that scope whose value is the ES **api_key** the connector authenticates with |
+
+`es_host_url`, `secret_scope_name`, and `secret_key_name` are the global ES connection settings,
+shared by every index job (the auth secret is an api_key, not a username/password). Like
+`wheel_path`, they default to empty and are baked in at deploy; an index job run with any of them
+empty fails closed, and `deploy_views` doesn't need them.
 
 Everything else is per-pipeline and lives in `pipeline_definitions/<config_name>.yml`. Each object is fully
 qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
@@ -94,6 +102,7 @@ its `.sql` filename):
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
 pipeline_mode: batch              # default export mode: batch | streaming (required; can override per run)
+filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL); omit for no filter
 view:                             # the view this pipeline uses
   catalog: acme_${environment}
   schema: es_poc
@@ -127,30 +136,38 @@ so a typo fails the deploy rather than surfacing later at export time.
 
 Two different mechanisms carry values into a job, and they resolve at different times:
 
-- **Bundle variables** (`environment`, `wheel_path`) are `--var` values resolved into the job at
-  **deploy** time. A `--var` on `bundle run` is ignored: only what was set at the last `bundle deploy`
-  applies. `wheel_path` is baked in this way, so supply it on `deploy`. It defaults to empty, so a
-  deploy without it still succeeds and `deploy_views` runs fine (it needs no connector); only an index
-  job needs a real wheel, and one deployed with an empty `wheel_path` fails closed.
-- **Job parameters** (`pipeline_mode`) are `--params` values applied at **run** time. Each index job's
-  `pipeline_mode` defaults to its config value, and you can override it for a single run without
-  redeploying (an unknown value fails the run closed).
+- **Bundle variables** (`environment`, `wheel_path`, `es_host_url`, `secret_scope_name`,
+  `secret_key_name`) are `--var` values resolved into the job at **deploy** time. A `--var` on
+  `bundle run` is ignored: only what was set at the last `bundle deploy` applies. They default to
+  empty, so a deploy without them still succeeds and `deploy_views` runs fine (it needs no
+  connector or ES); an index job needs a real `wheel_path` and the three ES connection settings, and
+  one deployed with any of them empty fails closed.
+- **Job parameters** are `--params` values applied at **run** time, overridable per run without
+  redeploying (an invalid value fails the run closed):
+  - `pipeline_mode` (`batch` | `streaming`) and `filter_condition` (a Spark SQL predicate) default
+    to their config values.
+  - `chunk_size`, `require_existing_index`, `verify_certs` tune the connector's write; leave a knob
+    unset to use the connector's own default.
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from pipeline_definitions/*.yml
 
 WHEEL="/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
-databricks bundle deploy -t dev -p <profile> --var="environment=<env>" --var="wheel_path=$WHEEL"
+databricks bundle deploy -t dev -p <profile> \
+  --var="environment=<env>" --var="wheel_path=$WHEEL" \
+  --var="es_host_url=https://<host>:9200" \
+  --var="secret_scope_name=<scope>" --var="secret_key_name=<key>"
 
 databricks bundle run deploy_views                 -t dev -p <profile>
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile>
 
-# override the export mode for one run (defaults to the config's pipeline_mode otherwise):
-databricks bundle run index_pipeline_<config_name> -t dev -p <profile> --params pipeline_mode=streaming
+# override run-time settings for a single run (each defaults to its config/connector value otherwise):
+databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
+  --params filter_condition="action = 'allowed'",chunk_size=1000
 ```
 
-(`environment`/`wheel_path` come from the last `deploy`, so they are not repeated on `run`. Set a
-real `wheel_path` default in your fork's `databricks.yml` to avoid passing it each deploy.)
+(Bundle variables come from the last `deploy`, so they are not repeated on `run`. Set real defaults
+in your fork's `databricks.yml` to avoid passing them each deploy.)
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
@@ -178,7 +195,8 @@ Shared notebooks (run by the jobs, not edited per pipeline):
                                 environment), then runs CREATE OR REPLACE
     run_index_pipeline.py       Run by every per-index job: installs the connector wheel (verifying
                                 the import), loads its config by name, resolves the environment, and
-                                prints the resolved config (export logic lands here later)
+                                exports the view to Elasticsearch via the connector's bulk_write
+                                (batch mode; streaming stubbed until a later phase)
 
 Shared library + tests (the config schema, used by the generator and both notebooks):
   pipeline_lib/

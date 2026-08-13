@@ -10,6 +10,8 @@ Schema (see pipeline_definitions/*.yml for a commented example):
     es_id_field:   <column>              # view output column passed to the connector as the ES _id
     pipeline_mode: batch | streaming     # THIS index's DEFAULT export mode (required); a job parameter,
                                          #   so it is overridable per run with --params pipeline_mode=...
+    filter_condition: <sql predicate>    # OPTIONAL default row filter (a Spark SQL boolean expr);
+                                         #   also a job parameter, overridable per run. Empty => no filter.
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -107,6 +109,60 @@ def require_pipeline_mode(value: object, where: str = "pipeline_mode") -> str:
     return value
 
 
+def require_filter_condition(value: object, where: str = "filter_condition") -> str:
+    """An OPTIONAL row filter: a Spark SQL boolean expression, or "" for no filter.
+
+    Public because it validates two things (like require_pipeline_mode): the config's
+    filter_condition (the per-index DEFAULT) AND the run-time job-parameter override the runner
+    notebook receives. We only enforce that it is a string here; the expression itself is validated
+    by Spark when the notebook applies df.filter(...), so a malformed predicate fails closed there
+    (on the actual DataFrame schema) rather than being second-guessed by a partial parser here. A
+    non-string (e.g. a YAML number/bool) is rejected, since df.filter expects a string expression."""
+    if not isinstance(value, str):
+        raise PipelineConfigError(f"{where} must be a string SQL predicate (or empty), got {value!r}")
+    return value
+
+
+def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object) -> dict:
+    """Parse the run-time EsWriteConfig tuning job-parameters into a kwargs dict, fail closed.
+
+    Each is a job parameter whose empty value means "leave the connector default alone", so an unset
+    knob is simply omitted from the returned dict (never coerced to a value that overrides the
+    connector's own default). A SET value is parsed and validated here so a bad --params override
+    (e.g. chunk_size=abc, verify_certs=maybe) fails closed BEFORE any write, rather than raising deep
+    in EsWriteConfig or, worse, being silently misread. The result splats into EsWriteConfig(**...).
+
+    - chunk_size: a positive integer (docs per bulk request). Zero/negative/non-integer rejected.
+    - require_existing_index / verify_certs: booleans via an allow-list of the exact strings
+      'true'/'false' (case-insensitive). Anything else is rejected rather than falling to a truthy/
+      falsy guess (e.g. bool('false') is True), which is exactly the trap a bool-ish knob must avoid.
+    """
+    overrides: dict = {}
+
+    if isinstance(chunk_size, str):
+        chunk_size = chunk_size.strip()
+    if chunk_size not in (None, ""):
+        try:
+            parsed = int(chunk_size)
+        except (TypeError, ValueError):
+            raise PipelineConfigError(f"chunk_size must be a positive integer, got {chunk_size!r}")
+        if parsed <= 0:
+            raise PipelineConfigError(f"chunk_size must be a positive integer, got {chunk_size!r}")
+        overrides["chunk_size"] = parsed
+
+    for name, value in (("require_existing_index", require_existing_index), ("verify_certs", verify_certs)):
+        if isinstance(value, str):
+            value = value.strip()
+        if value in (None, ""):
+            continue
+        lowered = value.lower() if isinstance(value, str) else value
+        if lowered not in ("true", "false"):
+            raise PipelineConfigError(f"{name} must be 'true' or 'false', got {value!r}")
+        overrides[name] = lowered == "true"
+
+    return overrides
+
+
 def _require_es_index(value: object, where: str) -> str:
     """A valid Elasticsearch index name. Enforces the char/leading-char rules via the regex, plus the
     255-BYTE length bound and no-trailing-dot rule (which a single regex can't express well)."""
@@ -164,7 +220,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if not isinstance(raw, dict):
         raise PipelineConfigError(f"{source}: expected a YAML mapping, got {type(raw).__name__}")
 
-    allowed_top = {"es_index_name", "es_id_field", "pipeline_mode", "view", "source", "reference_tables"}
+    allowed_top = {"es_index_name", "es_id_field", "pipeline_mode", "filter_condition", "view", "source", "reference_tables"}
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
@@ -176,6 +232,9 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     es_index_name = _require_es_index(raw["es_index_name"], f"{source}: es_index_name")
     es_id_field = _require_identifier(raw["es_id_field"], f"{source}: es_id_field")
     pipeline_mode = require_pipeline_mode(raw["pipeline_mode"], f"{source}: pipeline_mode")
+    # filter_condition is OPTIONAL: absent -> "" (no filter). It is a SQL predicate, not an object
+    # name, so it is not an identifier and carries no ${environment} token.
+    filter_condition = require_filter_condition(raw.get("filter_condition", ""), f"{source}: filter_condition")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
     # source carries primary_key in addition to catalog/schema/table: it is a column of the SOURCE
     # table (unique-row identity for the streaming read), so it lives with the source, not at top level.
@@ -190,6 +249,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "es_index_name": es_index_name,
         "es_id_field": es_id_field,
         "pipeline_mode": pipeline_mode,
+        "filter_condition": filter_condition,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
@@ -265,6 +325,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "es_index_name": cfg["es_index_name"],
         "es_id_field": cfg["es_id_field"],
         "pipeline_mode": cfg["pipeline_mode"],
+        # filter_condition is a SQL predicate, not an object name: passed through verbatim (no
+        # ${environment} folding), like pipeline_mode.
+        "filter_condition": cfg["filter_condition"],
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
@@ -311,24 +374,36 @@ def view_substitutions(cfg: dict, environment: str) -> dict:
     return subs
 
 
-def job_base_parameters(config_name: str, environment_ref: str, wheel_path_ref: str) -> dict:
+def job_base_parameters(
+    config_name: str,
+    environment_ref: str,
+    wheel_path_ref: str,
+    es_host_url_ref: str,
+    secret_scope_name_ref: str,
+    secret_key_name_ref: str,
+) -> dict:
     """The DEPLOY-TIME values the generated per-index job passes to run_index_pipeline.py as widgets.
 
     These are notebook-task base_parameters: fixed at deploy, not meant to change per run. The
-    generator runs OFFLINE and cannot know `environment` or `wheel_path` (deploy-time values), so it
-    passes the config's NAME (the notebook loads/resolves that config at runtime, so object names come
-    from the config) plus two DAB variable references threaded through unchanged:
+    generator runs OFFLINE and cannot know the deploy-time values, so it passes the config's NAME
+    (the notebook loads/resolves that config at runtime, so object names come from the config) plus
+    DAB variable references threaded through unchanged, all resolved by the bundle at deploy:
     - `environment_ref` (e.g. "${var.environment}"): folded into ${environment} in the config names.
     - `wheel_path_ref` (e.g. "${var.wheel_path}"): the ONE global connector wheel every job installs.
-    The bundle resolves both at deploy. All values are strings, as job base_parameters must be.
+    - `es_host_url_ref`, `secret_scope_name_ref`, `secret_key_name_ref`: the global ES connection
+      settings (endpoint, and the secret scope/key holding the ES api_key), shared by every index job.
+    All values are strings, as job base_parameters must be.
 
-    pipeline_mode is deliberately NOT here: it is a run-time-overridable job parameter (see
-    job_parameters), so it can be toggled per run with `--params pipeline_mode=...`.
+    Run-time-overridable knobs (pipeline_mode, filter_condition, the EsWriteConfig tuning params) are
+    deliberately NOT here: they are job parameters (see job_parameters), toggleable per run.
     """
     return {
         "config_name": config_name,
         "environment": environment_ref,
         "wheel_path": wheel_path_ref,
+        "es_host_url": es_host_url_ref,
+        "secret_scope_name": secret_scope_name_ref,
+        "secret_key_name": secret_key_name_ref,
     }
 
 
@@ -336,12 +411,23 @@ def job_parameters(cfg: dict) -> list:
     """The RUN-TIME-overridable job-level parameters for a per-index job, as JobParameterDefinitions.
 
     Unlike base_parameters (fixed at deploy), a job parameter can be overridden per run with
-    `--params <name>=<value>` and surfaces to the notebook as a widget of the same name. pipeline_mode
-    is such a parameter: its DEFAULT comes from the config (the per-index choice, already allow-list
-    validated by validate_config), and an operator can flip batch<->streaming for a single run without
-    redeploying. The runner re-validates the effective value, so a bad --params override fails closed.
+    `--params <name>=<value>` and surfaces to the notebook as a widget of the same name. The runner
+    re-validates each effective value, so a bad --params override fails closed.
 
-    Returns the list shape DAB expects under a job's `parameters:` key. As more run-time toggles are
-    added later, they join this list.
+    - pipeline_mode: DEFAULT from the config (already allow-list validated); flip batch<->streaming
+      for one run without redeploying.
+    - filter_condition: DEFAULT from the config ("" if the config omits it); an optional row filter
+      applied before the write, overridable per run.
+    - chunk_size / require_existing_index / verify_certs: EsWriteConfig tuning knobs. Default ""
+      (meaning "use the connector's own default"); set per run to override. Parsed + validated by
+      write_config_overrides at run time (an unset one leaves the connector default untouched).
+
+    Returns the list shape DAB expects under a job's `parameters:` key.
     """
-    return [{"name": "pipeline_mode", "default": cfg["pipeline_mode"]}]
+    return [
+        {"name": "pipeline_mode", "default": cfg["pipeline_mode"]},
+        {"name": "filter_condition", "default": cfg["filter_condition"]},
+        {"name": "chunk_size", "default": ""},
+        {"name": "require_existing_index", "default": ""},
+        {"name": "verify_certs", "default": ""},
+    ]
