@@ -36,7 +36,7 @@ VIEWS_DIR = os.path.join(FILES_ROOT, "views")
 CONFIG_DIR = os.path.join(FILES_ROOT, "pipeline_definitions")
 print("files root:", FILES_ROOT)
 
-from pipeline_lib.config import column_present, load_config, view_substitutions  # noqa: E402
+from pipeline_lib.config import column_present, load_config, render_view_sql, view_substitutions  # noqa: E402
 
 # COMMAND ----------
 # Load every pipeline definition and key it by the view name it declares, so a view .sql file can be
@@ -69,12 +69,10 @@ if missing_sql:
 print(f"found {len(sql_files)} view file(s): {', '.join(sql_files)}")
 
 # COMMAND ----------
-# Render each view's ${parameter} tokens from its config and run it. Substitution is explicit (not
-# str.format, which would choke on any literal braces in SQL) and fail-closed: an unknown ${token}
-# in a file is an error, not a silently-unsubstituted string that would create a broken view.
-import re
-
-_TOKEN = re.compile(r"\$\{(\w+)\}")
+# Render each view's ${parameter} tokens from its config and run it. The token substitution itself
+# lives in pipeline_lib.config.render_view_sql (shared with the streaming runner so both apply the
+# same rule and fail closed on an unknown ${token}); this cell adds the deploy-time concerns:
+# capped debug printing and per-view CREATE OR REPLACE.
 
 # Caps for the debug print of rendered SQL. These are deliberately set FAR above any realistic view
 # (even a view listing 1000+ columns one-per-line is well under both) and exist only as a backstop so
@@ -92,18 +90,6 @@ _SQL_PRINT_MAX_CHARS = 200_000
 # that fails the run). Once total printed SQL crosses this budget, later views' SQL is suppressed (a
 # one-line notice prints instead); every view still deploys. Set well under the 10 MB cell limit.
 _SQL_PRINT_TOTAL_BUDGET = 4_000_000
-
-
-def render(sql: str, filename: str, subs: dict) -> str:
-    def _sub(m: "re.Match") -> str:
-        key = m.group(1)
-        if key not in subs:
-            raise ValueError(
-                f"{filename}: unknown parameter ${{{key}}}; available: {sorted(subs)}"
-            )
-        return subs[key]
-
-    return _TOKEN.sub(_sub, sql)
 
 
 _SQL_PRINT_INDENT = "      "  # each printed SQL line is indented by this
@@ -176,7 +162,7 @@ for filename in sql_files:
         cfg = configs_by_view[view_name]
         subs = view_substitutions(cfg, ENVIRONMENT)
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
-            rendered = render(fh.read(), filename, subs)
+            rendered = render_view_sql(fh.read(), subs, filename)
         # Print the substitutions and the fully-rendered SQL that is about to run (all ${...}
         # substituted, ${environment} folded in) so the exact CREATE OR REPLACE is visible in the job
         # output for debugging - but only until the cumulative budget is reached, so many views can't

@@ -67,9 +67,21 @@ _VALID_ES_INDEX = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _ES_INDEX_MAX_BYTES = 255
 
 # Export modes the runner supports. Allow-list: an unrecognized/absent mode is rejected (fail closed),
-# never silently defaulted. Threaded to the runner notebook (which currently just prints it; the
-# batch/streaming branch lands with the export logic in a later step).
+# never silently defaulted.
 _VALID_PIPELINE_MODES = ("batch", "streaming")
+
+# Streaming start positions (a run-time job parameter, streaming mode only). Allow-list, fail closed.
+# - "new"  (DEFAULT): the stream starts at the source table's CURRENT version (readStream
+#   startingVersion=latest), so nothing already in the table is exported; only commits after the
+#   stream first starts are sent. This is the common case: batch mode owns the history, streaming
+#   carries the ongoing delta.
+# - "full": omit startingVersion, so the stream's first micro-batch(es) are the full existing table
+#   snapshot, then it continues with new commits. Deterministic _id makes any overlap with a prior
+#   batch export an idempotent upsert, not a duplicate.
+# FIRST-RUN-ONLY: startingVersion is honored only when the stream has no checkpoint yet. Once a
+# checkpoint exists it is the position of record and this knob is ignored, so flipping it on an
+# already-running stream is a no-op until that stream's checkpoint is cleared.
+_VALID_STREAMING_STARTS = ("new", "full")
 
 
 class PipelineConfigError(ValueError):
@@ -105,6 +117,19 @@ def require_pipeline_mode(value: object, where: str = "pipeline_mode") -> str:
     if value not in _VALID_PIPELINE_MODES:
         raise PipelineConfigError(
             f"{where} must be one of {', '.join(_VALID_PIPELINE_MODES)}, got {value!r}"
+        )
+    return value
+
+
+def require_streaming_start(value: object, where: str = "streaming_start") -> str:
+    """The streaming start position, restricted to the allow-list (new|full). Fail closed.
+
+    Validated by the runner notebook on the streaming_start job-parameter value (streaming mode
+    only), so a bad `--params streaming_start=...` fails closed rather than silently picking a
+    backfill behavior. See _VALID_STREAMING_STARTS for what each value does."""
+    if value not in _VALID_STREAMING_STARTS:
+        raise PipelineConfigError(
+            f"{where} must be one of {', '.join(_VALID_STREAMING_STARTS)}, got {value!r}"
         )
     return value
 
@@ -354,12 +379,20 @@ def column_present(column: str, columns: list) -> bool:
     return column.lower() in {c.lower() for c in columns}
 
 
-def view_substitutions(cfg: dict, environment: str) -> dict:
+def view_substitutions(cfg: dict, environment: str, source_override: str | None = None) -> dict:
     """The ${...} tokens a view .sql may reference, with ${environment} folded in.
 
     - view / source: the fully-qualified object, e.g. `catalog.schema.name`.
     - ref_<alias>: the aliased, fully-qualified reference table, e.g. `catalog.schema.table alias`, so
       the SQL writes `LEFT JOIN ${ref_alias} ON ...` and refers to columns via the alias.
+
+    `source_override`, when given, replaces the `${source}` value with that string (leaving `view`
+    and every `ref_<alias>` untouched). This is the seam the streaming runner uses: it binds
+    `${source}` to a temp view over the current micro-batch, so the SAME view SQL that deploy_views
+    ran against the full source table instead runs against just the batch. The reference tables stay
+    their real, fully-qualified selves in both modes, because a reference join is small-batch-to-
+    dimension and we do want it against the real table. None (the default) => the real source FQN,
+    which is what deploy_views uses.
 
     Join tuning (a broadcast hint, etc.) is the view author's responsibility, written directly in the
     SQL like the rest of the join - the framework only resolves table locations.
@@ -367,11 +400,67 @@ def view_substitutions(cfg: dict, environment: str) -> dict:
     resolved = resolve_config(cfg, environment)
     subs = {
         "view": _fqn(resolved["view"], "name"),
-        "source": _fqn(resolved["source"], "table"),
+        "source": source_override if source_override is not None else _fqn(resolved["source"], "table"),
     }
     for alias, spec in resolved["reference_tables"].items():
         subs[f"ref_{alias}"] = f"{_fqn(spec, 'table')} {alias}"
     return subs
+
+
+# The ${token} pattern a view .sql may reference. Shared by every renderer so the substitution rule
+# (which characters form a token) is defined in exactly one place.
+_VIEW_TOKEN = re.compile(r"\$\{(\w+)\}")
+
+
+def render_view_sql(sql: str, subs: dict, filename: str = "<view>") -> str:
+    """Substitute every ${token} in a view .sql body from `subs`, fail closed on an unknown token.
+
+    Explicit regex substitution (NOT str.format, which would choke on literal braces in SQL). An
+    unknown ${token} is a hard error rather than a silently-unsubstituted string, so a typo can't
+    produce SQL that points at the wrong place or references a nonexistent relation. Shared by
+    deploy_views (renders CREATE OR REPLACE VIEW against the real source) and the streaming runner
+    (renders the same file with ${source} bound to a micro-batch temp view), so both apply provably
+    identical transform logic from one code path.
+    """
+    def _sub(m: "re.Match") -> str:
+        token = m.group(1)
+        if token not in subs:
+            raise PipelineConfigError(
+                f"{filename}: unknown parameter ${{{token}}}; available: {sorted(subs)}"
+            )
+        return subs[token]
+
+    return _VIEW_TOKEN.sub(_sub, sql)
+
+
+# The mandatory opening of every view .sql: `CREATE OR REPLACE VIEW ${view} AS <select>`. Matched
+# against the RAW (pre-substitution) file, keying off the literal ${view} token, so leading comments
+# are skipped and the match can't be confused by a resolved name that happens to contain SQL words.
+_VIEW_DDL_PREFIX = re.compile(
+    r"CREATE\s+OR\s+REPLACE\s+VIEW\s+\$\{view\}\s+AS\b(.*)", re.IGNORECASE | re.DOTALL
+)
+
+
+def view_select_body(sql: str, filename: str = "<view>") -> str:
+    """Return just the SELECT body of a view .sql, stripping the `CREATE OR REPLACE VIEW ${view} AS`.
+
+    The streaming runner needs the view's SELECT (with ${source}/${ref_*} tokens still intact) so it
+    can render that SELECT against a micro-batch temp view instead of creating a persistent view. The
+    body is extracted from the RAW template text by matching the literal ${view} token in the
+    framework's mandatory DDL prefix, so it is robust to leading comments and to whatever the resolved
+    object names turn out to be. Fail closed if the file does not follow that shape - streaming can't
+    reinterpret an arbitrary statement, and a silent mis-parse would export the wrong rows.
+    """
+    m = _VIEW_DDL_PREFIX.search(sql)
+    if not m:
+        raise PipelineConfigError(
+            f"{filename}: expected a 'CREATE OR REPLACE VIEW ${{view}} AS <select>' statement "
+            f"(required for streaming to render the view's SELECT over a micro-batch)"
+        )
+    body = m.group(1).strip()
+    if not body:
+        raise PipelineConfigError(f"{filename}: no SELECT body after 'CREATE OR REPLACE VIEW ${{view}} AS'")
+    return body
 
 
 def job_base_parameters(
@@ -381,6 +470,7 @@ def job_base_parameters(
     es_host_url_ref: str,
     secret_scope_name_ref: str,
     secret_key_name_ref: str,
+    checkpoint_base_path_ref: str,
 ) -> dict:
     """The DEPLOY-TIME values the generated per-index job passes to run_index_pipeline.py as widgets.
 
@@ -392,10 +482,14 @@ def job_base_parameters(
     - `wheel_path_ref` (e.g. "${var.wheel_path}"): the ONE global connector wheel every job installs.
     - `es_host_url_ref`, `secret_scope_name_ref`, `secret_key_name_ref`: the global ES connection
       settings (endpoint, and the secret scope/key holding the ES api_key), shared by every index job.
+    - `checkpoint_base_path_ref` (e.g. "${var.checkpoint_base_path}"): the global base path (a UC
+      Volume) under which each STREAMING job keeps its checkpoint; the runner appends /<config_name>
+      so each stream gets a stable, unique subfolder. Unused by batch runs.
     All values are strings, as job base_parameters must be.
 
-    Run-time-overridable knobs (pipeline_mode, filter_condition, the EsWriteConfig tuning params) are
-    deliberately NOT here: they are job parameters (see job_parameters), toggleable per run.
+    Run-time-overridable knobs (pipeline_mode, filter_condition, streaming_start, the EsWriteConfig
+    tuning params) are deliberately NOT here: they are job parameters (see job_parameters),
+    toggleable per run.
     """
     return {
         "config_name": config_name,
@@ -404,6 +498,7 @@ def job_base_parameters(
         "es_host_url": es_host_url_ref,
         "secret_scope_name": secret_scope_name_ref,
         "secret_key_name": secret_key_name_ref,
+        "checkpoint_base_path": checkpoint_base_path_ref,
     }
 
 
@@ -421,6 +516,10 @@ def job_parameters(cfg: dict) -> list:
     - chunk_size / require_existing_index / verify_certs: EsWriteConfig tuning knobs. Default ""
       (meaning "use the connector's own default"); set per run to override. Parsed + validated by
       write_config_overrides at run time (an unset one leaves the connector default untouched).
+    - streaming_start: new|full, DEFAULT "new" (start the stream at the source's current version, so
+      only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
+      run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
+      default rather than a config key: it is a per-rollout operator choice, not a per-index property.
 
     Returns the list shape DAB expects under a job's `parameters:` key.
     """
@@ -430,4 +529,5 @@ def job_parameters(cfg: dict) -> list:
         {"name": "chunk_size", "default": ""},
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
+        {"name": "streaming_start", "default": "new"},
     ]

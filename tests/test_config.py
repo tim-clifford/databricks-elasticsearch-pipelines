@@ -12,17 +12,20 @@ from pipeline_lib.config import (
     column_present,
     job_base_parameters,
     job_parameters,
+    render_view_sql,
     require_filter_condition,
     require_pipeline_mode,
+    require_streaming_start,
     resolve_config,
     resolve_name,
     validate_config,
+    view_select_body,
     view_substitutions,
     write_config_overrides,
 )
 
 
-# job_base_parameters grew three connection refs; a tiny helper keeps the call sites readable.
+# job_base_parameters grew connection + checkpoint refs; a tiny helper keeps the call sites readable.
 def _job_base_parameters(config_name):
     return job_base_parameters(
         config_name,
@@ -31,6 +34,7 @@ def _job_base_parameters(config_name):
         es_host_url_ref="${var.es_host_url}",
         secret_scope_name_ref="${var.secret_scope_name}",
         secret_key_name_ref="${var.secret_key_name}",
+        checkpoint_base_path_ref="${var.checkpoint_base_path}",
     )
 
 
@@ -312,6 +316,88 @@ def test_view_substitutions_missing_env_fails():
         view_substitutions(validate_config(_with_env()), environment="")
 
 
+def test_view_substitutions_source_override_only_changes_source():
+    # The streaming seam: source_override replaces ${source} with the given name (a micro-batch temp
+    # view), while ${view} and every ${ref_*} keep their real, fully-qualified values.
+    subs = view_substitutions(validate_config(_with_env()), environment="catalog", source_override="__batch_src")
+    assert subs["source"] == "__batch_src"
+    assert subs["view"] == "acme_catalog.es_poc.ecs_dns_activity"
+    assert subs["ref_validation"] == "acme_catalog.ocsf_validation_catalog.dns_activity validation"
+
+
+def test_view_substitutions_source_override_none_is_real_source():
+    # None (the default, what deploy_views uses) keeps the real source FQN.
+    subs = view_substitutions(validate_config(_base()), environment="", source_override=None)
+    assert subs["source"] == "cat.ocsf.dns_activity"
+
+
+# --------------------------------------------------------------------------- render_view_sql
+
+
+def test_render_view_sql_substitutes_known_tokens():
+    sql = "SELECT * FROM ${source} base LEFT JOIN ${ref_v} ON base.id = v.id -- creates ${view}"
+    subs = {"source": "c.s.t", "ref_v": "c.s.ref v", "view": "c.s.myview"}
+    out = render_view_sql(sql, subs, "f.sql")
+    assert "FROM c.s.t base" in out
+    assert "LEFT JOIN c.s.ref v ON" in out
+    assert out.endswith("c.s.myview")  # the token inside the comment is substituted too
+
+
+def test_render_view_sql_unknown_token_fails_closed():
+    with pytest.raises(PipelineConfigError, match=r"unknown parameter \$\{nope\}"):
+        render_view_sql("SELECT * FROM ${nope}", {"source": "c.s.t"}, "f.sql")
+
+
+def test_render_view_sql_no_tokens_is_identity():
+    assert render_view_sql("SELECT 1", {"source": "c.s.t"}, "f.sql") == "SELECT 1"
+
+
+# --------------------------------------------------------------------------- view_select_body
+
+
+def test_view_select_body_strips_ddl_prefix():
+    sql = (
+        "-- a leading comment mentioning ${view}\n"
+        "CREATE OR REPLACE VIEW ${view} AS\n"
+        "SELECT a, b FROM ${source} base"
+    )
+    assert view_select_body(sql, "f.sql") == "SELECT a, b FROM ${source} base"
+
+
+def test_view_select_body_case_insensitive_and_whitespace():
+    sql = "create   or  replace   view   ${view}   as\n  SELECT 1 FROM ${source}\n"
+    assert view_select_body(sql, "f.sql") == "SELECT 1 FROM ${source}"
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT a FROM ${source}",                       # no CREATE VIEW prefix at all
+    "CREATE OR REPLACE VIEW real.view.name AS SELECT 1",  # not keyed off the ${view} token
+    "CREATE VIEW ${view} AS SELECT 1",               # missing 'OR REPLACE'
+])
+def test_view_select_body_rejects_non_framework_shape(sql):
+    with pytest.raises(PipelineConfigError, match="CREATE OR REPLACE VIEW"):
+        view_select_body(sql, "f.sql")
+
+
+def test_view_select_body_rejects_empty_body():
+    with pytest.raises(PipelineConfigError, match="no SELECT body"):
+        view_select_body("CREATE OR REPLACE VIEW ${view} AS   \n  ", "f.sql")
+
+
+# --------------------------------------------------------------------------- require_streaming_start
+
+
+@pytest.mark.parametrize("value", ["new", "full"])
+def test_require_streaming_start_accepts_allowed(value):
+    assert require_streaming_start(value, "streaming_start job parameter") == value
+
+
+@pytest.mark.parametrize("bad", ["New", "FULL", "latest", "", None, "backfill", 5])
+def test_require_streaming_start_rejects_bad(bad):
+    with pytest.raises(PipelineConfigError, match="streaming_start"):
+        require_streaming_start(bad, "streaming_start job parameter")
+
+
 # --------------------------------------------------------------------------- job_base_parameters
 
 
@@ -324,14 +410,17 @@ def test_job_base_parameters():
         "es_host_url": "${var.es_host_url}",
         "secret_scope_name": "${var.secret_scope_name}",
         "secret_key_name": "${var.secret_key_name}",
+        "checkpoint_base_path": "${var.checkpoint_base_path}",
     }
 
 
 def test_job_base_parameters_excludes_run_time_params():
-    # Run-time job parameters (pipeline_mode, filter_condition, and the EsWriteConfig tuning knobs)
-    # must NOT leak into base_parameters, which would re-fix them at deploy and defeat per-run override.
+    # Run-time job parameters (pipeline_mode, filter_condition, streaming_start, and the EsWriteConfig
+    # tuning knobs) must NOT leak into base_parameters, which would re-fix them at deploy and defeat
+    # per-run override.
     params = _job_base_parameters("x")
-    for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "require_existing_index", "verify_certs"):
+    for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "require_existing_index",
+                     "verify_certs", "streaming_start"):
         assert run_time not in params
 
 
@@ -358,7 +447,14 @@ def test_job_parameters_full_shape_and_order():
         {"name": "chunk_size", "default": ""},
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
+        {"name": "streaming_start", "default": "new"},
     ]
+
+
+def test_job_parameters_streaming_start_defaults_new():
+    # streaming_start is a literal default (not a config key), always "new" regardless of the config.
+    params = job_parameters(validate_config(_base()))
+    assert {"name": "streaming_start", "default": "new"} in params
 
 
 def test_job_parameters_filter_condition_defaults_empty_when_absent():
