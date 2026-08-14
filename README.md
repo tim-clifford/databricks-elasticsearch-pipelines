@@ -194,6 +194,12 @@ Key behaviors:
   takes the view's `SELECT` and runs it with the micro-batch bound in place of the source table, so
   the exact same projection/joins/hints the view defines apply, but only to batch-sized data (never a
   join back to the full view). Reference (join) tables are read as their real tables.
+- **Row-wise views only (streaming).** Because the view runs per micro-batch, streaming supports only
+  **row-wise** views: projection, filters, scalar expressions, and 1:1 reference joins, where each
+  output row depends on a single source row. A view that aggregates **across** source rows (`GROUP
+  BY`, `DISTINCT`, window/`OVER`, `PIVOT`) would be computed per batch, not over the whole stream, so
+  its streamed results would silently differ from batch mode. This is a limitation of streaming mode;
+  use `batch` mode for aggregating views.
 - **Append-only assumption.** The stream uses `skipChangeCommits`, so a non-append commit (a manual
   `UPDATE`/`DELETE`/`MERGE` on the source) is skipped rather than failing the stream. If you make such
   a change and need it reflected in the index, re-send the affected records with a `batch` run.

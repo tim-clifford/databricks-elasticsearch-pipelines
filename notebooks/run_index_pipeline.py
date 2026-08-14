@@ -257,6 +257,13 @@ elif PIPELINE_MODE == "streaming":
     # take the view's OWN SELECT and run it with ${source} bound to a temp view over just the
     # micro-batch, so the identical transform the deployed view applies runs against batch-sized data.
     # Reference tables (${ref_*}) stay their real FQNs - a reference join is small-batch-to-dimension.
+    #
+    # ROW-WISE VIEWS ONLY. Running the view SELECT per micro-batch is correct only for row-wise logic:
+    # projection, filters, scalar expressions, and 1:1 reference joins - each output row depends on a
+    # single source row. A view that aggregates ACROSS source rows (GROUP BY, DISTINCT, window/OVER,
+    # PIVOT, ...) would be computed PER BATCH here, not over the whole stream, so streaming would
+    # silently emit different results than batch (which scans the full view). This is a limitation of
+    # streaming mode: do not point a streaming pipeline at an aggregating view; use batch mode for those.
 
     # checkpoint_base_path is required ONLY for a streaming run (batch/deploy_views never stream), so
     # it is validated here rather than up top. Per-stream subfolder keyed by config_name (stable +
