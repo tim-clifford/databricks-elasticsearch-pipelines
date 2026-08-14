@@ -289,6 +289,11 @@ if PIPELINE_MODE == "streaming":
     # real reference tables. Extracted + rendered from the SAME .sql the deployed view uses (shared
     # renderer), so streaming and batch provably apply identical transform logic. Rendered ONCE here
     # (the SQL text is constant across micro-batches); only the temp view's contents change per batch.
+    #
+    # Opening by view['name'] (the RESOLVED name) matches the on-disk .sql filename because a view NAME
+    # cannot contain ${environment}: config.py validates view.name with _require_identifier (a plain
+    # identifier, token rejected at load), so resolve_config leaves it byte-for-byte unchanged. Thus
+    # resolved == unresolved == filename for the view name, and deploy_views keys files the same way.
     _view_file = os.path.join(FILES_ROOT, "views", f"{view['name']}.sql")
     with open(_view_file) as _fh:
         _view_sql = _fh.read()
