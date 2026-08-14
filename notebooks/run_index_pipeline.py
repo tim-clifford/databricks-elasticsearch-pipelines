@@ -391,17 +391,25 @@ if PIPELINE_MODE == "streaming":
     # succeed failed the run instead of recording, and a TERMINATED-SUCCESS total is exact.
     from pyspark.sql import functions as _F  # noqa: E402
 
-    def _metrics_dir_exists():
-        # Existence probe, isolated from the READ below. dbutils.fs.ls raises for a nonexistent path;
-        # that (no metric files written) is the ONLY case that legitimately means "0 batches ran". We
-        # do NOT wrap the read itself in a broad except: doing so would map a real read failure (corrupt
-        # files, IO/permission error) to a 0-row SUCCESS and mask a run that actually pushed rows.
+    def _metrics_dir_missing():
+        # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
+        # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
+        # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
+        # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
+        # run that already pushed rows is exactly the fail-open bug this must avoid.
         try:
-            return len(dbutils.fs.ls(metrics_dir)) > 0
-        except Exception:
-            return False
+            dbutils.fs.ls(metrics_dir)
+            return False  # path exists
+        except Exception as _e:
+            # Verified on this runtime: a missing path raises ExecutionError wrapping
+            # CloudFileNotFoundException with text "No such file or directory". Match the not-found
+            # signal explicitly; re-raise everything else.
+            _msg = str(_e)
+            if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
+                return True  # positively not-found: no batches wrote metrics
+            raise  # anything else is a real failure - do not swallow it
 
-    if not _metrics_dir_exists():
+    if _metrics_dir_missing():
         # No metric files => the stream drained zero micro-batches (no new source data since the last
         # run). A valid outcome, reported as 0, not a failure.
         num_batches, rows_pushed = 0, 0
