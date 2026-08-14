@@ -73,16 +73,13 @@ import databricks_es_connector  # noqa: E402
 _connector_version = getattr(databricks_es_connector, "__version__", "unknown")
 print(f"connector installed: databricks_es_connector {_connector_version}")
 
-# The write surface used by the export cell below. Imported here (after the restart) so the export
-# cell reads as pure orchestration. bulk_write does the batch mapInPandas export; reconcile_or_raise
-# turns the result dict into an exception when any document was rejected or any row went unaccounted
-# for; make_foreach_batch wraps that same write+reconcile into a foreachBatch fn for the streaming path.
-from databricks_es_connector import (  # noqa: E402
-    EsWriteConfig,
-    bulk_write,
-    make_foreach_batch,
-    reconcile_or_raise,
-)
+# The write surface used by the export cells below. Imported here (after the restart) so the export
+# cells read as pure orchestration. bulk_write does the mapInPandas export (returns the count dict);
+# reconcile_or_raise turns that dict into an exception when any document was rejected or any row went
+# unaccounted for. Batch calls bulk_write then reconcile_or_raise; streaming calls
+# bulk_write(..., raise_on_error=True) per micro-batch (same write+reconcile in one call) so a failed
+# batch fails the trigger and the checkpoint holds.
+from databricks_es_connector import EsWriteConfig, bulk_write, reconcile_or_raise  # noqa: E402
 
 # COMMAND ----------
 # Now read the remaining parameters (the restart above cleared any earlier Python state, so this is
@@ -310,18 +307,17 @@ if PIPELINE_MODE == "streaming":
     print(f"checkpoint_location = {checkpoint_location}")
     print(f"rendered micro-batch SELECT (source bound to {BATCH_SOURCE_VIEW}):\n{RENDERED_SELECT}")
 
-    # Per-run metrics table (Delta). How-many-rows-did-this-run-push must be recorded DURABLY, not in a
-    # Python variable: on serverless the foreachBatch body runs server-side, so a client-side counter
-    # never sees the mutation (verified: rows landed in ES while a client-side dict read 0), and
-    # query.recentProgress is delivered asynchronously so reading it right after awaitTermination is
-    # racy (verified: it reported 0 for a batch that really moved rows). Writing each batch's count to
-    # a Delta table from inside foreachBatch (a server-side write, like the export itself) survives both
-    # problems; the summary cell reads the table back. Recreated per run so it reflects THIS run only.
-    METRICS_TABLE = f"{view['catalog']}.{view['schema']}.`_stream_metrics_{_safe_config}`"
-    spark.sql(f"DROP TABLE IF EXISTS {METRICS_TABLE}")
-    spark.sql(f"CREATE TABLE {METRICS_TABLE} (batch_id BIGINT, rows_written BIGINT) USING delta")
-
-    _write_batch = make_foreach_batch(es_write_config)
+    # How-many-rows-did-this-run-push must be recorded DURABLY, not in a Python variable: on serverless
+    # the foreachBatch body runs server-side, so a client-side counter never sees the mutation (verified
+    # live: rows landed in ES while a client-side dict read 0), and query.recentProgress is delivered
+    # asynchronously so reading it right after awaitTermination is racy (verified: it reported 0 for a
+    # batch that really moved rows). So each batch appends its count to a METRICS DIRECTORY of small
+    # JSON files, written server-side from foreachBatch and read back by the summary cell. It lives
+    # UNDER the checkpoint location (a UC Volume path we already require for streaming), so it creates
+    # NO catalog object in the customer's namespace. Cleared at the start of THIS run so the directory
+    # only ever holds this run's files; retries within the run are deduped by batch_id when summing.
+    metrics_dir = f"{checkpoint_location}/_run_metrics"
+    dbutils.fs.rm(metrics_dir, recurse=True)
 
     def foreach_batch(batch_df, batch_id: int):
         # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so
@@ -333,13 +329,18 @@ if PIPELINE_MODE == "streaming":
         session = batch_df.sparkSession
         batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
         transformed = apply_filter(session.sql(RENDERED_SELECT))
-        # Count the rows we are about to write, then write. The write raises on any failure, so a row
-        # recorded here was genuinely exported. Record the count durably (see METRICS_TABLE above)
-        # using the batch's own session, so the summary cell can total it after the stream finishes.
-        n = transformed.count()
-        _write_batch(transformed, batch_id)
-        session.createDataFrame([(batch_id, n)], "batch_id bigint, rows_written bigint") \
-            .write.mode("append").saveAsTable(METRICS_TABLE)
+        # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
+        # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
+        # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
+        # micro-batch here: the checkpoint does not advance, Spark retries (idempotent via deterministic
+        # _id), and if it never recovers the run fails with no summary. So the record step below is only
+        # reached for a batch that wrote every row cleanly, and result['written'] is the true count.
+        result = bulk_write(transformed, es_write_config, raise_on_error=True)
+        # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
+        # the summary can dedup a retried batch (write mode append; each batch is its own small file).
+        session.createDataFrame(
+            [(int(batch_id), int(result.get("written", 0) or 0))], "batch_id bigint, written bigint"
+        ).coalesce(1).write.mode("append").json(metrics_dir)
 
 # COMMAND ----------
 # STREAMING run (streaming mode only). Read the RAW source as a Delta stream and drain it once.
@@ -380,18 +381,23 @@ if PIPELINE_MODE == "streaming":
     )
     query.awaitTermination()
 
-    # Report how many rows this run pushed, read back from the durable per-batch metrics table that
-    # foreachBatch wrote (see METRICS_TABLE above). This is the reliable driver-side total: it survives
-    # the server-side foreachBatch boundary and the async delivery of query.recentProgress, both of
-    # which under-reported in testing. A run with no new source data wrote no metric rows, so the total
-    # is 0 (a valid outcome, not a failure). The write raised on any batch failure, so a TERMINATED
-    # SUCCESS run pushed exactly this many rows with no errors.
+    # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
+    # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
+    # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
+    # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that was
+    # retried within this run is counted once, not summed twice - then total. A run with no new source
+    # data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid outcome, not a
+    # failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch that did not fully
+    # succeed failed the run instead of recording, and a TERMINATED-SUCCESS total is exact.
     from pyspark.sql import functions as _F  # noqa: E402
-    _agg = spark.table(METRICS_TABLE).agg(
-        _F.count("*").alias("batches"), _F.coalesce(_F.sum("rows_written"), _F.lit(0)).alias("rows")
-    ).collect()[0]
-    num_batches = int(_agg["batches"])
-    rows_pushed = int(_agg["rows"])
+    try:
+        _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
+        _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
+        num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
+    except Exception:
+        # No metrics files => the run drained zero micro-batches (no new source data). spark.read.json
+        # of an empty/absent dir raises rather than returning empty, so treat that as 0/0.
+        num_batches, rows_pushed = 0, 0
     RUN_SUMMARY = (
         f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
         f"checkpoint={checkpoint_location}"
