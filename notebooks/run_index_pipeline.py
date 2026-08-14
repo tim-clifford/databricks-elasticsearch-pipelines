@@ -297,9 +297,16 @@ elif PIPELINE_MODE == "streaming":
         against it (so joins/projections/hints all execute exactly as the deployed view defines them,
         but only over this batch). The optional filter_condition is applied to the result. Kept as a
         pure DataFrame->DataFrame transform so the connector's make_foreach_batch can wrap it.
+
+        Register the temp view AND run the SELECT through batch_df.sparkSession (not the notebook's
+        global `spark`). Inside foreachBatch the micro-batch can carry a cloned SparkSession, and a
+        temp view is session-scoped; using the batch's own session for both guarantees the view is
+        visible to the query in every runtime. (They coincide on this deployment - the export is
+        verified working - but binding both to one session removes the cross-runtime dependency.)
         """
+        session = batch_df.sparkSession
         batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
-        return apply_filter(spark.sql(RENDERED_SELECT))
+        return apply_filter(session.sql(RENDERED_SELECT))
 
     # Wrap the connector's writer so each micro-batch is transformed (raw source -> view logic ->
     # filter) BEFORE it is bulk-written. make_foreach_batch handles the write + reconcile: it raises
