@@ -217,8 +217,9 @@ if PIPELINE_MODE == "streaming":
     print(f"streaming_start    = {STREAMING_START}")
 
 # COMMAND ----------
-# Build the connector write config. Everything here is MODE-INDEPENDENT (batch and streaming write
-# through the same EsWriteConfig), so it lives above the mode branch and both modes reuse it as-is.
+# Build the connector write config + the shared filter helper. Both are MODE-INDEPENDENT (batch and
+# streaming write through the same EsWriteConfig and apply the same filter), so they are prepared once
+# here, above the per-mode cells below.
 #
 # api_key auth: the secret's value is passed straight to the connector as api_key. dbutils.secrets
 # reads it on the DRIVER; EsWriteConfig is a plain frozen dataclass that carries the string into the
@@ -243,37 +244,45 @@ def apply_filter(df):
     return df.filter(FILTER_CONDITION) if FILTER_CONDITION else df
 
 
+# Set by whichever mode cell below runs, and read by the summary/exit cell. Initialized to None so the
+# backstop cell can fail closed if NO mode handled the run (e.g. a mode added to the allow-list without
+# an export cell here) rather than exiting on a stale/empty summary.
+RUN_SUMMARY = None
+
 # COMMAND ----------
-# Export. The mode branch is the ONE place batch and streaming differ; both share es_write_config and
-# apply_filter above, and both run the SAME view transform (batch reads the deployed view; streaming
-# renders that view's SELECT over each micro-batch - see the streaming branch).
+# BATCH export. Read the whole (optionally filtered) deployed view and bulk_write it in one shot.
+# bulk_write returns the count dict; reconcile_or_raise then FAILS the run if any document was rejected
+# (errors > 0) or any row went unaccounted for, so a partial export surfaces as a job failure, not a
+# silent success. (raise_on_error=False so the result is printed for the log before we reconcile.)
 if PIPELINE_MODE == "batch":
-    # Batch: read the whole (optionally filtered) deployed view and bulk_write it. bulk_write returns
-    # the count dict; reconcile_or_raise then FAILS the run if any document was rejected (errors > 0)
-    # or any row went unaccounted for, so a partial export surfaces as a job failure, not a silent
-    # success. (raise_on_error=False here so the result is printed for the log before we reconcile.)
     export_df = apply_filter(spark.table(VIEW_FQN))
     result = bulk_write(export_df, es_write_config)
-    print(f"bulk_write result: {result}")
+    print(f"batch bulk_write result: {result}")
     reconcile_or_raise(result, index=es_write_config.index)
     RUN_SUMMARY = (
         f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
         f"ignored={result['ignored']} total_input={result['total_input']}"
     )
-elif PIPELINE_MODE == "streaming":
-    # Streaming export. The design constraint: we must NOT read the deployed VIEW and join it back to
-    # each micro-batch (that would scan the huge source side of the view every trigger). Instead we
-    # take the view's OWN SELECT and run it with ${source} bound to a temp view over just the
-    # micro-batch, so the identical transform the deployed view applies runs against batch-sized data.
-    # Reference tables (${ref_*}) stay their real FQNs - a reference join is small-batch-to-dimension.
-    #
-    # ROW-WISE VIEWS ONLY. Running the view SELECT per micro-batch is correct only for row-wise logic:
-    # projection, filters, scalar expressions, and 1:1 reference joins - each output row depends on a
-    # single source row. A view that aggregates ACROSS source rows (GROUP BY, DISTINCT, window/OVER,
-    # PIVOT, ...) would be computed PER BATCH here, not over the whole stream, so streaming would
-    # silently emit different results than batch (which scans the full view). This is a limitation of
-    # streaming mode: do not point a streaming pipeline at an aggregating view; use batch mode for those.
+    print(f"BATCH EXPORT COMPLETE: {RUN_SUMMARY}")
 
+# COMMAND ----------
+# STREAMING setup (streaming mode only). Prepare everything the stream needs BEFORE starting it, so a
+# problem here surfaces in this cell rather than mid-stream: the checkpoint location, the rendered
+# per-micro-batch SELECT, and the foreachBatch writer (with a driver-side totals accumulator).
+#
+# The design constraint: we must NOT read the deployed VIEW and join it back to each micro-batch (that
+# would scan the huge source side of the view every trigger). Instead we take the view's OWN SELECT
+# and run it with ${source} bound to a temp view over just the micro-batch, so the identical transform
+# the deployed view applies runs against batch-sized data. Reference tables (${ref_*}) stay their real
+# FQNs - a reference join is small-batch-to-dimension.
+#
+# ROW-WISE VIEWS ONLY. Running the view SELECT per micro-batch is correct only for row-wise logic:
+# projection, filters, scalar expressions, and 1:1 reference joins - each output row depends on a
+# single source row. A view that aggregates ACROSS source rows (GROUP BY, DISTINCT, window/OVER,
+# PIVOT, ...) would be computed PER BATCH here, not over the whole stream, so streaming would silently
+# emit different results than batch (which scans the full view). This is a limitation of streaming
+# mode: do not point a streaming pipeline at an aggregating view; use batch mode for those.
+if PIPELINE_MODE == "streaming":
     # checkpoint_base_path was validated non-empty at the validation stage above (streaming only).
     # Per-stream subfolder keyed by config_name (stable + unique + filesystem-safe), so each stream's
     # checkpoint is isolated and survives across runs.
@@ -301,52 +310,59 @@ elif PIPELINE_MODE == "streaming":
     print(f"checkpoint_location = {checkpoint_location}")
     print(f"rendered micro-batch SELECT (source bound to {BATCH_SOURCE_VIEW}):\n{RENDERED_SELECT}")
 
-    # make_foreach_batch is the connector's writer: it returns a fn(dataframe, batch_id) that
-    # bulk-writes the dataframe to ES and raises on a failed batch, so the checkpoint does not advance
-    # past lost rows (at-least-once + deterministic _id => effectively exactly-once on retry). It
-    # expects the FINAL rows, so our foreach_batch transforms each raw-source micro-batch first, then
-    # hands the result to the writer. batch_id is Spark's per-micro-batch sequence number; we do not
-    # branch on it, just pass it through (the connector uses it for logging).
+    # Per-run metrics table (Delta). How-many-rows-did-this-run-push must be recorded DURABLY, not in a
+    # Python variable: on serverless the foreachBatch body runs server-side, so a client-side counter
+    # never sees the mutation (verified: rows landed in ES while a client-side dict read 0), and
+    # query.recentProgress is delivered asynchronously so reading it right after awaitTermination is
+    # racy (verified: it reported 0 for a batch that really moved rows). Writing each batch's count to
+    # a Delta table from inside foreachBatch (a server-side write, like the export itself) survives both
+    # problems; the summary cell reads the table back. Recreated per run so it reflects THIS run only.
+    METRICS_TABLE = f"{view['catalog']}.{view['schema']}.`_stream_metrics_{_safe_config}`"
+    spark.sql(f"DROP TABLE IF EXISTS {METRICS_TABLE}")
+    spark.sql(f"CREATE TABLE {METRICS_TABLE} (batch_id BIGINT, rows_written BIGINT) USING delta")
+
     _write_batch = make_foreach_batch(es_write_config)
 
     def foreach_batch(batch_df, batch_id: int):
         # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so
-        # the deployed view's projection/joins/hints apply to exactly this batch. Both the register
-        # and the query go through batch_df.sparkSession, NOT the notebook's global `spark`: inside
-        # foreachBatch the micro-batch can carry a cloned session, and a temp view is session-scoped,
-        # so binding both to the batch's own session keeps the view visible to the query in every
-        # runtime. (They coincide on this deployment - export verified working - but this removes the
-        # cross-runtime dependency.) filter_condition is applied to the transformed rows.
+        # the deployed view's projection/joins/hints apply to exactly this batch. Both the register and
+        # the query go through batch_df.sparkSession, NOT the notebook's global `spark`: inside
+        # foreachBatch the micro-batch can carry a cloned session, and a temp view is session-scoped, so
+        # binding both to the batch's own session keeps the view visible to the query in every runtime.
+        # filter_condition is applied to the transformed rows.
         session = batch_df.sparkSession
         batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
         transformed = apply_filter(session.sql(RENDERED_SELECT))
+        # Count the rows we are about to write, then write. The write raises on any failure, so a row
+        # recorded here was genuinely exported. Record the count durably (see METRICS_TABLE above)
+        # using the batch's own session, so the summary cell can total it after the stream finishes.
+        n = transformed.count()
         _write_batch(transformed, batch_id)
+        session.createDataFrame([(batch_id, n)], "batch_id bigint, rows_written bigint") \
+            .write.mode("append").saveAsTable(METRICS_TABLE)
 
-    # Read the RAW source table as a stream (not the view: we apply the view logic per-batch above).
-    # skipChangeCommits=true: tolerate non-append commits (a manual UPDATE/DELETE upstream) by skipping
-    # them rather than failing the stream; corrections are handled out-of-band via a batch backfill.
-    #
-    # streaming_start controls where a FIRST run (no checkpoint yet) begins; once a checkpoint exists
-    # it is the position of record and startingVersion is ignored (Spark resumes from the checkpoint).
-    # - "new": start at the source's CURRENT Delta version, so existing history is NOT re-exported and
-    #   subsequent runs pick up only new commits. We resolve the concrete current version NUMBER rather
-    #   than startingVersion="latest" because of a Trigger.availableNow interaction proven live: a
-    #   "latest" first run finds no new rows, runs zero micro-batches, and persists NO checkpoint
-    #   offset, so it never establishes a resume point and later runs keep skipping new data. A numeric
-    #   startingVersion seeds a real, persisted offset even on a zero-row first batch, so the next run
-    #   resumes correctly (verified: seed -> append -> resume exports exactly the appended rows).
-    #   startingVersion is INCLUSIVE and must be an EXISTING version, so we use the current version
-    #   (current+1 is rejected when it does not exist yet). One consequence: if the current commit is
-    #   an append, the first "new" run re-exports that single commit's rows. With deterministic _id
-    #   this is an idempotent upsert bounded to one commit (not the whole table), so it is harmless.
-    # - "full": omit startingVersion, so the first micro-batches backfill the whole existing table.
+# COMMAND ----------
+# STREAMING run (streaming mode only). Read the RAW source as a Delta stream and drain it once.
+# skipChangeCommits=true: tolerate non-append commits (a manual UPDATE/DELETE upstream) by skipping
+# them rather than failing the stream; corrections are handled out-of-band via a batch backfill.
+#
+# streaming_start controls where a FIRST run (no checkpoint yet) begins; once a checkpoint exists it is
+# the position of record and startingVersion is ignored (Spark resumes from the checkpoint).
+# - "new": start at the source's CURRENT Delta version, so existing history is NOT re-exported and
+#   subsequent runs pick up only new commits. We resolve the concrete current version NUMBER rather
+#   than startingVersion="latest" because of a Trigger.availableNow interaction proven live: a "latest"
+#   first run finds no new rows, runs zero micro-batches, and persists NO checkpoint offset, so it never
+#   establishes a resume point and later runs keep skipping new data. A numeric startingVersion seeds a
+#   real, persisted offset even on a zero-row first batch, so the next run resumes correctly.
+#   startingVersion is INCLUSIVE and must be an EXISTING version, so we use the current version
+#   (current+1 is rejected when it does not exist yet). One consequence: if the current commit is an
+#   append, the first "new" run re-exports that single commit's rows - a harmless idempotent upsert via
+#   the deterministic _id, bounded to one commit.
+# - "full": omit startingVersion, so the first micro-batches backfill the whole existing table.
+if PIPELINE_MODE == "streaming":
     reader = spark.readStream.option("skipChangeCommits", "true")
     if STREAMING_START == "new":
-        current_version = (
-            spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN}")
-            .agg({"version": "max"})
-            .collect()[0][0]
-        )
+        current_version = spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN}").agg({"version": "max"}).collect()[0][0]
         print(f"streaming_start=new: seeding at current source version {current_version} (history skipped)")
         reader = reader.option("startingVersion", str(current_version))
     stream_df = reader.table(SOURCE_FQN)
@@ -363,20 +379,38 @@ elif PIPELINE_MODE == "streaming":
         .start()
     )
     query.awaitTermination()
-    _progress = query.lastProgress
-    _rows = (_progress or {}).get("numInputRows", "unknown")
-    print(f"stream drained (availableNow); last-batch numInputRows={_rows}")
-    RUN_SUMMARY = f"streaming_start={STREAMING_START}; checkpoint={checkpoint_location}; last_numInputRows={_rows}"
-else:
-    # Unreachable: require_pipeline_mode already allow-list validated PIPELINE_MODE above. Kept as a
-    # fail-closed backstop so a future mode added to the allow-list without a branch here cannot
-    # silently do nothing.
-    raise ValueError(f"unhandled pipeline_mode {PIPELINE_MODE!r}")
+
+    # Report how many rows this run pushed, read back from the durable per-batch metrics table that
+    # foreachBatch wrote (see METRICS_TABLE above). This is the reliable driver-side total: it survives
+    # the server-side foreachBatch boundary and the async delivery of query.recentProgress, both of
+    # which under-reported in testing. A run with no new source data wrote no metric rows, so the total
+    # is 0 (a valid outcome, not a failure). The write raised on any batch failure, so a TERMINATED
+    # SUCCESS run pushed exactly this many rows with no errors.
+    from pyspark.sql import functions as _F  # noqa: E402
+    _agg = spark.table(METRICS_TABLE).agg(
+        _F.count("*").alias("batches"), _F.coalesce(_F.sum("rows_written"), _F.lit(0)).alias("rows")
+    ).collect()[0]
+    num_batches = int(_agg["batches"])
+    rows_pushed = int(_agg["rows"])
+    RUN_SUMMARY = (
+        f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
+        f"checkpoint={checkpoint_location}"
+    )
+    if rows_pushed == 0:
+        print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
+    print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
+
+# COMMAND ----------
+# Fail-closed backstop: every supported mode's cell above sets RUN_SUMMARY. If it is still None, the
+# effective PIPELINE_MODE passed allow-list validation but no export cell handled it (e.g. a new mode
+# added to the allow-list without a corresponding cell). Raise rather than exit on an empty summary.
+if RUN_SUMMARY is None:
+    raise ValueError(f"no export ran for pipeline_mode {PIPELINE_MODE!r} (allow-listed but unhandled)")
 
 # COMMAND ----------
 # dbutils.notebook.exit() must be the ONLY statement in its cell: its return value becomes the cell's
-# rendered output, visually replacing any print() output from the same cell. Keeping it separate
-# leaves the prints above visible in their own completed cells.
+# rendered output, visually replacing any print() output from the same cell. Keeping it separate leaves
+# the prints above visible in their own completed cells.
 dbutils.notebook.exit(
     f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; pipeline_mode={PIPELINE_MODE}; "
     f"view={VIEW_FQN}; {RUN_SUMMARY}"
