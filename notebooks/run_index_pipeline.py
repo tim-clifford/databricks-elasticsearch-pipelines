@@ -390,14 +390,27 @@ if PIPELINE_MODE == "streaming":
     # failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch that did not fully
     # succeed failed the run instead of recording, and a TERMINATED-SUCCESS total is exact.
     from pyspark.sql import functions as _F  # noqa: E402
-    try:
+
+    def _metrics_dir_exists():
+        # Existence probe, isolated from the READ below. dbutils.fs.ls raises for a nonexistent path;
+        # that (no metric files written) is the ONLY case that legitimately means "0 batches ran". We
+        # do NOT wrap the read itself in a broad except: doing so would map a real read failure (corrupt
+        # files, IO/permission error) to a 0-row SUCCESS and mask a run that actually pushed rows.
+        try:
+            return len(dbutils.fs.ls(metrics_dir)) > 0
+        except Exception:
+            return False
+
+    if not _metrics_dir_exists():
+        # No metric files => the stream drained zero micro-batches (no new source data since the last
+        # run). A valid outcome, reported as 0, not a failure.
+        num_batches, rows_pushed = 0, 0
+    else:
+        # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the run
+        # rather than being silently reported as 0.
         _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
         _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
         num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
-    except Exception:
-        # No metrics files => the run drained zero micro-batches (no new source data). spark.read.json
-        # of an empty/absent dir raises rather than returning empty, so treat that as 0/0.
-        num_batches, rows_pushed = 0, 0
     RUN_SUMMARY = (
         f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
         f"checkpoint={checkpoint_location}"
