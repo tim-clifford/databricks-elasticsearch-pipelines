@@ -74,9 +74,15 @@ _connector_version = getattr(databricks_es_connector, "__version__", "unknown")
 print(f"connector installed: databricks_es_connector {_connector_version}")
 
 # The write surface used by the export cell below. Imported here (after the restart) so the export
-# cell reads as pure orchestration. bulk_write does the mapInPandas export; reconcile_or_raise turns
-# the result dict into an exception when any document was rejected or any row went unaccounted for.
-from databricks_es_connector import EsWriteConfig, bulk_write, reconcile_or_raise  # noqa: E402
+# cell reads as pure orchestration. bulk_write does the batch mapInPandas export; reconcile_or_raise
+# turns the result dict into an exception when any document was rejected or any row went unaccounted
+# for; make_foreach_batch wraps that same write+reconcile into a foreachBatch fn for the streaming path.
+from databricks_es_connector import (  # noqa: E402
+    EsWriteConfig,
+    bulk_write,
+    make_foreach_batch,
+    reconcile_or_raise,
+)
 
 # COMMAND ----------
 # Now read the remaining parameters (the restart above cleared any earlier Python state, so this is
@@ -298,13 +304,30 @@ elif PIPELINE_MODE == "streaming":
     # Read the RAW source table as a stream (not the view: we apply the view logic per-batch above).
     # skipChangeCommits=true: tolerate non-append commits (a manual UPDATE/DELETE upstream) by skipping
     # them rather than failing the stream; corrections are handled out-of-band via a batch backfill.
-    # startingVersion=latest for streaming_start="new" (only commits after the stream starts; batch
-    # mode owns the history); omitted for "full" so the first micro-batches backfill the whole table.
-    # HONORED ONLY ON FIRST RUN: once the checkpoint exists it is the position of record, so flipping
-    # streaming_start on an already-running stream is a no-op until its checkpoint is cleared.
+    #
+    # streaming_start controls where a FIRST run (no checkpoint yet) begins; once a checkpoint exists
+    # it is the position of record and startingVersion is ignored (Spark resumes from the checkpoint).
+    # - "new": start at the source's CURRENT Delta version, so existing history is NOT re-exported and
+    #   subsequent runs pick up only new commits. We resolve the concrete current version NUMBER rather
+    #   than startingVersion="latest" because of a Trigger.availableNow interaction proven live: a
+    #   "latest" first run finds no new rows, runs zero micro-batches, and persists NO checkpoint
+    #   offset, so it never establishes a resume point and later runs keep skipping new data. A numeric
+    #   startingVersion seeds a real, persisted offset even on a zero-row first batch, so the next run
+    #   resumes correctly (verified: seed -> append -> resume exports exactly the appended rows).
+    #   startingVersion is INCLUSIVE and must be an EXISTING version, so we use the current version
+    #   (current+1 is rejected when it does not exist yet). One consequence: if the current commit is
+    #   an append, the first "new" run re-exports that single commit's rows. With deterministic _id
+    #   this is an idempotent upsert bounded to one commit (not the whole table), so it is harmless.
+    # - "full": omit startingVersion, so the first micro-batches backfill the whole existing table.
     reader = spark.readStream.option("skipChangeCommits", "true")
     if STREAMING_START == "new":
-        reader = reader.option("startingVersion", "latest")
+        current_version = (
+            spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN}")
+            .agg({"version": "max"})
+            .collect()[0][0]
+        )
+        print(f"streaming_start=new: seeding at current source version {current_version} (history skipped)")
+        reader = reader.option("startingVersion", str(current_version))
     stream_df = reader.table(SOURCE_FQN)
 
     # Trigger.availableNow: drain every currently-available source commit in one or more micro-batches,

@@ -198,9 +198,12 @@ Key behaviors:
   `UPDATE`/`DELETE`/`MERGE` on the source) is skipped rather than failing the stream. If you make such
   a change and need it reflected in the index, re-send the affected records with a `batch` run.
 - **Where the stream starts (`streaming_start`).** Default `new` starts at the source's current
-  version (only new commits are exported); `full` backfills the whole existing table on the first run.
-  This choice is honored **only on the first run**, before a checkpoint exists: once a stream has a
-  checkpoint, that checkpoint is the position of record and `streaming_start` is ignored.
+  Delta version, so existing history is not re-exported and later runs pick up only new commits;
+  `full` backfills the whole existing table on the first run. This choice is honored **only on the
+  first run**, before a checkpoint exists: once a stream has a checkpoint, that checkpoint is the
+  position of record and `streaming_start` is ignored. (The start version is inclusive, so if the
+  source's current commit is itself an append, that one commit's rows are re-sent on the first `new`
+  run; deterministic `_id`s make this a harmless idempotent upsert bounded to a single commit.)
 - **Checkpoints.** Each stream keeps its checkpoint at `<checkpoint_base_path>/<config_name>`. If an
   index is reset and you want to resend its records from the Delta table, clear that stream's
   checkpoint first, otherwise the stream considers those records already exported and writes nothing.
