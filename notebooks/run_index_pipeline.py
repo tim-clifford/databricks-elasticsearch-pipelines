@@ -172,6 +172,15 @@ for _param, _value in (
     if not _value:
         raise ValueError(f"missing required parameter: {_param} (set the bundle variable at deploy)")
 
+# checkpoint_base_path is required for a STREAMING run only (batch and deploy_views never stream, so
+# their runs leave it empty). Validated here, at the validation stage, so a streaming run with no
+# checkpoint location fails closed immediately rather than after the config load and stream setup.
+if PIPELINE_MODE == "streaming" and not CHECKPOINT_BASE_PATH:
+    raise ValueError(
+        "missing required parameter: checkpoint_base_path (set the bundle variable at deploy); "
+        "a streaming run needs a UC Volume checkpoint location"
+    )
+
 # Resolve the config file, accepting either extension: gen_jobs.py and deploy_views.py both discover
 # .yml AND .yaml, so the runner must too, or a .yaml-defined pipeline would deploy fine and then fail
 # here at runtime. Fail closed if neither exists.
@@ -265,14 +274,9 @@ elif PIPELINE_MODE == "streaming":
     # silently emit different results than batch (which scans the full view). This is a limitation of
     # streaming mode: do not point a streaming pipeline at an aggregating view; use batch mode for those.
 
-    # checkpoint_base_path is required ONLY for a streaming run (batch/deploy_views never stream), so
-    # it is validated here rather than up top. Per-stream subfolder keyed by config_name (stable +
-    # unique + filesystem-safe), so each stream's checkpoint is isolated and survives across runs.
-    if not CHECKPOINT_BASE_PATH:
-        raise ValueError(
-            "missing required parameter: checkpoint_base_path (set the bundle variable at deploy); "
-            "a streaming run needs a UC Volume checkpoint location"
-        )
+    # checkpoint_base_path was validated non-empty at the validation stage above (streaming only).
+    # Per-stream subfolder keyed by config_name (stable + unique + filesystem-safe), so each stream's
+    # checkpoint is isolated and survives across runs.
     checkpoint_location = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
 
     # The view's SELECT body, with ${source} bound to the per-batch temp view and ${ref_*} left as the
@@ -297,32 +301,26 @@ elif PIPELINE_MODE == "streaming":
     print(f"checkpoint_location = {checkpoint_location}")
     print(f"rendered micro-batch SELECT (source bound to {BATCH_SOURCE_VIEW}):\n{RENDERED_SELECT}")
 
-    def transform_micro_batch(batch_df, batch_id: int):
-        """Run the view's SELECT over one raw-source micro-batch, returning the transformed rows.
-
-        The batch is registered as the ${source} temp view, then the rendered view SELECT runs
-        against it (so joins/projections/hints all execute exactly as the deployed view defines them,
-        but only over this batch). The optional filter_condition is applied to the result. Kept as a
-        pure DataFrame->DataFrame transform so the connector's make_foreach_batch can wrap it.
-
-        Register the temp view AND run the SELECT through batch_df.sparkSession (not the notebook's
-        global `spark`). Inside foreachBatch the micro-batch can carry a cloned SparkSession, and a
-        temp view is session-scoped; using the batch's own session for both guarantees the view is
-        visible to the query in every runtime. (They coincide on this deployment - the export is
-        verified working - but binding both to one session removes the cross-runtime dependency.)
-        """
-        session = batch_df.sparkSession
-        batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
-        return apply_filter(session.sql(RENDERED_SELECT))
-
-    # Wrap the connector's writer so each micro-batch is transformed (raw source -> view logic ->
-    # filter) BEFORE it is bulk-written. make_foreach_batch handles the write + reconcile: it raises
-    # on a failed batch so the checkpoint does not advance past lost rows (at-least-once + deterministic
-    # _id => effectively exactly-once on retry).
+    # make_foreach_batch is the connector's writer: it returns a fn(dataframe, batch_id) that
+    # bulk-writes the dataframe to ES and raises on a failed batch, so the checkpoint does not advance
+    # past lost rows (at-least-once + deterministic _id => effectively exactly-once on retry). It
+    # expects the FINAL rows, so our foreach_batch transforms each raw-source micro-batch first, then
+    # hands the result to the writer. batch_id is Spark's per-micro-batch sequence number; we do not
+    # branch on it, just pass it through (the connector uses it for logging).
     _write_batch = make_foreach_batch(es_write_config)
 
     def foreach_batch(batch_df, batch_id: int):
-        _write_batch(transform_micro_batch(batch_df, batch_id), batch_id)
+        # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so
+        # the deployed view's projection/joins/hints apply to exactly this batch. Both the register
+        # and the query go through batch_df.sparkSession, NOT the notebook's global `spark`: inside
+        # foreachBatch the micro-batch can carry a cloned session, and a temp view is session-scoped,
+        # so binding both to the batch's own session keeps the view visible to the query in every
+        # runtime. (They coincide on this deployment - export verified working - but this removes the
+        # cross-runtime dependency.) filter_condition is applied to the transformed rows.
+        session = batch_df.sparkSession
+        batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
+        transformed = apply_filter(session.sql(RENDERED_SELECT))
+        _write_batch(transformed, batch_id)
 
     # Read the RAW source table as a stream (not the view: we apply the view logic per-batch above).
     # skipChangeCommits=true: tolerate non-append commits (a manual UPDATE/DELETE upstream) by skipping
