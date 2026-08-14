@@ -275,7 +275,16 @@ elif PIPELINE_MODE == "streaming":
     _view_file = os.path.join(FILES_ROOT, "views", f"{view['name']}.sql")
     with open(_view_file) as _fh:
         _view_sql = _fh.read()
-    BATCH_SOURCE_VIEW = f"_stream_src_{CONFIG_NAME}"
+    # The per-batch temp view name is substituted UNQUOTED into the rendered SELECT's FROM (via
+    # source_override), so it must be a bare SQL identifier. config_name is only [A-Za-z0-9_-]+ (a
+    # bundle resource key), which permits hyphens - and a hyphen is not a legal bare identifier, so a
+    # hyphenated config would produce `FROM _stream_src_my-index`, a parse error failing every
+    # streaming run for that config. Sanitize non-identifier chars to '_'. The name only has to be
+    # valid + stable within THIS run's Spark session (a temp view is session-scoped, and each job run
+    # is a single config), so collapsing e.g. '-' to '_' cannot collide with another config's view.
+    # The `_stream_src_` prefix also guarantees a letter/underscore start regardless of config_name.
+    _safe_config = "".join(c if (c.isalnum() or c == "_") else "_" for c in CONFIG_NAME)
+    BATCH_SOURCE_VIEW = f"_stream_src_{_safe_config}"
     stream_subs = view_substitutions(cfg, ENVIRONMENT, source_override=BATCH_SOURCE_VIEW)
     RENDERED_SELECT = render_view_sql(view_select_body(_view_sql, _view_file), stream_subs, _view_file)
     print(f"checkpoint_location = {checkpoint_location}")
