@@ -13,6 +13,8 @@ from pipeline_lib.config import (
     job_base_parameters,
     job_parameters,
     render_view_sql,
+    require_chunk_size,
+    require_es_flag,
     require_filter_condition,
     require_pipeline_mode,
     require_streaming_start,
@@ -72,6 +74,10 @@ def test_minimal_valid():
     out = validate_config(_base())
     assert out["view"] == {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"}
     assert out["reference_tables"] == {}
+    # The optional tuning knobs, omitted here, default to "" (canonical "unset" => connector default).
+    assert out["chunk_size"] == ""
+    assert out["require_existing_index"] == ""
+    assert out["verify_certs"] == ""
 
 
 def test_environment_token_accepted_as_template():
@@ -545,6 +551,101 @@ def test_write_config_overrides_combined():
         "require_existing_index": False,
         "verify_certs": False,
     }
+
+
+# ------------------------------------------------- require_chunk_size / require_es_flag (shared validators)
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("", ""), (None, ""), ("  ", ""),          # unset -> canonical ""
+    (500, "500"), ("500", "500"), (" 250 ", "250"),  # YAML int OR string -> canonical string
+])
+def test_require_chunk_size_canonical(value, expected):
+    assert require_chunk_size(value) == expected
+
+
+@pytest.mark.parametrize("bad", ["abc", "12.5", "0", "-5", "1e3", 0, -1, 12.5, True, False])
+def test_require_chunk_size_fails_closed(bad):
+    # A non-positive-int, a float, a non-numeric string, or a bool (int subclass) must fail closed.
+    with pytest.raises(PipelineConfigError, match="chunk_size"):
+        require_chunk_size(bad)
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("", ""), (None, ""), ("  ", ""),                  # unset -> canonical ""
+    (True, "true"), (False, "false"),                  # YAML bool -> canonical string
+    ("true", "true"), ("false", "false"),              # string passthrough
+    ("True", "true"), ("FALSE", "false"), (" true ", "true"),  # case-insensitive + trimmed
+])
+def test_require_es_flag_canonical(value, expected):
+    assert require_es_flag(value, "verify_certs") == expected
+
+
+@pytest.mark.parametrize("bad", ["maybe", "1", "0", "yes", "no", "T", 5, 1.0, ["a"]])
+def test_require_es_flag_fails_closed(bad):
+    # Allow-list 'true'/'false'/bool only; never fall back to Python truthiness.
+    with pytest.raises(PipelineConfigError, match="verify_certs"):
+        require_es_flag(bad, "verify_certs")
+
+
+# ------------------------------------------------- tuning knobs as config keys
+
+
+def test_tuning_knobs_from_yaml_native_types_canonicalized():
+    # A config may set the knobs with YAML-native types (int, bool); they are stored canonical strings.
+    cfg = _base()
+    cfg["chunk_size"] = 1000
+    cfg["require_existing_index"] = False
+    cfg["verify_certs"] = True
+    out = validate_config(cfg)
+    assert out["chunk_size"] == "1000"
+    assert out["require_existing_index"] == "false"
+    assert out["verify_certs"] == "true"
+
+
+def test_tuning_knobs_from_yaml_string_values():
+    # Strings are equally accepted (and canonicalized) in the config.
+    cfg = _base()
+    cfg["chunk_size"] = "250"
+    cfg["require_existing_index"] = "TRUE"
+    out = validate_config(cfg)
+    assert out["chunk_size"] == "250"
+    assert out["require_existing_index"] == "true"
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("chunk_size", "abc"), ("chunk_size", 0), ("chunk_size", -5), ("chunk_size", 12.5),
+    ("require_existing_index", "maybe"), ("require_existing_index", 1),
+    ("verify_certs", "yes"),
+])
+def test_tuning_knobs_bad_config_value_fails_closed(key, bad):
+    cfg = _base()
+    cfg[key] = bad
+    with pytest.raises(PipelineConfigError, match=key):
+        validate_config(cfg)
+
+
+def test_tuning_knobs_carried_through_resolve():
+    # Connector settings, not object names: resolve passes the canonical strings through unchanged.
+    cfg = _with_env()
+    cfg["chunk_size"] = 800
+    cfg["verify_certs"] = False
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["chunk_size"] == "800"
+    assert out["verify_certs"] == "false"
+    assert out["require_existing_index"] == ""  # omitted -> unset
+
+
+def test_job_parameters_tuning_defaults_from_config():
+    # The tuning job parameters' defaults come from the config (the whole point of this change), in
+    # canonical string form; an omitted knob defaults to "".
+    cfg = _base()
+    cfg["chunk_size"] = 1000
+    cfg["verify_certs"] = False
+    params = job_parameters(validate_config(cfg))
+    assert {"name": "chunk_size", "default": "1000"} in params
+    assert {"name": "verify_certs", "default": "false"} in params
+    assert {"name": "require_existing_index", "default": ""} in params
 
 
 # --------------------------------------------------------------------------- require_pipeline_mode
