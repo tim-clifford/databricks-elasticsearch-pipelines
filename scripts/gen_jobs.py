@@ -93,6 +93,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                                     "${var.es_host_url}",
                                     "${var.secret_scope_name}",
                                     "${var.secret_key_name}",
+                                    "${var.checkpoint_base_path}",
                                 ),
                             },
                         }

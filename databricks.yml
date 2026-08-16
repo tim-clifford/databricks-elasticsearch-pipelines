@@ -60,6 +60,17 @@ variables:
     description: "Key within secret_scope_name whose value is the ES api_key passed to the connector. Empty default; required for index-job runs."
     default: ""
 
+  # GLOBAL base path (a UC Volume) under which each STREAMING index job keeps its Structured
+  # Streaming checkpoint. The runner appends /<config_name> so every stream gets a stable, unique
+  # subfolder. Global like wheel_path (one base for all jobs); deploy-time; empty default so batch
+  # runs and `deploy_views` (which never stream) resolve without it. A STREAMING run with an empty
+  # value fails closed in the runner. Must be a UC Volume path: dbfs:/tmp checkpoints fail with
+  # INSUFFICIENT_PERMISSIONS on serverless. Supply at deploy, e.g.
+  #   --var="checkpoint_base_path=/Volumes/<catalog>/<schema>/<volume>/checkpoints"
+  checkpoint_base_path:
+    description: "UC Volume base path for streaming checkpoints; the runner appends /<config_name> per job. Empty default; required for streaming runs (fails closed if empty)."
+    default: ""
+
 # Targets differ only by deployment mode. The workspace HOST is intentionally not hardcoded here:
 # it is taken from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var,
 # so the bundle carries no environment-specific URL and deploys to whatever workspace you point it at.

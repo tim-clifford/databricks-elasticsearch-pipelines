@@ -6,8 +6,11 @@
 # MAGIC import), loads `pipeline_definitions/<config_name>.yml`, resolves `${environment}` into the object
 # MAGIC names, and exports the config's view to Elasticsearch via the connector's `bulk_write`.
 # MAGIC
-# MAGIC Currently `pipeline_mode=batch` is implemented (read the whole view, optionally filter, bulk write);
-# MAGIC `pipeline_mode=streaming` is a stub that raises until the streaming phase lands.
+# MAGIC Both modes are implemented. `pipeline_mode=batch` reads the whole deployed view, optionally
+# MAGIC filters, and bulk-writes it. `pipeline_mode=streaming` reads the RAW source table as a stream
+# MAGIC (Trigger.availableNow), renders the view's OWN SELECT over each micro-batch (so the view logic
+# MAGIC runs against batch-sized data, never a join back to the full view), and bulk-writes per batch
+# MAGIC through the connector's foreachBatch writer with a checkpoint.
 # MAGIC
 # MAGIC Why load the config here rather than receive resolved values: the job resources are generated
 # MAGIC offline by scripts/gen_jobs.py, which cannot know the deploy-time environment, so it cannot bake
@@ -19,11 +22,15 @@
 # MAGIC - `wheel_path`: UC Volume path to the connector `.whl` to install (required).
 # MAGIC - `es_host_url`, `secret_scope_name`, `secret_key_name`: the ES endpoint, and the Databricks
 # MAGIC   secret scope/key holding the ES api_key (all required for an index-job run).
+# MAGIC - `checkpoint_base_path`: UC Volume base for streaming checkpoints; the runner appends
+# MAGIC   `/<config_name>` (required for a streaming run; unused by batch).
 # MAGIC
 # MAGIC Run-time parameters (job parameters; overridable per run with `--params <name>=<value>`):
 # MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config).
 # MAGIC - `filter_condition`: optional Spark SQL predicate applied before the write (default from config).
 # MAGIC - `chunk_size`, `require_existing_index`, `verify_certs`: EsWriteConfig tuning; empty => connector default.
+# MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
+# MAGIC   streaming only, honored on the first run before a checkpoint exists.
 
 # COMMAND ----------
 # FIRST, install the connector wheel and restart Python. This cell handles ONLY the wheel, because
@@ -66,9 +73,12 @@ import databricks_es_connector  # noqa: E402
 _connector_version = getattr(databricks_es_connector, "__version__", "unknown")
 print(f"connector installed: databricks_es_connector {_connector_version}")
 
-# The write surface used by the export cell below. Imported here (after the restart) so the export
-# cell reads as pure orchestration. bulk_write does the mapInPandas export; reconcile_or_raise turns
-# the result dict into an exception when any document was rejected or any row went unaccounted for.
+# The write surface used by the export cells below. Imported here (after the restart) so the export
+# cells read as pure orchestration. bulk_write does the mapInPandas export (returns the count dict);
+# reconcile_or_raise turns that dict into an exception when any document was rejected or any row went
+# unaccounted for. Batch calls bulk_write then reconcile_or_raise; streaming calls
+# bulk_write(..., raise_on_error=True) per micro-batch (same write+reconcile in one call) so a failed
+# batch fails the trigger and the checkpoint holds.
 from databricks_es_connector import EsWriteConfig, bulk_write, reconcile_or_raise  # noqa: E402
 
 # COMMAND ----------
@@ -92,6 +102,10 @@ dbutils.widgets.text("filter_condition", "", "Optional row filter, a Spark SQL p
 dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty => connector default)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
+# Streaming-only widgets. checkpoint_base_path is a deploy-time base_parameter (bundle variable);
+# streaming_start is a run-time job parameter (default "new"). Both are ignored by a batch run.
+dbutils.widgets.text("checkpoint_base_path", "", "UC Volume base for streaming checkpoints (runner appends /<config_name>)")
+dbutils.widgets.text("streaming_start", "", "Streaming start: new (only new commits) | full (backfill whole table)")
 CONFIG_NAME = dbutils.widgets.get("config_name").strip()
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
 ES_HOST_URL = dbutils.widgets.get("es_host_url").strip()
@@ -102,6 +116,8 @@ FILTER_CONDITION = dbutils.widgets.get("filter_condition").strip()
 CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
+CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
+STREAMING_START = dbutils.widgets.get("streaming_start").strip()
 if not CONFIG_NAME:
     raise ValueError("missing required parameter: config_name")
 
@@ -118,9 +134,13 @@ if FILES_ROOT not in sys.path:
 
 from pipeline_lib.config import (  # noqa: E402
     load_config,
+    render_view_sql,
     require_filter_condition,
     require_pipeline_mode,
+    require_streaming_start,
     resolve_config,
+    view_select_body,
+    view_substitutions,
     write_config_overrides,
 )
 
@@ -131,9 +151,13 @@ from pipeline_lib.config import (  # noqa: E402
 # - filter_condition: must be a string (the SQL expression itself is validated by Spark at df.filter).
 # - write_overrides: EsWriteConfig tuning knobs, parsed from their string widgets; an unset knob is
 #   omitted so the connector default stands, and a bad value (chunk_size=abc, verify_certs=maybe) fails.
+# - streaming_start: allow-list (new|full). Validated unconditionally (cheap, fails a bad --params
+#   value regardless of mode); only actually USED by the streaming branch. Empty widget -> "new"
+#   default, so an unset value takes the intended default rather than failing.
 PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS)
+STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
 
 # The global ES connection settings are required for any index-job run: fail closed on an empty one
 # (e.g. a deploy that forgot --var=es_host_url) rather than constructing a broken EsWriteConfig.
@@ -144,6 +168,15 @@ for _param, _value in (
 ):
     if not _value:
         raise ValueError(f"missing required parameter: {_param} (set the bundle variable at deploy)")
+
+# checkpoint_base_path is required for a STREAMING run only (batch and deploy_views never stream, so
+# their runs leave it empty). Validated here, at the validation stage, so a streaming run with no
+# checkpoint location fails closed immediately rather than after the config load and stream setup.
+if PIPELINE_MODE == "streaming" and not CHECKPOINT_BASE_PATH:
+    raise ValueError(
+        "missing required parameter: checkpoint_base_path (set the bundle variable at deploy); "
+        "a streaming run needs a UC Volume checkpoint location"
+    )
 
 # Resolve the config file, accepting either extension: gen_jobs.py and deploy_views.py both discover
 # .yml AND .yaml, so the runner must too, or a .yaml-defined pipeline would deploy fine and then fail
@@ -166,6 +199,7 @@ cfg = resolve_config(load_config(config_path), ENVIRONMENT)
 view = cfg["view"]
 source = cfg["source"]
 VIEW_FQN = f"{view['catalog']}.{view['schema']}.{view['name']}"
+SOURCE_FQN = f"{source['catalog']}.{source['schema']}.{source['table']}"
 print(f"config_name        = {CONFIG_NAME}")
 print(f"environment        = {ENVIRONMENT!r}")
 print(f"es_index_name      = {cfg['es_index_name']}")
@@ -174,12 +208,15 @@ print(f"pipeline_mode      = {PIPELINE_MODE}")
 print(f"filter_condition   = {FILTER_CONDITION!r}")
 print(f"write_overrides    = {write_overrides}")
 print(f"view               = {VIEW_FQN}")
-print(f"source             = {source['catalog']}.{source['schema']}.{source['table']}")
+print(f"source             = {SOURCE_FQN}")
 print(f"es_host_url        = {ES_HOST_URL}")
+if PIPELINE_MODE == "streaming":
+    print(f"streaming_start    = {STREAMING_START}")
 
 # COMMAND ----------
-# Build the connector write config. Everything here is MODE-INDEPENDENT (batch and streaming write
-# through the same EsWriteConfig), so it lives above the mode branch and streaming reuses it as-is.
+# Build the connector write config + the shared filter helper. Both are MODE-INDEPENDENT (batch and
+# streaming write through the same EsWriteConfig and apply the same filter), so they are prepared once
+# here, above the per-mode cells below.
 #
 # api_key auth: the secret's value is passed straight to the connector as api_key. dbutils.secrets
 # reads it on the DRIVER; EsWriteConfig is a plain frozen dataclass that carries the string into the
@@ -198,54 +235,214 @@ es_write_config = EsWriteConfig(
 )
 
 
-def read_view_df():
-    """The rows to export: the whole view, with the optional filter_condition applied.
+def apply_filter(df):
+    """Apply the optional filter_condition to a DataFrame. Shared by both modes so the filter step is
+    written once and applied identically to a batch DataFrame or a streaming micro-batch."""
+    return df.filter(FILTER_CONDITION) if FILTER_CONDITION else df
 
-    Shared by both modes so the source-of-rows logic is written once. Batch reads it as a static
-    DataFrame; the streaming phase will read the same VIEW_FQN with spark.readStream and reuse this
-    same filter step, so the filter is applied here rather than duplicated per mode.
-    """
-    df = spark.table(VIEW_FQN)
-    if FILTER_CONDITION:
-        df = df.filter(FILTER_CONDITION)
-    return df
 
+# Set by whichever mode cell below runs, and read by the summary/exit cell. Initialized to None so the
+# backstop cell can fail closed if NO mode handled the run (e.g. a mode added to the allow-list without
+# an export cell here) rather than exiting on a stale/empty summary.
+RUN_SUMMARY = None
 
 # COMMAND ----------
-# Export. The mode branch is the ONE place batch and streaming differ; both share es_write_config and
-# read_view_df above. Keeping the branch this thin is deliberate, so adding streaming is additive
-# (fill in the elif) rather than a rewrite.
+# BATCH export. Read the whole (optionally filtered) deployed view and bulk_write it in one shot.
+# bulk_write returns the count dict; reconcile_or_raise then FAILS the run if any document was rejected
+# (errors > 0) or any row went unaccounted for, so a partial export surfaces as a job failure, not a
+# silent success. (raise_on_error=False so the result is printed for the log before we reconcile.)
 if PIPELINE_MODE == "batch":
-    # Batch: read the whole (optionally filtered) view and bulk_write it. bulk_write returns the
-    # count dict; reconcile_or_raise then FAILS the run if any document was rejected (errors > 0) or
-    # any row went unaccounted for, so a partial export surfaces as a job failure, not a silent
-    # success. (raise_on_error=False here so the result is printed for the log before we reconcile.)
-    export_df = read_view_df()
+    export_df = apply_filter(spark.table(VIEW_FQN))
     result = bulk_write(export_df, es_write_config)
-    print(f"bulk_write result: {result}")
+    print(f"batch bulk_write result: {result}")
     reconcile_or_raise(result, index=es_write_config.index)
     RUN_SUMMARY = (
         f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
         f"ignored={result['ignored']} total_input={result['total_input']}"
     )
-elif PIPELINE_MODE == "streaming":
-    # STREAMING IS NOT IMPLEMENTED YET (lands in the next phase). It will reuse es_write_config and
-    # read_view_df above: spark.readStream.table(VIEW_FQN) through the same filter, written via the
-    # connector's make_foreach_batch(es_write_config). Fail closed rather than silently no-op.
-    raise NotImplementedError(
-        "pipeline_mode=streaming is not implemented yet; use pipeline_mode=batch. Streaming export "
-        "lands in a later phase."
+    print(f"BATCH EXPORT COMPLETE: {RUN_SUMMARY}")
+
+# COMMAND ----------
+# STREAMING setup (streaming mode only). Prepare everything the stream needs BEFORE starting it, so a
+# problem here surfaces in this cell rather than mid-stream: the checkpoint location, the rendered
+# per-micro-batch SELECT, and the foreachBatch writer (with a driver-side totals accumulator).
+#
+# The design constraint: we must NOT read the deployed VIEW and join it back to each micro-batch (that
+# would scan the huge source side of the view every trigger). Instead we take the view's OWN SELECT
+# and run it with ${source} bound to a temp view over just the micro-batch, so the identical transform
+# the deployed view applies runs against batch-sized data. Reference tables (${ref_*}) stay their real
+# FQNs - a reference join is small-batch-to-dimension.
+#
+# ROW-WISE VIEWS ONLY. Running the view SELECT per micro-batch is correct only for row-wise logic:
+# projection, filters, scalar expressions, and 1:1 reference joins - each output row depends on a
+# single source row. A view that aggregates ACROSS source rows (GROUP BY, DISTINCT, window/OVER,
+# PIVOT, ...) would be computed PER BATCH here, not over the whole stream, so streaming would silently
+# emit different results than batch (which scans the full view). This is a limitation of streaming
+# mode: do not point a streaming pipeline at an aggregating view; use batch mode for those.
+if PIPELINE_MODE == "streaming":
+    # checkpoint_base_path was validated non-empty at the validation stage above (streaming only).
+    # Per-stream subfolder keyed by config_name (stable + unique + filesystem-safe), so each stream's
+    # checkpoint is isolated and survives across runs.
+    checkpoint_location = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
+
+    # The view's SELECT body, with ${source} bound to the per-batch temp view and ${ref_*} left as the
+    # real reference tables. Extracted + rendered from the SAME .sql the deployed view uses (shared
+    # renderer), so streaming and batch provably apply identical transform logic. Rendered ONCE here
+    # (the SQL text is constant across micro-batches); only the temp view's contents change per batch.
+    #
+    # Opening by view['name'] (the RESOLVED name) matches the on-disk .sql filename because a view NAME
+    # cannot contain ${environment}: config.py validates view.name with _require_identifier (a plain
+    # identifier, token rejected at load), so resolve_config leaves it byte-for-byte unchanged. Thus
+    # resolved == unresolved == filename for the view name, and deploy_views keys files the same way.
+    _view_file = os.path.join(FILES_ROOT, "views", f"{view['name']}.sql")
+    with open(_view_file) as _fh:
+        _view_sql = _fh.read()
+    # The per-batch temp view name is substituted UNQUOTED into the rendered SELECT's FROM (via
+    # source_override), so it must be a bare SQL identifier. config_name is only [A-Za-z0-9_-]+ (a
+    # bundle resource key), which permits hyphens - and a hyphen is not a legal bare identifier, so a
+    # hyphenated config would produce `FROM _stream_src_my-index`, a parse error failing every
+    # streaming run for that config. Sanitize non-identifier chars to '_'. The name only has to be
+    # valid + stable within THIS run's Spark session (a temp view is session-scoped, and each job run
+    # is a single config), so collapsing e.g. '-' to '_' cannot collide with another config's view.
+    # The `_stream_src_` prefix also guarantees a letter/underscore start regardless of config_name.
+    _safe_config = "".join(c if (c.isalnum() or c == "_") else "_" for c in CONFIG_NAME)
+    BATCH_SOURCE_VIEW = f"_stream_src_{_safe_config}"
+    stream_subs = view_substitutions(cfg, ENVIRONMENT, source_override=BATCH_SOURCE_VIEW)
+    RENDERED_SELECT = render_view_sql(view_select_body(_view_sql, _view_file), stream_subs, _view_file)
+    print(f"checkpoint_location = {checkpoint_location}")
+    print(f"rendered micro-batch SELECT (source bound to {BATCH_SOURCE_VIEW}):\n{RENDERED_SELECT}")
+
+    # How-many-rows-did-this-run-push must be recorded DURABLY, not in a Python variable: on serverless
+    # the foreachBatch body runs server-side, so a client-side counter never sees the mutation (verified
+    # live: rows landed in ES while a client-side dict read 0), and query.recentProgress is delivered
+    # asynchronously so reading it right after awaitTermination is racy (verified: it reported 0 for a
+    # batch that really moved rows). So each batch appends its count to a METRICS DIRECTORY of small
+    # JSON files, written server-side from foreachBatch and read back by the summary cell. It lives
+    # UNDER the checkpoint location (a UC Volume path we already require for streaming), so it creates
+    # NO catalog object in the customer's namespace. Cleared at the start of THIS run so the directory
+    # only ever holds this run's files; retries within the run are deduped by batch_id when summing.
+    metrics_dir = f"{checkpoint_location}/_run_metrics"
+    dbutils.fs.rm(metrics_dir, recurse=True)
+
+    def foreach_batch(batch_df, batch_id: int):
+        # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so
+        # the deployed view's projection/joins/hints apply to exactly this batch. Both the register and
+        # the query go through batch_df.sparkSession, NOT the notebook's global `spark`: inside
+        # foreachBatch the micro-batch can carry a cloned session, and a temp view is session-scoped, so
+        # binding both to the batch's own session keeps the view visible to the query in every runtime.
+        # filter_condition is applied to the transformed rows.
+        session = batch_df.sparkSession
+        batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
+        transformed = apply_filter(session.sql(RENDERED_SELECT))
+        # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
+        # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
+        # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
+        # micro-batch here: the checkpoint does not advance, Spark retries (idempotent via deterministic
+        # _id), and if it never recovers the run fails with no summary. So the record step below is only
+        # reached for a batch that wrote every row cleanly, and result['written'] is the true count.
+        result = bulk_write(transformed, es_write_config, raise_on_error=True)
+        # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
+        # the summary can dedup a retried batch (write mode append; each batch is its own small file).
+        session.createDataFrame(
+            [(int(batch_id), int(result.get("written", 0) or 0))], "batch_id bigint, written bigint"
+        ).coalesce(1).write.mode("append").json(metrics_dir)
+
+# COMMAND ----------
+# STREAMING run (streaming mode only). Read the RAW source as a Delta stream and drain it once.
+# skipChangeCommits=true: tolerate non-append commits (a manual UPDATE/DELETE upstream) by skipping
+# them rather than failing the stream; corrections are handled out-of-band via a batch backfill.
+#
+# streaming_start controls where a FIRST run (no checkpoint yet) begins; once a checkpoint exists it is
+# the position of record and startingVersion is ignored (Spark resumes from the checkpoint).
+# - "new": start at the source's CURRENT Delta version, so existing history is NOT re-exported and
+#   subsequent runs pick up only new commits. We resolve the concrete current version NUMBER rather
+#   than startingVersion="latest" because of a Trigger.availableNow interaction proven live: a "latest"
+#   first run finds no new rows, runs zero micro-batches, and persists NO checkpoint offset, so it never
+#   establishes a resume point and later runs keep skipping new data. A numeric startingVersion seeds a
+#   real, persisted offset even on a zero-row first batch, so the next run resumes correctly.
+#   startingVersion is INCLUSIVE and must be an EXISTING version, so we use the current version
+#   (current+1 is rejected when it does not exist yet). One consequence: if the current commit is an
+#   append, the first "new" run re-exports that single commit's rows - a harmless idempotent upsert via
+#   the deterministic _id, bounded to one commit.
+# - "full": omit startingVersion, so the first micro-batches backfill the whole existing table.
+if PIPELINE_MODE == "streaming":
+    reader = spark.readStream.option("skipChangeCommits", "true")
+    if STREAMING_START == "new":
+        current_version = spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN}").agg({"version": "max"}).collect()[0][0]
+        print(f"streaming_start=new: seeding at current source version {current_version} (history skipped)")
+        reader = reader.option("startingVersion", str(current_version))
+    stream_df = reader.table(SOURCE_FQN)
+
+    # Trigger.availableNow: drain every currently-available source commit in one or more micro-batches,
+    # then stop. This is the supported serverless streaming trigger (processingTime is rejected) and
+    # fits the DAB job model - each job RUN exports the new data since the last run and terminates,
+    # rather than holding an always-on cluster. Schedule the job (or run on demand) to pick up new data.
+    query = (
+        stream_df.writeStream
+        .option("checkpointLocation", checkpoint_location)
+        .trigger(availableNow=True)
+        .foreachBatch(foreach_batch)
+        .start()
     )
-else:
-    # Unreachable: require_pipeline_mode already allow-list validated PIPELINE_MODE above. Kept as a
-    # fail-closed backstop so a future mode added to the allow-list without a branch here cannot
-    # silently do nothing.
-    raise ValueError(f"unhandled pipeline_mode {PIPELINE_MODE!r}")
+    query.awaitTermination()
+
+    # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
+    # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
+    # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
+    # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that was
+    # retried within this run is counted once, not summed twice - then total. A run with no new source
+    # data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid outcome, not a
+    # failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch that did not fully
+    # succeed failed the run instead of recording, and a TERMINATED-SUCCESS total is exact.
+    from pyspark.sql import functions as _F  # noqa: E402
+
+    def _metrics_dir_missing():
+        # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
+        # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
+        # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
+        # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
+        # run that already pushed rows is exactly the fail-open bug this must avoid.
+        try:
+            dbutils.fs.ls(metrics_dir)
+            return False  # path exists
+        except Exception as _e:
+            # Verified on this runtime: a missing path raises ExecutionError wrapping
+            # CloudFileNotFoundException with text "No such file or directory". Match the not-found
+            # signal explicitly; re-raise everything else.
+            _msg = str(_e)
+            if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
+                return True  # positively not-found: no batches wrote metrics
+            raise  # anything else is a real failure - do not swallow it
+
+    if _metrics_dir_missing():
+        # No metric files => the stream drained zero micro-batches (no new source data since the last
+        # run). A valid outcome, reported as 0, not a failure.
+        num_batches, rows_pushed = 0, 0
+    else:
+        # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the run
+        # rather than being silently reported as 0.
+        _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
+        _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
+        num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
+    RUN_SUMMARY = (
+        f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
+        f"checkpoint={checkpoint_location}"
+    )
+    if rows_pushed == 0:
+        print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
+    print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
+
+# COMMAND ----------
+# Fail-closed backstop: every supported mode's cell above sets RUN_SUMMARY. If it is still None, the
+# effective PIPELINE_MODE passed allow-list validation but no export cell handled it (e.g. a new mode
+# added to the allow-list without a corresponding cell). Raise rather than exit on an empty summary.
+if RUN_SUMMARY is None:
+    raise ValueError(f"no export ran for pipeline_mode {PIPELINE_MODE!r} (allow-listed but unhandled)")
 
 # COMMAND ----------
 # dbutils.notebook.exit() must be the ONLY statement in its cell: its return value becomes the cell's
-# rendered output, visually replacing any print() output from the same cell. Keeping it separate
-# leaves the prints above visible in their own completed cells.
+# rendered output, visually replacing any print() output from the same cell. Keeping it separate leaves
+# the prints above visible in their own completed cells.
 dbutils.notebook.exit(
     f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; pipeline_mode={PIPELINE_MODE}; "
     f"view={VIEW_FQN}; {RUN_SUMMARY}"

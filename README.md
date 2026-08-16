@@ -87,11 +87,14 @@ or `DATABRICKS_HOST`. The bundle variables are:
 | `es_host_url` | the Elasticsearch endpoint every index job writes to, e.g. `https://<host>:9200` |
 | `secret_scope_name` | the Databricks [secret scope](https://docs.databricks.com/security/secrets/) holding the ES **api_key** |
 | `secret_key_name` | the key within that scope whose value is the ES **api_key** the connector authenticates with |
+| `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Required for a streaming run (fails closed if empty); unused by batch and `deploy_views` |
 
 `es_host_url`, `secret_scope_name`, and `secret_key_name` are the global ES connection settings,
 shared by every index job (the auth secret is an api_key, not a username/password). Like
 `wheel_path`, they default to empty and are baked in at deploy; an index job run with any of them
-empty fails closed, and `deploy_views` doesn't need them.
+empty fails closed, and `deploy_views` doesn't need them. `checkpoint_base_path` is the same shape
+(global, deploy-time, empty default) but only a **streaming** run requires it; it must be a UC Volume
+path (serverless streaming checkpoints can't live on `dbfs:/tmp`).
 
 Everything else is per-pipeline and lives in `pipeline_definitions/<config_name>.yml`. Each object is fully
 qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
@@ -137,17 +140,21 @@ so a typo fails the deploy rather than surfacing later at export time.
 Two different mechanisms carry values into a job, and they resolve at different times:
 
 - **Bundle variables** (`environment`, `wheel_path`, `es_host_url`, `secret_scope_name`,
-  `secret_key_name`) are `--var` values resolved into the job at **deploy** time. A `--var` on
-  `bundle run` is ignored: only what was set at the last `bundle deploy` applies. They default to
-  empty, so a deploy without them still succeeds and `deploy_views` runs fine (it needs no
-  connector or ES); an index job needs a real `wheel_path` and the three ES connection settings, and
-  one deployed with any of them empty fails closed.
+  `secret_key_name`, `checkpoint_base_path`) are `--var` values resolved into the job at **deploy**
+  time. A `--var` on `bundle run` is ignored: only what was set at the last `bundle deploy` applies.
+  They default to empty, so a deploy without them still succeeds and `deploy_views` runs fine (it
+  needs no connector or ES); an index job needs a real `wheel_path` and the three ES connection
+  settings, a streaming run also needs `checkpoint_base_path`, and one deployed with a required one
+  empty fails closed.
 - **Job parameters** are `--params` values applied at **run** time, overridable per run without
   redeploying (an invalid value fails the run closed):
   - `pipeline_mode` (`batch` | `streaming`) and `filter_condition` (a Spark SQL predicate) default
     to their config values.
   - `chunk_size`, `require_existing_index`, `verify_certs` tune the connector's write; leave a knob
     unset to use the connector's own default.
+  - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
+    first run: `new` streams only commits after the stream starts (batch mode owns the history);
+    `full` backfills the whole existing table first. See [Streaming](#streaming).
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from pipeline_definitions/*.yml
@@ -156,7 +163,8 @@ WHEEL="/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py
 databricks bundle deploy -t dev -p <profile> \
   --var="environment=<env>" --var="wheel_path=$WHEEL" \
   --var="es_host_url=https://<host>:9200" \
-  --var="secret_scope_name=<scope>" --var="secret_key_name=<key>"
+  --var="secret_scope_name=<scope>" --var="secret_key_name=<key>" \
+  --var="checkpoint_base_path=/Volumes/<catalog>/<schema>/<volume>/checkpoints"
 
 databricks bundle run deploy_views                 -t dev -p <profile>
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile>
@@ -164,10 +172,48 @@ databricks bundle run index_pipeline_<config_name> -t dev -p <profile>
 # override run-time settings for a single run (each defaults to its config/connector value otherwise):
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
   --params filter_condition="action = 'allowed'",chunk_size=1000
+
+# stream a one-off full backfill of the whole table (default is new-commits-only):
+databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
+  --params pipeline_mode=streaming,streaming_start=full
 ```
 
 (Bundle variables come from the last `deploy`, so they are not repeated on `run`. Set real defaults
 in your fork's `databricks.yml` to avoid passing them each deploy.)
+
+## Streaming
+
+A `pipeline_mode=streaming` run reads the **raw source table** as a Delta stream
+(`Trigger.availableNow`: it drains all currently-available new commits, then stops, so each job run
+exports what's arrived since the last run), applies the view's own transform to each micro-batch, and
+bulk-writes it. Schedule the job (or run it on demand) to keep an index current.
+
+Key behaviors:
+
+- **The view logic runs over each micro-batch, not by reading the deployed view.** The framework
+  takes the view's `SELECT` and runs it with the micro-batch bound in place of the source table, so
+  the exact same projection/joins/hints the view defines apply, but only to batch-sized data (never a
+  join back to the full view). Reference (join) tables are read as their real tables.
+- **Row-wise views only (streaming).** Because the view runs per micro-batch, streaming supports only
+  **row-wise** views: projection, filters, scalar expressions, and 1:1 reference joins, where each
+  output row depends on a single source row. A view that aggregates **across** source rows (`GROUP
+  BY`, `DISTINCT`, window/`OVER`, `PIVOT`) would be computed per batch, not over the whole stream, so
+  its streamed results would silently differ from batch mode. This is a limitation of streaming mode;
+  use `batch` mode for aggregating views.
+- **Append-only assumption.** The stream uses `skipChangeCommits`, so a non-append commit (a manual
+  `UPDATE`/`DELETE`/`MERGE` on the source) is skipped rather than failing the stream. If you make such
+  a change and need it reflected in the index, re-send the affected records with a `batch` run.
+- **Where the stream starts (`streaming_start`).** Default `new` starts at the source's current
+  Delta version, so existing history is not re-exported and later runs pick up only new commits;
+  `full` backfills the whole existing table on the first run. This choice is honored **only on the
+  first run**, before a checkpoint exists: once a stream has a checkpoint, that checkpoint is the
+  position of record and `streaming_start` is ignored. (The start version is inclusive, so if the
+  source's current commit is itself an append, that one commit's rows are re-sent on the first `new`
+  run; deterministic `_id`s make this a harmless idempotent upsert bounded to a single commit.)
+- **Checkpoints.** Each stream keeps its checkpoint at `<checkpoint_base_path>/<config_name>`. If an
+  index is reset and you want to resend its records from the Delta table, clear that stream's
+  checkpoint first, otherwise the stream considers those records already exported and writes nothing.
+  Deterministic document `_id`s make a re-send an idempotent upsert, not a duplicate.
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
@@ -195,8 +241,8 @@ Shared notebooks (run by the jobs, not edited per pipeline):
                                 environment), then runs CREATE OR REPLACE
     run_index_pipeline.py       Run by every per-index job: installs the connector wheel (verifying
                                 the import), loads its config by name, resolves the environment, and
-                                exports the view to Elasticsearch via the connector's bulk_write
-                                (batch mode; streaming stubbed until a later phase)
+                                exports to Elasticsearch via the connector - batch (bulk_write over the
+                                deployed view) or streaming (view SELECT over each source micro-batch)
 
 Shared library + tests (the config schema, used by the generator and both notebooks):
   pipeline_lib/
