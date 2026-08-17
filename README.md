@@ -106,6 +106,9 @@ es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
 pipeline_mode: batch              # default export mode: batch | streaming (required; can override per run)
 filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL); omit for no filter
+chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
+require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
+verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
 view:                             # the view this pipeline uses
   catalog: acme_${environment}
   schema: es_poc
@@ -148,10 +151,11 @@ Two different mechanisms carry values into a job, and they resolve at different 
   empty fails closed.
 - **Job parameters** are `--params` values applied at **run** time, overridable per run without
   redeploying (an invalid value fails the run closed):
-  - `pipeline_mode` (`batch` | `streaming`) and `filter_condition` (a Spark SQL predicate) default
-    to their config values.
-  - `chunk_size`, `require_existing_index`, `verify_certs` tune the connector's write; leave a knob
-    unset to use the connector's own default.
+  - `pipeline_mode` (`batch` | `streaming`), `filter_condition` (a Spark SQL predicate), and the
+    connector-write tuning knobs `chunk_size`, `require_existing_index`, `verify_certs` all default to
+    their config values (each is an optional config key; see [Configuration](#configuration)).
+  - For the tuning knobs, a config that omits a knob (and a run that doesn't override it) leaves the
+    connector's own default in force.
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).

@@ -28,7 +28,8 @@
 # MAGIC Run-time parameters (job parameters; overridable per run with `--params <name>=<value>`):
 # MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config).
 # MAGIC - `filter_condition`: optional Spark SQL predicate applied before the write (default from config).
-# MAGIC - `chunk_size`, `require_existing_index`, `verify_certs`: EsWriteConfig tuning; empty => connector default.
+# MAGIC - `chunk_size`, `require_existing_index`, `verify_certs`: EsWriteConfig tuning (default from config;
+# MAGIC   omitted there and unset per run => connector default).
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
 # MAGIC   streaming only, honored on the first run before a checkpoint exists.
 

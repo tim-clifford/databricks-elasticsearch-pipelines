@@ -8,6 +8,9 @@ es_index_name: ecs-dns-activity   # target Elasticsearch index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
 pipeline_mode: batch              # default export mode: batch | streaming (override per run with --params)
 # filter_condition: "action = 'allowed'"   # OPTIONAL default row filter (Spark SQL); override per run
+# chunk_size: 1000                # OPTIONAL EsWriteConfig tuning: docs per bulk request (override per run)
+# require_existing_index: true    # OPTIONAL EsWriteConfig tuning: require the ES index to exist first
+# verify_certs: true              # OPTIONAL EsWriteConfig tuning: verify the ES TLS certificate
 
 view:                             # the view this pipeline creates and exports
   catalog: tim_clifford_classic_dsl_lite_${environment}

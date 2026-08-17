@@ -12,6 +12,11 @@ Schema (see pipeline_definitions/*.yml for a commented example):
                                          #   so it is overridable per run with --params pipeline_mode=...
     filter_condition: <sql predicate>    # OPTIONAL default row filter (a Spark SQL boolean expr);
                                          #   also a job parameter, overridable per run. Empty => no filter.
+    chunk_size: <positive int>           # OPTIONAL EsWriteConfig tuning: docs per bulk request.
+    require_existing_index: true | false # OPTIONAL EsWriteConfig tuning: require the index to exist.
+    verify_certs: true | false           # OPTIONAL EsWriteConfig tuning: verify the ES TLS certificate.
+                                         #   All three: config DEFAULT, also a job parameter overridable
+                                         #   per run. Omitted => the connector's own default stands.
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -148,42 +153,86 @@ def require_filter_condition(value: object, where: str = "filter_condition") -> 
     return value
 
 
+# The EsWriteConfig tuning knobs (chunk_size, require_existing_index, verify_certs) follow the SAME
+# pattern as filter_condition: an OPTIONAL config key that sets the per-index DEFAULT, AND a run-time
+# job parameter overridable per run. Each validator below accepts EITHER the YAML-native value (the
+# config default: a YAML int/bool) OR a string (the run-time job-parameter widget value), and returns
+# the CANONICAL STRING form - "" meaning "unset, leave the connector's own default alone". A string is
+# the canonical form because a job-parameter default must be a string; the string is converted back to
+# the typed value (int/bool) only at the point it is splatted into EsWriteConfig, in
+# write_config_overrides. Validating once, here, means config-load and run-time override apply exactly
+# the same fail-closed rule (single source of truth), never two subtly different parses.
+
+
+def require_chunk_size(value: object, where: str = "chunk_size") -> str:
+    """OPTIONAL EsWriteConfig chunk_size (docs per bulk request): a positive integer, or "" for unset.
+
+    Accepts a YAML int (config default) or a string (run-time override) and returns the canonical
+    string form ("" when unset). A float, non-numeric string, zero/negative, or bool is rejected
+    (fail closed): bool is an int subclass, so a YAML true/false must be refused explicitly rather
+    than silently read as 1/0."""
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        raise PipelineConfigError(f"{where} must be a positive integer, got {value!r}")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)  # rejects "12.5"/"1e3"/"abc" (no silent float truncation)
+        except ValueError:
+            raise PipelineConfigError(f"{where} must be a positive integer, got {value!r}")
+    else:
+        raise PipelineConfigError(f"{where} must be a positive integer, got {value!r}")
+    if parsed <= 0:
+        raise PipelineConfigError(f"{where} must be a positive integer, got {value!r}")
+    return str(parsed)
+
+
+def require_es_flag(value: object, where: str) -> str:
+    """OPTIONAL EsWriteConfig boolean knob (require_existing_index / verify_certs): the canonical
+    string "true"/"false", or "" for unset.
+
+    Accepts a YAML bool (config default) or a case-insensitive 'true'/'false' string (run-time
+    override). Anything else is rejected via an allow-list rather than falling to Python truthiness
+    (bool('false') is True), the exact trap a bool-ish knob must avoid. bool is checked BEFORE any
+    other type since it is an int subclass."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return ""
+        lowered = value.lower()
+        if lowered in ("true", "false"):
+            return lowered
+    raise PipelineConfigError(f"{where} must be 'true' or 'false', got {value!r}")
+
+
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object) -> dict:
-    """Parse the run-time EsWriteConfig tuning job-parameters into a kwargs dict, fail closed.
+    """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
-    Each is a job parameter whose empty value means "leave the connector default alone", so an unset
-    knob is simply omitted from the returned dict (never coerced to a value that overrides the
-    connector's own default). A SET value is parsed and validated here so a bad --params override
-    (e.g. chunk_size=abc, verify_certs=maybe) fails closed BEFORE any write, rather than raising deep
-    in EsWriteConfig or, worse, being silently misread. The result splats into EsWriteConfig(**...).
-
-    - chunk_size: a positive integer (docs per bulk request). Zero/negative/non-integer rejected.
-    - require_existing_index / verify_certs: booleans via an allow-list of the exact strings
-      'true'/'false' (case-insensitive). Anything else is rejected rather than falling to a truthy/
-      falsy guess (e.g. bool('false') is True), which is exactly the trap a bool-ish knob must avoid.
-    """
+    Called by the runner on the effective (config-default or --params override) widget values. Each
+    knob's empty/unset value means "leave the connector default alone", so it is simply omitted from
+    the returned dict (never coerced to a value that overrides the connector's own default). Validation
+    is delegated to the shared require_chunk_size / require_es_flag helpers (the same ones the config
+    schema uses), so a bad value (chunk_size=abc, verify_certs=maybe) fails closed BEFORE any write.
+    The set knobs are converted from their canonical string form to the typed value EsWriteConfig
+    expects (int / bool) and splatted into EsWriteConfig(**...)."""
     overrides: dict = {}
 
-    if isinstance(chunk_size, str):
-        chunk_size = chunk_size.strip()
-    if chunk_size not in (None, ""):
-        try:
-            parsed = int(chunk_size)
-        except (TypeError, ValueError):
-            raise PipelineConfigError(f"chunk_size must be a positive integer, got {chunk_size!r}")
-        if parsed <= 0:
-            raise PipelineConfigError(f"chunk_size must be a positive integer, got {chunk_size!r}")
-        overrides["chunk_size"] = parsed
+    canonical_chunk_size = require_chunk_size(chunk_size)
+    if canonical_chunk_size:
+        overrides["chunk_size"] = int(canonical_chunk_size)
 
     for name, value in (("require_existing_index", require_existing_index), ("verify_certs", verify_certs)):
-        if isinstance(value, str):
-            value = value.strip()
-        if value in (None, ""):
-            continue
-        lowered = value.lower() if isinstance(value, str) else value
-        if lowered not in ("true", "false"):
-            raise PipelineConfigError(f"{name} must be 'true' or 'false', got {value!r}")
-        overrides[name] = lowered == "true"
+        flag = require_es_flag(value, name)
+        if flag:
+            overrides[name] = flag == "true"
 
     return overrides
 
@@ -245,7 +294,11 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if not isinstance(raw, dict):
         raise PipelineConfigError(f"{source}: expected a YAML mapping, got {type(raw).__name__}")
 
-    allowed_top = {"es_index_name", "es_id_field", "pipeline_mode", "filter_condition", "view", "source", "reference_tables"}
+    allowed_top = {
+        "es_index_name", "es_id_field", "pipeline_mode", "filter_condition",
+        "chunk_size", "require_existing_index", "verify_certs",
+        "view", "source", "reference_tables",
+    }
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
@@ -260,6 +313,12 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # filter_condition is OPTIONAL: absent -> "" (no filter). It is a SQL predicate, not an object
     # name, so it is not an identifier and carries no ${environment} token.
     filter_condition = require_filter_condition(raw.get("filter_condition", ""), f"{source}: filter_condition")
+    # The three EsWriteConfig tuning knobs are OPTIONAL: absent -> "" (leave the connector default). Each
+    # is stored in its CANONICAL STRING form (the require_* helpers accept the YAML-native int/bool and
+    # return a string), because it becomes a string-valued job-parameter default in job_parameters.
+    chunk_size = require_chunk_size(raw.get("chunk_size", ""), f"{source}: chunk_size")
+    require_existing_index = require_es_flag(raw.get("require_existing_index", ""), f"{source}: require_existing_index")
+    verify_certs = require_es_flag(raw.get("verify_certs", ""), f"{source}: verify_certs")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
     # source carries primary_key in addition to catalog/schema/table: it is a column of the SOURCE
     # table (unique-row identity for the streaming read), so it lives with the source, not at top level.
@@ -275,6 +334,9 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "es_id_field": es_id_field,
         "pipeline_mode": pipeline_mode,
         "filter_condition": filter_condition,
+        "chunk_size": chunk_size,
+        "require_existing_index": require_existing_index,
+        "verify_certs": verify_certs,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
@@ -353,6 +415,11 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # filter_condition is a SQL predicate, not an object name: passed through verbatim (no
         # ${environment} folding), like pipeline_mode.
         "filter_condition": cfg["filter_condition"],
+        # The EsWriteConfig tuning knobs are connector settings, not object names: passed through
+        # verbatim (canonical string form), like filter_condition.
+        "chunk_size": cfg["chunk_size"],
+        "require_existing_index": cfg["require_existing_index"],
+        "verify_certs": cfg["verify_certs"],
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
@@ -513,9 +580,11 @@ def job_parameters(cfg: dict) -> list:
       for one run without redeploying.
     - filter_condition: DEFAULT from the config ("" if the config omits it); an optional row filter
       applied before the write, overridable per run.
-    - chunk_size / require_existing_index / verify_certs: EsWriteConfig tuning knobs. Default ""
-      (meaning "use the connector's own default"); set per run to override. Parsed + validated by
-      write_config_overrides at run time (an unset one leaves the connector default untouched).
+    - chunk_size / require_existing_index / verify_certs: EsWriteConfig tuning knobs. DEFAULT from the
+      config ("" if the config omits it, meaning "use the connector's own default"); overridable per
+      run. The config stores each in canonical string form (see validate_config), which is exactly the
+      string a job-parameter default must be. Parsed + validated by write_config_overrides at run time
+      (an unset one leaves the connector default untouched).
     - streaming_start: new|full, DEFAULT "new" (start the stream at the source's current version, so
       only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
       run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
@@ -526,8 +595,8 @@ def job_parameters(cfg: dict) -> list:
     return [
         {"name": "pipeline_mode", "default": cfg["pipeline_mode"]},
         {"name": "filter_condition", "default": cfg["filter_condition"]},
-        {"name": "chunk_size", "default": ""},
-        {"name": "require_existing_index", "default": ""},
-        {"name": "verify_certs", "default": ""},
+        {"name": "chunk_size", "default": cfg["chunk_size"]},
+        {"name": "require_existing_index", "default": cfg["require_existing_index"]},
+        {"name": "verify_certs", "default": cfg["verify_certs"]},
         {"name": "streaming_start", "default": "new"},
     ]
