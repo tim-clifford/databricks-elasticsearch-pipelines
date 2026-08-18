@@ -3,7 +3,7 @@
 # MAGIC # databricks-elasticsearch-pipelines: per-index pipeline runner
 # MAGIC
 # MAGIC The shared notebook run by every per-index job. It installs the connector wheel (verifying the
-# MAGIC import), loads `pipeline_definitions/<config_name>.yml`, resolves `${environment}` into the object
+# MAGIC import), loads `_pipelines/pipeline_configs/<config_name>.yml`, resolves `${environment}` into the object
 # MAGIC names, and exports the config's view to Elasticsearch via the connector's `bulk_write`.
 # MAGIC
 # MAGIC Both modes are implemented. `pipeline_mode=batch` reads the whole deployed view, optionally
@@ -17,7 +17,7 @@
 # MAGIC resolved catalog/schema names into the job. The notebook resolves them at runtime instead.
 # MAGIC
 # MAGIC Deploy-time parameters (base_parameters; from bundle variables, fixed at deploy):
-# MAGIC - `config_name`: the pipeline definition to load (`pipeline_definitions/<config_name>.yml`).
+# MAGIC - `config_name`: the pipeline definition to load (`_pipelines/pipeline_configs/<config_name>.yml`).
 # MAGIC - `environment`: folded into any `${environment}` in the config's object names (may be empty).
 # MAGIC - `wheel_path`: UC Volume path to the connector `.whl` to install (required).
 # MAGIC - `es_host_url`, `secret_scope_name`, `secret_key_name`: the ES endpoint, and the Databricks
@@ -93,7 +93,7 @@ from databricks_es_connector import EsWriteConfig, bulk_write, reconcile_or_rais
 # overridable per run with `--params <name>=<value>`. We read the EFFECTIVE value here (default or
 # override) and validate below, so the widget, not the config value, is the source of truth at run
 # time. Empty defaults fail closed at validation rather than silently assuming a value.
-dbutils.widgets.text("config_name", "", "Pipeline definition name (pipeline_definitions/<config_name>.yml)")
+dbutils.widgets.text("config_name", "", "Pipeline definition name (_pipelines/pipeline_configs/<config_name>.yml)")
 dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
 dbutils.widgets.text("es_host_url", "", "Elasticsearch endpoint, e.g. https://<host>:9200")
 dbutils.widgets.text("secret_scope_name", "", "Databricks secret scope holding the ES api_key")
@@ -124,7 +124,7 @@ if not CONFIG_NAME:
 
 # COMMAND ----------
 # Resolve the synced bundle root and make pipeline_lib importable. This notebook is synced to
-# <bundle files>/notebooks/run_index_pipeline.py; pipeline_definitions/ is a sibling of notebooks/.
+# <bundle files>/notebooks/run_index_pipeline.py; the _pipelines/ tree is a sibling of notebooks/.
 import os
 import sys
 
@@ -182,7 +182,7 @@ if PIPELINE_MODE == "streaming" and not CHECKPOINT_BASE_PATH:
 # Resolve the config file, accepting either extension: gen_jobs.py and deploy_views.py both discover
 # .yml AND .yaml, so the runner must too, or a .yaml-defined pipeline would deploy fine and then fail
 # here at runtime. Fail closed if neither exists.
-CONFIG_DIR = os.path.join(FILES_ROOT, "pipeline_definitions")
+CONFIG_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_configs")
 config_path = next(
     (p for ext in (".yml", ".yaml") if os.path.exists(p := os.path.join(CONFIG_DIR, f"{CONFIG_NAME}{ext}"))),
     None,
@@ -295,7 +295,7 @@ if PIPELINE_MODE == "streaming":
     # cannot contain ${environment}: config.py validates view.name with _require_identifier (a plain
     # identifier, token rejected at load), so resolve_config leaves it byte-for-byte unchanged. Thus
     # resolved == unresolved == filename for the view name, and deploy_views keys files the same way.
-    _view_file = os.path.join(FILES_ROOT, "views", f"{view['name']}.sql")
+    _view_file = os.path.join(FILES_ROOT, "_pipelines", "pipeline_views", f"{view['name']}.sql")
     with open(_view_file) as _fh:
         _view_sql = _fh.read()
     # The per-batch temp view name is substituted UNQUOTED into the rendered SELECT's FROM (via

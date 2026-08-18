@@ -1,5 +1,5 @@
 # Pipeline definition for one Elasticsearch index. One file here => one deployed job (see
-# scripts/gen_jobs.py) and one view (see views/<view.name>.sql, deployed by the deploy_views job).
+# scripts/gen_jobs.py) and one view (see _pipelines/pipeline_views/<view.name>.sql, deployed by the deploy_views job).
 #
 # Any catalog/schema/table/name may embed ${environment}, folded in at deploy time from the
 # `environment` bundle variable (e.g. ocsf_${environment} -> ocsf_prod). A value with no token is

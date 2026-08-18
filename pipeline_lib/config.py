@@ -1,10 +1,10 @@
 """Load, validate, and derive substitutions from a pipeline definition config.
 
-One pipeline_definitions/<name>.yml describes one Elasticsearch index's pipeline. This module is the
-single source of truth for that schema: both the offline job generator (scripts/gen_jobs.py) and the
-on-cluster notebooks (deploy_views.py, run_index_pipeline.py) import it, so validation can never drift.
+One _pipelines/pipeline_configs/<name>.yml describes one Elasticsearch index's pipeline. This module is
+the single source of truth for that schema: both the offline job generator (scripts/gen_jobs.py) and
+the on-cluster notebooks (deploy_views.py, run_index_pipeline.py) import it, so validation can never drift.
 
-Schema (see pipeline_definitions/*.yml for a commented example):
+Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
 
     es_index_name: <es index>            # ES index name (hyphens allowed; NOT a SQL identifier)
     es_id_field:   <column>              # view output column passed to the connector as the ES _id

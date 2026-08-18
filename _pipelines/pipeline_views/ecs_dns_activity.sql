@@ -10,7 +10,7 @@
 --   view                           the fully-qualified view to create (catalog.schema.name)
 --   source                         the fully-qualified source table (catalog.schema.table)
 --   ref_<alias>                    a reference table, aliased, e.g. `catalog.schema.table alias`
--- The ref_<alias> name matches the reference_tables key in pipeline_definitions/ecs_dns_activity.yml.
+-- The ref_<alias> name matches the reference_tables key in _pipelines/pipeline_configs/ecs_dns_activity.yml.
 -- Join tuning (a /*+ BROADCAST(alias) */ hint, etc.) is written directly here by the view author,
 -- like the rest of the join.
 --
