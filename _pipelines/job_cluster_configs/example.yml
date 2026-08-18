@@ -1,0 +1,25 @@
+# EXAMPLE reusable job-cluster spec. Copy this file to <your_key>.yml, edit the fields for your
+# workspace, then point a pipeline at it from its config:
+#
+#   # _pipelines/pipeline_configs/<name>.yml
+#   compute:
+#     type: job_cluster
+#     job_cluster_config: <your_key>     # this file's name without the .yml extension
+#
+# The file's contents are a Databricks `new_cluster` spec, passed through verbatim into the generated
+# job's job_clusters block (scripts/gen_jobs.py inlines it). Any valid new_cluster field is allowed;
+# `databricks bundle validate` checks the actual field values at deploy. Defining it once here means
+# several pipelines can share the same spec by key instead of repeating it. (Each job run still spins
+# up its own ephemeral job cluster from this spec; for a genuinely shared always-on cluster, use
+# `type: existing_cluster` with an existing_cluster_id instead.)
+#
+# This example is not referenced by any pipeline; it exists only to document the format.
+spark_version: "15.4.x-scala2.12"
+node_type_id: "m5d.large"
+num_workers: 2
+# Autoscale instead of a fixed worker count:
+# autoscale:
+#   min_workers: 2
+#   max_workers: 8
+# spark_conf:
+#   spark.databricks.delta.preview.enabled: "true"

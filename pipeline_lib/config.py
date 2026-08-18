@@ -75,6 +75,21 @@ _ES_INDEX_MAX_BYTES = 255
 # never silently defaulted.
 _VALID_PIPELINE_MODES = ("batch", "streaming")
 
+# Compute options for a per-index job: WHERE its notebook task runs. Allow-list, fail closed: an
+# unrecognized type is rejected, never silently treated as serverless.
+# - serverless (DEFAULT, also when `compute` is omitted): no cluster block => serverless notebook task.
+# - existing_cluster: attach to an existing all-purpose/interactive cluster by id.
+# - job_cluster: run on a job cluster whose new_cluster spec is defined once under
+#   _pipelines/job_cluster_configs/<key>.yml and referenced here by that key (the generator inlines it).
+# Only the generator (scripts/gen_jobs.py) acts on compute (it wires the job's cluster); the on-cluster
+# notebooks ignore it, since compute affects WHERE a job runs, not what it does.
+_VALID_COMPUTE_TYPES = ("serverless", "existing_cluster", "job_cluster")
+
+# A job_cluster_config reference is a filename stem under _pipelines/job_cluster_configs/, so restrict
+# it to safe filename characters (no dots or slashes) - this also blocks path traversal when the
+# generator resolves the key to a file.
+_VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
 # Streaming start positions (a run-time job parameter, streaming mode only). Allow-list, fail closed.
 # - "new"  (DEFAULT): the stream starts at the source table's CURRENT version (readStream
 #   startingVersion=latest), so nothing already in the table is exported; only commits after the
@@ -297,7 +312,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     allowed_top = {
         "es_index_name", "es_id_field", "pipeline_mode", "filter_condition",
         "chunk_size", "require_existing_index", "verify_certs",
-        "view", "source", "reference_tables",
+        "view", "source", "reference_tables", "compute",
     }
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
@@ -328,6 +343,9 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         extra_identifiers=("primary_key",),
     )
     reference_tables = _validate_reference_tables(raw.get("reference_tables"), source)
+    # compute is OPTIONAL: absent -> serverless (the default). It says WHERE the job runs; carries no
+    # object names or ${environment} tokens, so it is validated here and passed through resolve unchanged.
+    compute = _validate_compute(raw.get("compute"), f"{source}: compute")
 
     return {
         "es_index_name": es_index_name,
@@ -340,6 +358,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
+        "compute": compute,
     }
 
 
@@ -391,6 +410,62 @@ def _validate_reference_tables(node: object, source: str) -> dict:
     return result
 
 
+def _validate_compute(node: object, where: str = "compute") -> dict:
+    """Validate the OPTIONAL per-index `compute` block; return a normalized dict. Fail closed.
+
+    Absent (node is None) => {"type": "serverless"}: the job runs as a serverless notebook task with no
+    cluster block, the framework default. Otherwise `type` is allow-listed and each type carries exactly
+    its own required key (unknown keys for that type are rejected, so a typo can't be silently ignored):
+      - serverless:       no other keys.
+      - existing_cluster: existing_cluster_id (non-empty string) - attach to an existing cluster by id.
+      - job_cluster:      job_cluster_config (a job_cluster_configs/<key> stem) - the generator inlines
+                          that reusable new_cluster spec into the job's job_clusters block.
+    """
+    if node is None:
+        return {"type": "serverless"}
+    if not isinstance(node, dict):
+        raise PipelineConfigError(f"{where} must be a mapping, got {type(node).__name__}")
+
+    ctype = node.get("type")
+    if ctype not in _VALID_COMPUTE_TYPES:
+        raise PipelineConfigError(
+            f"{where}.type must be one of {', '.join(_VALID_COMPUTE_TYPES)}, got {ctype!r}"
+        )
+
+    # Per-type allow-list of keys: reject anything else so a misplaced/typo'd key fails closed rather
+    # than being silently dropped (e.g. an existing_cluster_id under a job_cluster compute).
+    allowed = {
+        "serverless": {"type"},
+        "existing_cluster": {"type", "existing_cluster_id"},
+        "job_cluster": {"type", "job_cluster_config"},
+    }[ctype]
+    unknown = sorted(set(node) - allowed)
+    if unknown:
+        raise PipelineConfigError(
+            f"{where} has unknown key(s) for type '{ctype}': {', '.join(unknown)}; "
+            f"allowed: {', '.join(sorted(allowed))}"
+        )
+
+    result = {"type": ctype}
+    if ctype == "existing_cluster":
+        cid = node.get("existing_cluster_id")
+        if not isinstance(cid, str) or not cid.strip():
+            raise PipelineConfigError(
+                f"{where}.existing_cluster_id is required for type 'existing_cluster' and must be a "
+                f"non-empty string, got {cid!r}"
+            )
+        result["existing_cluster_id"] = cid.strip()
+    elif ctype == "job_cluster":
+        key = node.get("job_cluster_config")
+        if not isinstance(key, str) or not _VALID_JOB_CLUSTER_KEY.match(key):
+            raise PipelineConfigError(
+                f"{where}.job_cluster_config is required for type 'job_cluster' and must name a "
+                f"_pipelines/job_cluster_configs/ entry (letters, digits, '_', '-'), got {key!r}"
+            )
+        result["job_cluster_config"] = key
+    return result
+
+
 def resolve_config(cfg: dict, environment: str) -> dict:
     """Fold `environment` into every name template in a validated config, returning resolved names.
 
@@ -426,6 +501,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
             alias: obj(spec, "table", f"reference_tables.{alias}")
             for alias, spec in cfg["reference_tables"].items()
         },
+        # compute is a deploy-time job property (where the job runs), not an object name: passed
+        # through verbatim, like the connector tuning knobs.
+        "compute": cfg["compute"],
     }
 
 

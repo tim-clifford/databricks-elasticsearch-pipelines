@@ -1,0 +1,110 @@
+"""Offline unit tests for scripts/gen_jobs.py: the compute-aware job rendering and the reusable
+job-cluster spec loader. No cluster, no bundle: render to YAML text and assert the parsed structure.
+"""
+import os
+import sys
+
+import pytest
+import yaml
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
+
+import gen_jobs  # noqa: E402
+from pipeline_lib.config import validate_config  # noqa: E402
+
+
+def _cfg(compute=None):
+    """A minimal validated config, optionally with a compute block."""
+    raw = {
+        "es_index_name": "ecs-dns-activity",
+        "es_id_field": "dsl_id",
+        "pipeline_mode": "batch",
+        "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
+        "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity", "primary_key": "dsl_id"},
+    }
+    if compute is not None:
+        raw["compute"] = compute
+    return validate_config(raw)
+
+
+def _render_job(cfg, spec=None):
+    """Render and parse a job resource; return the single job dict under resources.jobs."""
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, spec)
+    assert text.startswith(gen_jobs._GENERATED_MARKER)  # header preserved
+    parsed = yaml.safe_load(text)
+    jobs = parsed["resources"]["jobs"]
+    assert list(jobs) == ["index_pipeline_ecs_dns_activity"]
+    return jobs["index_pipeline_ecs_dns_activity"]
+
+
+# --------------------------------------------------------------------------- render: serverless
+
+
+def test_render_serverless_has_no_cluster_block():
+    job = _render_job(_cfg())  # default serverless
+    task = job["tasks"][0]
+    assert "existing_cluster_id" not in task
+    assert "job_cluster_key" not in task
+    assert "job_clusters" not in job
+    assert "notebook_task" in task
+
+
+def test_render_all_jobs_max_concurrent_runs_1():
+    for compute, spec in (
+        (None, None),
+        ({"type": "existing_cluster", "existing_cluster_id": "0123-x"}, None),
+        ({"type": "job_cluster", "job_cluster_config": "std"}, {"spark_version": "15.4.x-scala2.12", "num_workers": 1}),
+    ):
+        assert _render_job(_cfg(compute), spec)["max_concurrent_runs"] == 1
+
+
+# --------------------------------------------------------------------------- render: existing_cluster
+
+
+def test_render_existing_cluster():
+    job = _render_job(_cfg({"type": "existing_cluster", "existing_cluster_id": "0123-456789-abcde"}))
+    task = job["tasks"][0]
+    assert task["existing_cluster_id"] == "0123-456789-abcde"
+    assert "job_clusters" not in job
+    assert "job_cluster_key" not in task
+    # the cluster ref precedes notebook_task in the task (deterministic key order)
+    assert list(task) == ["task_key", "existing_cluster_id", "notebook_task"]
+
+
+# --------------------------------------------------------------------------- render: job_cluster
+
+
+def test_render_job_cluster_inlines_spec():
+    spec = {"spark_version": "15.4.x-scala2.12", "node_type_id": "m5d.large", "num_workers": 2}
+    job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "standard_batch"}), spec)
+    assert job["job_clusters"] == [{"job_cluster_key": "standard_batch", "new_cluster": spec}]
+    task = job["tasks"][0]
+    assert task["job_cluster_key"] == "standard_batch"
+    assert "existing_cluster_id" not in task
+    # job_clusters is emitted before tasks (deterministic key order)
+    keys = list(job)
+    assert keys.index("job_clusters") < keys.index("tasks")
+
+
+def test_render_job_cluster_without_spec_fails_closed():
+    # A job_cluster compute with no loaded spec is a caller bug; render must raise, not emit a blank cluster.
+    with pytest.raises(ValueError, match="requires a loaded new_cluster spec"):
+        gen_jobs.render_job_yaml(
+            "x.yml", "x", _cfg({"type": "job_cluster", "job_cluster_config": "std"}), None
+        )
+
+
+# --------------------------------------------------------------------------- load_job_cluster_spec
+
+
+def test_load_job_cluster_spec_missing_fails_closed():
+    with pytest.raises(ValueError, match="not found"):
+        gen_jobs.load_job_cluster_spec("definitely_no_such_cluster_config_key")
+
+
+def test_example_job_cluster_spec_loads():
+    # The shipped example must be a valid non-empty mapping (documents the format + guards it).
+    spec = gen_jobs.load_job_cluster_spec("example")
+    assert isinstance(spec, dict) and spec
+    assert "spark_version" in spec

@@ -128,6 +128,9 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
     catalog: acme_${environment}
     schema: ocsf_validation_${environment}
     table: dns_activity
+# compute:                        # OPTIONAL: where this job runs. Omit for serverless (see Compute)
+#   type: existing_cluster
+#   existing_cluster_id: "0123-456789-abcde"
 ```
 
 A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token
@@ -140,6 +143,45 @@ is a column of the **source table**, used by the streaming read to identify a un
 share a value but need not, and neither defaults to the other. When `deploy_views` creates a view it
 verifies `es_id_field` is actually one of that view's output columns (against Spark's resolved schema),
 so a typo fails the deploy rather than surfacing later at export time.
+
+### Compute
+
+By default each index job runs as a **serverless** notebook task (no cluster block). Set an optional
+`compute` block per index to run it elsewhere; the choice is per index, so different pipelines can run
+on different compute. `type` is one of:
+
+| `type` | Extra key | Runs on |
+|---|---|---|
+| `serverless` (default; also when `compute` is omitted) | none | serverless notebook task |
+| `existing_cluster` | `existing_cluster_id` | an existing all-purpose/interactive cluster you give the id of |
+| `job_cluster` | `job_cluster_config` | a job cluster created per run from a reusable spec (see below) |
+
+```yaml
+# attach to an existing interactive cluster:
+compute:
+  type: existing_cluster
+  existing_cluster_id: "0123-456789-abcde"
+
+# or run on a job cluster defined once and referenced by key:
+compute:
+  type: job_cluster
+  job_cluster_config: standard_batch    # -> _pipelines/job_cluster_configs/standard_batch.yml
+```
+
+**Reusable job-cluster specs** live in `_pipelines/job_cluster_configs/<key>.yml`. Each file is a
+Databricks [`new_cluster`](https://docs.databricks.com/api/workspace/jobs/create) spec
+(`spark_version`, `node_type_id`, `num_workers` or `autoscale`, `spark_conf`, ...), defined once and
+referenced by its filename stem from any number of pipelines' `compute.job_cluster_config`. The
+generator inlines the spec into each referencing job's `job_clusters` block, so there's no copy-paste;
+`databricks bundle validate` checks the spec's own fields at deploy. See
+[`_pipelines/job_cluster_configs/example.yml`](_pipelines/job_cluster_configs/example.yml) for the
+format. (A job cluster is created fresh for each run and torn down after; for a single always-on
+cluster shared across jobs, use `existing_cluster` instead.) A `job_cluster_config` that names no
+existing file fails the generator, so a bad reference never deploys. `deploy_views` always runs
+serverless.
+
+The whole `compute` block is validated fail-closed: an unrecognized `type`, a missing required key,
+or a stray key for the chosen type is rejected at config load (and by `gen_jobs.py --check`).
 
 ## Deploy and run
 
