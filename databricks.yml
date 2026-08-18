@@ -82,6 +82,17 @@ variables:
     description: "PAUSED or UNPAUSED for all job schedules (default PAUSED = fail-safe). Only prd binds UNPAUSED so schedules fire there; dev and stg stay paused."
     default: "PAUSED"
 
+  # The SINGLE cluster policy applied to EVERY job cluster in this target. gen_jobs.py injects
+  # policy_id: ${var.cluster_policy_id} into each generated job_clusters.new_cluster, so all
+  # job_cluster-compute pipelines share the one policy for the environment they deploy to (serverless
+  # and existing_cluster pipelines have no new_cluster and are unaffected). Empty default because most
+  # pipelines run serverless and never reference it; a target that DOES use a job cluster must bind a
+  # real policy_id (an empty value is unsafe - some CLI versions render a literal policy_id: "" the Jobs
+  # API rejects). Bind it per target below (dev is wired to this workspace's Job Compute policy).
+  cluster_policy_id:
+    description: "Cluster policy id applied to every job cluster in this target (one policy per environment). Empty default; required for any pipeline that uses job_cluster compute."
+    default: ""
+
 # Three targets: dev, stg, prd. The workspace HOST is intentionally not hardcoded here: it is taken
 # from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var, so the bundle
 # carries no environment-specific URL and deploys to whatever workspace you point it at. The
@@ -100,9 +111,18 @@ targets:
   dev:
     default: true
     mode: development
+    variables:
+      # This workspace's built-in "Job Compute" cluster policy (cluster_type: job). Applied to the
+      # job-cluster example pipeline (ecs_dns_activity_jobcluster). A different workspace has different
+      # policy ids: replace this with the target workspace's job-cluster policy id.
+      cluster_policy_id: "00156D2098BE864B"
 
   stg:
     mode: production
+    variables:
+      # Bind stg's own job-cluster policy id here before deploying any job_cluster pipeline to stg
+      # (leave empty only if stg runs serverless/existing_cluster pipelines exclusively).
+      cluster_policy_id: ""
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}
 
@@ -110,5 +130,8 @@ targets:
     mode: production
     variables:
       schedule_pause_status: UNPAUSED
+      # Bind prd's own job-cluster policy id here before deploying any job_cluster pipeline to prd
+      # (leave empty only if prd runs serverless/existing_cluster pipelines exclusively).
+      cluster_policy_id: ""
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}

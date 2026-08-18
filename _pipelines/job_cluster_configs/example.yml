@@ -13,10 +13,26 @@
 # up its own ephemeral job cluster from this spec; for a genuinely shared always-on cluster, use
 # `type: existing_cluster` with an existing_cluster_id instead.)
 #
-# This example is not referenced by any pipeline; it exists only to document the format.
+# Two things NOT to put here:
+#   - policy_id: the generator injects policy_id: ${var.cluster_policy_id} into every job cluster, so
+#     the target's single cluster policy is applied at deploy. A policy_id written here is overridden.
+#   - environment-specific values: this spec is reused across environments; keep per-environment values
+#     (like the policy) in bundle variables, not in the spec.
+#
+# This example is not referenced by any pipeline; it exists only to document the format. For a
+# referenced, working spec see standard_batch.yml (used by the ecs_dns_activity_jobcluster pipeline).
 spark_version: "15.4.x-scala2.12"
 node_type_id: "m5d.large"
 num_workers: 2
+# REQUIRED for this framework: the runner installs the connector wheel from a UC Volume and reads UC
+# tables, so a job cluster needs a Unity-Catalog-enabled access mode or the %pip install fails (a
+# classic cluster with no access mode cannot see /Volumes). SINGLE_USER suits an ephemeral per-run job
+# cluster; use USER_ISOLATION for a shared cluster. Serverless pipelines get UC access implicitly.
+data_security_mode: SINGLE_USER
+# custom_tags are HARDCODED name/value pairs that ride the verbatim passthrough straight onto the
+# cluster (not templated, not environment-specific). Use them for cost/ownership tagging, e.g.:
+custom_tags:
+  project: elastic
 # Autoscale instead of a fixed worker count:
 # autoscale:
 #   min_workers: 2

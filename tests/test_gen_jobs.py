@@ -80,13 +80,44 @@ def test_render_existing_cluster():
 def test_render_job_cluster_inlines_spec():
     spec = {"spark_version": "15.4.x-scala2.12", "node_type_id": "m5d.large", "num_workers": 2}
     job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "standard_batch"}), spec)
-    assert job["job_clusters"] == [{"job_cluster_key": "standard_batch", "new_cluster": spec}]
+    # The spec is inlined verbatim, PLUS the injected per-environment policy_id bundle-variable ref and
+    # apply_policy_default_values (so the policy's own defaults fill omitted cluster attrs at deploy).
+    expected_new_cluster = {**spec, "policy_id": "${var.cluster_policy_id}", "apply_policy_default_values": True}
+    assert job["job_clusters"] == [{"job_cluster_key": "standard_batch", "new_cluster": expected_new_cluster}]
+    # The caller's loaded spec dict must NOT be mutated (render builds a copy); policy_id is not added to it.
+    assert "policy_id" not in spec
     task = job["tasks"][0]
     assert task["job_cluster_key"] == "standard_batch"
     assert "existing_cluster_id" not in task
     # job_clusters is emitted before tasks (deterministic key order)
     keys = list(job)
     assert keys.index("job_clusters") < keys.index("tasks")
+
+
+def test_render_job_cluster_injects_policy_id_var():
+    # Every job cluster gets policy_id bound to the cluster_policy_id bundle variable, so the target's
+    # single cluster policy is applied at deploy (not hardcoded per config).
+    spec = {"spark_version": "15.4.x-scala2.12", "num_workers": 1}
+    job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "std"}), spec)
+    nc = job["job_clusters"][0]["new_cluster"]
+    assert nc["policy_id"] == "${var.cluster_policy_id}"
+    # apply_policy_default_values lets the policy's own defaults fill attrs the spec omits.
+    assert nc["apply_policy_default_values"] is True
+
+
+def test_render_job_cluster_policy_var_overrides_spec_policy_id():
+    # The injected variable is authoritative: a policy_id in the spec file is overridden (policy is an
+    # environment property, bound per target, not part of the reusable spec).
+    spec = {"spark_version": "15.4.x-scala2.12", "num_workers": 1, "policy_id": "HARDCODED_SHOULD_LOSE"}
+    job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "std"}), spec)
+    assert job["job_clusters"][0]["new_cluster"]["policy_id"] == "${var.cluster_policy_id}"
+
+
+def test_render_job_cluster_passes_custom_tags_verbatim():
+    # Hardcoded custom_tags in the spec ride the verbatim passthrough onto the cluster, no special handling.
+    spec = {"spark_version": "15.4.x-scala2.12", "num_workers": 1, "custom_tags": {"project": "elastic"}}
+    job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "std"}), spec)
+    assert job["job_clusters"][0]["new_cluster"]["custom_tags"] == {"project": "elastic"}
 
 
 def test_render_job_cluster_without_spec_fails_closed():
@@ -139,3 +170,11 @@ def test_example_job_cluster_spec_loads():
     spec = gen_jobs.load_job_cluster_spec("example")
     assert isinstance(spec, dict) and spec
     assert "spark_version" in spec
+
+
+def test_standard_batch_spec_loads_with_tags_and_no_policy_id():
+    # The referenced spec (used by ecs_dns_activity_jobcluster) carries hardcoded custom_tags and must
+    # NOT hardcode a policy_id (the generator injects the per-environment cluster_policy_id variable).
+    spec = gen_jobs.load_job_cluster_spec("standard_batch")
+    assert spec.get("custom_tags") == {"project": "elastic"}
+    assert "policy_id" not in spec

@@ -104,7 +104,12 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     - job_cluster: the job gets a job_clusters entry (job_cluster_key + the inlined new_cluster spec,
       passed in as `job_cluster_spec`) and the task references it by job_cluster_key. `job_cluster_spec`
       is REQUIRED for a job_cluster compute (the caller loads it via load_job_cluster_spec) and unused
-      otherwise; a job_cluster compute without it is a caller bug and fails closed here.
+      otherwise; a job_cluster compute without it is a caller bug and fails closed here. The inlined
+      new_cluster also gets a policy_id bound to the cluster_policy_id bundle variable (plus
+      apply_policy_default_values: true so the policy's own defaults fill omitted attrs), so the target's
+      single cluster policy is applied to every job cluster at deploy (see the job_cluster block below).
+      Any custom_tags (and every other field) in the spec file pass through VERBATIM - the spec is
+      inlined as-is, so hardcoded tags like `project: elastic` land on the cluster with no special handling.
 
     Schedule (cfg["schedule"], per-index) decides WHEN the job runs: None => on-demand (no schedule
     block); otherwise a job `schedule` with the config's quartz_cron_expression, timezone_id UTC, and
@@ -181,8 +186,26 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
                 f"job_cluster compute for '{name}' requires a loaded new_cluster spec "
                 f"(job_cluster_config '{compute['job_cluster_config']}'); none was provided"
             )
+        # Apply the target's single cluster policy to every job cluster: inject policy_id bound to the
+        # cluster_policy_id bundle variable (one policy per environment, set at deploy). The variable is
+        # authoritative - it overrides any policy_id in the spec file - because the policy is an
+        # ENVIRONMENT property, not part of the reusable, environment-agnostic new_cluster spec. Also
+        # inject apply_policy_default_values: true so the policy's fixed AND default values fill any
+        # attribute the spec omits (e.g. aws_attributes the policy fixes/defaults) - this lets a spec
+        # stay minimal and conform to ANY target's policy without hand-copying that policy's values here
+        # (which would drift per environment). apply_policy_default_values only fills OMITTED fields, so a
+        # value the spec sets explicitly still wins. Built as a COPY (new dict) so the caller's loaded
+        # spec is not mutated; custom_tags and all other spec fields pass through verbatim. NOTE:
+        # cluster_policy_id defaults to empty; a target that uses a job cluster MUST bind it (an empty
+        # policy_id resolves to a literal "" that the Jobs API rejects at deploy - verified), so this
+        # feature requires the deployer to set the variable per target.
+        new_cluster = {
+            **job_cluster_spec,
+            "policy_id": "${var.cluster_policy_id}",
+            "apply_policy_default_values": True,
+        }
         job_def["job_clusters"] = [
-            {"job_cluster_key": compute["job_cluster_config"], "new_cluster": job_cluster_spec}
+            {"job_cluster_key": compute["job_cluster_config"], "new_cluster": new_cluster}
         ]
     job_def["tasks"] = [task]
     job_def["permissions"] = [{"level": "CAN_MANAGE_RUN", "group_name": "users"}]
