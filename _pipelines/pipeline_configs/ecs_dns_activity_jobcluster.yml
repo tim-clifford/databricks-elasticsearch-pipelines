@@ -1,0 +1,28 @@
+# Job-cluster example pipeline. Identical export to ecs_dns_activity, but this one runs on a JOB
+# CLUSTER (classic compute) instead of serverless, to demonstrate and prove out per-index compute
+# selection, the per-environment cluster policy, and hardcoded cluster tags. It reads the same source
+# table and writes to its own Elasticsearch index so it never collides with the serverless pipeline.
+#
+# See ecs_dns_activity.yml for the full field reference. ${environment} folding works the same here.
+es_index_name: ecs-dns-activity-jobcluster   # own ES index (separate from the serverless pipeline's)
+es_id_field: dsl_id                          # view output column used as the ES document _id
+pipeline_mode: batch                         # default export mode: batch | streaming
+
+view:                             # the view this pipeline creates and exports
+  catalog: tim_clifford_classic_dsl_lite_${environment}
+  schema: es_poc
+  name: ecs_dns_activity_jobcluster
+
+source:                           # the single source table the view reads from (same as the serverless pipeline)
+  catalog: tim_clifford_classic_dsl_lite_${environment}
+  schema: ocsf
+  table: dns_activity
+  primary_key: dsl_id             # source-table column identifying a unique row (for the streaming read)
+
+# Internal testing note (not a customer concern): a job cluster reaches ES over classic-compute egress,
+# which our internal test ES endpoint does not allow-list (it trusts only serverless egress). So there
+# this example deploys and the cluster boots, but the run cannot reach ES; serverless pipelines are
+# unaffected.
+compute:                          # run this job on a JOB CLUSTER (classic compute), not serverless
+  type: job_cluster
+  job_cluster_config: standard_batch   # -> _pipelines/job_cluster_configs/standard_batch.yml (new_cluster spec)

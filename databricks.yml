@@ -82,11 +82,25 @@ variables:
     description: "PAUSED or UNPAUSED for all job schedules (default PAUSED = fail-safe). Only prd binds UNPAUSED so schedules fire there; dev and stg stay paused."
     default: "PAUSED"
 
+  # Cluster policy id injected into EVERY generated job cluster: gen_jobs.py emits policy_id:
+  # ${var.cluster_policy_id} into each job_clusters.new_cluster, so all job_cluster-compute pipelines get
+  # the policy for the workspace they deploy to (serverless and existing_cluster pipelines have no
+  # new_cluster and are unaffected). A policy id is WORKSPACE-SPECIFIC (valid only in the workspace it was
+  # created in), so - exactly like wheel_path / es_host_url / checkpoint_base_path - it is NOT hardcoded
+  # per target here; supply it at deploy with --var=cluster_policy_id=<id>. Empty default so
+  # serverless-only deployments and variable-only commands resolve without it; an empty value with a
+  # job_cluster pipeline fails closed at deploy (policy_id "" is rejected by the Jobs API), so provide it
+  # whenever any pipeline uses job_cluster compute.
+  cluster_policy_id:
+    description: "Workspace-specific cluster policy id injected into every job cluster. Empty default; supply at deploy (--var=cluster_policy_id=<id>) whenever a pipeline uses job_cluster compute. Not hardcoded per target - policy ids are workspace-specific, like wheel_path."
+    default: ""
+
 # Three targets: dev, stg, prd. The workspace HOST is intentionally not hardcoded here: it is taken
 # from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var, so the bundle
 # carries no environment-specific URL and deploys to whatever workspace you point it at. The
 # `environment` variable (folded into ${environment} in config names) is likewise NOT bound per target;
-# pass it at deploy with --var=environment=<env> (empty default; see the variables block above).
+# pass it at deploy with --var=environment=<env> (empty default; see the variables block above). Same for
+# cluster_policy_id (workspace-specific): supply it at deploy, not per target, when using job clusters.
 #
 # dev vs stg/prd differ by DEPLOYMENT MODE, which is the DAB best practice:
 # - dev uses `mode: development`: it isolates per user (root_path defaults to the deploying user's

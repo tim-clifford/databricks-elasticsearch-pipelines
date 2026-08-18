@@ -183,6 +183,16 @@ cluster shared across jobs, use `existing_cluster` instead.) A `job_cluster_conf
 existing file fails the generator, so a bad reference never deploys. `deploy_views` always runs
 serverless.
 
+**Cluster policy and tags.** The generator injects `policy_id: ${var.cluster_policy_id}` (plus
+`apply_policy_default_values: true`) into every job cluster, so all job-cluster pipelines run under the
+target workspace's cluster policy. A policy id is workspace-specific, so it is not hardcoded in the
+bundle: supply it at deploy with `--var=cluster_policy_id=<id>`, the same way as `wheel_path` and the
+other workspace values. An empty value fails closed at deploy when a job-cluster pipeline is present
+(the Jobs API rejects `policy_id: ""`), so provide it whenever any pipeline uses `job_cluster` compute.
+Hardcoded `custom_tags` in a job-cluster spec pass straight through onto the cluster (e.g.
+`project: elastic`). Serverless and `existing_cluster` pipelines have no job cluster and are unaffected
+by either.
+
 The whole `compute` block is validated fail-closed: an unrecognized `type`, a missing required key,
 or a stray key for the chosen type is rejected at config load (and by `gen_jobs.py --check`).
 
@@ -248,7 +258,8 @@ databricks bundle deploy -t dev -p <profile> \
   --var="environment=<env>" --var="wheel_path=$WHEEL" \
   --var="es_host_url=https://<host>:9200" \
   --var="secret_scope_name=<scope>" --var="secret_key_name=<key>" \
-  --var="checkpoint_base_path=/Volumes/<catalog>/<schema>/<volume>/checkpoints"
+  --var="checkpoint_base_path=/Volumes/<catalog>/<schema>/<volume>/checkpoints" \
+  --var="cluster_policy_id=<id>"   # only needed if a pipeline uses job_cluster compute
 
 databricks bundle run deploy_views                 -t dev -p <profile>
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile>

@@ -1,0 +1,30 @@
+# Reusable job-cluster spec for the job-cluster example pipeline (ecs_dns_activity_jobcluster).
+#
+# The file's contents are a Databricks `new_cluster` spec, inlined VERBATIM into the generated job's
+# job_clusters block by scripts/gen_jobs.py. The generator additionally injects
+#   policy_id: ${var.cluster_policy_id}
+# so this cluster inherits the target's single cluster policy at deploy - do NOT put a policy_id here
+# (the environment binds it, and the injected value would override a hardcoded one anyway).
+#
+# custom_tags below are HARDCODED name/value pairs that sit in this spec and ride the verbatim
+# passthrough onto the cluster (they are not templated or environment-specific). Add/remove tags here.
+# DBR 17.2+ is required to read this source table: it uses the Delta reader feature
+# variantShredding-preview, which older runtimes (e.g. 15.4/16.4 LTS) reject with
+# DELTA_UNSUPPORTED_FEATURES_FOR_READ. Serverless tracks a recent engine so serverless pipelines are
+# unaffected; a classic job cluster must pin a new-enough runtime. 17.3 LTS is the newest LTS here.
+spark_version: "17.3.x-scala2.13"
+node_type_id: "i3.xlarge"       # allowed by this workspace's Job Compute policy (node_type_id: unlimited)
+num_workers: 1                  # small, cheap cluster for the example export
+# A Unity-Catalog-enabled access mode is REQUIRED: the runner installs the connector wheel from a UC
+# Volume (wheel_path) and reads UC tables, and a classic cluster with no access mode cannot see
+# /Volumes (the %pip install fails). DATA_SECURITY_MODE_STANDARD is the "Standard" (USER_ISOLATION)
+# access mode; SINGLE_USER ("Dedicated") is the other UC-enabled option. Serverless pipelines have UC
+# access implicitly, so serverless pipelines need none of this. Set here EXPLICITLY (not omitted)
+# because a policy that supplies no access mode would otherwise leave the cluster with no UC access.
+# CORNER CASE: if a target's cluster policy FIXES data_security_mode to a different value, this explicit
+# value conflicts and the deploy is rejected (apply_policy_default_values only fills omitted fields, it
+# does not reconcile a fixed rule) - set this to match the policy's fixed value then. No issue when the
+# policy leaves data_security_mode open or fixes it to this same value.
+data_security_mode: DATA_SECURITY_MODE_STANDARD
+custom_tags:
+  project: elastic              # example hardcoded tag applied to the job cluster
