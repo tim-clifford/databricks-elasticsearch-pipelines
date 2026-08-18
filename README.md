@@ -185,6 +185,12 @@ or a stray key for the chosen type is rejected at config load (and by `gen_jobs.
 
 ## Deploy and run
 
+The bundle defines three **targets**, selected with `-t`: `dev` (the default), `stg`, and `prd`.
+`dev` uses DAB `development` mode (deploys are isolated to the deploying user and schedules are
+paused); `stg` and `prd` use `production` mode with a shared, non-user deploy path. All three take the
+workspace host from your CLI profile (`-p <profile>`) or `DATABRICKS_HOST`, so the same target can
+point at any workspace, and none binds the `environment` variable (pass `--var=environment=<env>`).
+
 Two different mechanisms carry values into a job, and they resolve at different times:
 
 - **Bundle variables** (`environment`, `wheel_path`, `es_host_url`, `secret_scope_name`,
