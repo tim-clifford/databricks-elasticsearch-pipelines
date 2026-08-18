@@ -14,6 +14,12 @@
 
 bundle:
   name: databricks_elasticsearch_pipelines
+  # Deploy with the DIRECT engine (calls the Databricks REST APIs via the Go SDK) rather than the
+  # legacy Terraform engine. Set explicitly so the engine is deterministic regardless of the deploying
+  # CLI's default (new bundles default to direct on CLI v1.3.0+; older CLIs default to terraform). No
+  # Terraform provider download, faster deploys, richer `bundle plan`. State lives in resources.json
+  # (not terraform.tfstate). Requires a CLI new enough to support direct (v1.0.0+ has the engine).
+  engine: direct
 
 # Sync the whole repo so the job notebook (and everything it will grow to import) is available
 # under ${workspace.file_path}. Run bundle commands from the repo root.
