@@ -131,6 +131,8 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
 # compute:                        # OPTIONAL: where this job runs. Omit for serverless (see Compute)
 #   type: existing_cluster
 #   existing_cluster_id: "0123-456789-abcde"
+# schedule:                        # OPTIONAL: when this job runs. Omit for on-demand (see Scheduling)
+#   quartz_cron_expression: "0 0 8 * * ?"   # 08:00 UTC daily
 ```
 
 A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token
@@ -182,6 +184,27 @@ serverless.
 
 The whole `compute` block is validated fail-closed: an unrecognized `type`, a missing required key,
 or a stray key for the chosen type is rejected at config load (and by `gen_jobs.py --check`).
+
+### Scheduling
+
+By default each index job is **on-demand** (run it with `bundle run` or the API). Add an optional
+`schedule` block per index to run it on a [Quartz cron](https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html):
+
+```yaml
+schedule:
+  quartz_cron_expression: "0 0 8 * * ?"   # 08:00 every day
+```
+
+The timezone is always **UTC** (not a config field). Quartz cron has **6 or 7** fields (seconds first,
+optional trailing year), so a 5-field Unix cron like `0 8 * * *` is rejected at config load with a
+clear message rather than failing at deploy. Omitting `schedule` leaves the job on-demand.
+
+The schedule pairs naturally with either export mode: a `batch` job re-exports the view on each tick,
+and a `streaming` job drains new source commits since its last run on each tick (it uses
+`Trigger.availableNow`, so a scheduled run processes the delta and stops). Because every job sets
+`max_concurrent_runs: 1`, a scheduled run that fires while the previous one is still going is skipped
+rather than overlapping. Note the `dev` target (`mode: development`) deploys schedules **paused**, so
+scheduled firing only happens under `stg`/`prd`.
 
 ## Deploy and run
 
@@ -290,7 +313,7 @@ You edit these, one pair per pipeline (all under _pipelines/, the pipeline-confi
     pipeline_configs/
       <config_name>.yml         The config: view/source/reference locations + es_index_name,
                                 es_id_field, pipeline_mode, source.primary_key, optional compute
-                                (see Configuration)
+                                + schedule (see Configuration)
     job_cluster_configs/
       <key>.yml                 OPTIONAL reusable new_cluster specs, referenced by key from a
                                 config's compute.job_cluster_config (see Compute)

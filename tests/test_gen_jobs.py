@@ -14,8 +14,8 @@ import gen_jobs  # noqa: E402
 from pipeline_lib.config import validate_config  # noqa: E402
 
 
-def _cfg(compute=None):
-    """A minimal validated config, optionally with a compute block."""
+def _cfg(compute=None, schedule=None):
+    """A minimal validated config, optionally with a compute and/or schedule block."""
     raw = {
         "es_index_name": "ecs-dns-activity",
         "es_id_field": "dsl_id",
@@ -25,6 +25,8 @@ def _cfg(compute=None):
     }
     if compute is not None:
         raw["compute"] = compute
+    if schedule is not None:
+        raw["schedule"] = schedule
     return validate_config(raw)
 
 
@@ -96,6 +98,29 @@ def test_render_job_cluster_without_spec_fails_closed():
 
 
 # --------------------------------------------------------------------------- load_job_cluster_spec
+
+
+# --------------------------------------------------------------------------- render: schedule
+
+
+def test_render_no_schedule_omits_block():
+    job = _render_job(_cfg())  # default: on-demand
+    assert "schedule" not in job
+
+
+def test_render_schedule_emits_utc_block():
+    job = _render_job(_cfg(schedule={"quartz_cron_expression": "0 0 8 * * ?"}))
+    assert job["schedule"] == {"quartz_cron_expression": "0 0 8 * * ?", "timezone_id": "UTC"}
+
+
+def test_render_schedule_composes_with_compute():
+    # schedule and compute are independent; both render on the same job.
+    job = _render_job(
+        _cfg(compute={"type": "existing_cluster", "existing_cluster_id": "0123-x"},
+             schedule={"quartz_cron_expression": "0 0 8 * * ?"}),
+    )
+    assert job["schedule"]["timezone_id"] == "UTC"
+    assert job["tasks"][0]["existing_cluster_id"] == "0123-x"
 
 
 def test_load_job_cluster_spec_missing_fails_closed():

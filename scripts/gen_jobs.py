@@ -105,6 +105,9 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
       passed in as `job_cluster_spec`) and the task references it by job_cluster_key. `job_cluster_spec`
       is REQUIRED for a job_cluster compute (the caller loads it via load_job_cluster_spec) and unused
       otherwise; a job_cluster compute without it is a caller bug and fails closed here.
+
+    Schedule (cfg["schedule"], per-index) decides WHEN the job runs: None => on-demand (no schedule
+    block); otherwise a job `schedule` with the config's quartz_cron_expression and timezone_id UTC.
     """
     compute = cfg["compute"]
     ctype = compute["type"]
@@ -157,6 +160,14 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
         # tuning knobs): defaults come from the config, overridable per run with `--params <name>=<value>`.
         "parameters": job_parameters(cfg),
     }
+    # Optional schedule: when the config sets one, the job runs on that Quartz cron; otherwise it stays
+    # on-demand (no schedule block). Timezone is always UTC (not a config knob). Under a `development`
+    # target the schedule is deployed but auto-paused, so dev deploys don't start firing.
+    if cfg["schedule"] is not None:
+        job_def["schedule"] = {
+            "quartz_cron_expression": cfg["schedule"]["quartz_cron_expression"],
+            "timezone_id": "UTC",
+        }
     if ctype == "job_cluster":
         if job_cluster_spec is None:
             raise ValueError(
