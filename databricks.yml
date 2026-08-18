@@ -120,8 +120,11 @@ targets:
   stg:
     mode: production
     variables:
-      # Bind stg's own job-cluster policy id here before deploying any job_cluster pipeline to stg
-      # (leave empty only if stg runs serverless/existing_cluster pipelines exclusively).
+      # FAIL-CLOSED by design: with this empty default, deploying a job_cluster pipeline (e.g. the
+      # shipped ecs_dns_activity_jobcluster example) to stg FAILS at the Jobs API - policy_id resolves
+      # to "", which is rejected - because a policy-governed job cluster must have a real policy. Bind
+      # stg's own job-cluster policy id here before deploying any job_cluster pipeline (or delete/adapt
+      # that example). Serverless and existing_cluster pipelines deploy fine regardless of this value.
       cluster_policy_id: ""
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}
@@ -130,8 +133,11 @@ targets:
     mode: production
     variables:
       schedule_pause_status: UNPAUSED
-      # Bind prd's own job-cluster policy id here before deploying any job_cluster pipeline to prd
-      # (leave empty only if prd runs serverless/existing_cluster pipelines exclusively).
+      # FAIL-CLOSED by design: with this empty default, deploying a job_cluster pipeline (e.g. the
+      # shipped ecs_dns_activity_jobcluster example) to prd FAILS at the Jobs API - policy_id resolves
+      # to "", which is rejected - because a policy-governed job cluster must have a real policy. Bind
+      # prd's own job-cluster policy id here before deploying any job_cluster pipeline (or delete/adapt
+      # that example). Serverless and existing_cluster pipelines deploy fine regardless of this value.
       cluster_policy_id: ""
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}
