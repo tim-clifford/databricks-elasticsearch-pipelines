@@ -17,8 +17,9 @@ node_type_id: "i3.xlarge"       # allowed by this workspace's Job Compute policy
 num_workers: 1                  # small, cheap cluster for the example export
 # A Unity-Catalog-enabled access mode is REQUIRED: the runner installs the connector wheel from a UC
 # Volume (wheel_path) and reads UC tables, and a classic cluster with no access mode cannot see
-# /Volumes (the %pip install fails). SINGLE_USER fits an ephemeral per-run job cluster (serverless has
-# UC access implicitly, so serverless pipelines need none of this).
-data_security_mode: SINGLE_USER
+# /Volumes (the %pip install fails). DATA_SECURITY_MODE_STANDARD is the "Standard" (USER_ISOLATION)
+# access mode; SINGLE_USER ("Dedicated") is the other UC-enabled option. Serverless pipelines have UC
+# access implicitly, so serverless pipelines need none of this.
+data_security_mode: DATA_SECURITY_MODE_STANDARD
 custom_tags:
   project: elastic              # example hardcoded tag applied to the job cluster

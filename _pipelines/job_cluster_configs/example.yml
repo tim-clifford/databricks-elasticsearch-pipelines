@@ -26,9 +26,10 @@ node_type_id: "m5d.large"
 num_workers: 2
 # REQUIRED for this framework: the runner installs the connector wheel from a UC Volume and reads UC
 # tables, so a job cluster needs a Unity-Catalog-enabled access mode or the %pip install fails (a
-# classic cluster with no access mode cannot see /Volumes). SINGLE_USER suits an ephemeral per-run job
-# cluster; use USER_ISOLATION for a shared cluster. Serverless pipelines get UC access implicitly.
-data_security_mode: SINGLE_USER
+# classic cluster with no access mode cannot see /Volumes). DATA_SECURITY_MODE_STANDARD is the
+# "Standard" (USER_ISOLATION) mode; SINGLE_USER ("Dedicated") is the other option. Serverless pipelines
+# get UC access implicitly.
+data_security_mode: DATA_SECURITY_MODE_STANDARD
 # custom_tags are HARDCODED name/value pairs that ride the verbatim passthrough straight onto the
 # cluster (not templated, not environment-specific). Use them for cost/ownership tagging, e.g.:
 custom_tags:
