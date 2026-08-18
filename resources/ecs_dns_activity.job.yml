@@ -7,6 +7,7 @@ resources:
       description: Export pipeline for the ecs-dns-activity Elasticsearch index. Runs the shared notebook
         notebooks/run_index_pipeline.py with this index's config. No cluster block => serverless notebook
         task.
+      max_concurrent_runs: 1
       parameters:
       - name: pipeline_mode
         default: batch

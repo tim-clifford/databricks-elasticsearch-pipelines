@@ -62,6 +62,10 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
     can never produce malformed YAML. Deterministic (sort_keys=False preserves this insertion order),
     so --check can compare byte-for-byte. Serverless notebook task (no cluster block), on-demand,
     CAN_MANAGE_RUN to `users` - consistent with the other jobs in this bundle.
+
+    max_concurrent_runs is hard-fixed to 1 for every job (not a config knob): a second concurrent run
+    of the same index would double-write to the same ES index, and for a streaming job would contend
+    on the one checkpoint. Serial-only is the invariant, so it is baked in here, not exposed.
     """
     job = {
         "resources": {
@@ -73,6 +77,9 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict) -> str:
                         "the shared notebook notebooks/run_index_pipeline.py with this index's config. No "
                         "cluster block => serverless notebook task."
                     ),
+                    # Never run two copies of the same index pipeline at once (double-write / checkpoint
+                    # contention). Fixed at 1 for all jobs, deliberately not parameterized.
+                    "max_concurrent_runs": 1,
                     # Run-time-overridable job parameters (pipeline_mode, filter_condition, and the
                     # EsWriteConfig tuning knobs): defaults come from the config, overridable per run
                     # with `--params <name>=<value>`.
