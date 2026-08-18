@@ -807,3 +807,77 @@ def test_compute_carried_through_resolve():
     cfg["compute"] = {"type": "job_cluster", "job_cluster_config": "standard_batch"}
     out = resolve_config(validate_config(cfg), environment="prod")
     assert out["compute"] == {"type": "job_cluster", "job_cluster_config": "standard_batch"}
+
+
+# --------------------------------------------------------------------------- schedule
+
+
+def test_schedule_absent_defaults_none():
+    # No schedule block => None (on-demand, the default: no schedule emitted on the job).
+    assert validate_config(_base())["schedule"] is None
+
+
+@pytest.mark.parametrize("cron", [
+    "0 0 8 * * ?",        # 6 fields: 08:00 daily
+    "0 0 8 * * ? 2027",   # 7 fields: with year
+    "0 */15 * * * ?",     # every 15 minutes
+])
+def test_schedule_valid_cron_accepted(cron):
+    cfg = _base()
+    cfg["schedule"] = {"quartz_cron_expression": cron}
+    assert validate_config(cfg)["schedule"] == {"quartz_cron_expression": cron}
+
+
+def test_schedule_cron_trimmed():
+    cfg = _base()
+    cfg["schedule"] = {"quartz_cron_expression": "  0 0 8 * * ?  "}
+    assert validate_config(cfg)["schedule"]["quartz_cron_expression"] == "0 0 8 * * ?"
+
+
+@pytest.mark.parametrize("bad", ["0 0 8 * * ?", 5, ["cron"]])
+def test_schedule_non_mapping_rejected(bad):
+    # schedule must be a mapping with quartz_cron_expression, not a bare string/list/number.
+    cfg = _base()
+    cfg["schedule"] = bad
+    with pytest.raises(PipelineConfigError, match="schedule"):
+        validate_config(cfg)
+
+
+def test_schedule_unknown_key_rejected():
+    cfg = _base()
+    cfg["schedule"] = {"quartz_cron_expression": "0 0 8 * * ?", "timezone_id": "UTC"}
+    with pytest.raises(PipelineConfigError, match="unknown key"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("bad", [None, "", "   ", 5, True, ["x"]])
+def test_schedule_missing_or_bad_cron_rejected(bad):
+    cfg = _base()
+    schedule = {}
+    if bad is not None:
+        schedule["quartz_cron_expression"] = bad
+    cfg["schedule"] = schedule
+    with pytest.raises(PipelineConfigError, match="quartz_cron_expression"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("cron", ["0 8 * * *", "* * * * *", "0 0 8 * * ? 2027 extra"])
+def test_schedule_wrong_field_count_rejected(cron):
+    # 5-field Unix cron (or an 8-field typo) must fail closed: Quartz needs 6 or 7 fields.
+    cfg = _base()
+    cfg["schedule"] = {"quartz_cron_expression": cron}
+    with pytest.raises(PipelineConfigError, match="6 or 7 fields"):
+        validate_config(cfg)
+
+
+def test_schedule_carried_through_resolve():
+    # schedule is a deploy-time job property, not an object name: resolve passes it through unchanged.
+    cfg = _with_env()
+    cfg["schedule"] = {"quartz_cron_expression": "0 0 8 * * ?"}
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["schedule"] == {"quartz_cron_expression": "0 0 8 * * ?"}
+
+
+def test_schedule_none_carried_through_resolve():
+    out = resolve_config(validate_config(_base()), environment="")
+    assert out["schedule"] is None

@@ -21,6 +21,10 @@ resources:
         default: ''
       - name: streaming_start
         default: new
+      schedule:
+        quartz_cron_expression: 0 */10 * * * ?
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
       tasks:
       - task_key: index_pipeline_ecs_dns_activity
         notebook_task:

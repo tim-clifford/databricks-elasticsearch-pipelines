@@ -312,7 +312,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     allowed_top = {
         "es_index_name", "es_id_field", "pipeline_mode", "filter_condition",
         "chunk_size", "require_existing_index", "verify_certs",
-        "view", "source", "reference_tables", "compute",
+        "view", "source", "reference_tables", "compute", "schedule",
     }
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
@@ -346,6 +346,9 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # compute is OPTIONAL: absent -> serverless (the default). It says WHERE the job runs; carries no
     # object names or ${environment} tokens, so it is validated here and passed through resolve unchanged.
     compute = _validate_compute(raw.get("compute"), f"{source}: compute")
+    # schedule is OPTIONAL: absent -> None (on-demand, the default). It says WHEN the job runs (a Quartz
+    # cron), carries no object names or ${environment}, so it is validated here and passed through resolve.
+    schedule = _validate_schedule(raw.get("schedule"), f"{source}: schedule")
 
     return {
         "es_index_name": es_index_name,
@@ -359,6 +362,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "source": source_map,
         "reference_tables": reference_tables,
         "compute": compute,
+        "schedule": schedule,
     }
 
 
@@ -466,6 +470,46 @@ def _validate_compute(node: object, where: str = "compute") -> dict:
     return result
 
 
+def _validate_schedule(node: object, where: str = "schedule") -> dict | None:
+    """Validate the OPTIONAL per-index `schedule` block; return a normalized dict or None. Fail closed.
+
+    Absent (node is None) => None: the job stays on-demand (no schedule block), the default. Otherwise
+    it is a mapping carrying a single required `quartz_cron_expression`. The timezone is not a config
+    key: the generator always emits UTC (see gen_jobs.render_job_yaml). Only the generator acts on the
+    schedule; the on-cluster notebooks ignore it.
+
+    The cron string itself is a Quartz expression validated at deploy by the bundle/Jobs API (like a
+    new_cluster spec), so here we only enforce it is a non-empty string with 6 or 7 whitespace-separated
+    fields. That field-count check exists to catch the common mistake of pasting a 5-field Unix cron
+    (`0 8 * * *`): Quartz requires a leading seconds field (6 fields, optional 7th for year), so a
+    5-field value is always wrong and fails closed here with a clear message instead of at deploy.
+    """
+    if node is None:
+        return None
+    if not isinstance(node, dict):
+        raise PipelineConfigError(f"{where} must be a mapping with quartz_cron_expression, got {type(node).__name__}")
+
+    unknown = sorted(set(node) - {"quartz_cron_expression"})
+    if unknown:
+        raise PipelineConfigError(
+            f"{where} has unknown key(s): {', '.join(unknown)}; allowed: quartz_cron_expression"
+        )
+
+    cron = node.get("quartz_cron_expression")
+    if not isinstance(cron, str) or not cron.strip():
+        raise PipelineConfigError(
+            f"{where}.quartz_cron_expression is required and must be a non-empty string, got {cron!r}"
+        )
+    fields = cron.split()
+    if len(fields) not in (6, 7):
+        raise PipelineConfigError(
+            f"{where}.quartz_cron_expression must be a Quartz cron of 6 or 7 fields "
+            f"(seconds minutes hours day-of-month month day-of-week [year]), got {len(fields)} "
+            f"field(s) in {cron!r}; note Quartz needs a leading seconds field, unlike 5-field Unix cron"
+        )
+    return {"quartz_cron_expression": cron.strip()}
+
+
 def resolve_config(cfg: dict, environment: str) -> dict:
     """Fold `environment` into every name template in a validated config, returning resolved names.
 
@@ -504,6 +548,8 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # compute is a deploy-time job property (where the job runs), not an object name: passed
         # through verbatim, like the connector tuning knobs.
         "compute": cfg["compute"],
+        # schedule (when the job runs) is likewise a deploy-time job property: passed through verbatim.
+        "schedule": cfg["schedule"],
     }
 
 

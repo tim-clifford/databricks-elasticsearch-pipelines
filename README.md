@@ -91,6 +91,7 @@ or `DATABRICKS_HOST`. The bundle variables are:
 | `secret_scope_name` | the Databricks [secret scope](https://docs.databricks.com/security/secrets/) holding the ES **api_key** |
 | `secret_key_name` | the key within that scope whose value is the ES **api_key** the connector authenticates with |
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Required for a streaming run (fails closed if empty); unused by batch and `deploy_views` |
+| `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy schedules without firing them; only `prd` binds `UNPAUSED` to actually run them. Only affects jobs that declare a `schedule` (see [Scheduling](#scheduling)) |
 
 `es_host_url`, `secret_scope_name`, and `secret_key_name` are the global ES connection settings,
 shared by every index job (the auth secret is an api_key, not a username/password). Like
@@ -131,6 +132,8 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
 # compute:                        # OPTIONAL: where this job runs. Omit for serverless (see Compute)
 #   type: existing_cluster
 #   existing_cluster_id: "0123-456789-abcde"
+# schedule:                        # OPTIONAL: when this job runs. Omit for on-demand (see Scheduling)
+#   quartz_cron_expression: "0 0 8 * * ?"   # 08:00 UTC daily
 ```
 
 A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token
@@ -182,6 +185,32 @@ serverless.
 
 The whole `compute` block is validated fail-closed: an unrecognized `type`, a missing required key,
 or a stray key for the chosen type is rejected at config load (and by `gen_jobs.py --check`).
+
+### Scheduling
+
+By default each index job is **on-demand** (run it with `bundle run` or the API). Add an optional
+`schedule` block per index to run it on a [Quartz cron](https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html):
+
+```yaml
+schedule:
+  quartz_cron_expression: "0 0 8 * * ?"   # 08:00 every day
+```
+
+The timezone is always **UTC** (not a config field). Quartz cron has **6 or 7** fields (seconds first,
+optional trailing year), so a 5-field Unix cron like `0 8 * * *` is rejected at config load with a
+clear message rather than failing at deploy. Omitting `schedule` leaves the job on-demand.
+
+The schedule pairs naturally with either export mode: a `batch` job re-exports the view on each tick,
+and a `streaming` job drains new source commits since its last run on each tick (it uses
+`Trigger.availableNow`, so a scheduled run processes the delta and stops). Because every job sets
+`max_concurrent_runs: 1`, a scheduled run that fires while the previous one is still going is skipped
+rather than overlapping.
+
+**Where schedules actually fire.** Every generated schedule's `pause_status` is bound to the
+`schedule_pause_status` variable, which defaults to `PAUSED` (fail-safe), so a target controls firing
+without touching configs: `dev` and `stg` inherit the paused default, so schedules are deployed but
+**dormant** in both; only `prd` binds `UNPAUSED` and actually fires them. Unpause a single job in the
+UI/API for a one-off test, or set `--var=schedule_pause_status=UNPAUSED` at deploy to override.
 
 ## Deploy and run
 
@@ -290,7 +319,7 @@ You edit these, one pair per pipeline (all under _pipelines/, the pipeline-confi
     pipeline_configs/
       <config_name>.yml         The config: view/source/reference locations + es_index_name,
                                 es_id_field, pipeline_mode, source.primary_key, optional compute
-                                (see Configuration)
+                                + schedule (see Configuration)
     job_cluster_configs/
       <key>.yml                 OPTIONAL reusable new_cluster specs, referenced by key from a
                                 config's compute.job_cluster_config (see Compute)
