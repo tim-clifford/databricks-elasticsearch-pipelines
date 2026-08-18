@@ -28,7 +28,8 @@ num_workers: 2
 # tables, so a job cluster needs a Unity-Catalog-enabled access mode or the %pip install fails (a
 # classic cluster with no access mode cannot see /Volumes). DATA_SECURITY_MODE_STANDARD is the
 # "Standard" (USER_ISOLATION) mode; SINGLE_USER ("Dedicated") is the other option. Serverless pipelines
-# get UC access implicitly.
+# get UC access implicitly. If your cluster policy FIXES data_security_mode, set this to match it - an
+# explicit value that conflicts with a fixed policy rule is rejected at deploy.
 data_security_mode: DATA_SECURITY_MODE_STANDARD
 # custom_tags are HARDCODED name/value pairs that ride the verbatim passthrough straight onto the
 # cluster (not templated, not environment-specific). Use them for cost/ownership tagging, e.g.:
