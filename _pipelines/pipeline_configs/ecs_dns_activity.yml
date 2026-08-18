@@ -31,3 +31,6 @@ reference_tables:                 # OPTIONAL: extra tables the view joins
     catalog: tim_clifford_classic_dsl_lite_${environment}
     schema: ocsf_validation_${environment}
     table: dns_activity
+
+schedule:                         # OPTIONAL: run this job on a Quartz cron (UTC); omit for on-demand
+  quartz_cron_expression: "0 */10 * * * ?"   # every 10 minutes (paused under dev + stg; fires under prd)

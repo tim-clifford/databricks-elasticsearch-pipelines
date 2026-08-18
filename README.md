@@ -91,6 +91,7 @@ or `DATABRICKS_HOST`. The bundle variables are:
 | `secret_scope_name` | the Databricks [secret scope](https://docs.databricks.com/security/secrets/) holding the ES **api_key** |
 | `secret_key_name` | the key within that scope whose value is the ES **api_key** the connector authenticates with |
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Required for a streaming run (fails closed if empty); unused by batch and `deploy_views` |
+| `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy schedules without firing them; only `prd` binds `UNPAUSED` to actually run them. Only affects jobs that declare a `schedule` (see [Scheduling](#scheduling)) |
 
 `es_host_url`, `secret_scope_name`, and `secret_key_name` are the global ES connection settings,
 shared by every index job (the auth secret is an api_key, not a username/password). Like
@@ -203,8 +204,13 @@ The schedule pairs naturally with either export mode: a `batch` job re-exports t
 and a `streaming` job drains new source commits since its last run on each tick (it uses
 `Trigger.availableNow`, so a scheduled run processes the delta and stops). Because every job sets
 `max_concurrent_runs: 1`, a scheduled run that fires while the previous one is still going is skipped
-rather than overlapping. Note the `dev` target (`mode: development`) deploys schedules **paused**, so
-scheduled firing only happens under `stg`/`prd`.
+rather than overlapping.
+
+**Where schedules actually fire.** Every generated schedule's `pause_status` is bound to the
+`schedule_pause_status` variable, which defaults to `PAUSED` (fail-safe), so a target controls firing
+without touching configs: `dev` and `stg` inherit the paused default, so schedules are deployed but
+**dormant** in both; only `prd` binds `UNPAUSED` and actually fires them. Unpause a single job in the
+UI/API for a one-off test, or set `--var=schedule_pause_status=UNPAUSED` at deploy to override.
 
 ## Deploy and run
 

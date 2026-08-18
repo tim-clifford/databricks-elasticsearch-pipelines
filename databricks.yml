@@ -71,6 +71,17 @@ variables:
     description: "UC Volume base path for streaming checkpoints; the runner appends /<config_name> per job. Empty default; required for streaming runs (fails closed if empty)."
     default: ""
 
+  # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
+  # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
+  # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds
+  # UNPAUSED to actually run them. Default PAUSED (rather than relying on `mode: development` to pause
+  # dev) because an EXPLICIT pause_status is honored as-is - development mode does not override it
+  # (verified live), so the safe value has to be the default here. Only jobs that declare a schedule
+  # are affected; on-demand jobs have no schedule block.
+  schedule_pause_status:
+    description: "PAUSED or UNPAUSED for all job schedules (default PAUSED = fail-safe). Only prd binds UNPAUSED so schedules fire there; dev and stg stay paused."
+    default: "PAUSED"
+
 # Three targets: dev, stg, prd. The workspace HOST is intentionally not hardcoded here: it is taken
 # from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var, so the bundle
 # carries no environment-specific URL and deploys to whatever workspace you point it at. The
@@ -83,6 +94,8 @@ variables:
 #   root_path is deliberately NOT set here - the per-user default is the point.
 # - stg and prd use `mode: production`: no per-user isolation, so each sets an explicit SHARED
 #   root_path (not under any user's home). ${bundle.target} in the path keeps stg and prd separate.
+# Job schedules default to PAUSED (schedule_pause_status), so dev and stg deploy schedules but never
+# fire them; only prd binds schedule_pause_status=UNPAUSED to actually run on the cron.
 targets:
   dev:
     default: true
@@ -95,5 +108,7 @@ targets:
 
   prd:
     mode: production
+    variables:
+      schedule_pause_status: UNPAUSED
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}

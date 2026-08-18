@@ -107,7 +107,8 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
       otherwise; a job_cluster compute without it is a caller bug and fails closed here.
 
     Schedule (cfg["schedule"], per-index) decides WHEN the job runs: None => on-demand (no schedule
-    block); otherwise a job `schedule` with the config's quartz_cron_expression and timezone_id UTC.
+    block); otherwise a job `schedule` with the config's quartz_cron_expression, timezone_id UTC, and
+    pause_status bound to the schedule_pause_status bundle variable (so a target can pause its schedules).
     """
     compute = cfg["compute"]
     ctype = compute["type"]
@@ -161,12 +162,18 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
         "parameters": job_parameters(cfg),
     }
     # Optional schedule: when the config sets one, the job runs on that Quartz cron; otherwise it stays
-    # on-demand (no schedule block). Timezone is always UTC (not a config knob). Under a `development`
-    # target the schedule is deployed but auto-paused, so dev deploys don't start firing.
+    # on-demand (no schedule block). Timezone is always UTC (not a config knob).
+    #
+    # pause_status is a bundle variable (schedule_pause_status, default PAUSED = fail-safe) so a target
+    # decides whether its schedules fire without editing any config: dev and stg inherit the PAUSED
+    # default (deploy but never fire) and only prd binds UNPAUSED. Default PAUSED rather than relying on
+    # `mode: development` to pause dev, because an explicit pause_status is honored as-is (development
+    # mode does not override it), so the safe value must be the default.
     if cfg["schedule"] is not None:
         job_def["schedule"] = {
             "quartz_cron_expression": cfg["schedule"]["quartz_cron_expression"],
             "timezone_id": "UTC",
+            "pause_status": "${var.schedule_pause_status}",
         }
     if ctype == "job_cluster":
         if job_cluster_spec is None:

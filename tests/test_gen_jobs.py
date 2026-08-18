@@ -108,9 +108,15 @@ def test_render_no_schedule_omits_block():
     assert "schedule" not in job
 
 
-def test_render_schedule_emits_utc_block():
+def test_render_schedule_emits_utc_block_with_pause_var():
+    # timezone is always UTC; pause_status is bound to the schedule_pause_status bundle variable so a
+    # target (stg) can pause all schedules at deploy without editing configs.
     job = _render_job(_cfg(schedule={"quartz_cron_expression": "0 0 8 * * ?"}))
-    assert job["schedule"] == {"quartz_cron_expression": "0 0 8 * * ?", "timezone_id": "UTC"}
+    assert job["schedule"] == {
+        "quartz_cron_expression": "0 0 8 * * ?",
+        "timezone_id": "UTC",
+        "pause_status": "${var.schedule_pause_status}",
+    }
 
 
 def test_render_schedule_composes_with_compute():
