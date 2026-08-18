@@ -230,6 +230,11 @@ paused); `stg` and `prd` use `production` mode with a shared, non-user deploy pa
 workspace host from your CLI profile (`-p <profile>`) or `DATABRICKS_HOST`, so the same target can
 point at any workspace, and none binds the `environment` variable (pass `--var=environment=<env>`).
 
+**Deployment engine.** The bundle sets `bundle.engine: direct`, so it deploys through the direct engine
+(the Databricks REST APIs via the Go SDK) rather than the legacy Terraform engine: faster deploys, no
+Terraform provider download, and state kept in `resources.json`. Any recent CLI works; a bundle that was
+previously deployed on the Terraform engine auto-migrates its state to direct on the next deploy.
+
 Two different mechanisms carry values into a job, and they resolve at different times:
 
 - **Bundle variables** (`environment`, `wheel_path`, `es_host_url`, `secret_scope_name`,
