@@ -696,3 +696,114 @@ def test_column_present_case_insensitive(field, columns):
 
 def test_column_present_empty_columns():
     assert not column_present("dsl_id", [])
+
+
+# --------------------------------------------------------------------------- compute
+
+
+def test_compute_absent_defaults_serverless():
+    # No compute block => serverless (the framework default: no cluster block, serverless notebook task).
+    assert validate_config(_base())["compute"] == {"type": "serverless"}
+
+
+def test_compute_explicit_serverless():
+    cfg = _base()
+    cfg["compute"] = {"type": "serverless"}
+    assert validate_config(cfg)["compute"] == {"type": "serverless"}
+
+
+def test_compute_serverless_rejects_extra_keys():
+    # serverless takes no other keys; a stray key (e.g. a cluster id) must fail closed, not be dropped.
+    cfg = _base()
+    cfg["compute"] = {"type": "serverless", "existing_cluster_id": "x"}
+    with pytest.raises(PipelineConfigError, match="unknown key"):
+        validate_config(cfg)
+
+
+def test_compute_existing_cluster_valid():
+    cfg = _base()
+    cfg["compute"] = {"type": "existing_cluster", "existing_cluster_id": "0123-456789-abcde"}
+    assert validate_config(cfg)["compute"] == {
+        "type": "existing_cluster",
+        "existing_cluster_id": "0123-456789-abcde",
+    }
+
+
+def test_compute_existing_cluster_id_trimmed():
+    cfg = _base()
+    cfg["compute"] = {"type": "existing_cluster", "existing_cluster_id": "  0123-456789-abcde  "}
+    assert validate_config(cfg)["compute"]["existing_cluster_id"] == "0123-456789-abcde"
+
+
+@pytest.mark.parametrize("bad", [None, "", "   ", 5, True, ["x"]])
+def test_compute_existing_cluster_requires_id(bad):
+    # existing_cluster with a missing/empty/non-string id must fail closed.
+    cfg = _base()
+    compute = {"type": "existing_cluster"}
+    if bad is not None:
+        compute["existing_cluster_id"] = bad
+    cfg["compute"] = compute
+    with pytest.raises(PipelineConfigError, match="existing_cluster_id"):
+        validate_config(cfg)
+
+
+def test_compute_existing_cluster_rejects_unknown_key():
+    cfg = _base()
+    cfg["compute"] = {"type": "existing_cluster", "existing_cluster_id": "x", "job_cluster_config": "y"}
+    with pytest.raises(PipelineConfigError, match="unknown key"):
+        validate_config(cfg)
+
+
+def test_compute_job_cluster_valid():
+    cfg = _base()
+    cfg["compute"] = {"type": "job_cluster", "job_cluster_config": "standard_batch"}
+    assert validate_config(cfg)["compute"] == {
+        "type": "job_cluster",
+        "job_cluster_config": "standard_batch",
+    }
+
+
+@pytest.mark.parametrize("bad", [None, "", "has space", "with.dot", "with/slash", 5, True])
+def test_compute_job_cluster_requires_valid_key(bad):
+    # job_cluster_config must be present and a safe filename stem (letters/digits/_/-): it maps to a
+    # file, so dots/slashes (path traversal) and non-strings fail closed.
+    cfg = _base()
+    compute = {"type": "job_cluster"}
+    if bad is not None:
+        compute["job_cluster_config"] = bad
+    cfg["compute"] = compute
+    with pytest.raises(PipelineConfigError, match="job_cluster_config"):
+        validate_config(cfg)
+
+
+def test_compute_job_cluster_rejects_unknown_key():
+    cfg = _base()
+    cfg["compute"] = {"type": "job_cluster", "job_cluster_config": "x", "existing_cluster_id": "y"}
+    with pytest.raises(PipelineConfigError, match="unknown key"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("bad", ["Serverless", "cluster", "", None, 5, "new_cluster"])
+def test_compute_unknown_type_rejected(bad):
+    # Allow-list on type: a near-miss, wrong case, empty, or non-string must fail closed.
+    cfg = _base()
+    cfg["compute"] = {"type": bad}
+    with pytest.raises(PipelineConfigError, match="compute.type"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("bad", ["serverless", 5, ["type"]])
+def test_compute_non_mapping_rejected(bad):
+    # compute must be a mapping (not a bare string/list/number).
+    cfg = _base()
+    cfg["compute"] = bad
+    with pytest.raises(PipelineConfigError, match="compute"):
+        validate_config(cfg)
+
+
+def test_compute_carried_through_resolve():
+    # compute is a deploy-time job property, not an object name: resolve passes it through unchanged.
+    cfg = _with_env()
+    cfg["compute"] = {"type": "job_cluster", "job_cluster_config": "standard_batch"}
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["compute"] == {"type": "job_cluster", "job_cluster_config": "standard_batch"}

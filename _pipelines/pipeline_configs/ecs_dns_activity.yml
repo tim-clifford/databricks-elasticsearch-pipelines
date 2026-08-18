@@ -1,5 +1,5 @@
 # Pipeline definition for one Elasticsearch index. One file here => one deployed job (see
-# scripts/gen_jobs.py) and one view (see views/<view.name>.sql, deployed by the deploy_views job).
+# scripts/gen_jobs.py) and one view (see _pipelines/pipeline_views/<view.name>.sql, deployed by the deploy_views job).
 #
 # Any catalog/schema/table/name may embed ${environment}, folded in at deploy time from the
 # `environment` bundle variable (e.g. ocsf_${environment} -> ocsf_prod). A value with no token is
@@ -25,7 +25,7 @@ source:                           # the single source table the view reads from
 
 reference_tables:                 # OPTIONAL: extra tables the view joins
   # The key (`validation`) is YOUR choice: it is the SQL alias the view joins against and must match
-  # the ${ref_validation} token used in views/ecs_dns_activity.sql. This one uses an
+  # the ${ref_validation} token used in _pipelines/pipeline_views/ecs_dns_activity.sql. This one uses an
   # environment-specific schema to exercise ${environment} on a reference table.
   validation:
     catalog: tim_clifford_classic_dsl_lite_${environment}

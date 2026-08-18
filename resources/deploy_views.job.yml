@@ -4,9 +4,13 @@ resources:
       name: "[${bundle.target}] databricks-elasticsearch-pipelines: _deploy views"
       description: >-
         A serverless notebook task that creates or replaces one Databricks view per Elasticsearch
-        index. Each view is a .sql file in views/ paired with a pipeline_definitions/<name>.yml; the
-        notebook renders each view's parameters from its config (folding in the environment) and runs
-        every file with spark.sql. No cluster block => serverless notebook task.
+        index. Each view is a .sql file in _pipelines/pipeline_views/ paired with a
+        _pipelines/pipeline_configs/<name>.yml; the notebook renders each view's parameters from its
+        config (folding in the environment) and runs every file with spark.sql. No cluster block =>
+        serverless notebook task.
+
+      # Never run two copies at once, consistent with every index job. Fixed at 1, not parameterized.
+      max_concurrent_runs: 1
 
       tasks:
         - task_key: deploy_views

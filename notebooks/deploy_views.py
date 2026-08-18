@@ -3,8 +3,9 @@
 # MAGIC # databricks-elasticsearch-pipelines: deploy views
 # MAGIC
 # MAGIC Creates or replaces one Databricks view per Elasticsearch index. Each view is a `.sql` file in
-# MAGIC `views/`, paired with a `pipeline_definitions/<name>.yml` that says where its view, source, and
-# MAGIC reference tables live (fully qualified, with an optional `${environment}` component). This
+# MAGIC `_pipelines/pipeline_views/`, paired with a `_pipelines/pipeline_configs/<name>.yml` that says where
+# MAGIC its view, source, and reference tables live (fully qualified, with an optional `${environment}`
+# MAGIC component). This
 # MAGIC notebook renders each view's `${...}` parameters from its config and runs it with `spark.sql`.
 # MAGIC
 # MAGIC Parameter (set by the DAB job as a widget):
@@ -21,9 +22,10 @@ ENVIRONMENT = dbutils.widgets.get("environment").strip()
 print(f"environment = {ENVIRONMENT!r}")
 
 # COMMAND ----------
-# Resolve the synced bundle root so we can read both views/ and pipeline_definitions/, and add it to
-# sys.path so pipeline_lib (the shared config schema) is importable. This notebook is synced to
-# <bundle files>/notebooks/deploy_views.py; both dirs are siblings of notebooks/.
+# Resolve the synced bundle root so we can read both _pipelines/pipeline_views/ and
+# _pipelines/pipeline_configs/, and add it to sys.path so pipeline_lib (the shared config schema) is
+# importable. This notebook is synced to <bundle files>/notebooks/deploy_views.py; the _pipelines/ tree
+# is a sibling of notebooks/.
 import os
 import sys
 
@@ -32,8 +34,8 @@ FILES_ROOT = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # .../fi
 if FILES_ROOT not in sys.path:
     sys.path.insert(0, FILES_ROOT)
 
-VIEWS_DIR = os.path.join(FILES_ROOT, "views")
-CONFIG_DIR = os.path.join(FILES_ROOT, "pipeline_definitions")
+VIEWS_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_views")
+CONFIG_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_configs")
 print("files root:", FILES_ROOT)
 
 from pipeline_lib.config import column_present, load_config, render_view_sql, view_substitutions  # noqa: E402
