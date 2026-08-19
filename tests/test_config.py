@@ -84,7 +84,7 @@ def test_minimal_valid():
     # default (NOT "unset"). write_repartition defaults to 0 (off - read parallelism is the primary
     # lever); max_partition_bytes defaults to the built-in scan-parallelism size.
     assert out["write_repartition"] == "0"
-    assert out["max_partition_bytes"] == "32m"
+    assert out["max_partition_bytes"] == "2m"
 
 
 def test_environment_token_accepted_as_template():
@@ -462,7 +462,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "verify_certs", "default": ""},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": "0"},
-        {"name": "max_partition_bytes", "default": "32m"},
+        {"name": "max_partition_bytes", "default": "2m"},
     ]
 
 
@@ -734,7 +734,7 @@ def test_require_max_partition_bytes_canonical(value, expected):
 @pytest.mark.parametrize("value", ["", None, "  "])
 def test_require_max_partition_bytes_empty_takes_builtin_default(value):
     # Unset falls back to the built-in scan-parallelism default (not "unset"/engine default).
-    assert require_max_partition_bytes(value) == "32m"
+    assert require_max_partition_bytes(value) == "2m"
 
 
 @pytest.mark.parametrize("bad", ["abc", "32.5m", "32x", "m", "-5", -1, 12.5, True, False, "32 m"])
@@ -746,7 +746,7 @@ def test_require_max_partition_bytes_fails_closed(bad):
 
 
 def test_max_partition_bytes_absent_defaults_builtin_in_config():
-    assert validate_config(_base())["max_partition_bytes"] == "32m"
+    assert validate_config(_base())["max_partition_bytes"] == "2m"
 
 
 @pytest.mark.parametrize("value,expected", [("16m", "16m"), (67108864, "67108864"), ("0", "0")])

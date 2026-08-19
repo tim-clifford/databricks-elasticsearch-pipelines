@@ -113,7 +113,7 @@ filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
-max_partition_bytes: 32m          # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 32m
+max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
 view:                             # the view this pipeline uses
   catalog: acme_${environment}
@@ -251,7 +251,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).
-  - `max_partition_bytes` (a Spark byte-size such as `32m`, default `32m`) sets
+  - `max_partition_bytes` (a Spark byte-size such as `2m`, default `2m`) sets
     `spark.sql.files.maxPartitionBytes` for the source read. Smaller values produce more, smaller file
     splits, so the scan and the view transform fan out across more cores. This is the primary
     parallelism lever, since those partitions carry through the (shuffle-free) view to the write. Tune

@@ -108,12 +108,14 @@ _VALID_STREAMING_STARTS = ("new", "full")
 # This is the PRIMARY parallelism lever, because the scan+transform (projections, casts, broadcast
 # reference joins, filter) are narrow operations that preserve the partition count all the way to the
 # write - so parallelizing the read parallelizes the whole pipeline in ONE stage, with no extra shuffle.
-# _DEFAULT_MAX_PARTITION_BYTES lowers Spark's own 128m default so a modest read (e.g. ~360MB/day, which
-# 128m scans in only ~3 splits) spreads across the cluster instead of running on ~3 cores. Tune it to
-# roughly data_size / (target partitions); see the README. "0" means "do not set it" (defer to the
-# cluster/engine default). max_partition_bytes accepts a Spark byte-size string ("32m", "16m", "128m")
-# or a raw byte count.
-_DEFAULT_MAX_PARTITION_BYTES = "32m"
+# _DEFAULT_MAX_PARTITION_BYTES is well below Spark's own 128m default so the small-to-medium reads this
+# framework typically runs (a day is only ~hundreds of MB, which 128m scans in just a few splits)
+# parallelize across the cluster instead of running on a handful of cores. Tune it to roughly
+# data_size / (target partitions); see the README. Note a very large one-off load wants a LARGER value
+# than this default (e.g. tens of MB) to avoid thousands of tiny partitions. "0" means "do not set it"
+# (defer to the cluster/engine default). max_partition_bytes accepts a Spark byte-size string ("2m",
+# "16m", "128m") or a raw byte count.
+_DEFAULT_MAX_PARTITION_BYTES = "2m"
 # A Spark byte-size: digits, optional unit (k/m/g/t/p, optionally with a trailing 'b'), case-insensitive.
 _MAX_PARTITION_BYTES_RE = re.compile(r"^(\d+)([kmgtp]b?)?$", re.IGNORECASE)
 

@@ -24,7 +24,7 @@ resources:
       - name: write_repartition
         default: '0'
       - name: max_partition_bytes
-        default: 32m
+        default: 2m
       tasks:
       - task_key: index_pipeline_ecs_authentication
         notebook_task:
