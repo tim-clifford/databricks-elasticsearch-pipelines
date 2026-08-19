@@ -103,6 +103,7 @@ dbutils.widgets.text("filter_condition", "", "Optional row filter, a Spark SQL p
 dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty => connector default)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
+dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
 # Streaming-only widgets. checkpoint_base_path is a deploy-time base_parameter (bundle variable);
 # streaming_start is a run-time job parameter (default "new"). Both are ignored by a batch run.
 dbutils.widgets.text("checkpoint_base_path", "", "UC Volume base for streaming checkpoints (runner appends /<config_name>)")
@@ -117,6 +118,7 @@ FILTER_CONDITION = dbutils.widgets.get("filter_condition").strip()
 CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
+WRITE_REPARTITION = dbutils.widgets.get("write_repartition").strip()
 CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
 STREAMING_START = dbutils.widgets.get("streaming_start").strip()
 if not CONFIG_NAME:
@@ -139,6 +141,7 @@ from pipeline_lib.config import (  # noqa: E402
     require_filter_condition,
     require_pipeline_mode,
     require_streaming_start,
+    require_write_repartition,
     resolve_config,
     view_select_body,
     view_substitutions,
@@ -155,10 +158,15 @@ from pipeline_lib.config import (  # noqa: E402
 # - streaming_start: allow-list (new|full). Validated unconditionally (cheap, fails a bad --params
 #   value regardless of mode); only actually USED by the streaming branch. Empty widget -> "new"
 #   default, so an unset value takes the intended default rather than failing.
+# - write_repartition: non-negative int (0 disables). Validated unconditionally and used by BOTH modes
+#   (the batch export and each streaming micro-batch). Empty widget -> the built-in default (the
+#   validator turns "" into _DEFAULT_WRITE_REPARTITION), so a standalone run still parallelizes. Parsed
+#   to int here since it feeds df.repartition(N).
 PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS)
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
+WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repartition job parameter"))
 
 # The global ES connection settings are required for any index-job run: fail closed on an empty one
 # (e.g. a deploy that forgot --var=es_host_url) rather than constructing a broken EsWriteConfig.
@@ -208,6 +216,7 @@ print(f"es_id_field        = {cfg['es_id_field']}")
 print(f"pipeline_mode      = {PIPELINE_MODE}")
 print(f"filter_condition   = {FILTER_CONDITION!r}")
 print(f"write_overrides    = {write_overrides}")
+print(f"write_repartition  = {WRITE_REPARTITION}" + (" (disabled: natural partitioning)" if WRITE_REPARTITION == 0 else ""))
 print(f"view               = {VIEW_FQN}")
 print(f"source             = {SOURCE_FQN}")
 print(f"es_host_url        = {ES_HOST_URL}")
@@ -254,6 +263,14 @@ RUN_SUMMARY = None
 # silent success. (raise_on_error=False so the result is printed for the log before we reconcile.)
 if PIPELINE_MODE == "batch":
     export_df = apply_filter(spark.table(VIEW_FQN))
+    # Repartition the (filtered) export before the write so bulk_write fans out across the cluster.
+    # bulk_write runs one ES bulk stream per DataFrame partition (mapInPandas), so write parallelism ==
+    # partition count. A full-day read is only a handful of ~128MB file splits and the view's reference
+    # joins broadcast (no shuffle), so export_df otherwise carries ~3 partitions and the write would use
+    # ~3 cores regardless of cluster size. WRITE_REPARTITION=0 disables this (keep natural partitioning);
+    # repartition AFTER the filter so the surviving rows are spread evenly.
+    if WRITE_REPARTITION > 0:
+        export_df = export_df.repartition(WRITE_REPARTITION)
     result = bulk_write(export_df, es_write_config)
     print(f"batch bulk_write result: {result}")
     reconcile_or_raise(result, index=es_write_config.index)
@@ -335,6 +352,14 @@ if PIPELINE_MODE == "streaming":
         session = batch_df.sparkSession
         batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
         transformed = apply_filter(session.sql(RENDERED_SELECT))
+        # Repartition each micro-batch before the write, same rationale and knob as the batch path:
+        # bulk_write parallelizes one ES bulk stream per partition, and a micro-batch inherits the
+        # stream read's ~few partitions (broadcast reference joins add no shuffle), so without this the
+        # write uses ~few cores. Matters most for a full-backfill micro-batch (streaming_start=full);
+        # for a low-volume near-real-time stream set WRITE_REPARTITION=0 to avoid over-partitioning
+        # small batches into many near-empty tasks each trigger.
+        if WRITE_REPARTITION > 0:
+            transformed = transformed.repartition(WRITE_REPARTITION)
         # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
         # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
         # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
