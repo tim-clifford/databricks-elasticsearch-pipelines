@@ -43,6 +43,15 @@ def _render_job(cfg, spec=None):
 # --------------------------------------------------------------------------- render: serverless
 
 
+def test_render_job_name_uses_config_name_not_es_index():
+    # The job display name is keyed on the config NAME (the resource-key stem), not es_index_name, so
+    # a job lines up with the config you edit/deploy. es_index_name differs here ("ecs-dns-activity")
+    # to prove the name follows the config name; the ES index still appears in the description.
+    job = _render_job(_cfg())
+    assert job["name"] == "[${bundle.target}] databricks-elasticsearch-pipelines: ecs_dns_activity"
+    assert "ecs-dns-activity" in job["description"]  # es_index_name still named in the description
+
+
 def test_render_serverless_has_no_cluster_block():
     job = _render_job(_cfg())  # default serverless
     task = job["tasks"][0]
