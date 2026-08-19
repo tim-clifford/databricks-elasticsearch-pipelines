@@ -250,15 +250,13 @@ Two different mechanisms carry values into a job, and they resolve at different 
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).
-  - `write_repartition` (a non-negative integer, default `128`) sets how many partitions the write
-    input is repartitioned into before the ES write. `bulk_write` runs one ES bulk stream per
-    partition, so this is what fans the write out across the cluster; without it a large export
-    inherits the read's handful of partitions (~3 for a full-day read, since the view's reference
-    joins broadcast and add no shuffle) and the write uses ~3 cores no matter the cluster size. `0`
-    disables it (keep the read's natural partitioning) for a low-volume near-real-time stream or a
-    tiny batch, where fanning out to 128 would only add a shuffle and many near-empty tasks. Applies
-    to **both** modes (the whole export in batch, each micro-batch in streaming). Raise it for a
-    bigger cluster (roughly 2-3x total worker cores is a good target).
+  - `write_repartition` (a non-negative integer, default `128`) repartitions the write input to N
+    partitions before the ES write. `bulk_write` runs one ES bulk stream per partition, so this sets
+    how far the write fans out across the cluster; the default keeps a large write from running on
+    the few partitions a read produces. `0` disables it (keep the read's natural partitioning), which
+    suits a small write where fanning out would only add a shuffle. Applies to **both** modes (the
+    whole export in batch, each micro-batch in streaming). For a large write on a big cluster, raise
+    it toward 2-3x total worker cores.
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
