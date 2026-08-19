@@ -154,7 +154,11 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     # max_concurrent_runs, parameters, [job_clusters], tasks, permissions) regardless of compute type,
     # keeping --check's byte-for-byte compare stable.
     job_def: dict = {
-        "name": f"[${{bundle.target}}] databricks-elasticsearch-pipelines: {cfg['es_index_name']}",
+        # Display name uses the config NAME (the same stem as the resource key index_pipeline_<name>
+        # and the config filename), not es_index_name, so a job is identified by its pipeline config -
+        # the unit you edit and deploy - and lines up with its resource key. The target ES index is
+        # still named in the description below.
+        "name": f"[${{bundle.target}}] databricks-elasticsearch-pipelines: {name}",
         "description": (
             f"Export pipeline for the {cfg['es_index_name']} Elasticsearch index. Runs the shared "
             f"notebook notebooks/run_index_pipeline.py with this index's config. {compute_desc}"
