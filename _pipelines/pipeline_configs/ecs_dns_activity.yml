@@ -14,7 +14,8 @@ pipeline_mode: batch              # default export mode: batch | streaming (over
 # max_partition_bytes: 2m         # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read
 #                                 # (read/scan parallelism). Smaller => more, smaller splits => the
 #                                 # scan+transform fans out across more cores. Primary parallelism
-#                                 # lever. Tune to ~data_size/worker_cores; 0 leaves the engine default.
+#                                 # lever. Tune for ~2-3x worker cores partitions
+#                                 # (~data_size/(2-3x cores)); 0 leaves the engine default.
 # write_repartition: 0            # OPTIONAL: partitions for a pre-write repartition. 0 (default) = off:
 #                                 # read parallelism above already carries through the (shuffle-free)
 #                                 # view to the write. Set > 0 (~2-3x worker cores) only if the view

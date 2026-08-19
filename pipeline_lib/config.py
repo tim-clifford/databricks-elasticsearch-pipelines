@@ -110,9 +110,10 @@ _VALID_STREAMING_STARTS = ("new", "full")
 # write - so parallelizing the read parallelizes the whole pipeline in ONE stage, with no extra shuffle.
 # _DEFAULT_MAX_PARTITION_BYTES is well below Spark's own 128m default so the small-to-medium reads this
 # framework typically runs (a day is only ~hundreds of MB, which 128m scans in just a few splits)
-# parallelize across the cluster instead of running on a handful of cores. Tune it to roughly
-# data_size / (target partitions); see the README. Note a very large one-off load wants a LARGER value
-# than this default (e.g. tens of MB) to avoid thousands of tiny partitions. "0" means "do not set it"
+# parallelize across the cluster instead of running on a handful of cores. Tune it so the read yields
+# ~2-3x worker cores partitions (data_size / (2-3 x cores)), the same partition-count target as
+# write_repartition; see the README. Note a very large one-off load wants a LARGER value than this
+# default (e.g. tens of MB) to avoid thousands of tiny partitions. "0" means "do not set it"
 # (defer to the cluster/engine default). max_partition_bytes accepts a Spark byte-size string ("2m",
 # "16m", "128m") or a raw byte count.
 _DEFAULT_MAX_PARTITION_BYTES = "2m"

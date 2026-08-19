@@ -254,9 +254,10 @@ Two different mechanisms carry values into a job, and they resolve at different 
   - `max_partition_bytes` (a Spark byte-size such as `2m`, default `2m`) sets
     `spark.sql.files.maxPartitionBytes` for the source read. Smaller values produce more, smaller file
     splits, so the scan and the view transform fan out across more cores. This is the primary
-    parallelism lever, since those partitions carry through the (shuffle-free) view to the write. Tune
-    it to roughly `data_size / target_partitions` (aim for around the cluster's worker-core count, or a
-    small multiple). `0` leaves the cluster/engine default untouched. Applies to **both** modes.
+    parallelism lever, since those partitions carry through the (shuffle-free) view to the write. Aim
+    for a partition count of **~2-3x total worker cores** (the same target as `write_repartition`
+    below), i.e. set it to about `data_size / (2-3 × cores)`. `0` leaves the cluster/engine default
+    untouched. Applies to **both** modes.
   - `write_repartition` (a non-negative integer, default `0` = off) repartitions the write input to N
     partitions before the ES write (`bulk_write` runs one bulk stream per partition). It is off by
     default because `max_partition_bytes` already parallelizes the read and that partitioning flows

@@ -284,12 +284,13 @@ RUN_SUMMARY = None
 # silent success. (raise_on_error=False so the result is printed for the log before we reconcile.)
 if PIPELINE_MODE == "batch":
     export_df = apply_filter(spark.table(VIEW_FQN))
-    # Repartition the (filtered) export before the write so bulk_write fans out across the cluster.
     # bulk_write runs one ES bulk stream per DataFrame partition (mapInPandas), so write parallelism ==
-    # partition count. A full-day read is only a handful of ~128MB file splits and the view's reference
-    # joins broadcast (no shuffle), so export_df otherwise carries ~3 partitions and the write would use
-    # ~3 cores regardless of cluster size. WRITE_REPARTITION=0 disables this (keep natural partitioning);
-    # repartition AFTER the filter so the surviving rows are spread evenly.
+    # partition count. Read parallelism (max_partition_bytes, set above) is the primary lever: the scan
+    # and this narrow, shuffle-free transform preserve that partition count through to the write, so the
+    # write already fans out and WRITE_REPARTITION defaults to 0 (off). Set WRITE_REPARTITION > 0 only to
+    # override the write's partition count independently of the read (e.g. a view that shuffles resets it
+    # to spark.sql.shuffle.partitions); the target is the same either way, ~2-3x total worker cores.
+    # Repartition AFTER the filter so the surviving rows spread evenly.
     if WRITE_REPARTITION > 0:
         export_df = export_df.repartition(WRITE_REPARTITION)
     result = bulk_write(export_df, es_write_config)
@@ -373,12 +374,11 @@ if PIPELINE_MODE == "streaming":
         session = batch_df.sparkSession
         batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
         transformed = apply_filter(session.sql(RENDERED_SELECT))
-        # Repartition each micro-batch before the write, same rationale and knob as the batch path:
-        # bulk_write parallelizes one ES bulk stream per partition, and a micro-batch inherits the
-        # stream read's ~few partitions (broadcast reference joins add no shuffle), so without this the
-        # write uses ~few cores. Matters most for a full-backfill micro-batch (streaming_start=full);
-        # for a low-volume near-real-time stream set WRITE_REPARTITION=0 to avoid over-partitioning
-        # small batches into many near-empty tasks each trigger.
+        # Optional per-micro-batch repartition, same knob and rationale as the batch path: read
+        # parallelism (max_partition_bytes) is the primary lever and its partition count carries
+        # through this shuffle-free transform to the write, so WRITE_REPARTITION defaults to 0 (off).
+        # Set it > 0 only to override the write's partition count independently (e.g. a view that
+        # shuffles), targeting ~2-3x worker cores, the same target as the batch path.
         if WRITE_REPARTITION > 0:
             transformed = transformed.repartition(WRITE_REPARTITION)
         # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
