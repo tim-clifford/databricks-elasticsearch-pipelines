@@ -22,7 +22,9 @@ resources:
       - name: streaming_start
         default: new
       - name: write_repartition
-        default: '128'
+        default: '0'
+      - name: max_partition_bytes
+        default: 32m
       job_clusters:
       - job_cluster_key: standard_batch
         new_cluster:

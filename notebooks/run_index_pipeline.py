@@ -104,6 +104,7 @@ dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
 dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
+dbutils.widgets.text("max_partition_bytes", "", "spark.sql.files.maxPartitionBytes for the source read, e.g. 32m (0 leaves it unset; empty => default)")
 # Streaming-only widgets. checkpoint_base_path is a deploy-time base_parameter (bundle variable);
 # streaming_start is a run-time job parameter (default "new"). Both are ignored by a batch run.
 dbutils.widgets.text("checkpoint_base_path", "", "UC Volume base for streaming checkpoints (runner appends /<config_name>)")
@@ -119,6 +120,7 @@ CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
 WRITE_REPARTITION = dbutils.widgets.get("write_repartition").strip()
+MAX_PARTITION_BYTES = dbutils.widgets.get("max_partition_bytes").strip()
 CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
 STREAMING_START = dbutils.widgets.get("streaming_start").strip()
 if not CONFIG_NAME:
@@ -139,6 +141,7 @@ from pipeline_lib.config import (  # noqa: E402
     load_config,
     render_view_sql,
     require_filter_condition,
+    require_max_partition_bytes,
     require_pipeline_mode,
     require_streaming_start,
     require_write_repartition,
@@ -167,6 +170,9 @@ FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition 
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS)
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
 WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repartition job parameter"))
+# - max_partition_bytes: Spark byte-size (or "0" = leave unset). Validated unconditionally; applied to
+#   the source read below (both modes). Empty widget -> the built-in default via the validator.
+MAX_PARTITION_BYTES = require_max_partition_bytes(MAX_PARTITION_BYTES, "max_partition_bytes job parameter")
 
 # The global ES connection settings are required for any index-job run: fail closed on an empty one
 # (e.g. a deploy that forgot --var=es_host_url) rather than constructing a broken EsWriteConfig.
@@ -217,11 +223,26 @@ print(f"pipeline_mode      = {PIPELINE_MODE}")
 print(f"filter_condition   = {FILTER_CONDITION!r}")
 print(f"write_overrides    = {write_overrides}")
 print(f"write_repartition  = {WRITE_REPARTITION}" + (" (disabled: natural partitioning)" if WRITE_REPARTITION == 0 else ""))
+print(f"max_partition_bytes= {MAX_PARTITION_BYTES}" + (" (leave engine default)" if MAX_PARTITION_BYTES == "0" else ""))
 print(f"view               = {VIEW_FQN}")
 print(f"source             = {SOURCE_FQN}")
 print(f"es_host_url        = {ES_HOST_URL}")
 if PIPELINE_MODE == "streaming":
     print(f"streaming_start    = {STREAMING_START}")
+
+# Tune read/scan parallelism for BOTH modes by setting spark.sql.files.maxPartitionBytes before any
+# read below (smaller => more, smaller source-file splits => the scan+view-transform fans out across
+# more cores). "0" means leave the cluster/engine default untouched, so we skip the set. Guarded: this
+# is a performance conf, not a correctness one, and some runtimes (e.g. serverless, which auto-tunes
+# parallelism) may reject setting it - so a failure to set it warns and continues on the engine default
+# rather than failing the run.
+if MAX_PARTITION_BYTES != "0":
+    try:
+        spark.conf.set("spark.sql.files.maxPartitionBytes", MAX_PARTITION_BYTES)
+        print(f"set spark.sql.files.maxPartitionBytes = {MAX_PARTITION_BYTES}")
+    except Exception as _e:
+        print(f"WARNING: could not set spark.sql.files.maxPartitionBytes={MAX_PARTITION_BYTES} "
+              f"({type(_e).__name__}: {_e}); continuing on the engine default")
 
 # COMMAND ----------
 # Build the connector write config + the shared filter helper. Both are MODE-INDEPENDENT (batch and
