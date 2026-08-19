@@ -103,18 +103,32 @@ _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 # already-running stream is a no-op until that stream's checkpoint is cleared.
 _VALID_STREAMING_STARTS = ("new", "full")
 
-# Built-in default for the write repartition count (write_repartition), applied when the config omits
-# the key AND no --params override is given. Deliberately NOT the read's natural partitioning: a
-# full-day batch (or a full-backfill streaming micro-batch) reads as only a handful of ~128MB file
-# splits, and the view's reference joins broadcast (no shuffle), so an un-repartitioned write input
-# carries ~3 partitions and bulk_write - which runs one ES bulk stream per partition (mapInPandas) -
-# would use ~3 cores no matter how large the cluster is. A moderate default fans the write out across a
-# substantial cluster (extra partitions relative to cores are fine here: the write is I/O-bound on ES,
-# so oversubscription hides per-request latency). Applied in BOTH modes (to the whole export in batch,
-# and per micro-batch in streaming). Override per config or per run for a bigger cluster; set 0 to
-# disable (keep the read's natural partitioning) for a low-volume near-real-time stream or a tiny batch,
-# where fanning out to 128 would only add a shuffle and many near-empty tasks each micro-batch.
-_DEFAULT_WRITE_REPARTITION = 128
+# Read/scan parallelism is governed by spark.sql.files.maxPartitionBytes (the size of each source file
+# split): smaller => more, smaller splits => the scan and the view transform fan out across more cores.
+# This is the PRIMARY parallelism lever, because the scan+transform (projections, casts, broadcast
+# reference joins, filter) are narrow operations that preserve the partition count all the way to the
+# write - so parallelizing the read parallelizes the whole pipeline in ONE stage, with no extra shuffle.
+# _DEFAULT_MAX_PARTITION_BYTES is well below Spark's own 128m default so the small-to-medium reads this
+# framework typically runs (a day is only ~hundreds of MB, which 128m scans in just a few splits)
+# parallelize across the cluster instead of running on a handful of cores. Tune it so the read yields
+# ~2-3x worker cores partitions (data_size / (2-3 x cores)), the same partition-count target as
+# write_repartition; see the README. Note a very large one-off load wants a LARGER value than this
+# default (e.g. tens of MB) to avoid thousands of tiny partitions. "0" means "do not set it"
+# (defer to the cluster/engine default). max_partition_bytes accepts a Spark byte-size string ("2m",
+# "16m", "128m") or a raw byte count.
+_DEFAULT_MAX_PARTITION_BYTES = "2m"
+# A Spark byte-size: digits, optional unit (k/m/g/t/p, optionally with a trailing 'b'), case-insensitive.
+_MAX_PARTITION_BYTES_RE = re.compile(r"^(\d+)([kmgtp]b?)?$", re.IGNORECASE)
+
+# write_repartition explicitly repartitions the write input (a df.repartition(N) before bulk_write). It
+# defaults to 0 = OFF, because maxPartitionBytes above already parallelizes the read AND the partition
+# count flows through the (shuffle-free) view to the write, so an explicit repartition is normally
+# redundant and would only add a shuffle. Set it > 0 (a good target is ~2-3x total worker cores) when
+# the write needs parallelism the read does not supply: a view that SHUFFLES (a non-broadcast join, a
+# GROUP BY/DISTINCT/window) resets the post-shuffle partition count to spark.sql.shuffle.partitions, so
+# there the read parallelism does not reach the write and this knob restores it. Applied in BOTH modes
+# (the whole export in batch, each micro-batch in streaming).
+_DEFAULT_WRITE_REPARTITION = 0
 
 
 class PipelineConfigError(ValueError):
@@ -270,18 +284,16 @@ def require_write_repartition(value: object, where: str = "write_repartition") -
 
     Follows the same config-default-plus-run-time-override pattern as require_chunk_size (one validator
     shared by the config schema AND the runner's --params value, so both apply the identical fail-closed
-    rule), with two deliberate differences:
-      - It is NOT an EsWriteConfig knob: it drives a Spark `df.repartition(N)` on the write input BEFORE
-        bulk_write (the whole export in batch mode, each transformed micro-batch in streaming mode), so
-        the bulk write fans out across the cluster instead of inheriting the read's ~few partitions.
-      - Empty/absent does NOT mean "unset": there is no upstream default to fall back to, so an omitted
-        value returns the built-in _DEFAULT_WRITE_REPARTITION rather than "". That is what guarantees a
-        write parallelizes by default instead of running on the read's handful of partitions.
-    0 is allowed and means "do not repartition" (keep the read's natural partitioning) - the escape
-    hatch for a low-volume near-real-time stream or a tiny batch, where fanning out to the default would
-    only add a shuffle and near-empty tasks. Accepts a YAML int (config default) or a string (run-time
-    override). A bool (int subclass), a float, a non-numeric string, or a negative value is rejected
-    (fail closed)."""
+    rule). It is NOT an EsWriteConfig knob: it drives a Spark `df.repartition(N)` on the write input
+    BEFORE bulk_write (the whole export in batch mode, each transformed micro-batch in streaming mode).
+    0 means "do not repartition" (keep the read's natural partitioning) and is the DEFAULT
+    (_DEFAULT_WRITE_REPARTITION): read parallelism (max_partition_bytes) is the primary lever and its
+    partition count flows through a shuffle-free view to the write, so an explicit repartition is
+    normally redundant. Set it > 0 (a good target is ~2-3x total worker cores) when the write needs
+    parallelism the read does not supply - e.g. a view that shuffles resets the post-shuffle partition
+    count to spark.sql.shuffle.partitions. Empty/absent returns the default. Accepts a YAML int (config
+    default) or a string (run-time override). A bool (int subclass), a float, a non-numeric string, or a
+    negative value is rejected (fail closed)."""
     if isinstance(value, str):
         value = value.strip()
     if value is None or value == "":
@@ -300,6 +312,41 @@ def require_write_repartition(value: object, where: str = "write_repartition") -
     if parsed < 0:
         raise PipelineConfigError(f"{where} must be a non-negative integer (0 disables repartitioning), got {value!r}")
     return str(parsed)
+
+
+def require_max_partition_bytes(value: object, where: str = "max_partition_bytes") -> str:
+    """OPTIONAL spark.sql.files.maxPartitionBytes for the source read: a Spark byte-size, canonical str.
+
+    Governs read/scan parallelism (the size of each source file split): a smaller value yields more,
+    smaller splits, so the scan and the (narrow) view transform fan out across more cores - the primary
+    parallelism lever for the whole pipeline. Same shared-validator pattern as the other tuning knobs.
+    Accepts a Spark byte-size string ("32m", "16m", "128m", "512mb"; unit k/m/g/t/p, optional trailing
+    'b', case-insensitive) OR a raw positive byte count (int or its string). Returned canonical
+    (lowercased). "0" (or 0, or "0m") is the escape hatch meaning "do NOT set it" - defer to the
+    cluster/engine default; the runner skips the spark.conf.set in that case. Empty/absent returns the
+    built-in default (_DEFAULT_MAX_PARTITION_BYTES). A bool (int subclass), a float, a negative value, or
+    a malformed size string is rejected (fail closed)."""
+    if isinstance(value, bool):
+        raise PipelineConfigError(f"{where} must be a Spark byte-size like '32m' or a byte count (0 to leave unset), got {value!r}")
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "":
+        return _DEFAULT_MAX_PARTITION_BYTES
+    if isinstance(value, int):
+        if value < 0:
+            raise PipelineConfigError(f"{where} must be non-negative (0 to leave unset), got {value!r}")
+        return str(value)  # raw bytes; 0 -> "0" meaning "do not set"
+    if isinstance(value, str):
+        m = _MAX_PARTITION_BYTES_RE.match(value)
+        if not m:
+            raise PipelineConfigError(
+                f"{where} must be a Spark byte-size like '32m'/'16m'/'128m' or a raw byte count "
+                f"(0 to leave unset), got {value!r}"
+            )
+        if int(m.group(1)) == 0:
+            return "0"  # normalize "0"/"0m"/"0b" to the "do not set" sentinel
+        return value.lower()
+    raise PipelineConfigError(f"{where} must be a Spark byte-size like '32m' or a byte count (0 to leave unset), got {value!r}")
 
 
 def _require_es_index(value: object, where: str) -> str:
@@ -361,7 +408,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
 
     allowed_top = {
         "es_index_name", "es_id_field", "pipeline_mode", "filter_condition",
-        "chunk_size", "require_existing_index", "verify_certs", "write_repartition",
+        "chunk_size", "require_existing_index", "verify_certs", "write_repartition", "max_partition_bytes",
         "view", "source", "reference_tables", "compute", "schedule",
     }
     unknown = sorted(set(raw) - allowed_top)
@@ -389,6 +436,9 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # _DEFAULT_WRITE_REPARTITION), so a config that omits it still parallelizes the write instead of
     # inheriting the read's ~few partitions. Stored in canonical string form (a job-parameter default).
     write_repartition = require_write_repartition(raw.get("write_repartition", ""), f"{source}: write_repartition")
+    # max_partition_bytes is OPTIONAL: absent -> the built-in default (require_max_partition_bytes turns
+    # "" into _DEFAULT_MAX_PARTITION_BYTES). It governs read/scan parallelism; "0" means leave it unset.
+    max_partition_bytes = require_max_partition_bytes(raw.get("max_partition_bytes", ""), f"{source}: max_partition_bytes")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
     # source carries primary_key in addition to catalog/schema/table: it is a column of the SOURCE
     # table (unique-row identity for the streaming read), so it lives with the source, not at top level.
@@ -414,6 +464,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "require_existing_index": require_existing_index,
         "verify_certs": verify_certs,
         "write_repartition": write_repartition,
+        "max_partition_bytes": max_partition_bytes,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
@@ -595,9 +646,11 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "chunk_size": cfg["chunk_size"],
         "require_existing_index": cfg["require_existing_index"],
         "verify_certs": cfg["verify_certs"],
-        # write_repartition (partitions for the pre-write repartition) is a run behavior, not an object
-        # name: passed through verbatim (canonical string form), like the tuning knobs.
+        # write_repartition (partitions for the pre-write repartition) and max_partition_bytes (read
+        # scan parallelism) are run behaviors, not object names: passed through verbatim (canonical
+        # string form), like the tuning knobs.
         "write_repartition": cfg["write_repartition"],
+        "max_partition_bytes": cfg["max_partition_bytes"],
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
@@ -772,10 +825,12 @@ def job_parameters(cfg: dict) -> list:
       only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
       run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
       default rather than a config key: it is a per-rollout operator choice, not a per-index property.
-    - write_repartition: how many partitions to repartition the write input into before bulk_write (0
-      disables), so the ES write fans out across the cluster instead of inheriting the read's ~few
-      partitions. DEFAULT from the config, which itself defaults to _DEFAULT_WRITE_REPARTITION when the
-      config omits it (validate_config), so this is never "". Applies to both modes.
+    - max_partition_bytes: spark.sql.files.maxPartitionBytes for the source read (read/scan
+      parallelism); DEFAULT from the config, which defaults to _DEFAULT_MAX_PARTITION_BYTES when the
+      config omits it. "0" leaves it unset. The primary parallelism lever; applies to both modes.
+    - write_repartition: how many partitions to repartition the write input into before bulk_write; 0
+      (the default) leaves the read's partitioning in place (see max_partition_bytes). DEFAULT from the
+      config, which defaults to _DEFAULT_WRITE_REPARTITION. Applies to both modes.
 
     Returns the list shape DAB expects under a job's `parameters:` key.
     """
@@ -787,4 +842,5 @@ def job_parameters(cfg: dict) -> list:
         {"name": "verify_certs", "default": cfg["verify_certs"]},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": cfg["write_repartition"]},
+        {"name": "max_partition_bytes", "default": cfg["max_partition_bytes"]},
     ]

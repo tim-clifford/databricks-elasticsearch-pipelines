@@ -11,10 +11,15 @@ pipeline_mode: batch              # default export mode: batch | streaming (over
 # chunk_size: 1000                # OPTIONAL EsWriteConfig tuning: docs per bulk request (override per run)
 # require_existing_index: true    # OPTIONAL EsWriteConfig tuning: require the ES index to exist first
 # verify_certs: true              # OPTIONAL EsWriteConfig tuning: verify the ES TLS certificate
-# write_repartition: 128          # OPTIONAL: partitions for the pre-write repartition, so bulk_write
-#                                 # fans out across the cluster (0 disables). Omitted => default 128.
-#                                 # Raise it (~2-3x worker cores) for a big bulk load; set 0 for a
-#                                 # low-volume stream where 128 partitions/micro-batch is overkill.
+# max_partition_bytes: 2m         # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read
+#                                 # (read/scan parallelism). Smaller => more, smaller splits => the
+#                                 # scan+transform fans out across more cores. Primary parallelism
+#                                 # lever. Tune for ~2-3x worker cores partitions
+#                                 # (~data_size/(2-3x cores)); 0 leaves the engine default.
+# write_repartition: 0            # OPTIONAL: partitions for a pre-write repartition. 0 (default) = off:
+#                                 # read parallelism above already carries through the (shuffle-free)
+#                                 # view to the write. Set > 0 (~2-3x worker cores) only if the view
+#                                 # shuffles (non-broadcast join / GROUP BY / window).
 
 view:                             # the view this pipeline creates and exports
   catalog: tim_clifford_classic_dsl_lite_${environment}

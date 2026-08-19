@@ -22,7 +22,9 @@ resources:
       - name: streaming_start
         default: new
       - name: write_repartition
-        default: '128'
+        default: '0'
+      - name: max_partition_bytes
+        default: 2m
       schedule:
         quartz_cron_expression: 0 */10 * * * ?
         timezone_id: UTC

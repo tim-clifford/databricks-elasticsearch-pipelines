@@ -16,6 +16,7 @@ from pipeline_lib.config import (
     require_chunk_size,
     require_es_flag,
     require_filter_condition,
+    require_max_partition_bytes,
     require_pipeline_mode,
     require_streaming_start,
     require_write_repartition,
@@ -79,9 +80,11 @@ def test_minimal_valid():
     assert out["chunk_size"] == ""
     assert out["require_existing_index"] == ""
     assert out["verify_certs"] == ""
-    # write_repartition is the exception: omitted, it takes the built-in default (NOT "unset"), so a
-    # config that never mentions it still parallelizes the write instead of inheriting ~few partitions.
-    assert out["write_repartition"] == "128"
+    # write_repartition and max_partition_bytes are the exceptions: omitted, they take a built-in
+    # default (NOT "unset"). write_repartition defaults to 0 (off - read parallelism is the primary
+    # lever); max_partition_bytes defaults to the built-in scan-parallelism size.
+    assert out["write_repartition"] == "0"
+    assert out["max_partition_bytes"] == "2m"
 
 
 def test_environment_token_accepted_as_template():
@@ -430,7 +433,7 @@ def test_job_base_parameters_excludes_run_time_params():
     # per-run override.
     params = _job_base_parameters("x")
     for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "require_existing_index",
-                     "verify_certs", "streaming_start", "write_repartition"):
+                     "verify_certs", "streaming_start", "write_repartition", "max_partition_bytes"):
         assert run_time not in params
 
 
@@ -458,7 +461,8 @@ def test_job_parameters_full_shape_and_order():
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
         {"name": "streaming_start", "default": "new"},
-        {"name": "write_repartition", "default": "128"},
+        {"name": "write_repartition", "default": "0"},
+        {"name": "max_partition_bytes", "default": "2m"},
     ]
 
 
@@ -667,8 +671,8 @@ def test_require_write_repartition_canonical(value, expected):
 @pytest.mark.parametrize("value", ["", None, "  "])
 def test_require_write_repartition_empty_takes_builtin_default(value):
     # Unlike the tuning knobs (empty -> ""), an unset write_repartition falls back to the built-in
-    # default, so a config/run that never sets it still parallelizes instead of using ~few partitions.
-    assert require_write_repartition(value) == "128"
+    # default, which is 0 = off (read parallelism via max_partition_bytes is the primary lever).
+    assert require_write_repartition(value) == "0"
 
 
 @pytest.mark.parametrize("bad", ["abc", "12.5", "-5", "1e3", -1, -100, 12.5, True, False])
@@ -681,8 +685,8 @@ def test_require_write_repartition_fails_closed(bad):
 
 def test_write_repartition_absent_defaults_builtin_in_config():
     # A config that omits write_repartition stores the built-in default (canonical string), which then
-    # becomes the job-parameter default.
-    assert validate_config(_base())["write_repartition"] == "128"
+    # becomes the job-parameter default. Default is 0 = off.
+    assert validate_config(_base())["write_repartition"] == "0"
 
 
 @pytest.mark.parametrize("value,expected", [(256, "256"), ("256", "256"), (0, "0")])
@@ -712,6 +716,64 @@ def test_job_parameters_write_repartition_default_from_config():
     cfg = _base()
     cfg["write_repartition"] = 256
     assert {"name": "write_repartition", "default": "256"} in job_parameters(validate_config(cfg))
+
+
+# --------------------------------------------------------------------------- max_partition_bytes
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("32m", "32m"), ("16M", "16m"), ("128m", "128m"), ("512mb", "512mb"), ("1g", "1g"),  # byte-size strings
+    (" 8m ", "8m"),                                   # trimmed + lowercased
+    (33554432, "33554432"), ("33554432", "33554432"), # raw byte count (int or string)
+    (0, "0"), ("0", "0"), ("0m", "0"),                # 0 sentinel: "do not set", normalized to "0"
+])
+def test_require_max_partition_bytes_canonical(value, expected):
+    assert require_max_partition_bytes(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", None, "  "])
+def test_require_max_partition_bytes_empty_takes_builtin_default(value):
+    # Unset falls back to the built-in scan-parallelism default (not "unset"/engine default).
+    assert require_max_partition_bytes(value) == "2m"
+
+
+@pytest.mark.parametrize("bad", ["abc", "32.5m", "32x", "m", "-5", -1, 12.5, True, False, "32 m"])
+def test_require_max_partition_bytes_fails_closed(bad):
+    # A malformed size, a bad/space-separated unit, a float, a bool (int subclass), or a negative value
+    # must fail closed rather than reach spark.conf.set as a value it would choke on at read time.
+    with pytest.raises(PipelineConfigError, match="max_partition_bytes"):
+        require_max_partition_bytes(bad)
+
+
+def test_max_partition_bytes_absent_defaults_builtin_in_config():
+    assert validate_config(_base())["max_partition_bytes"] == "2m"
+
+
+@pytest.mark.parametrize("value,expected", [("16m", "16m"), (67108864, "67108864"), ("0", "0")])
+def test_max_partition_bytes_from_config(value, expected):
+    cfg = _base()
+    cfg["max_partition_bytes"] = value
+    assert validate_config(cfg)["max_partition_bytes"] == expected
+
+
+@pytest.mark.parametrize("bad", ["nope", "32.5m", -1, 12.5, True])
+def test_max_partition_bytes_bad_config_value_fails_closed(bad):
+    cfg = _base()
+    cfg["max_partition_bytes"] = bad
+    with pytest.raises(PipelineConfigError, match="max_partition_bytes"):
+        validate_config(cfg)
+
+
+def test_max_partition_bytes_carried_through_resolve():
+    cfg = _with_env()
+    cfg["max_partition_bytes"] = "16m"
+    assert resolve_config(validate_config(cfg), environment="prod")["max_partition_bytes"] == "16m"
+
+
+def test_job_parameters_max_partition_bytes_default_from_config():
+    cfg = _base()
+    cfg["max_partition_bytes"] = "16m"
+    assert {"name": "max_partition_bytes", "default": "16m"} in job_parameters(validate_config(cfg))
 
 
 # --------------------------------------------------------------------------- require_pipeline_mode
