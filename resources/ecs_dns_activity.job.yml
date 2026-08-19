@@ -21,6 +21,8 @@ resources:
         default: ''
       - name: streaming_start
         default: new
+      - name: write_repartition
+        default: '128'
       schedule:
         quartz_cron_expression: 0 */10 * * * ?
         timezone_id: UTC

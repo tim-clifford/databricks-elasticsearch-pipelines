@@ -103,6 +103,19 @@ _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 # already-running stream is a no-op until that stream's checkpoint is cleared.
 _VALID_STREAMING_STARTS = ("new", "full")
 
+# Built-in default for the write repartition count (write_repartition), applied when the config omits
+# the key AND no --params override is given. Deliberately NOT the read's natural partitioning: a
+# full-day batch (or a full-backfill streaming micro-batch) reads as only a handful of ~128MB file
+# splits, and the view's reference joins broadcast (no shuffle), so an un-repartitioned write input
+# carries ~3 partitions and bulk_write - which runs one ES bulk stream per partition (mapInPandas) -
+# would use ~3 cores no matter how large the cluster is. A moderate default fans the write out across a
+# substantial cluster (extra partitions relative to cores are fine here: the write is I/O-bound on ES,
+# so oversubscription hides per-request latency). Applied in BOTH modes (to the whole export in batch,
+# and per micro-batch in streaming). Override per config or per run for a bigger cluster; set 0 to
+# disable (keep the read's natural partitioning) for a low-volume near-real-time stream or a tiny batch,
+# where fanning out to 128 would only add a shuffle and many near-empty tasks each micro-batch.
+_DEFAULT_WRITE_REPARTITION = 128
+
 
 class PipelineConfigError(ValueError):
     """A pipeline definition is invalid. Raised at load/resolve time, never at row time (fail closed)."""
@@ -252,6 +265,43 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     return overrides
 
 
+def require_write_repartition(value: object, where: str = "write_repartition") -> str:
+    """OPTIONAL write repartition count: a NON-NEGATIVE integer, returned as a canonical string.
+
+    Follows the same config-default-plus-run-time-override pattern as require_chunk_size (one validator
+    shared by the config schema AND the runner's --params value, so both apply the identical fail-closed
+    rule), with two deliberate differences:
+      - It is NOT an EsWriteConfig knob: it drives a Spark `df.repartition(N)` on the write input BEFORE
+        bulk_write (the whole export in batch mode, each transformed micro-batch in streaming mode), so
+        the bulk write fans out across the cluster instead of inheriting the read's ~few partitions.
+      - Empty/absent does NOT mean "unset": there is no upstream default to fall back to, so an omitted
+        value returns the built-in _DEFAULT_WRITE_REPARTITION rather than "". That is what guarantees a
+        write parallelizes by default instead of running on the read's handful of partitions.
+    0 is allowed and means "do not repartition" (keep the read's natural partitioning) - the escape
+    hatch for a low-volume near-real-time stream or a tiny batch, where fanning out to the default would
+    only add a shuffle and near-empty tasks. Accepts a YAML int (config default) or a string (run-time
+    override). A bool (int subclass), a float, a non-numeric string, or a negative value is rejected
+    (fail closed)."""
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "":
+        return str(_DEFAULT_WRITE_REPARTITION)
+    if isinstance(value, bool):
+        raise PipelineConfigError(f"{where} must be a non-negative integer (0 disables repartitioning), got {value!r}")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)  # rejects "12.5"/"1e3"/"abc" (no silent float truncation)
+        except ValueError:
+            raise PipelineConfigError(f"{where} must be a non-negative integer (0 disables repartitioning), got {value!r}")
+    else:
+        raise PipelineConfigError(f"{where} must be a non-negative integer (0 disables repartitioning), got {value!r}")
+    if parsed < 0:
+        raise PipelineConfigError(f"{where} must be a non-negative integer (0 disables repartitioning), got {value!r}")
+    return str(parsed)
+
+
 def _require_es_index(value: object, where: str) -> str:
     """A valid Elasticsearch index name. Enforces the char/leading-char rules via the regex, plus the
     255-BYTE length bound and no-trailing-dot rule (which a single regex can't express well)."""
@@ -311,7 +361,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
 
     allowed_top = {
         "es_index_name", "es_id_field", "pipeline_mode", "filter_condition",
-        "chunk_size", "require_existing_index", "verify_certs",
+        "chunk_size", "require_existing_index", "verify_certs", "write_repartition",
         "view", "source", "reference_tables", "compute", "schedule",
     }
     unknown = sorted(set(raw) - allowed_top)
@@ -334,6 +384,11 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     chunk_size = require_chunk_size(raw.get("chunk_size", ""), f"{source}: chunk_size")
     require_existing_index = require_es_flag(raw.get("require_existing_index", ""), f"{source}: require_existing_index")
     verify_certs = require_es_flag(raw.get("verify_certs", ""), f"{source}: verify_certs")
+    # write_repartition is OPTIONAL but, unlike the tuning knobs above, an absent value does NOT mean
+    # "unset": it falls back to the built-in default (require_write_repartition turns "" into
+    # _DEFAULT_WRITE_REPARTITION), so a config that omits it still parallelizes the write instead of
+    # inheriting the read's ~few partitions. Stored in canonical string form (a job-parameter default).
+    write_repartition = require_write_repartition(raw.get("write_repartition", ""), f"{source}: write_repartition")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
     # source carries primary_key in addition to catalog/schema/table: it is a column of the SOURCE
     # table (unique-row identity for the streaming read), so it lives with the source, not at top level.
@@ -358,6 +413,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "chunk_size": chunk_size,
         "require_existing_index": require_existing_index,
         "verify_certs": verify_certs,
+        "write_repartition": write_repartition,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
@@ -539,6 +595,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "chunk_size": cfg["chunk_size"],
         "require_existing_index": cfg["require_existing_index"],
         "verify_certs": cfg["verify_certs"],
+        # write_repartition (partitions for the pre-write repartition) is a run behavior, not an object
+        # name: passed through verbatim (canonical string form), like the tuning knobs.
+        "write_repartition": cfg["write_repartition"],
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
@@ -713,6 +772,10 @@ def job_parameters(cfg: dict) -> list:
       only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
       run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
       default rather than a config key: it is a per-rollout operator choice, not a per-index property.
+    - write_repartition: how many partitions to repartition the write input into before bulk_write (0
+      disables), so the ES write fans out across the cluster instead of inheriting the read's ~few
+      partitions. DEFAULT from the config, which itself defaults to _DEFAULT_WRITE_REPARTITION when the
+      config omits it (validate_config), so this is never "". Applies to both modes.
 
     Returns the list shape DAB expects under a job's `parameters:` key.
     """
@@ -723,4 +786,5 @@ def job_parameters(cfg: dict) -> list:
         {"name": "require_existing_index", "default": cfg["require_existing_index"]},
         {"name": "verify_certs", "default": cfg["verify_certs"]},
         {"name": "streaming_start", "default": "new"},
+        {"name": "write_repartition", "default": cfg["write_repartition"]},
     ]

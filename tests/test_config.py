@@ -18,6 +18,7 @@ from pipeline_lib.config import (
     require_filter_condition,
     require_pipeline_mode,
     require_streaming_start,
+    require_write_repartition,
     resolve_config,
     resolve_name,
     validate_config,
@@ -78,6 +79,9 @@ def test_minimal_valid():
     assert out["chunk_size"] == ""
     assert out["require_existing_index"] == ""
     assert out["verify_certs"] == ""
+    # write_repartition is the exception: omitted, it takes the built-in default (NOT "unset"), so a
+    # config that never mentions it still parallelizes the write instead of inheriting ~few partitions.
+    assert out["write_repartition"] == "128"
 
 
 def test_environment_token_accepted_as_template():
@@ -426,7 +430,7 @@ def test_job_base_parameters_excludes_run_time_params():
     # per-run override.
     params = _job_base_parameters("x")
     for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "require_existing_index",
-                     "verify_certs", "streaming_start"):
+                     "verify_certs", "streaming_start", "write_repartition"):
         assert run_time not in params
 
 
@@ -454,6 +458,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
         {"name": "streaming_start", "default": "new"},
+        {"name": "write_repartition", "default": "128"},
     ]
 
 
@@ -646,6 +651,67 @@ def test_job_parameters_tuning_defaults_from_config():
     assert {"name": "chunk_size", "default": "1000"} in params
     assert {"name": "verify_certs", "default": "false"} in params
     assert {"name": "require_existing_index", "default": ""} in params
+
+
+# --------------------------------------------------------------------------- write_repartition
+
+
+@pytest.mark.parametrize("value,expected", [
+    (500, "500"), ("500", "500"), (" 250 ", "250"),  # YAML int OR string -> canonical string
+    (0, "0"), ("0", "0"),                             # 0 is allowed: "do not repartition"
+])
+def test_require_write_repartition_canonical(value, expected):
+    assert require_write_repartition(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", None, "  "])
+def test_require_write_repartition_empty_takes_builtin_default(value):
+    # Unlike the tuning knobs (empty -> ""), an unset write_repartition falls back to the built-in
+    # default, so a config/run that never sets it still parallelizes instead of using ~few partitions.
+    assert require_write_repartition(value) == "128"
+
+
+@pytest.mark.parametrize("bad", ["abc", "12.5", "-5", "1e3", -1, -100, 12.5, True, False])
+def test_require_write_repartition_fails_closed(bad):
+    # A negative int, a float, a non-numeric string, or a bool (int subclass) must fail closed. 0 is
+    # NOT here: it is a valid value meaning "disable repartitioning".
+    with pytest.raises(PipelineConfigError, match="write_repartition"):
+        require_write_repartition(bad)
+
+
+def test_write_repartition_absent_defaults_builtin_in_config():
+    # A config that omits write_repartition stores the built-in default (canonical string), which then
+    # becomes the job-parameter default.
+    assert validate_config(_base())["write_repartition"] == "128"
+
+
+@pytest.mark.parametrize("value,expected", [(256, "256"), ("256", "256"), (0, "0")])
+def test_write_repartition_from_config(value, expected):
+    # A config value (int or string, including 0 to disable) is accepted and canonicalized.
+    cfg = _base()
+    cfg["write_repartition"] = value
+    assert validate_config(cfg)["write_repartition"] == expected
+
+
+@pytest.mark.parametrize("bad", ["abc", -1, 12.5, True])
+def test_write_repartition_bad_config_value_fails_closed(bad):
+    cfg = _base()
+    cfg["write_repartition"] = bad
+    with pytest.raises(PipelineConfigError, match="write_repartition"):
+        validate_config(cfg)
+
+
+def test_write_repartition_carried_through_resolve():
+    # A run behavior, not an object name: resolve passes the canonical string through unchanged.
+    cfg = _with_env()
+    cfg["write_repartition"] = 200
+    assert resolve_config(validate_config(cfg), environment="prod")["write_repartition"] == "200"
+
+
+def test_job_parameters_write_repartition_default_from_config():
+    cfg = _base()
+    cfg["write_repartition"] = 256
+    assert {"name": "write_repartition", "default": "256"} in job_parameters(validate_config(cfg))
 
 
 # --------------------------------------------------------------------------- require_pipeline_mode
