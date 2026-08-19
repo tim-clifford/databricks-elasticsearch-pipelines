@@ -113,7 +113,8 @@ filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
-write_repartition: 128            # OPTIONAL: partitions to repartition the write into before bulk_write (0 disables); omit for default 128
+max_partition_bytes: 32m          # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 32m
+write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
 view:                             # the view this pipeline uses
   catalog: acme_${environment}
   schema: es_poc
@@ -250,13 +251,18 @@ Two different mechanisms carry values into a job, and they resolve at different 
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).
-  - `write_repartition` (a non-negative integer, default `128`) repartitions the write input to N
-    partitions before the ES write. `bulk_write` runs one ES bulk stream per partition, so this sets
-    how far the write fans out across the cluster; the default keeps a large write from running on
-    the few partitions a read produces. `0` disables it (keep the read's natural partitioning), which
-    suits a small write where fanning out would only add a shuffle. Applies to **both** modes (the
-    whole export in batch, each micro-batch in streaming). For a large write on a big cluster, raise
-    it toward 2-3x total worker cores.
+  - `max_partition_bytes` (a Spark byte-size such as `32m`, default `32m`) sets
+    `spark.sql.files.maxPartitionBytes` for the source read. Smaller values produce more, smaller file
+    splits, so the scan and the view transform fan out across more cores. This is the primary
+    parallelism lever, since those partitions carry through the (shuffle-free) view to the write. Tune
+    it to roughly `data_size / target_partitions` (aim for around the cluster's worker-core count, or a
+    small multiple). `0` leaves the cluster/engine default untouched. Applies to **both** modes.
+  - `write_repartition` (a non-negative integer, default `0` = off) repartitions the write input to N
+    partitions before the ES write (`bulk_write` runs one bulk stream per partition). It is off by
+    default because `max_partition_bytes` already parallelizes the read and that partitioning flows
+    through to the write. Set it `> 0` (a good target is ~2-3x total worker cores) only when the write
+    needs parallelism the read does not supply, e.g. a view that **shuffles** (a non-broadcast join,
+    `GROUP BY`, `DISTINCT`, window) resets the post-shuffle partition count. Applies to **both** modes.
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
@@ -274,7 +280,7 @@ databricks bundle run index_pipeline_<config_name> -t dev -p <profile>
 
 # override run-time settings for a single run (each defaults to its config/connector value otherwise):
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
-  --params filter_condition="action = 'allowed'",chunk_size=1000,write_repartition=240
+  --params filter_condition="action = 'allowed'",chunk_size=1000,max_partition_bytes=8m
 
 # stream a one-off full backfill of the whole table (default is new-commits-only):
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
