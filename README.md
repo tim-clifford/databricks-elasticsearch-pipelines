@@ -113,6 +113,7 @@ filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
+write_repartition: 128            # OPTIONAL: partitions to repartition the write into before bulk_write (0 disables); omit for default 128
 view:                             # the view this pipeline uses
   catalog: acme_${environment}
   schema: es_poc
@@ -249,6 +250,15 @@ Two different mechanisms carry values into a job, and they resolve at different 
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).
+  - `write_repartition` (a non-negative integer, default `128`) sets how many partitions the write
+    input is repartitioned into before the ES write. `bulk_write` runs one ES bulk stream per
+    partition, so this is what fans the write out across the cluster; without it a large export
+    inherits the read's handful of partitions (~3 for a full-day read, since the view's reference
+    joins broadcast and add no shuffle) and the write uses ~3 cores no matter the cluster size. `0`
+    disables it (keep the read's natural partitioning) for a low-volume near-real-time stream or a
+    tiny batch, where fanning out to 128 would only add a shuffle and many near-empty tasks. Applies
+    to **both** modes (the whole export in batch, each micro-batch in streaming). Raise it for a
+    bigger cluster (roughly 2-3x total worker cores is a good target).
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
@@ -266,7 +276,7 @@ databricks bundle run index_pipeline_<config_name> -t dev -p <profile>
 
 # override run-time settings for a single run (each defaults to its config/connector value otherwise):
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
-  --params filter_condition="action = 'allowed'",chunk_size=1000
+  --params filter_condition="action = 'allowed'",chunk_size=1000,write_repartition=240
 
 # stream a one-off full backfill of the whole table (default is new-commits-only):
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
