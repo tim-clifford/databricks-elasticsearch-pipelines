@@ -86,9 +86,9 @@ or `DATABRICKS_HOST`. The environment-specific connection, path, and policy vari
 target** in `databricks.yml` (`targets.<env>.variables`), shipping **empty** on `main` for you to fill
 in for the environments you deploy to, so a routine deploy needs no `--var`. (`schedule_pause_status` is
 also per-environment but is the exception: it defaults to `PAUSED` globally and only `prd` overrides it,
-see [Scheduling](#scheduling).) The four simple string variables (`environment`, `wheel_path`,
-`checkpoint_base_path`, `cluster_policy_id`) can still be overridden at deploy with
-`--var=<name>=<value>`; the `type: complex` ES host configs **cannot** be set via `--var` at all (the
+and it is `--var`-settable too; see [Scheduling](#scheduling).) The four simple per-target string
+variables (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`) can still be
+overridden at deploy with `--var=<name>=<value>`; the `type: complex` ES host configs **cannot** be set via `--var` at all (the
 CLI rejects it: *"setting variables of complex type via --var flag is not supported"*), so override
 those through the git-ignored `variable-overrides.json` (see
 [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). Precedence,
@@ -156,8 +156,9 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
 ```
 
 A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token
-but is deployed with an empty `environment` fails closed at deploy time, as does an environment value
-that would produce an illegal identifier (e.g. one containing a hyphen).
+fails closed at **run** (the runner folds the token in when the job runs; `bundle deploy`/`validate`
+don't resolve it) if `environment` is empty or would produce an illegal identifier (e.g. one containing
+a hyphen).
 
 `es_id_field` and `source.primary_key` are two distinct keys for two distinct contexts: `es_id_field`
 is a column of the **view's** output, handed to the connector as the ES document `_id`; `primary_key`

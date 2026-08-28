@@ -36,7 +36,8 @@ include:
 variables:
   # Folded into any config name that contains ${environment} (e.g. ocsf_${environment} -> ocsf_prod).
   # Empty default: not every deployment has an environment component, and a config that uses the token
-  # but gets an empty value fails closed at resolve time. Set the real value PER TARGET below
+  # but gets an empty value fails closed at run (the runner resolves the token when the job runs;
+  # bundle deploy/validate don't). Set the real value PER TARGET below
   # (targets.<env>.variables); it ships empty on main. Override at deploy with --var=environment=<env>
   # if needed. All other object naming (catalog, schema, table, view name) lives per pipeline in
   # _pipelines/pipeline_configs/<name>.yml.
