@@ -36,8 +36,9 @@ table, used by the streaming read to identify a unique row. They often share a n
 neither defaults to the other. Both are plain column identifiers (no ${environment} token).
 
 ENVIRONMENT SUBSTITUTION
-A `catalog` or `schema` value may embed the token `${environment}`, folded in at deploy time from the
-`environment` bundle variable, e.g. `ocsf_${environment}` -> `ocsf_prod`. A value with no token is used
+A `catalog` or `schema` value may embed the token `${environment}`, folded in by the runner when the job
+runs (resolve_config below; NOT at bundle deploy/validate) from the `environment` bundle variable, e.g.
+`ocsf_${environment}` -> `ocsf_prod`. A value with no token is used
 as-is. The environment component only ever belongs at the catalog/schema level, so table/view NAMES
 are plain identifiers and may NOT contain the token (this also guarantees a view's name always equals
 its `.sql` filename). Validated in two phases: at load, a catalog/schema is a legal identifier

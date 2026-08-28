@@ -102,6 +102,24 @@ def load_job_cluster_spec(key: str) -> dict:
     return spec
 
 
+def _load_complex_configs(fields: frozenset, path: str) -> set:
+    """Names of databricks.yml `type: complex` variables whose default mapping's keys are EXACTLY `fields`.
+
+    The shared scan behind load_es_host_configs and load_cluster_configs (they differ only in the field
+    set), so the "complex var with an exact key set" logic lives in one place. A complex variable with a
+    different key set, and any plain (non-complex) variable, are ignored - so a config name can only ever
+    resolve to a variable of the intended shape, never an unrelated one.
+    """
+    with open(path) as fh:
+        doc = yaml.safe_load(fh) or {}
+    variables = doc.get("variables") or {}
+    return {
+        name for name, spec in variables.items()
+        if isinstance(spec, dict) and spec.get("type") == "complex"
+        and isinstance(spec.get("default"), dict) and set(spec["default"]) == fields
+    }
+
+
 def load_es_host_configs(path: str = _DATABRICKS_YML) -> set:
     """The set of declared Elasticsearch host-config names, read from databricks.yml. Fail closed.
 
@@ -112,17 +130,7 @@ def load_es_host_configs(path: str = _DATABRICKS_YML) -> set:
     the bundle resolves per target at deploy. A complex variable whose default has a DIFFERENT key set is
     not a host config and is ignored, so unrelated complex variables never collide with this scan.
     """
-    with open(path) as fh:
-        doc = yaml.safe_load(fh) or {}
-    variables = doc.get("variables") or {}
-    names = set()
-    for var_name, spec in variables.items():
-        if not isinstance(spec, dict) or spec.get("type") != "complex":
-            continue
-        default = spec.get("default")
-        if isinstance(default, dict) and set(default) == _ES_HOST_CONFIG_FIELDS:
-            names.add(var_name)
-    return names
+    return _load_complex_configs(_ES_HOST_CONFIG_FIELDS, path)
 
 
 def load_default_es_host_config(path: str = _DATABRICKS_YML):
@@ -177,17 +185,7 @@ def load_cluster_configs(path: str = _DATABRICKS_YML) -> set:
     config) or a plain string variable (wheel_path, environment, ...) is NOT a cluster config and is
     ignored, so cluster_config can only ever name a real, purpose-shaped cluster-id variable.
     """
-    with open(path) as fh:
-        doc = yaml.safe_load(fh) or {}
-    variables = doc.get("variables") or {}
-    names = set()
-    for var_name, spec in variables.items():
-        if not isinstance(spec, dict) or spec.get("type") != "complex":
-            continue
-        default = spec.get("default")
-        if isinstance(default, dict) and set(default) == _CLUSTER_CONFIG_FIELDS:
-            names.add(var_name)
-    return names
+    return _load_complex_configs(_CLUSTER_CONFIG_FIELDS, path)
 
 
 def require_cluster_config(name: str, declared: set) -> None:
@@ -467,10 +465,10 @@ def main(argv: list[str] | None = None) -> int:
         job_cluster_spec = None
         if cfg["compute"]["type"] == "job_cluster":
             job_cluster_spec = load_job_cluster_spec(cfg["compute"]["job_cluster_config"])
-        # An existing_cluster pipeline that names a cluster_config must reference a declared cluster config
-        # (a complex var with a cluster_id field); fail closed here rather than emit a job whose
-        # ${var.<name>.cluster_id} would break at deploy.
-        if cfg["compute"].get("cluster_config"):
+        # An existing_cluster pipeline names a cluster_config; it must reference a declared cluster config
+        # (a complex var with a cluster_id field). Fail closed here rather than emit a job whose
+        # ${var.<name>.cluster_id} would break at deploy. Keyed on compute type, like the job_cluster guard.
+        if cfg["compute"]["type"] == "existing_cluster":
             require_cluster_config(cfg["compute"]["cluster_config"], cluster_configs)
         rendered[name] = render_job_yaml(os.path.basename(path), name, cfg, job_cluster_spec)
     if collisions:
