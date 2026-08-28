@@ -173,9 +173,11 @@ idempotent and a retried batch or restarted stream converges to one document per
 pipeline passes no id_field to the connector, so ES assigns a random `_id` to every document.** That is
 zero-config, but it is *not* idempotent: because both modes are at-least-once (a retried batch, a
 restarted stream that reprocesses its last micro-batch), the same source rows can be written again as
-**new** documents, leaving **duplicates** in the index. Omit `es_id_field` only when duplicates are
-acceptable (or the source guarantees no replay); set it whenever you need a stable 1:1 row→document
-mapping. (Conversely, if `es_id_field` is set but two input rows share its value, the later row upserts
+**new** documents, leaving **duplicates** in the index. This is especially pronounced for
+`pipeline_mode: streaming`, where restarts and micro-batch retries are routine rather than
+exceptional, so an omitted `es_id_field` will typically accumulate duplicates over the life of the
+stream. Omit `es_id_field` only when duplicates are acceptable (or the source guarantees no replay);
+set it whenever you need a stable 1:1 row→document mapping. (Conversely, if `es_id_field` is set but two input rows share its value, the later row upserts
 over the earlier one, so ES ends up with *fewer* documents than rows sent - ensure the column is unique
 across the input.)
 
