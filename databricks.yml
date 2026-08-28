@@ -175,7 +175,7 @@ targets:
       # DEV deploy-time values. All ship EMPTY on main - fill in for your environment (or override any of
       # them at deploy with --var=<name>=<value>). An empty value fails closed where it is required
       # (wheel_path for index runs, checkpoint_base_path for streaming, cluster_policy_id for job clusters).
-      environment: ""              # e.g. catalog - folded into ${environment} in config object names
+      environment: ""              # e.g. dev - folded into ${environment} in config object names
       wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
       # checkpoint_base_path: append ${workspace.current_user.short_name} to give each developer their own
       # streaming checkpoints under a shared dev volume. `mode: development` isolates workspace files and
