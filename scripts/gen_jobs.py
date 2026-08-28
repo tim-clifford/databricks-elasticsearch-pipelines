@@ -102,7 +102,16 @@ def load_job_cluster_spec(key: str) -> dict:
     return spec
 
 
-def _load_complex_configs(fields: frozenset, path: str) -> set:
+def _read_bundle_doc(path: str = _DATABRICKS_YML) -> dict:
+    """Parse databricks.yml once. main() reads several things from it, so it parses once here and passes
+    the parsed doc to the loaders below (their `doc=` argument), opening the file a single time per run.
+    The loaders keep a path default so each is still independently callable (and unit-testable) on its own.
+    """
+    with open(path) as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _load_complex_configs(fields: frozenset, path: str = _DATABRICKS_YML, doc: dict | None = None) -> set:
     """Names of databricks.yml `type: complex` variables whose default mapping's keys are EXACTLY `fields`.
 
     The shared scan behind load_es_host_configs and load_cluster_configs (they differ only in the field
@@ -110,9 +119,7 @@ def _load_complex_configs(fields: frozenset, path: str) -> set:
     different key set, and any plain (non-complex) variable, are ignored - so a config name can only ever
     resolve to a variable of the intended shape, never an unrelated one.
     """
-    with open(path) as fh:
-        doc = yaml.safe_load(fh) or {}
-    variables = doc.get("variables") or {}
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
     return {
         name for name, spec in variables.items()
         if isinstance(spec, dict) and spec.get("type") == "complex"
@@ -120,7 +127,7 @@ def _load_complex_configs(fields: frozenset, path: str) -> set:
     }
 
 
-def load_es_host_configs(path: str = _DATABRICKS_YML) -> set:
+def load_es_host_configs(path: str = _DATABRICKS_YML, doc: dict | None = None) -> set:
     """The set of declared Elasticsearch host-config names, read from databricks.yml. Fail closed.
 
     A host config is a bundle variable with `type: complex` whose default mapping's keys are exactly
@@ -130,10 +137,10 @@ def load_es_host_configs(path: str = _DATABRICKS_YML) -> set:
     the bundle resolves per target at deploy. A complex variable whose default has a DIFFERENT key set is
     not a host config and is ignored, so unrelated complex variables never collide with this scan.
     """
-    return _load_complex_configs(_ES_HOST_CONFIG_FIELDS, path)
+    return _load_complex_configs(_ES_HOST_CONFIG_FIELDS, path, doc)
 
 
-def load_default_es_host_config(path: str = _DATABRICKS_YML):
+def load_default_es_host_config(path: str = _DATABRICKS_YML, doc: dict | None = None):
     """The bundle's default host-config name, from databricks.yml `variables.default_es_host_config.default`
     (or None if not declared). A pipeline that OMITS es_host_config falls back to this (see main).
 
@@ -142,8 +149,8 @@ def load_default_es_host_config(path: str = _DATABRICKS_YML):
     while its per-environment VALUES live on the host config itself). The value is returned as-is; whether
     it names a real declared host config is enforced by require_es_host_config once a pipeline resolves to it.
     """
-    with open(path) as fh:
-        doc = yaml.safe_load(fh) or {}
+    if doc is None:
+        doc = _read_bundle_doc(path)
     spec = (doc.get("variables") or {}).get("default_es_host_config")
     if not isinstance(spec, dict):
         return None
@@ -174,7 +181,7 @@ def require_es_host_config(name: str, declared: set) -> None:
         )
 
 
-def load_cluster_configs(path: str = _DATABRICKS_YML) -> set:
+def load_cluster_configs(path: str = _DATABRICKS_YML, doc: dict | None = None) -> set:
     """The set of declared cluster-config names, read from databricks.yml. Fail closed.
 
     A cluster config is a bundle variable with `type: complex` whose default mapping's keys are exactly
@@ -185,7 +192,7 @@ def load_cluster_configs(path: str = _DATABRICKS_YML) -> set:
     config) or a plain string variable (wheel_path, environment, ...) is NOT a cluster config and is
     ignored, so cluster_config can only ever name a real, purpose-shaped cluster-id variable.
     """
-    return _load_complex_configs(_CLUSTER_CONFIG_FIELDS, path)
+    return _load_complex_configs(_CLUSTER_CONFIG_FIELDS, path, doc)
 
 
 def require_cluster_config(name: str, declared: set) -> None:
@@ -431,11 +438,13 @@ def main(argv: list[str] | None = None) -> int:
     # every pipeline's es_host_config is validated against the same set (and a bundle with none declared
     # fails each referencing pipeline with a clear message). default_es_host_config is the fallback used
     # when a pipeline omits es_host_config (may be None if the bundle declares no default).
-    es_host_configs = load_es_host_configs()
-    default_es_host_config = load_default_es_host_config()
+    # Parse databricks.yml once, then extract each set from the same parsed doc (single read per run).
+    bundle_doc = _read_bundle_doc()
+    es_host_configs = load_es_host_configs(doc=bundle_doc)
+    default_es_host_config = load_default_es_host_config(doc=bundle_doc)
     # The declared cluster configs (databricks.yml complex vars with a cluster_id field), for validating
     # an existing_cluster pipeline's cluster_config reference.
-    cluster_configs = load_cluster_configs()
+    cluster_configs = load_cluster_configs(doc=bundle_doc)
 
     rendered: dict[str, str] = {}
     collisions = []
