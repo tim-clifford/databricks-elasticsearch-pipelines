@@ -81,22 +81,27 @@ columns, and any tuning such as a `/*+ BROADCAST(alias) */` hint, written direct
 ## Configuration
 
 The **workspace** is not a bundle variable: it comes from your Databricks CLI profile (`-p <profile>`)
-or `DATABRICKS_HOST`. The bundle variables are:
+or `DATABRICKS_HOST`. Every environment-specific bundle variable is set **per target** in
+`databricks.yml` (`targets.<env>.variables`), shipping **empty** on `main` for you to fill in for the
+environments you deploy to, so a routine deploy needs no `--var`. Any of them can still be overridden
+at deploy with `--var=<name>=<value>` (which wins over the per-target value); an empty value fails
+closed wherever the value is required. The bundle variables are:
 
 | Variable | What it sets |
 |---|---|
-| `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
-| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel each **index job** installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). Defaults to empty; supply it on `bundle deploy` (or set a real default in your fork). An index job deployed with an empty `wheel_path` fails closed at run; `deploy_views` doesn't need it |
-| `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Required for a streaming run (fails closed if empty); unused by batch and `deploy_views` |
+| `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token. Set per target |
+| `wheel_path` | UC Volume path to the `databricks-es-connector` wheel each **index job** installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). Set per target (empty on `main`). An index job deployed with an empty `wheel_path` fails closed at run; `deploy_views` doesn't need it |
+| `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Set per target (empty on `main`). Required for a streaming run (fails closed if empty); unused by batch and `deploy_views`. The `dev` target shows how to append `${workspace.current_user.short_name}` to isolate each developer's checkpoints (see [Streaming](#streaming)) |
+| `cluster_policy_id` | workspace-specific cluster policy id injected into every job cluster (see [Compute](#compute)). Set per target (empty on `main`); required only when a pipeline uses `job_cluster` compute |
 | `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy schedules without firing them; only `prd` binds `UNPAUSED` to actually run them. Only affects jobs that declare a `schedule` (see [Scheduling](#scheduling)) |
 
 The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
 pipeline selects, with values that differ per environment. See
 [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections) below.
-`wheel_path` defaults to empty and is baked in at deploy; an index job run with an empty `wheel_path`
-fails closed, and `deploy_views` doesn't need it. `checkpoint_base_path` is the same shape (global,
-deploy-time, empty default) but only a **streaming** run requires it; it must be a UC Volume path
-(serverless streaming checkpoints can't live on `dbfs:/tmp`).
+`wheel_path` ships empty and is baked in at deploy; an index job run with an empty `wheel_path` fails
+closed, and `deploy_views` doesn't need it. `checkpoint_base_path` is the same shape (global, per-target,
+empty default) but only a **streaming** run requires it; it must be a UC Volume path (serverless
+streaming checkpoints can't live on `dbfs:/tmp`).
 
 Everything else is per-pipeline and lives in `_pipelines/pipeline_configs/<config_name>.yml`. Each object is fully
 qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
@@ -244,9 +249,11 @@ serverless.
 
 **Cluster policy and tags.** The generator injects `policy_id: ${var.cluster_policy_id}` (plus
 `apply_policy_default_values: true`) into every job cluster, so all job-cluster pipelines run under the
-target workspace's cluster policy. A policy id is workspace-specific, so it is not hardcoded in the
-bundle: supply it at deploy with `--var=cluster_policy_id=<id>`, the same way as `wheel_path` and the
-other workspace values. An empty value fails closed at deploy when a job-cluster pipeline is present
+target workspace's cluster policy. A policy id is workspace-specific: set it **per target** in
+`databricks.yml` (empty on `main`), the same way as `wheel_path` and the other environment values, or
+override at deploy with `--var=cluster_policy_id=<id>`. Under `dev`'s `development` mode each engineer
+deploys to their own workspace, so a committed `dev` value fits only one workspace; others override it
+with `--var`. An empty value fails closed at deploy when a job-cluster pipeline is present
 (the Jobs API rejects `policy_id: ""`), so provide it whenever any pipeline uses `job_cluster` compute.
 Hardcoded `custom_tags` in a job-cluster spec pass straight through onto the cluster (e.g.
 `project: elastic`). Serverless and `existing_cluster` pipelines have no job cluster and are unaffected
@@ -287,20 +294,20 @@ The bundle defines three **targets**, selected with `-t`: `dev` (the default), `
 `dev` uses DAB `development` mode (deploys are isolated to the deploying user and schedules are
 paused); `stg` and `prd` use `production` mode with a shared, non-user deploy path. All three take the
 workspace host from your CLI profile (`-p <profile>`) or `DATABRICKS_HOST`, so the same target can
-point at any workspace, and none binds the `environment` variable (pass `--var=environment=<env>`).
+point at any workspace.
 
 Two different mechanisms carry values into a job, and they resolve at different times:
 
-- **Bundle variables** (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`) are
-  `--var` values resolved into the job at **deploy** time. A `--var` on `bundle run` is ignored: only
-  what was set at the last `bundle deploy` applies. They default to empty, so a deploy without them
-  still succeeds and `deploy_views` runs fine (it needs no connector or ES); an index job needs a real
-  `wheel_path`, a streaming run also needs `checkpoint_base_path`, and one deployed with a required one
-  empty fails closed. The **ES host configs** are also bundle variables but are set **per target in
-  `databricks.yml`** (not by `--var`; see
-  [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)), so a
-  deploy picks up the target's host automatically — an index job whose host config is empty for that
-  target fails closed at run.
+- **Bundle variables** (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, and
+  the ES host configs) are resolved into the job at **deploy** time. Each is set **per target** in
+  `databricks.yml` (`targets.<env>.variables`), so a routine deploy takes no `--var` at all; any of them
+  can still be overridden at deploy with `--var=<name>=<value>`, which wins over the per-target value. A
+  `--var` on `bundle run` is ignored: only what was set at the last `bundle deploy` applies. They ship
+  empty on `main`, so a deploy without filling them in still succeeds and `deploy_views` runs fine (it
+  needs no connector or ES); an index job needs a real `wheel_path`, a streaming run also needs
+  `checkpoint_base_path`, a job-cluster pipeline needs `cluster_policy_id`, and an index job whose host
+  config is empty for its target fails closed at run. The ES host configs have their own section:
+  [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections).
 - **Job parameters** are `--params` values applied at **run** time, overridable per run without
   redeploying (an invalid value fails the run closed):
   - `pipeline_mode` (`batch` | `streaming`), `filter_condition` (a Spark SQL predicate), and the
@@ -328,13 +335,14 @@ Two different mechanisms carry values into a job, and they resolve at different 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
-# The ES host connection is NOT passed here: fill in es_host_config for this target in databricks.yml
-# (see "Configuring Elasticsearch host connections"). The deploy picks it up automatically.
-WHEEL="/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
+# Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, and the
+# ES host config) come from this target's variables block in databricks.yml. Fill them in once for your
+# fork and the deploy needs no --var:
+databricks bundle deploy -t dev -p <profile>
+
+# Any of them can still be overridden ad hoc, e.g. a one-off wheel:
 databricks bundle deploy -t dev -p <profile> \
-  --var="environment=<env>" --var="wheel_path=$WHEEL" \
-  --var="checkpoint_base_path=/Volumes/<catalog>/<schema>/<volume>/checkpoints" \
-  --var="cluster_policy_id=<id>"   # only needed if a pipeline uses job_cluster compute
+  --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
 
 databricks bundle run deploy_views                 -t dev -p <profile>
 databricks bundle run index_pipeline_<config_name> -t dev -p <profile>
@@ -348,8 +356,10 @@ databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
   --params pipeline_mode=streaming,streaming_start=full
 ```
 
-(Bundle variables come from the last `deploy`, so they are not repeated on `run`. Set real defaults
-in your fork's `databricks.yml` to avoid passing them each deploy.)
+(Bundle variables come from the last `deploy`, so they are not repeated on `run`. Fill in each target's
+`variables` block in your fork's `databricks.yml` once so no `--var` is needed per deploy. Prefer not to
+commit even placeholder paths? Put the per-target values in the git-ignored
+`.databricks/bundle/<target>/variable-overrides.json` instead; the rest works identically.)
 
 ## Streaming
 
@@ -384,6 +394,11 @@ Key behaviors:
   index is reset and you want to resend its records from the Delta table, clear that stream's
   checkpoint first, otherwise the stream considers those records already exported and writes nothing.
   Deterministic document `_id`s make a re-send an idempotent upsert, not a duplicate.
+  - **Per-developer checkpoints in `dev`.** `mode: development` isolates workspace files and resource
+    names per user but **not** UC Volume data paths, so two developers streaming the same pipeline would
+    share one checkpoint. The `dev` target in `databricks.yml` documents appending
+    `${workspace.current_user.short_name}` to `checkpoint_base_path` (DAB resolves it to the deploying
+    user at deploy time) so each engineer gets an isolated checkpoint tree.
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
