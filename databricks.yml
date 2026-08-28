@@ -149,7 +149,9 @@ variables:
 # in the environments you deploy to. An empty value fails closed where the value is required. This
 # replaces the older model of passing environment / wheel_path / checkpoint_base_path / cluster_policy_id
 # as --var on every deploy: those four SIMPLE STRING vars still accept a --var=<name>=<value> override at
-# deploy (it wins over the per-target value). The es_host_* configs are `type: complex` and CANNOT be set
+# deploy (precedence highest first: --var > .databricks/bundle/<target>/variable-overrides.json >
+# per-target value > top-level default, so a local overrides file also silently outranks the committed
+# per-target value). The es_host_* configs are `type: complex` and CANNOT be set
 # via --var at all (the CLI rejects it: "setting variables of complex type via --var flag is not
 # supported"); override their per-target values through the git-ignored
 # .databricks/bundle/<target>/variable-overrides.json instead. (ES api_key

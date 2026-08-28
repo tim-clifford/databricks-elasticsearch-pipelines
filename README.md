@@ -81,15 +81,21 @@ columns, and any tuning such as a `/*+ BROADCAST(alias) */` hint, written direct
 ## Configuration
 
 The **workspace** is not a bundle variable: it comes from your Databricks CLI profile (`-p <profile>`)
-or `DATABRICKS_HOST`. Every environment-specific bundle variable is set **per target** in
-`databricks.yml` (`targets.<env>.variables`), shipping **empty** on `main` for you to fill in for the
-environments you deploy to, so a routine deploy needs no `--var`. The four simple string variables
-below (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`) can still be overridden
-at deploy with `--var=<name>=<value>` (which wins over the per-target value); the `type: complex` ES
-host configs **cannot** be set via `--var` at all (the CLI rejects it: *"setting variables of complex
-type via --var flag is not supported"*), so override those through the git-ignored
-`variable-overrides.json` (see
-[Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). An empty
+or `DATABRICKS_HOST`. The environment-specific connection, path, and policy variables (`environment`,
+`wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, and the ES host configs) are set **per
+target** in `databricks.yml` (`targets.<env>.variables`), shipping **empty** on `main` for you to fill
+in for the environments you deploy to, so a routine deploy needs no `--var`. (`schedule_pause_status` is
+also per-environment but is the exception: it defaults to `PAUSED` globally and only `prd` overrides it,
+see [Scheduling](#scheduling).) The four simple string variables (`environment`, `wheel_path`,
+`checkpoint_base_path`, `cluster_policy_id`) can still be overridden at deploy with
+`--var=<name>=<value>`; the `type: complex` ES host configs **cannot** be set via `--var` at all (the
+CLI rejects it: *"setting variables of complex type via --var flag is not supported"*), so override
+those through the git-ignored `variable-overrides.json` (see
+[Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). Precedence,
+highest first: `--var`, then the git-ignored `variable-overrides.json`, then the per-target `variables`
+value, then the top-level `default`. A stale `variable-overrides.json` therefore silently outranks a
+value you committed to a target block (this repo's dev workflow keeps one for exactly these variables,
+so if a committed per-target value looks ignored, check for a local overrides file). An empty
 value fails closed wherever the value is required. The bundle variables are:
 
 | Variable | What it sets |
