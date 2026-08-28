@@ -80,7 +80,7 @@ def test_render_wires_es_host_config_fields():
 def test_render_all_jobs_max_concurrent_runs_1():
     for compute, spec in (
         (None, None),
-        ({"type": "existing_cluster", "existing_cluster_id": "0123-x"}, None),
+        ({"type": "existing_cluster", "cluster_config": "interactive_primary"}, None),
         ({"type": "job_cluster", "job_cluster_config": "std"}, {"spark_version": "15.4.x-scala2.12", "num_workers": 1}),
     ):
         assert _render_job(_cfg(compute), spec)["max_concurrent_runs"] == 1
@@ -90,9 +90,11 @@ def test_render_all_jobs_max_concurrent_runs_1():
 
 
 def test_render_existing_cluster():
-    job = _render_job(_cfg({"type": "existing_cluster", "existing_cluster_id": "0123-456789-abcde"}))
+    # existing_cluster names a cluster_config bundle variable; the task's existing_cluster_id is rendered
+    # as a ${var.<name>} reference, so the bundle resolves the workspace-specific cluster id per target.
+    job = _render_job(_cfg({"type": "existing_cluster", "cluster_config": "interactive_primary"}))
     task = job["tasks"][0]
-    assert task["existing_cluster_id"] == "0123-456789-abcde"
+    assert task["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
     assert "job_clusters" not in job
     assert "job_cluster_key" not in task
     # the cluster ref precedes notebook_task in the task (deterministic key order)
@@ -178,11 +180,11 @@ def test_render_schedule_emits_utc_block_with_pause_var():
 def test_render_schedule_composes_with_compute():
     # schedule and compute are independent; both render on the same job.
     job = _render_job(
-        _cfg(compute={"type": "existing_cluster", "existing_cluster_id": "0123-x"},
+        _cfg(compute={"type": "existing_cluster", "cluster_config": "interactive_primary"},
              schedule={"quartz_cron_expression": "0 0 8 * * ?"}),
     )
     assert job["schedule"]["timezone_id"] == "UTC"
-    assert job["tasks"][0]["existing_cluster_id"] == "0123-x"
+    assert job["tasks"][0]["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
 
 
 def test_load_job_cluster_spec_missing_fails_closed():
@@ -237,6 +239,40 @@ def test_require_es_host_config_unknown_fails_closed():
 
 def test_require_es_host_config_known_passes():
     gen_jobs.require_es_host_config("es_host_primary", {"es_host_primary"})  # no raise
+
+
+# --------------------------------------------------------------------------- cluster_config (existing_cluster)
+
+
+def test_load_cluster_configs_ignores_non_cluster_complex_vars(tmp_path):
+    # A cluster config is a complex var whose default keys are EXACTLY {cluster_id}. A host-shaped complex
+    # var and a plain string var are ignored, so cluster_config can only ever name a real cluster-id
+    # variable - never es_host_primary, wheel_path, etc.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(
+        "variables:\n"
+        "  interactive_primary:\n    type: complex\n    default:\n      cluster_id: ''\n"
+        "  es_host_primary:\n    type: complex\n    default:\n"
+        "      es_host_url: ''\n      secret_scope_name: ''\n      secret_key_name: ''\n"
+        "  wheel_path:\n    default: ''\n"
+    )
+    assert gen_jobs.load_cluster_configs(str(yml)) == {"interactive_primary"}
+
+
+def test_load_cluster_configs_none_shipped_on_databricks_yml():
+    # interactive_primary ships COMMENTED, so no cluster config is declared out of the box.
+    assert gen_jobs.load_cluster_configs() == set()
+
+
+def test_require_cluster_config_unknown_fails_closed():
+    # A name that is not a declared cluster config - a typo, or a real but non-cluster variable like
+    # es_host_primary - fails closed at generation (not a deny-list: only cluster-shaped configs pass).
+    with pytest.raises(ValueError, match="not declared as a cluster config"):
+        gen_jobs.require_cluster_config("es_host_primary", {"interactive_primary"})
+
+
+def test_require_cluster_config_known_passes():
+    gen_jobs.require_cluster_config("interactive_primary", {"interactive_primary"})  # no raise
 
 
 def test_load_default_es_host_config_reads_databricks_yml():

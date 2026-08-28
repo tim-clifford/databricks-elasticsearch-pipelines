@@ -10,7 +10,10 @@
 # Quick start (the workspace host comes from your CLI profile; pass -p):
 #   python scripts/gen_jobs.py                 # regenerate resources/<name>.job.yml from configs
 #   databricks bundle validate -t dev -p <profile>
-#   databricks bundle deploy   -t dev -p <profile> --var="environment=<env>"
+#   databricks bundle deploy   -t dev -p <profile>   # env-specific values come from the target's variables block below
+# (Fill in each target's variables below once for your environment. The simple string vars also accept a
+# --var=<name>=<value> override at deploy; the complex es_host_* configs CAN'T be set via --var - override
+# them through .databricks/bundle/<target>/variable-overrides.json instead.)
 
 bundle:
   name: databricks_elasticsearch_pipelines
@@ -32,22 +35,25 @@ include:
 
 variables:
   # Folded into any config name that contains ${environment} (e.g. ocsf_${environment} -> ocsf_prod).
-  # Defaults to empty: not every deployment has an environment component, and a config that uses the
-  # token but gets an empty value fails closed at resolve time. All other object naming (catalog,
-  # schema, table, view name) lives per pipeline in _pipelines/pipeline_configs/<name>.yml.
+  # Empty default: not every deployment has an environment component, and a config that uses the token
+  # but gets an empty value fails closed at run (the runner resolves the token when the job runs;
+  # bundle deploy/validate don't). Set the real value PER TARGET below
+  # (targets.<env>.variables); it ships empty on main. Override at deploy with --var=environment=<env>
+  # if needed. All other object naming (catalog, schema, table, view name) lives per pipeline in
+  # _pipelines/pipeline_configs/<name>.yml.
   environment:
-    description: "Environment folded into ${environment} in config names. Empty if unused."
+    description: "Environment folded into ${environment} in config names. Empty default; set per target below or override with --var."
     default: ""
 
   # One GLOBAL connector wheel serves every per-index job, so it is a bundle variable, not per-config.
-  # Empty default (the path is environment-specific): variable-only commands like `bundle run
-  # deploy_views` resolve without it, while an index-job run with an empty wheel_path fails closed in
-  # the runner. Supply it at deploy, e.g.
+  # Set it PER TARGET below (targets.<env>.variables); it ships empty on main. Empty default (the path
+  # is environment-specific): variable-only commands like `bundle run deploy_views` resolve without it,
+  # while an index-job run with an empty wheel_path fails closed in the runner. Override at deploy if
+  # needed, e.g.
   #   --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
-  # See the README "Configuration" / "Deploy and run" sections for the full rationale (deploy-time
-  # resolution, version-in-filename, forking).
+  # See the README "Configuration" / "Deploy and run" sections for the full rationale (version-in-filename, forking).
   wheel_path:
-    description: "UC Volume path to the databricks-es-connector wheel every index job installs (version lives in the filename). Empty default; required for index-job runs (fails closed if empty)."
+    description: "UC Volume path to the databricks-es-connector wheel every index job installs (version lives in the filename). Empty default; set per target below or override with --var. Required for index-job runs (fails closed if empty)."
     default: ""
 
   # Elasticsearch HOST CONFIGS. Each is a NAMED GROUP of the three connection settings the connector
@@ -98,13 +104,15 @@ variables:
 
   # GLOBAL base path (a UC Volume) under which each STREAMING index job keeps its Structured
   # Streaming checkpoint. The runner appends /<config_name> so every stream gets a stable, unique
-  # subfolder. Global like wheel_path (one base for all jobs); deploy-time; empty default so batch
-  # runs and `deploy_views` (which never stream) resolve without it. A STREAMING run with an empty
-  # value fails closed in the runner. Must be a UC Volume path: dbfs:/tmp checkpoints fail with
-  # INSUFFICIENT_PERMISSIONS on serverless. Supply at deploy, e.g.
+  # subfolder. Global like wheel_path (one base for all jobs). Set it PER TARGET below
+  # (targets.<env>.variables); it ships empty on main. Empty default so batch runs and `deploy_views`
+  # (which never stream) resolve without it; a STREAMING run with an empty value fails closed in the
+  # runner. Must be a UC Volume path: dbfs:/tmp checkpoints fail with INSUFFICIENT_PERMISSIONS on
+  # serverless. Override at deploy if needed, e.g.
   #   --var="checkpoint_base_path=/Volumes/<catalog>/<schema>/<volume>/checkpoints"
+  # The dev target below shows how to append ${workspace.current_user.short_name} to isolate per developer.
   checkpoint_base_path:
-    description: "UC Volume base path for streaming checkpoints; the runner appends /<config_name> per job. Empty default; required for streaming runs (fails closed if empty)."
+    description: "UC Volume base path for streaming checkpoints; the runner appends /<config_name> per job. Empty default; set per target below or override with --var. Required for streaming runs (fails closed if empty)."
     default: ""
 
   # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
@@ -121,27 +129,53 @@ variables:
   # Cluster policy id injected into EVERY generated job cluster: gen_jobs.py emits policy_id:
   # ${var.cluster_policy_id} into each job_clusters.new_cluster, so all job_cluster-compute pipelines get
   # the policy for the workspace they deploy to (serverless and existing_cluster pipelines have no
-  # new_cluster and are unaffected). A policy id is WORKSPACE-SPECIFIC (valid only in the workspace it was
-  # created in), so - exactly like wheel_path / es_host_url / checkpoint_base_path - it is NOT hardcoded
-  # per target here; supply it at deploy with --var=cluster_policy_id=<id>. Empty default so
-  # serverless-only deployments and variable-only commands resolve without it; an empty value with a
-  # job_cluster pipeline fails closed at deploy (policy_id "" is rejected by the Jobs API), so provide it
-  # whenever any pipeline uses job_cluster compute.
+  # new_cluster and are unaffected). Set it PER TARGET below (targets.<env>.variables); it ships empty on
+  # main. A policy id is WORKSPACE-SPECIFIC (valid only in the workspace it was created in): under dev's
+  # `mode: development` each engineer deploys to their OWN workspace, so a committed dev value fits only
+  # one workspace - others override with --var=cluster_policy_id=<id> (which wins over the per-target
+  # value). Empty default so serverless-only deployments and variable-only commands resolve without it;
+  # an empty value with a job_cluster pipeline fails closed at deploy (policy_id "" is rejected by the
+  # Jobs API), so provide it whenever any pipeline uses job_cluster compute.
   cluster_policy_id:
-    description: "Workspace-specific cluster policy id injected into every job cluster. Empty default; supply at deploy (--var=cluster_policy_id=<id>) whenever a pipeline uses job_cluster compute. Not hardcoded per target - policy ids are workspace-specific, like wheel_path."
+    description: "Workspace-specific cluster policy id injected into every job cluster. Empty default; set per target below or override with --var=cluster_policy_id=<id> whenever a pipeline uses job_cluster compute. Workspace-specific: dev deploys go to each engineer's own workspace."
     default: ""
+
+  # OPTIONAL cluster config for existing_cluster compute. Like an ES host config, it is a `type: complex`
+  # variable (a single cluster_id field) so the generator can tell cluster configs apart from other
+  # variables. A pipeline that runs on an existing (interactive/all-purpose) cluster names one via
+  # `compute.cluster_config: <name>` in its _pipelines/pipeline_configs/<name>.yml; the generator emits
+  # existing_cluster_id: ${var.<name>.cluster_id}, resolved PER TARGET at deploy - a cluster id is
+  # WORKSPACE-SPECIFIC, like cluster_policy_id, so one pipeline attaches to a different cluster per
+  # environment. Shipped COMMENTED because no pipeline uses existing_cluster out of the box: to use it,
+  # uncomment this declaration AND the per-target placeholders below, then set
+  # `compute: {type: existing_cluster, cluster_config: interactive_primary}` in the pipeline. An empty
+  # value fails closed at deploy (the Jobs API rejects an empty cluster id). A cluster_config that does not
+  # name a declared cluster config fails at generation (scripts/gen_jobs.py). Add more (interactive_secondary,
+  # ...) the same way for pipelines that attach to different clusters.
+  # interactive_primary:
+  #   type: complex
+  #   description: "Existing (interactive) cluster config for existing_cluster pipelines that name it via compute.cluster_config. Per-target; empty cluster_id fails closed."
+  #   default:
+  #     cluster_id: ""
 
 # Three targets: dev, stg, prd. The workspace HOST is intentionally not hardcoded here: it is taken
 # from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var, so the bundle
-# carries no environment-specific URL and deploys to whatever workspace you point it at. The
-# `environment` variable (folded into ${environment} in config names) is likewise NOT bound per target;
-# pass it at deploy with --var=environment=<env> (empty default; see the variables block above). Same for
-# cluster_policy_id (workspace-specific): supply it at deploy, not per target, when using job clusters.
+# carries no environment-specific URL and deploys to whatever workspace you point it at.
 #
-# The Elasticsearch HOST CONFIGS are the exception: they ARE bound per target (targets.<env>.variables
-# below), because each environment writes to its own ES cluster, so the endpoint + secret scope/key are
-# an environment property. They ship as EMPTY placeholders on main - fill in the environments you deploy
-# to. (The api_key value is not here; it lives in the referenced Databricks secret scope.)
+# Every other environment-specific value is bound PER TARGET below (targets.<env>.variables): the
+# `environment` token, the connector `wheel_path`, the streaming `checkpoint_base_path`, the
+# `cluster_policy_id`, and the Elasticsearch HOST CONFIGS. All ship as EMPTY placeholders on main - fill
+# in the environments you deploy to. An empty value fails closed where the value is required. This
+# replaces the older model of passing environment / wheel_path / checkpoint_base_path / cluster_policy_id
+# as --var on every deploy: those four SIMPLE STRING vars still accept a --var=<name>=<value> override at
+# deploy (precedence highest first: --var > BUNDLE_VAR_<name> env var >
+# .databricks/bundle/<target>/variable-overrides.json > per-target value > top-level default, so a local
+# overrides file or an exported BUNDLE_VAR_ env var also silently outranks the committed per-target
+# value). The es_host_* configs are `type: complex` and CANNOT be set
+# via --var at all (the CLI rejects it: "setting variables of complex type via --var flag is not
+# supported"); override their per-target values through the git-ignored
+# .databricks/bundle/<target>/variable-overrides.json instead. (ES api_key
+# VALUES are never here; they live in the referenced Databricks secret scopes.)
 #
 # dev vs stg/prd differ by DEPLOYMENT MODE, which is the DAB best practice:
 # - dev uses `mode: development`: it isolates per user (root_path defaults to the deploying user's
@@ -156,6 +190,21 @@ targets:
     default: true
     mode: development
     variables:
+      # DEV deploy-time values. All ship EMPTY on main - fill in for your environment (or override any of
+      # them at deploy with --var=<name>=<value>). An empty value fails closed where it is required
+      # (wheel_path for index runs, checkpoint_base_path for streaming, cluster_policy_id for job clusters).
+      environment: ""              # e.g. dev - folded into ${environment} in config object names
+      wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
+      # checkpoint_base_path: append ${workspace.current_user.short_name} to give each developer their own
+      # streaming checkpoints under a shared dev volume. `mode: development` isolates workspace files and
+      # resource NAMES per user, but NOT UC Volume data paths, so without this two developers streaming the
+      # same pipeline would collide on one checkpoint. DAB resolves the token to the deploying user at
+      # deploy time; the runner then appends /<config_name>. e.g.
+      #   checkpoint_base_path: /Volumes/<catalog>/<schema>/<volume>/checkpoints/${workspace.current_user.short_name}
+      checkpoint_base_path: ""
+      cluster_policy_id: ""        # e.g. 00156D2098BE864B - workspace-specific; in dev each engineer uses their own
+      # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
+      #   cluster_id: ""           # e.g. 0123-456789-abcde
       # DEV Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-dev-es-host:9200
@@ -169,11 +218,22 @@ targets:
   stg:
     mode: production
     variables:
+      # STG deploy-time values. All ship EMPTY on main - fill in (or override at deploy with --var).
+      environment: ""              # e.g. staging - folded into ${environment} in config object names
+      wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
+      checkpoint_base_path: ""     # e.g. /Volumes/<catalog>/<schema>/<volume>/checkpoints (UC Volume; required only for streaming)
+      cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
+      # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
+      #   cluster_id: ""
       # STG Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-stg-es-host:9200
         secret_scope_name: ""
         secret_key_name: ""
+      # es_host_secondary:         # uncomment together with the declaration in the variables block above
+      #   es_host_url: ""
+      #   secret_scope_name: ""
+      #   secret_key_name: ""
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}
 
@@ -181,10 +241,21 @@ targets:
     mode: production
     variables:
       schedule_pause_status: UNPAUSED
+      # PRD deploy-time values. All ship EMPTY on main - fill in (or override at deploy with --var).
+      environment: ""              # e.g. prod - folded into ${environment} in config object names
+      wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
+      checkpoint_base_path: ""     # e.g. /Volumes/<catalog>/<schema>/<volume>/checkpoints (UC Volume; required only for streaming)
+      cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
+      # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
+      #   cluster_id: ""
       # PRD Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-prd-es-host:9200
         secret_scope_name: ""
         secret_key_name: ""
+      # es_host_secondary:         # uncomment together with the declaration in the variables block above
+      #   es_host_url: ""
+      #   secret_scope_name: ""
+      #   secret_key_name: ""
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}

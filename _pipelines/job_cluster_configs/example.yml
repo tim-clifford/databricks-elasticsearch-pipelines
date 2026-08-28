@@ -11,7 +11,7 @@
 # `databricks bundle validate` checks the actual field values at deploy. Defining it once here means
 # several pipelines can share the same spec by key instead of repeating it. (Each job run still spins
 # up its own ephemeral job cluster from this spec; for a genuinely shared always-on cluster, use
-# `type: existing_cluster` with an existing_cluster_id instead.)
+# `type: existing_cluster` with a cluster_config instead.)
 #
 # Two things NOT to put here:
 #   - policy_id: the generator injects policy_id: ${var.cluster_policy_id} into every job cluster, so

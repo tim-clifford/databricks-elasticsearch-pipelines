@@ -883,37 +883,50 @@ def test_compute_serverless_rejects_extra_keys():
         validate_config(cfg)
 
 
-def test_compute_existing_cluster_valid():
+def test_compute_existing_cluster_config_valid():
+    # existing_cluster names a bundle variable (cluster_config) whose per-target value is the cluster id;
+    # a cluster id is workspace-specific, so it is never a literal here. The generator turns the name
+    # into a ${var.<name>} reference resolved per target.
     cfg = _base()
-    cfg["compute"] = {"type": "existing_cluster", "existing_cluster_id": "0123-456789-abcde"}
+    cfg["compute"] = {"type": "existing_cluster", "cluster_config": "interactive_primary"}
     assert validate_config(cfg)["compute"] == {
         "type": "existing_cluster",
-        "existing_cluster_id": "0123-456789-abcde",
+        "cluster_config": "interactive_primary",
     }
 
 
-def test_compute_existing_cluster_id_trimmed():
+@pytest.mark.parametrize("missing", [{}, {"cluster_config": None}])
+def test_compute_existing_cluster_requires_cluster_config(missing):
+    # existing_cluster with no cluster_config fails closed (there is no cluster named to attach to).
     cfg = _base()
-    cfg["compute"] = {"type": "existing_cluster", "existing_cluster_id": "  0123-456789-abcde  "}
-    assert validate_config(cfg)["compute"]["existing_cluster_id"] == "0123-456789-abcde"
+    cfg["compute"] = {"type": "existing_cluster", **missing}
+    with pytest.raises(PipelineConfigError, match="cluster_config"):
+        validate_config(cfg)
 
 
-@pytest.mark.parametrize("bad", [None, "", "   ", 5, True, ["x"]])
-def test_compute_existing_cluster_requires_id(bad):
-    # existing_cluster with a missing/empty/non-string id must fail closed.
+def test_compute_existing_cluster_rejects_literal_id():
+    # The literal existing_cluster_id was removed (a cluster id is workspace-specific, so it is always
+    # per-target via cluster_config); passing it now fails closed as an unknown key.
     cfg = _base()
-    compute = {"type": "existing_cluster"}
-    if bad is not None:
-        compute["existing_cluster_id"] = bad
-    cfg["compute"] = compute
-    with pytest.raises(PipelineConfigError, match="existing_cluster_id"):
+    cfg["compute"] = {"type": "existing_cluster", "existing_cluster_id": "0123-456789-abcde"}
+    with pytest.raises(PipelineConfigError, match="unknown key"):
         validate_config(cfg)
 
 
 def test_compute_existing_cluster_rejects_unknown_key():
     cfg = _base()
-    cfg["compute"] = {"type": "existing_cluster", "existing_cluster_id": "x", "job_cluster_config": "y"}
+    cfg["compute"] = {"type": "existing_cluster", "cluster_config": "x", "job_cluster_config": "y"}
     with pytest.raises(PipelineConfigError, match="unknown key"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("bad", ["bad-name", "with.dot", "with space", "1leading", "", 5, True, ["x"]])
+def test_compute_existing_cluster_config_must_be_identifier(bad):
+    # cluster_config names a bundle variable, so it is held to the identifier rule (letter/underscore,
+    # then letters/digits/underscore): a hyphen/dot/space/non-string would make a broken ${var.<name>}.
+    cfg = _base()
+    cfg["compute"] = {"type": "existing_cluster", "cluster_config": bad}
+    with pytest.raises(PipelineConfigError, match="identifier"):
         validate_config(cfg)
 
 
