@@ -11,7 +11,9 @@
 #   python scripts/gen_jobs.py                 # regenerate resources/<name>.job.yml from configs
 #   databricks bundle validate -t dev -p <profile>
 #   databricks bundle deploy   -t dev -p <profile>   # env-specific values come from the target's variables block below
-# (Fill in each target's variables below once for your environment; --var=<name>=<value> still overrides any of them at deploy.)
+# (Fill in each target's variables below once for your environment. The simple string vars also accept a
+# --var=<name>=<value> override at deploy; the complex es_host_* configs CAN'T be set via --var - override
+# them through .databricks/bundle/<target>/variable-overrides.json instead.)
 
 bundle:
   name: databricks_elasticsearch_pipelines
@@ -144,10 +146,13 @@ variables:
 # Every other environment-specific value is bound PER TARGET below (targets.<env>.variables): the
 # `environment` token, the connector `wheel_path`, the streaming `checkpoint_base_path`, the
 # `cluster_policy_id`, and the Elasticsearch HOST CONFIGS. All ship as EMPTY placeholders on main - fill
-# in the environments you deploy to (or override any of them at deploy with --var=<name>=<value>, which
-# wins over the per-target value). An empty value fails closed where the value is required. This replaces
-# the older model of passing environment / wheel_path / checkpoint_base_path / cluster_policy_id as --var
-# on every deploy. (ES api_key VALUES are never here; they live in the referenced Databricks secret scopes.)
+# in the environments you deploy to. An empty value fails closed where the value is required. This
+# replaces the older model of passing environment / wheel_path / checkpoint_base_path / cluster_policy_id
+# as --var on every deploy: those four SIMPLE STRING vars still accept a --var=<name>=<value> override at
+# deploy (it wins over the per-target value). The es_host_* configs are `type: complex` and CANNOT be set
+# via --var (the CLI comma-splits the value and a JSON object fails to parse); override their per-target
+# values through the git-ignored .databricks/bundle/<target>/variable-overrides.json instead. (ES api_key
+# VALUES are never here; they live in the referenced Databricks secret scopes.)
 #
 # dev vs stg/prd differ by DEPLOYMENT MODE, which is the DAB best practice:
 # - dev uses `mode: development`: it isolates per user (root_path defaults to the deploying user's
