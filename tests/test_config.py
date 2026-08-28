@@ -917,6 +917,44 @@ def test_compute_existing_cluster_rejects_unknown_key():
         validate_config(cfg)
 
 
+def test_compute_existing_cluster_config_valid():
+    # existing_cluster may name a bundle variable (cluster_config) instead of a literal id, for a
+    # per-target (workspace-specific) cluster. The generator turns it into a ${var.<name>} reference.
+    cfg = _base()
+    cfg["compute"] = {"type": "existing_cluster", "cluster_config": "interactive_primary"}
+    assert validate_config(cfg)["compute"] == {
+        "type": "existing_cluster",
+        "cluster_config": "interactive_primary",
+    }
+
+
+def test_compute_existing_cluster_rejects_both_id_and_config():
+    # Exactly one of existing_cluster_id / cluster_config: naming both is ambiguous and fails closed.
+    cfg = _base()
+    cfg["compute"] = {
+        "type": "existing_cluster", "existing_cluster_id": "0123-x", "cluster_config": "interactive_primary",
+    }
+    with pytest.raises(PipelineConfigError, match="exactly one"):
+        validate_config(cfg)
+
+
+def test_compute_existing_cluster_rejects_neither_id_nor_config():
+    cfg = _base()
+    cfg["compute"] = {"type": "existing_cluster"}
+    with pytest.raises(PipelineConfigError, match="exactly one"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("bad", ["bad-name", "with.dot", "with space", "1leading", "", 5, True, ["x"]])
+def test_compute_existing_cluster_config_must_be_identifier(bad):
+    # cluster_config names a bundle variable, so it is held to the identifier rule (letter/underscore,
+    # then letters/digits/underscore): a hyphen/dot/space/non-string would make a broken ${var.<name>}.
+    cfg = _base()
+    cfg["compute"] = {"type": "existing_cluster", "cluster_config": bad}
+    with pytest.raises(PipelineConfigError, match="identifier"):
+        validate_config(cfg)
+
+
 def test_compute_job_cluster_valid():
     cfg = _base()
     cfg["compute"] = {"type": "job_cluster", "job_cluster_config": "standard_batch"}

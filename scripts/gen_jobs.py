@@ -161,6 +161,31 @@ def require_es_host_config(name: str, declared: set) -> None:
         )
 
 
+def load_declared_variables(path: str = _DATABRICKS_YML) -> set:
+    """The set of ALL top-level bundle-variable names declared in databricks.yml (the keys under
+    `variables:`). Used to validate an existing_cluster pipeline's `cluster_config` reference: the named
+    variable must actually be declared, so a job never emits a ${var.<name>} that fails to resolve at
+    deploy. databricks.yml is the single source of truth for what variables exist.
+    """
+    with open(path) as fh:
+        doc = yaml.safe_load(fh) or {}
+    return set((doc.get("variables") or {}).keys())
+
+
+def require_cluster_config(name: str, declared: set) -> None:
+    """Fail closed if an existing_cluster pipeline's cluster_config `name` is not a declared databricks.yml
+    variable. Mirrors require_es_host_config: a reference to a variable that was never declared (a typo, or
+    one left commented out) aborts generation with a clear message rather than emitting a job whose
+    ${var.<name>} would fail only later, at deploy.
+    """
+    if name not in declared:
+        raise ValueError(
+            f"cluster_config '{name}' is not declared as a variable in databricks.yml "
+            f"(declared variables: {', '.join(sorted(declared)) or '<none>'}); declare it under "
+            f"`variables:` (with per-target values) so ${{var.{name}}} resolves, or fix the pipeline's cluster_config"
+        )
+
+
 def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec: dict | None = None) -> str:
     """Render the resources/<name>.job.yml content for one index config.
 
@@ -176,7 +201,8 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
 
     Compute (cfg["compute"], per-index) decides WHERE the notebook task runs:
     - serverless (default): no cluster block => serverless notebook task.
-    - existing_cluster: the task gets existing_cluster_id (attach to an existing cluster).
+    - existing_cluster: the task gets existing_cluster_id - either the literal from the config, or, when
+      the config names a cluster_config, a ${var.<name>} reference the bundle resolves per target.
     - job_cluster: the job gets a job_clusters entry (job_cluster_key + the inlined new_cluster spec,
       passed in as `job_cluster_spec`) and the task references it by job_cluster_key. `job_cluster_spec`
       is REQUIRED for a job_cluster compute (the caller loads it via load_job_cluster_spec) and unused
@@ -194,10 +220,19 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     compute = cfg["compute"]
     ctype = compute["type"]
 
+    # For existing_cluster, the cluster id is either a literal or a ${var.<name>} reference (when the
+    # config names a cluster_config bundle variable), resolved per target by the bundle at deploy.
+    existing_cluster_ref = None
+    if ctype == "existing_cluster":
+        existing_cluster_ref = (
+            compute["existing_cluster_id"] if "existing_cluster_id" in compute
+            else f"${{var.{compute['cluster_config']}}}"
+        )
+
     if ctype == "serverless":
         compute_desc = "No cluster block => serverless notebook task."
     elif ctype == "existing_cluster":
-        compute_desc = f"Runs on existing cluster {compute['existing_cluster_id']}."
+        compute_desc = f"Runs on existing cluster {existing_cluster_ref}."
     else:  # job_cluster
         compute_desc = (
             f"Runs on job cluster '{compute['job_cluster_config']}' "
@@ -207,7 +242,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     # Build the task, inserting the cluster reference (if any) between task_key and notebook_task.
     task: dict = {"task_key": f"index_pipeline_{name}"}
     if ctype == "existing_cluster":
-        task["existing_cluster_id"] = compute["existing_cluster_id"]
+        task["existing_cluster_id"] = existing_cluster_ref
     elif ctype == "job_cluster":
         task["job_cluster_key"] = compute["job_cluster_config"]
     # The ES connection is a per-pipeline choice: cfg["es_host_config"] names a `type: complex` bundle
@@ -384,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
     # when a pipeline omits es_host_config (may be None if the bundle declares no default).
     es_host_configs = load_es_host_configs()
     default_es_host_config = load_default_es_host_config()
+    # All declared databricks.yml variables, for validating existing_cluster cluster_config references.
+    declared_variables = load_declared_variables()
 
     rendered: dict[str, str] = {}
     collisions = []
@@ -413,6 +450,10 @@ def main(argv: list[str] | None = None) -> int:
         job_cluster_spec = None
         if cfg["compute"]["type"] == "job_cluster":
             job_cluster_spec = load_job_cluster_spec(cfg["compute"]["job_cluster_config"])
+        # An existing_cluster pipeline that names a cluster_config variable must reference one declared in
+        # databricks.yml; fail closed here rather than emit a job whose ${var.<name>} would break at deploy.
+        if cfg["compute"].get("cluster_config"):
+            require_cluster_config(cfg["compute"]["cluster_config"], declared_variables)
         rendered[name] = render_job_yaml(os.path.basename(path), name, cfg, job_cluster_spec)
     if collisions:
         for name in collisions:

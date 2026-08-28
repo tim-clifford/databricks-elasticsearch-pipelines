@@ -234,20 +234,34 @@ on different compute. `type` is one of:
 | `type` | Extra key | Runs on |
 |---|---|---|
 | `serverless` (default; also when `compute` is omitted) | none | serverless notebook task |
-| `existing_cluster` | `existing_cluster_id` | an existing all-purpose/interactive cluster you give the id of |
+| `existing_cluster` | exactly one of `existing_cluster_id` or `cluster_config` | an existing all-purpose/interactive cluster, by a literal id or a per-target variable name |
 | `job_cluster` | `job_cluster_config` | a job cluster created per run from a reusable spec (see below) |
 
 ```yaml
-# attach to an existing interactive cluster:
+# attach to an existing interactive cluster by a literal id (same cluster in every environment):
 compute:
   type: existing_cluster
   existing_cluster_id: "0123-456789-abcde"
+
+# ...or, since a cluster id is workspace-specific, name a per-target bundle variable so one config
+# attaches to a different cluster per environment (dev/stg/prd):
+compute:
+  type: existing_cluster
+  cluster_config: interactive_primary   # -> existing_cluster_id: ${var.interactive_primary}
 
 # or run on a job cluster defined once and referenced by key:
 compute:
   type: job_cluster
   job_cluster_config: standard_batch    # -> _pipelines/job_cluster_configs/standard_batch.yml
 ```
+
+`cluster_config` names a `databricks.yml` bundle variable (declared with per-target values, empty
+placeholders on `main` like the other environment values); the generator emits
+`existing_cluster_id: ${var.<name>}` and the bundle resolves the right cluster id per target at deploy.
+A `cluster_config` naming a variable not declared in `databricks.yml` fails **at generation**
+(`scripts/gen_jobs.py`), before deploy. See the commented `interactive_primary` example in
+`databricks.yml`. Use `existing_cluster_id` (a literal) only when the same cluster id is valid in every
+environment you deploy to; otherwise prefer `cluster_config`.
 
 **Reusable job-cluster specs** live in `_pipelines/job_cluster_configs/<key>.yml`. Each file is a
 Databricks [`new_cluster`](https://docs.databricks.com/api/workspace/jobs/create) spec

@@ -99,6 +99,16 @@ def test_render_existing_cluster():
     assert list(task) == ["task_key", "existing_cluster_id", "notebook_task"]
 
 
+def test_render_existing_cluster_config_emits_var_ref():
+    # existing_cluster naming a cluster_config bundle variable renders existing_cluster_id as a
+    # ${var.<name>} reference, so the bundle resolves the workspace-specific cluster id per target.
+    job = _render_job(_cfg({"type": "existing_cluster", "cluster_config": "interactive_primary"}))
+    task = job["tasks"][0]
+    assert task["existing_cluster_id"] == "${var.interactive_primary}"
+    assert "job_cluster_key" not in task
+    assert "job_clusters" not in job
+
+
 # --------------------------------------------------------------------------- render: job_cluster
 
 
@@ -237,6 +247,27 @@ def test_require_es_host_config_unknown_fails_closed():
 
 def test_require_es_host_config_known_passes():
     gen_jobs.require_es_host_config("es_host_primary", {"es_host_primary"})  # no raise
+
+
+# --------------------------------------------------------------------------- cluster_config (existing_cluster)
+
+
+def test_load_declared_variables_reads_databricks_yml():
+    # All top-level variable names declared in the shipped databricks.yml, used to validate an
+    # existing_cluster pipeline's cluster_config reference.
+    declared = gen_jobs.load_declared_variables()
+    assert {"environment", "wheel_path", "cluster_policy_id", "es_host_primary"} <= declared
+    # interactive_primary ships COMMENTED, so it is NOT declared until a user uncomments it.
+    assert "interactive_primary" not in declared
+
+
+def test_require_cluster_config_unknown_fails_closed():
+    with pytest.raises(ValueError, match="not declared as a variable in databricks.yml"):
+        gen_jobs.require_cluster_config("interactive_typo", {"environment", "wheel_path"})
+
+
+def test_require_cluster_config_known_passes():
+    gen_jobs.require_cluster_config("interactive_primary", {"interactive_primary"})  # no raise
 
 
 def test_load_default_es_host_config_reads_databricks_yml():
