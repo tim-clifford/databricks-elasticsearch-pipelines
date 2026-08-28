@@ -174,15 +174,20 @@ WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repa
 #   the source read below (both modes). Empty widget -> the built-in default via the validator.
 MAX_PARTITION_BYTES = require_max_partition_bytes(MAX_PARTITION_BYTES, "max_partition_bytes job parameter")
 
-# The global ES connection settings are required for any index-job run: fail closed on an empty one
-# (e.g. a deploy that forgot --var=es_host_url) rather than constructing a broken EsWriteConfig.
+# The ES connection settings are required for any index-job run: fail closed on an empty one rather
+# than constructing a broken EsWriteConfig. These come from this pipeline's es_host_config (a complex
+# bundle variable in databricks.yml, resolved per target); an empty value means that host config's
+# fields were never filled in for the target being deployed - the common cause on a fresh checkout.
 for _param, _value in (
     ("es_host_url", ES_HOST_URL),
     ("secret_scope_name", SECRET_SCOPE_NAME),
     ("secret_key_name", SECRET_KEY_NAME),
 ):
     if not _value:
-        raise ValueError(f"missing required parameter: {_param} (set the bundle variable at deploy)")
+        raise ValueError(
+            f"missing required parameter: {_param} (fill in this pipeline's es_host_config values "
+            f"for this target in databricks.yml)"
+        )
 
 # checkpoint_base_path is required for a STREAMING run only (batch and deploy_views never stream, so
 # their runs leave it empty). Validated here, at the validation stage, so a streaming run with no

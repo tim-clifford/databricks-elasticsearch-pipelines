@@ -19,6 +19,7 @@ def _cfg(compute=None, schedule=None):
     raw = {
         "es_index_name": "ecs-dns-activity",
         "es_id_field": "dsl_id",
+        "es_host_config": "es_host_primary",
         "pipeline_mode": "batch",
         "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
         "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity", "primary_key": "dsl_id"},
@@ -59,6 +60,21 @@ def test_render_serverless_has_no_cluster_block():
     assert "job_cluster_key" not in task
     assert "job_clusters" not in job
     assert "notebook_task" in task
+
+
+def test_render_wires_es_host_config_fields():
+    # The generated notebook task references the pipeline's es_host_config as complex-variable subfields
+    # (${var.<name>.es_host_url} etc.), so the bundle resolves the right host per target at deploy. Use a
+    # non-default host-config name to prove the ref follows the config value, not a hardcoded literal.
+    cfg = validate_config({
+        "es_index_name": "ecs-dns-activity", "es_id_field": "dsl_id", "es_host_config": "es_host_secondary",
+        "pipeline_mode": "batch", "view": {"catalog": "c", "schema": "s", "name": "v"},
+        "source": {"catalog": "c", "schema": "s", "table": "t", "primary_key": "dsl_id"},
+    })
+    bp = _render_job(cfg)["tasks"][0]["notebook_task"]["base_parameters"]
+    assert bp["es_host_url"] == "${var.es_host_secondary.es_host_url}"
+    assert bp["secret_scope_name"] == "${var.es_host_secondary.secret_scope_name}"
+    assert bp["secret_key_name"] == "${var.es_host_secondary.secret_key_name}"
 
 
 def test_render_all_jobs_max_concurrent_runs_1():
@@ -187,3 +203,37 @@ def test_standard_batch_spec_loads_with_tags_and_no_policy_id():
     spec = gen_jobs.load_job_cluster_spec("standard_batch")
     assert spec.get("custom_tags") == {"project": "elastic"}
     assert "policy_id" not in spec
+
+
+# --------------------------------------------------------------------------- es_host_config
+
+
+def test_load_es_host_configs_reads_databricks_yml():
+    # The shipped databricks.yml declares es_host_primary (a complex var with the three connection
+    # fields). The scan must find it; the commented es_host_secondary example must NOT appear.
+    declared = gen_jobs.load_es_host_configs()
+    assert "es_host_primary" in declared
+    assert "es_host_secondary" not in declared
+
+
+def test_load_es_host_configs_ignores_non_host_complex_vars(tmp_path):
+    # Only a complex var whose default keys are EXACTLY the three connection fields is a host config; a
+    # complex var with a different shape (e.g. a cluster spec) must be ignored, not misread as one.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(
+        "variables:\n"
+        "  es_host_primary:\n    type: complex\n    default:\n"
+        "      es_host_url: ''\n      secret_scope_name: ''\n      secret_key_name: ''\n"
+        "  some_cluster:\n    type: complex\n    default:\n      spark_version: '15.4.x'\n"
+        "  a_plain_var:\n    default: ''\n"
+    )
+    assert gen_jobs.load_es_host_configs(str(yml)) == {"es_host_primary"}
+
+
+def test_require_es_host_config_unknown_fails_closed():
+    with pytest.raises(ValueError, match="not declared in databricks.yml"):
+        gen_jobs.require_es_host_config("es_host_typo", {"es_host_primary"})
+
+
+def test_require_es_host_config_known_passes():
+    gen_jobs.require_es_host_config("es_host_primary", {"es_host_primary"})  # no raise

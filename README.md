@@ -87,18 +87,16 @@ or `DATABRICKS_HOST`. The bundle variables are:
 |---|---|
 | `environment` | folded into any config name containing `${environment}` (e.g. `ocsf_${environment}` -> `ocsf_prod`); may be empty when no name uses the token |
 | `wheel_path` | UC Volume path to the `databricks-es-connector` wheel each **index job** installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). Defaults to empty; supply it on `bundle deploy` (or set a real default in your fork). An index job deployed with an empty `wheel_path` fails closed at run; `deploy_views` doesn't need it |
-| `es_host_url` | the Elasticsearch endpoint every index job writes to, e.g. `https://<host>:9200` |
-| `secret_scope_name` | the Databricks [secret scope](https://docs.databricks.com/security/secrets/) holding the ES **api_key** |
-| `secret_key_name` | the key within that scope whose value is the ES **api_key** the connector authenticates with |
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Required for a streaming run (fails closed if empty); unused by batch and `deploy_views` |
 | `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy schedules without firing them; only `prd` binds `UNPAUSED` to actually run them. Only affects jobs that declare a `schedule` (see [Scheduling](#scheduling)) |
 
-`es_host_url`, `secret_scope_name`, and `secret_key_name` are the global ES connection settings,
-shared by every index job (the auth secret is an api_key, not a username/password). Like
-`wheel_path`, they default to empty and are baked in at deploy; an index job run with any of them
-empty fails closed, and `deploy_views` doesn't need them. `checkpoint_base_path` is the same shape
-(global, deploy-time, empty default) but only a **streaming** run requires it; it must be a UC Volume
-path (serverless streaming checkpoints can't live on `dbfs:/tmp`).
+The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
+pipeline selects, with values that differ per environment. See
+[Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections) below.
+`wheel_path` defaults to empty and is baked in at deploy; an index job run with an empty `wheel_path`
+fails closed, and `deploy_views` doesn't need it. `checkpoint_base_path` is the same shape (global,
+deploy-time, empty default) but only a **streaming** run requires it; it must be a UC Volume path
+(serverless streaming checkpoints can't live on `dbfs:/tmp`).
 
 Everything else is per-pipeline and lives in `_pipelines/pipeline_configs/<config_name>.yml`. Each object is fully
 qualified (`catalog`, `schema`, and a name/table). Only `catalog` and `schema` may embed
@@ -108,6 +106,7 @@ its `.sql` filename):
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
+es_host_config: es_host_primary   # which ES host config to write to (required); declared in databricks.yml, see below
 pipeline_mode: batch              # default export mode: batch | streaming (required; can override per run)
 filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL); omit for no filter
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
@@ -148,6 +147,59 @@ is a column of the **source table**, used by the streaming read to identify a un
 share a value but need not, and neither defaults to the other. When `deploy_views` creates a view it
 verifies `es_id_field` is actually one of that view's output columns (against Spark's resolved schema),
 so a typo fails the deploy rather than surfacing later at export time.
+
+### Configuring Elasticsearch host connections
+
+Each pipeline writes to one **host config**: a named group of the three connection settings the
+connector needs, declared once in `databricks.yml` and referenced by name from the pipeline
+(`es_host_config: <name>`):
+
+| Field | What it is |
+|---|---|
+| `es_host_url` | the Elasticsearch endpoint, e.g. `https://<host>:9200` |
+| `secret_scope_name` | the Databricks [secret scope](https://docs.databricks.com/security/secrets/) holding the ES **api_key** |
+| `secret_key_name` | the key within that scope whose value is the ES **api_key** the connector authenticates with |
+
+Because each environment writes to its own Elasticsearch cluster, a host config's values are set
+**per target** (`dev`/`stg`/`prd`), so deploying to a target automatically uses that environment's host
+— no `--var` needed. Only the api_key **value** is a secret (it lives in the referenced Databricks
+secret scope); the endpoint and the scope/key **names** are not, so they are committed per target.
+
+A host config is a `type: complex` bundle variable. On `main` the per-target values ship **empty**
+(placeholders) — fill in the environments you deploy to:
+
+```yaml
+# databricks.yml
+variables:
+  es_host_primary:
+    type: complex
+    default: {es_host_url: "", secret_scope_name: "", secret_key_name: ""}   # empty = fail-closed
+
+targets:
+  dev:
+    variables:
+      es_host_primary:
+        es_host_url: "https://your-dev-es-host:9200"
+        secret_scope_name: "es_dev"
+        secret_key_name: "api_key"
+  prd:
+    variables:
+      es_host_primary:
+        es_host_url: "https://your-prd-es-host:9200"
+        secret_scope_name: "es_prd"
+        secret_key_name: "api_key"
+```
+
+A pipeline whose host config is left empty for the target it deploys to **fails closed** at run
+(`missing required parameter: es_host_url`) rather than writing nowhere.
+
+**To add another host config** (e.g. to route some pipelines to a second cluster): declare a second
+complex variable (`es_host_secondary`, same three fields), give it per-target values, and point a
+pipeline at it with `es_host_config: es_host_secondary`. A pipeline referencing a host config that
+isn't declared in `databricks.yml` fails **at generation** (`scripts/gen_jobs.py`), before deploy.
+
+(Don't want to commit even placeholder endpoints? Put the per-target maps in the git-ignored
+`.databricks/bundle/<target>/variable-overrides.json` instead; the rest works identically.)
 
 ### Compute
 
@@ -234,13 +286,16 @@ point at any workspace, and none binds the `environment` variable (pass `--var=e
 
 Two different mechanisms carry values into a job, and they resolve at different times:
 
-- **Bundle variables** (`environment`, `wheel_path`, `es_host_url`, `secret_scope_name`,
-  `secret_key_name`, `checkpoint_base_path`) are `--var` values resolved into the job at **deploy**
-  time. A `--var` on `bundle run` is ignored: only what was set at the last `bundle deploy` applies.
-  They default to empty, so a deploy without them still succeeds and `deploy_views` runs fine (it
-  needs no connector or ES); an index job needs a real `wheel_path` and the three ES connection
-  settings, a streaming run also needs `checkpoint_base_path`, and one deployed with a required one
-  empty fails closed.
+- **Bundle variables** (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`) are
+  `--var` values resolved into the job at **deploy** time. A `--var` on `bundle run` is ignored: only
+  what was set at the last `bundle deploy` applies. They default to empty, so a deploy without them
+  still succeeds and `deploy_views` runs fine (it needs no connector or ES); an index job needs a real
+  `wheel_path`, a streaming run also needs `checkpoint_base_path`, and one deployed with a required one
+  empty fails closed. The **ES host configs** are also bundle variables but are set **per target in
+  `databricks.yml`** (not by `--var`; see
+  [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)), so a
+  deploy picks up the target's host automatically — an index job whose host config is empty for that
+  target fails closed at run.
 - **Job parameters** are `--params` values applied at **run** time, overridable per run without
   redeploying (an invalid value fails the run closed):
   - `pipeline_mode` (`batch` | `streaming`), `filter_condition` (a Spark SQL predicate), and the
@@ -268,11 +323,11 @@ Two different mechanisms carry values into a job, and they resolve at different 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
+# The ES host connection is NOT passed here: fill in es_host_config for this target in databricks.yml
+# (see "Configuring Elasticsearch host connections"). The deploy picks it up automatically.
 WHEEL="/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
 databricks bundle deploy -t dev -p <profile> \
   --var="environment=<env>" --var="wheel_path=$WHEEL" \
-  --var="es_host_url=https://<host>:9200" \
-  --var="secret_scope_name=<scope>" --var="secret_key_name=<key>" \
   --var="checkpoint_base_path=/Volumes/<catalog>/<schema>/<volume>/checkpoints" \
   --var="cluster_policy_id=<id>"   # only needed if a pipeline uses job_cluster compute
 

@@ -35,9 +35,9 @@ def _job_base_parameters(config_name):
         config_name,
         environment_ref="${var.environment}",
         wheel_path_ref="${var.wheel_path}",
-        es_host_url_ref="${var.es_host_url}",
-        secret_scope_name_ref="${var.secret_scope_name}",
-        secret_key_name_ref="${var.secret_key_name}",
+        es_host_url_ref="${var.es_host_primary.es_host_url}",
+        secret_scope_name_ref="${var.es_host_primary.secret_scope_name}",
+        secret_key_name_ref="${var.es_host_primary.secret_key_name}",
         checkpoint_base_path_ref="${var.checkpoint_base_path}",
     )
 
@@ -47,6 +47,7 @@ def _base():
     return {
         "es_index_name": "ecs-dns-activity",
         "es_id_field": "dsl_id",
+        "es_host_config": "es_host_primary",
         "pipeline_mode": "batch",
         "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
         "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity", "primary_key": "dsl_id"},
@@ -97,7 +98,7 @@ def test_environment_token_accepted_as_template():
 # --------------------------------------------------------------------------- fail-closed: structure
 
 
-@pytest.mark.parametrize("missing", ["es_index_name", "es_id_field", "pipeline_mode", "view", "source"])
+@pytest.mark.parametrize("missing", ["es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "view", "source"])
 def test_missing_required_key(missing):
     cfg = _base()
     del cfg[missing]
@@ -160,6 +161,32 @@ def test_pipeline_mode_carried_through_resolve():
     # pipeline_mode is a passthrough (not an object name): resolve must keep it verbatim.
     out = resolve_config(validate_config(_with_env()), environment="prod")
     assert out["pipeline_mode"] == "batch"
+
+
+# --------------------------------------------------------------------------- es_host_config
+
+
+def test_es_host_config_round_trips():
+    cfg = _base()
+    cfg["es_host_config"] = "es_host_secondary"
+    assert validate_config(cfg)["es_host_config"] == "es_host_secondary"
+
+
+@pytest.mark.parametrize("bad", ["has-hyphen", "has space", "1leading", "a.b", "", None, 5])
+def test_illegal_es_host_config_rejected(bad):
+    # es_host_config becomes part of a ${var.<name>.field} reference, so it must be a bare identifier:
+    # a hyphen/dot/space or non-string fails closed (it would otherwise emit a broken variable ref).
+    cfg = _base()
+    cfg["es_host_config"] = bad
+    with pytest.raises(PipelineConfigError, match="es_host_config"):
+        validate_config(cfg)
+
+
+def test_es_host_config_carried_through_resolve():
+    # es_host_config names a bundle variable, not an object name: no ${environment} folding; resolve
+    # must keep it verbatim so the generated ${var.<name>.*} refs stay intact.
+    out = resolve_config(validate_config(_with_env()), environment="prod")
+    assert out["es_host_config"] == "es_host_primary"
 
 
 def test_unknown_top_level_key():
@@ -420,9 +447,9 @@ def test_job_base_parameters():
         "config_name": "ecs_dns_activity",
         "environment": "${var.environment}",
         "wheel_path": "${var.wheel_path}",
-        "es_host_url": "${var.es_host_url}",
-        "secret_scope_name": "${var.secret_scope_name}",
-        "secret_key_name": "${var.secret_key_name}",
+        "es_host_url": "${var.es_host_primary.es_host_url}",
+        "secret_scope_name": "${var.es_host_primary.secret_scope_name}",
+        "secret_key_name": "${var.es_host_primary.secret_key_name}",
         "checkpoint_base_path": "${var.checkpoint_base_path}",
     }
 

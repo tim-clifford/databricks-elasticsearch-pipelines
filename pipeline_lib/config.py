@@ -407,7 +407,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         raise PipelineConfigError(f"{source}: expected a YAML mapping, got {type(raw).__name__}")
 
     allowed_top = {
-        "es_index_name", "es_id_field", "pipeline_mode", "filter_condition",
+        "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
         "chunk_size", "require_existing_index", "verify_certs", "write_repartition", "max_partition_bytes",
         "view", "source", "reference_tables", "compute", "schedule",
     }
@@ -415,12 +415,17 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
 
-    for required in ("es_index_name", "es_id_field", "pipeline_mode", "view", "source"):
+    for required in ("es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "view", "source"):
         if required not in raw:
             raise PipelineConfigError(f"{source}: missing required key '{required}'")
 
     es_index_name = _require_es_index(raw["es_index_name"], f"{source}: es_index_name")
     es_id_field = _require_identifier(raw["es_id_field"], f"{source}: es_id_field")
+    # es_host_config names the Elasticsearch host config (endpoint + secret scope/key) this pipeline
+    # writes to; the generator wires the job to the matching complex bundle variable (${var.<name>.*}
+    # in databricks.yml) and fails closed if the name is not declared there. It becomes part of a bundle
+    # variable REFERENCE, so it must be a bare identifier (no dots/hyphens that would break ${var.<name>.field}).
+    es_host_config = _require_identifier(raw["es_host_config"], f"{source}: es_host_config")
     pipeline_mode = require_pipeline_mode(raw["pipeline_mode"], f"{source}: pipeline_mode")
     # filter_condition is OPTIONAL: absent -> "" (no filter). It is a SQL predicate, not an object
     # name, so it is not an identifier and carries no ${environment} token.
@@ -458,6 +463,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     return {
         "es_index_name": es_index_name,
         "es_id_field": es_id_field,
+        "es_host_config": es_host_config,
         "pipeline_mode": pipeline_mode,
         "filter_condition": filter_condition,
         "chunk_size": chunk_size,
@@ -637,6 +643,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
     return {
         "es_index_name": cfg["es_index_name"],
         "es_id_field": cfg["es_id_field"],
+        # es_host_config names a bundle variable (the host connection), not an object name: no
+        # ${environment} folding, passed through verbatim like the connector tuning knobs.
+        "es_host_config": cfg["es_host_config"],
         "pipeline_mode": cfg["pipeline_mode"],
         # filter_condition is a SQL predicate, not an object name: passed through verbatim (no
         # ${environment} folding), like pipeline_mode.
@@ -783,8 +792,11 @@ def job_base_parameters(
     DAB variable references threaded through unchanged, all resolved by the bundle at deploy:
     - `environment_ref` (e.g. "${var.environment}"): folded into ${environment} in the config names.
     - `wheel_path_ref` (e.g. "${var.wheel_path}"): the ONE global connector wheel every job installs.
-    - `es_host_url_ref`, `secret_scope_name_ref`, `secret_key_name_ref`: the global ES connection
-      settings (endpoint, and the secret scope/key holding the ES api_key), shared by every index job.
+    - `es_host_url_ref`, `secret_scope_name_ref`, `secret_key_name_ref`: the ES connection settings
+      (endpoint, and the secret scope/key holding the ES api_key) for THIS pipeline's chosen host
+      config. The generator passes fields of the pipeline's es_host_config complex bundle variable
+      (e.g. "${var.es_host_primary.es_host_url}"), so a pipeline can target a different ES host and the
+      bundle resolves the right per-target values at deploy.
     - `checkpoint_base_path_ref` (e.g. "${var.checkpoint_base_path}"): the global base path (a UC
       Volume) under which each STREAMING job keeps its checkpoint; the runner appends /<config_name>
       so each stream gets a stable, unique subfolder. Unused by batch runs.
