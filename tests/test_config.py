@@ -98,7 +98,7 @@ def test_environment_token_accepted_as_template():
 # --------------------------------------------------------------------------- fail-closed: structure
 
 
-@pytest.mark.parametrize("missing", ["es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "view", "source"])
+@pytest.mark.parametrize("missing", ["es_index_name", "es_id_field", "pipeline_mode", "view", "source"])
 def test_missing_required_key(missing):
     cfg = _base()
     del cfg[missing]
@@ -170,6 +170,14 @@ def test_es_host_config_round_trips():
     cfg = _base()
     cfg["es_host_config"] = "es_host_secondary"
     assert validate_config(cfg)["es_host_config"] == "es_host_secondary"
+
+
+def test_es_host_config_optional_when_omitted():
+    # es_host_config is optional: an omitted key validates and returns None, so the generator can fall
+    # back to the bundle's default_es_host_config (databricks.yml). Only OMISSION defers to the default.
+    cfg = _base()
+    del cfg["es_host_config"]
+    assert validate_config(cfg)["es_host_config"] is None
 
 
 @pytest.mark.parametrize("bad", ["has-hyphen", "has space", "1leading", "a.b", "", None, 5])

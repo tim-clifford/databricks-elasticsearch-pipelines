@@ -415,7 +415,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
 
-    for required in ("es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "view", "source"):
+    for required in ("es_index_name", "es_id_field", "pipeline_mode", "view", "source"):
         if required not in raw:
             raise PipelineConfigError(f"{source}: missing required key '{required}'")
 
@@ -424,8 +424,14 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # es_host_config names the Elasticsearch host config (endpoint + secret scope/key) this pipeline
     # writes to; the generator wires the job to the matching complex bundle variable (${var.<name>.*}
     # in databricks.yml) and fails closed if the name is not declared there. It becomes part of a bundle
-    # variable REFERENCE, so it must be a bare identifier (no dots/hyphens that would break ${var.<name>.field}).
-    es_host_config = _require_identifier(raw["es_host_config"], f"{source}: es_host_config")
+    # variable REFERENCE, so a PRESENT value must be a bare identifier (no dots/hyphens that would break
+    # ${var.<name>.field}). It is OPTIONAL: absent -> None, and the generator falls back to the bundle's
+    # default_es_host_config (databricks.yml). An explicit empty/invalid value still fails closed here;
+    # only OMISSION defers to the default.
+    es_host_config = (
+        _require_identifier(raw["es_host_config"], f"{source}: es_host_config")
+        if "es_host_config" in raw else None
+    )
     pipeline_mode = require_pipeline_mode(raw["pipeline_mode"], f"{source}: pipeline_mode")
     # filter_condition is OPTIONAL: absent -> "" (no filter). It is a SQL predicate, not an object
     # name, so it is not an identifier and carries no ${environment} token.

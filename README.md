@@ -106,7 +106,7 @@ its `.sql` filename):
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
-es_host_config: es_host_primary   # which ES host config to write to (required); declared in databricks.yml, see below
+es_host_config: es_host_primary   # OPTIONAL: which ES host config to write to; declared in databricks.yml (see below). Omit to use the bundle default
 pipeline_mode: batch              # default export mode: batch | streaming (required; can override per run)
 filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL); omit for no filter
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
@@ -152,7 +152,9 @@ so a typo fails the deploy rather than surfacing later at export time.
 
 Each pipeline writes to one **host config**: a named group of the three connection settings the
 connector needs, declared once in `databricks.yml` and referenced by name from the pipeline
-(`es_host_config: <name>`):
+(`es_host_config: <name>`). `es_host_config` is **optional**: a pipeline that omits it falls back to
+the bundle's `default_es_host_config` (a `databricks.yml` variable, `es_host_primary` out of the box —
+rename it or point it at your own default). A host config is:
 
 | Field | What it is |
 |---|---|
@@ -196,7 +198,10 @@ A pipeline whose host config is left empty for the target it deploys to **fails 
 **To add another host config** (e.g. to route some pipelines to a second cluster): declare a second
 complex variable (`es_host_secondary`, same three fields), give it per-target values, and point a
 pipeline at it with `es_host_config: es_host_secondary`. A pipeline referencing a host config that
-isn't declared in `databricks.yml` fails **at generation** (`scripts/gen_jobs.py`), before deploy.
+isn't declared in `databricks.yml` fails **at generation** (`scripts/gen_jobs.py`), before deploy — as
+does a pipeline that omits `es_host_config` when no `default_es_host_config` is declared. (The default
+is read from the variable's `default:` at generation time, so it can't vary per target or by `--var`;
+the default host config's *values* are still per target.)
 
 (Don't want to commit even placeholder endpoints? Put the per-target maps in the git-ignored
 `.databricks/bundle/<target>/variable-overrides.json` instead; the rest works identically.)

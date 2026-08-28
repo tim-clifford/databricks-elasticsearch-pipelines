@@ -237,3 +237,42 @@ def test_require_es_host_config_unknown_fails_closed():
 
 def test_require_es_host_config_known_passes():
     gen_jobs.require_es_host_config("es_host_primary", {"es_host_primary"})  # no raise
+
+
+def test_load_default_es_host_config_reads_databricks_yml():
+    # The shipped databricks.yml sets default_es_host_config to es_host_primary; that is what a pipeline
+    # that omits es_host_config falls back to.
+    assert gen_jobs.load_default_es_host_config() == "es_host_primary"
+
+
+def test_load_default_es_host_config_absent_is_none(tmp_path):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")  # no default_es_host_config declared
+    assert gen_jobs.load_default_es_host_config(str(yml)) is None
+
+
+def test_omitted_es_host_config_resolves_to_bundle_default():
+    # A pipeline that omits es_host_config (validate returns None) must render the BUNDLE DEFAULT's refs,
+    # mirroring how main() resolves it (cfg["es_host_config"] or the default) before rendering.
+    default = gen_jobs.load_default_es_host_config()  # es_host_primary
+    cfg = validate_config({
+        "es_index_name": "ecs-dns-activity", "es_id_field": "dsl_id",  # no es_host_config
+        "pipeline_mode": "batch", "view": {"catalog": "c", "schema": "s", "name": "v"},
+        "source": {"catalog": "c", "schema": "s", "table": "t", "primary_key": "dsl_id"},
+    })
+    assert cfg["es_host_config"] is None
+    cfg["es_host_config"] = cfg["es_host_config"] or default  # what main() does
+    bp = _render_job(cfg)["tasks"][0]["notebook_task"]["base_parameters"]
+    assert bp["es_host_url"] == "${var.es_host_primary.es_host_url}"
+
+
+def test_render_unresolved_es_host_config_fails_closed():
+    # render must never emit a ${var.None.*} ref: an unresolved (None) es_host_config is a caller bug
+    # (main resolves the default first), so rendering it fails closed.
+    cfg = validate_config({
+        "es_index_name": "ecs-dns-activity", "es_id_field": "dsl_id",  # no es_host_config -> None
+        "pipeline_mode": "batch", "view": {"catalog": "c", "schema": "s", "name": "v"},
+        "source": {"catalog": "c", "schema": "s", "table": "t", "primary_key": "dsl_id"},
+    })
+    with pytest.raises(ValueError, match="es_host_config for .* is unset"):
+        gen_jobs.render_job_yaml("x.yml", "x", cfg, None)

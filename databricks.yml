@@ -85,6 +85,17 @@ variables:
   #     secret_scope_name: ""
   #     secret_key_name: ""
 
+  # The host config a pipeline uses when it OMITS es_host_config. Its value must name one of the
+  # es_host_* complex variables above. scripts/gen_jobs.py reads THIS variable's `default:` at GENERATION
+  # time to resolve an omitted es_host_config, so only the value set here applies - per-target or --var
+  # overrides of default_es_host_config are NOT seen by the generator (the default host-config NAME is a
+  # repo-level choice; its per-environment VALUES still live on the host config itself, above). Rename it
+  # or point it at your own default host config; a pipeline that omits es_host_config AND has no default
+  # declared here fails closed at generation.
+  default_es_host_config:
+    description: "Host config a pipeline uses when it omits es_host_config (must name an es_host_* complex variable). Read at generation time."
+    default: es_host_primary
+
   # GLOBAL base path (a UC Volume) under which each STREAMING index job keeps its Structured
   # Streaming checkpoint. The runner appends /<config_name> so every stream gets a stable, unique
   # subfolder. Global like wheel_path (one base for all jobs); deploy-time; empty default so batch
