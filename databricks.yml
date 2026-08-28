@@ -150,8 +150,9 @@ variables:
 # replaces the older model of passing environment / wheel_path / checkpoint_base_path / cluster_policy_id
 # as --var on every deploy: those four SIMPLE STRING vars still accept a --var=<name>=<value> override at
 # deploy (it wins over the per-target value). The es_host_* configs are `type: complex` and CANNOT be set
-# via --var (the CLI comma-splits the value and a JSON object fails to parse); override their per-target
-# values through the git-ignored .databricks/bundle/<target>/variable-overrides.json instead. (ES api_key
+# via --var at all (the CLI rejects it: "setting variables of complex type via --var flag is not
+# supported"); override their per-target values through the git-ignored
+# .databricks/bundle/<target>/variable-overrides.json instead. (ES api_key
 # VALUES are never here; they live in the referenced Databricks secret scopes.)
 #
 # dev vs stg/prd differ by DEPLOYMENT MODE, which is the DAB best practice:

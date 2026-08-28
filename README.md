@@ -86,8 +86,9 @@ or `DATABRICKS_HOST`. Every environment-specific bundle variable is set **per ta
 environments you deploy to, so a routine deploy needs no `--var`. The four simple string variables
 below (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`) can still be overridden
 at deploy with `--var=<name>=<value>` (which wins over the per-target value); the `type: complex` ES
-host configs **cannot** be set via `--var` (the CLI can't parse an object value there), so override
-those through the git-ignored `variable-overrides.json` (see
+host configs **cannot** be set via `--var` at all (the CLI rejects it: *"setting variables of complex
+type via --var flag is not supported"*), so override those through the git-ignored
+`variable-overrides.json` (see
 [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). An empty
 value fails closed wherever the value is required. The bundle variables are:
 
@@ -306,8 +307,9 @@ Two different mechanisms carry values into a job, and they resolve at different 
   the ES host configs) are resolved into the job at **deploy** time. Each is set **per target** in
   `databricks.yml` (`targets.<env>.variables`), so a routine deploy takes no `--var` at all. The four
   simple string variables can still be overridden at deploy with `--var=<name>=<value>`, which wins over
-  the per-target value; the `type: complex` ES host configs cannot be set via `--var` (the CLI can't
-  parse an object value there), so override those through the git-ignored `variable-overrides.json`. A
+  the per-target value; the `type: complex` ES host configs cannot be set via `--var` at all (the CLI
+  rejects it: *"setting variables of complex type via --var flag is not supported"*), so override those
+  through the git-ignored `variable-overrides.json`. A
   `--var` on `bundle run` is ignored: only what was set at the last `bundle deploy` applies. They ship
   empty on `main`, so a deploy without filling them in still succeeds and `deploy_views` runs fine (it
   needs no connector or ES); an index job needs a real `wheel_path`, a streaming run also needs
@@ -342,8 +344,10 @@ Two different mechanisms carry values into a job, and they resolve at different 
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
 # Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, and the
-# ES host config) come from this target's variables block in databricks.yml. Fill them in once for your
-# fork and the deploy needs no --var:
+# ES host config) come from this target's variables block in databricks.yml. Fill in the target you
+# deploy to BEFORE running an index pipeline: the shipped configs embed ${environment} and install the
+# connector wheel, so an index run with those still empty fails closed (deploy itself always succeeds).
+# Filled in, the deploy needs no --var:
 databricks bundle deploy -t dev -p <profile>
 
 # The four simple string vars can still be overridden ad hoc, e.g. a one-off wheel:
