@@ -92,10 +92,12 @@ see [Scheduling](#scheduling).) The four simple string variables (`environment`,
 CLI rejects it: *"setting variables of complex type via --var flag is not supported"*), so override
 those through the git-ignored `variable-overrides.json` (see
 [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). Precedence,
-highest first: `--var`, then the git-ignored `variable-overrides.json`, then the per-target `variables`
-value, then the top-level `default`. A stale `variable-overrides.json` therefore silently outranks a
-value you committed to a target block (this repo's dev workflow keeps one for exactly these variables,
-so if a committed per-target value looks ignored, check for a local overrides file). An empty
+highest first: `--var`, then a `BUNDLE_VAR_<name>` environment variable, then the git-ignored
+`variable-overrides.json`, then the per-target `variables` value, then the top-level `default`. A stale
+`variable-overrides.json` (or an exported `BUNDLE_VAR_<name>`) therefore silently outranks a value you
+committed to a target block (this repo's dev workflow keeps an overrides file for exactly these
+variables, so if a committed per-target value looks ignored, check for a local overrides file or a stray
+`BUNDLE_VAR_` env var). An empty
 value fails closed wherever the value is required. The bundle variables are:
 
 | Variable | What it sets |

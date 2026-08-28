@@ -149,9 +149,10 @@ variables:
 # in the environments you deploy to. An empty value fails closed where the value is required. This
 # replaces the older model of passing environment / wheel_path / checkpoint_base_path / cluster_policy_id
 # as --var on every deploy: those four SIMPLE STRING vars still accept a --var=<name>=<value> override at
-# deploy (precedence highest first: --var > .databricks/bundle/<target>/variable-overrides.json >
-# per-target value > top-level default, so a local overrides file also silently outranks the committed
-# per-target value). The es_host_* configs are `type: complex` and CANNOT be set
+# deploy (precedence highest first: --var > BUNDLE_VAR_<name> env var >
+# .databricks/bundle/<target>/variable-overrides.json > per-target value > top-level default, so a local
+# overrides file or an exported BUNDLE_VAR_ env var also silently outranks the committed per-target
+# value). The es_host_* configs are `type: complex` and CANNOT be set
 # via --var at all (the CLI rejects it: "setting variables of complex type via --var flag is not
 # supported"); override their per-target values through the git-ignored
 # .databricks/bundle/<target>/variable-overrides.json instead. (ES api_key
@@ -206,6 +207,10 @@ targets:
         es_host_url: ""            # e.g. https://your-stg-es-host:9200
         secret_scope_name: ""
         secret_key_name: ""
+      # es_host_secondary:         # uncomment together with the declaration in the variables block above
+      #   es_host_url: ""
+      #   secret_scope_name: ""
+      #   secret_key_name: ""
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}
 
@@ -223,5 +228,9 @@ targets:
         es_host_url: ""            # e.g. https://your-prd-es-host:9200
         secret_scope_name: ""
         secret_key_name: ""
+      # es_host_secondary:         # uncomment together with the declaration in the variables block above
+      #   es_host_url: ""
+      #   secret_scope_name: ""
+      #   secret_key_name: ""
     workspace:
       root_path: /Workspace/databricks_elasticsearch_pipelines/.bundle/${bundle.name}/${bundle.target}
