@@ -223,7 +223,7 @@ SOURCE_FQN = f"{source['catalog']}.{source['schema']}.{source['table']}"
 print(f"config_name        = {CONFIG_NAME}")
 print(f"environment        = {ENVIRONMENT!r}")
 print(f"es_index_name      = {cfg['es_index_name']}")
-print(f"es_id_field        = {cfg['es_id_field']}")
+print(f"es_id_field        = {cfg['es_id_field']}" + ("" if cfg["es_id_field"] else " (unset: ES auto-generates _id; replays may duplicate)"))
 print(f"pipeline_mode      = {PIPELINE_MODE}")
 print(f"filter_condition   = {FILTER_CONDITION!r}")
 print(f"write_overrides    = {write_overrides}")
@@ -261,12 +261,15 @@ if MAX_PARTITION_BYTES != "0":
 #
 # write_overrides splats in only the tuning knobs that were set this run (chunk_size /
 # require_existing_index / verify_certs); an unset knob is absent, leaving the connector's own
-# default in force. index and id_field come from the (validated, resolved) config.
+# default in force. index and id_field come from the (validated, resolved) config. es_id_field is
+# OPTIONAL: an omitted one resolves to None, which is exactly the connector's "no id_field" default
+# (id_field: Optional[str] = None) - ES then assigns a random _id per doc, so at-least-once replays
+# can duplicate documents. A set es_id_field gives deterministic _ids => idempotent upserts.
 es_write_config = EsWriteConfig(
     hosts=ES_HOST_URL,
     api_key=dbutils.secrets.get(SECRET_SCOPE_NAME, SECRET_KEY_NAME),
     index=cfg["es_index_name"],
-    id_field=cfg["es_id_field"],
+    id_field=cfg["es_id_field"],  # None when unset == connector default (auto _id)
     **write_overrides,
 )
 

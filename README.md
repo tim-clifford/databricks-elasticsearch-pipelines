@@ -123,7 +123,7 @@ its `.sql` filename):
 
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
-es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
+es_id_field: dsl_id               # OPTIONAL: view output column passed to the connector as the ES document _id (idempotent upserts). Omit to let ES auto-generate _ids (replays may duplicate; see below)
 es_host_config: es_host_primary   # OPTIONAL: which ES host config to write to; declared in databricks.yml (see below). Omit to use the bundle default
 pipeline_mode: batch              # default export mode: batch | streaming (required; can override per run)
 filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL); omit for no filter
@@ -163,9 +163,21 @@ a hyphen).
 `es_id_field` and `source.primary_key` are two distinct keys for two distinct contexts: `es_id_field`
 is a column of the **view's** output, handed to the connector as the ES document `_id`; `primary_key`
 is a column of the **source table**, used by the streaming read to identify a unique row. They often
-share a value but need not, and neither defaults to the other. When `deploy_views` creates a view it
-verifies `es_id_field` is actually one of that view's output columns (against Spark's resolved schema),
-so a typo fails the deploy rather than surfacing later at export time.
+share a value but need not, and neither defaults to the other. When `es_id_field` is set and
+`deploy_views` creates a view it verifies `es_id_field` is actually one of that view's output columns
+(against Spark's resolved schema), so a typo fails the deploy rather than surfacing later at export time.
+
+`es_id_field` is **optional** (unlike `source.primary_key`, which is required). Set it and each
+document's `_id` is that column's value, so a re-run **upserts** over the same documents: the write is
+idempotent and a retried batch or restarted stream converges to one document per id. **Omit it and the
+pipeline passes no id_field to the connector, so ES assigns a random `_id` to every document.** That is
+zero-config, but it is *not* idempotent: because both modes are at-least-once (a retried batch, a
+restarted stream that reprocesses its last micro-batch), the same source rows can be written again as
+**new** documents, leaving **duplicates** in the index. Omit `es_id_field` only when duplicates are
+acceptable (or the source guarantees no replay); set it whenever you need a stable 1:1 row→document
+mapping. (Conversely, if `es_id_field` is set but two input rows share its value, the later row upserts
+over the earlier one, so ES ends up with *fewer* documents than rows sent - ensure the column is unique
+across the input.)
 
 ### Configuring Elasticsearch host connections
 
@@ -450,7 +462,7 @@ You edit these, one pair per pipeline (all under _pipelines/, the pipeline-confi
       <view_name>.sql           The view: what gets exported (filename == view.name)
     pipeline_configs/
       <config_name>.yml         The config: view/source/reference locations + es_index_name,
-                                es_id_field, pipeline_mode, source.primary_key, optional compute
+                                pipeline_mode, source.primary_key, optional es_id_field/compute
                                 + schedule (see Configuration)
     job_cluster_configs/
       <key>.yml                 OPTIONAL reusable new_cluster specs, referenced by key from a

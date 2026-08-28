@@ -184,8 +184,14 @@ for filename in sql_files:
         # runs here rather than in the offline generator because the generator has no Spark. A typo'd
         # es_id_field or a view that renamed the column would otherwise only surface much later, when
         # the connector is handed a nonexistent _id column. Fail closed per-view (collected below).
+        # es_id_field is OPTIONAL: when it is unset (None) the pipeline lets ES auto-generate the _id,
+        # so there is no column to verify - skip the check.
         fqn = subs["view"]  # catalog.schema.name, ${environment} already folded in
         es_id_field = cfg["es_id_field"]
+        if es_id_field is None:
+            created.append(filename)
+            print(f"    created {view_name} (no es_id_field: ES auto-generates _id)")
+            continue
         view_columns = spark.table(fqn).columns
         # column_present matches Spark's default (case-INSENSITIVE) column resolution, so a view
         # emitting e.g. `DSL_ID` for a config `dsl_id` is not false-rejected. Original casing is kept
