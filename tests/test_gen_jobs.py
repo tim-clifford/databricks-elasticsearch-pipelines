@@ -94,7 +94,7 @@ def test_render_existing_cluster():
     # as a ${var.<name>} reference, so the bundle resolves the workspace-specific cluster id per target.
     job = _render_job(_cfg({"type": "existing_cluster", "cluster_config": "interactive_primary"}))
     task = job["tasks"][0]
-    assert task["existing_cluster_id"] == "${var.interactive_primary}"
+    assert task["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
     assert "job_clusters" not in job
     assert "job_cluster_key" not in task
     # the cluster ref precedes notebook_task in the task (deterministic key order)
@@ -184,7 +184,7 @@ def test_render_schedule_composes_with_compute():
              schedule={"quartz_cron_expression": "0 0 8 * * ?"}),
     )
     assert job["schedule"]["timezone_id"] == "UTC"
-    assert job["tasks"][0]["existing_cluster_id"] == "${var.interactive_primary}"
+    assert job["tasks"][0]["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
 
 
 def test_load_job_cluster_spec_missing_fails_closed():
@@ -244,18 +244,31 @@ def test_require_es_host_config_known_passes():
 # --------------------------------------------------------------------------- cluster_config (existing_cluster)
 
 
-def test_load_declared_variables_reads_databricks_yml():
-    # All top-level variable names declared in the shipped databricks.yml, used to validate an
-    # existing_cluster pipeline's cluster_config reference.
-    declared = gen_jobs.load_declared_variables()
-    assert {"environment", "wheel_path", "cluster_policy_id", "es_host_primary"} <= declared
-    # interactive_primary ships COMMENTED, so it is NOT declared until a user uncomments it.
-    assert "interactive_primary" not in declared
+def test_load_cluster_configs_ignores_non_cluster_complex_vars(tmp_path):
+    # A cluster config is a complex var whose default keys are EXACTLY {cluster_id}. A host-shaped complex
+    # var and a plain string var are ignored, so cluster_config can only ever name a real cluster-id
+    # variable - never es_host_primary, wheel_path, etc.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(
+        "variables:\n"
+        "  interactive_primary:\n    type: complex\n    default:\n      cluster_id: ''\n"
+        "  es_host_primary:\n    type: complex\n    default:\n"
+        "      es_host_url: ''\n      secret_scope_name: ''\n      secret_key_name: ''\n"
+        "  wheel_path:\n    default: ''\n"
+    )
+    assert gen_jobs.load_cluster_configs(str(yml)) == {"interactive_primary"}
+
+
+def test_load_cluster_configs_none_shipped_on_databricks_yml():
+    # interactive_primary ships COMMENTED, so no cluster config is declared out of the box.
+    assert gen_jobs.load_cluster_configs() == set()
 
 
 def test_require_cluster_config_unknown_fails_closed():
-    with pytest.raises(ValueError, match="not declared as a variable in databricks.yml"):
-        gen_jobs.require_cluster_config("interactive_typo", {"environment", "wheel_path"})
+    # A name that is not a declared cluster config - a typo, or a real but non-cluster variable like
+    # es_host_primary - fails closed at generation (not a deny-list: only cluster-shaped configs pass).
+    with pytest.raises(ValueError, match="not declared as a cluster config"):
+        gen_jobs.require_cluster_config("es_host_primary", {"interactive_primary"})
 
 
 def test_require_cluster_config_known_passes():

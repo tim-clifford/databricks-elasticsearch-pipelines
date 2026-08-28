@@ -140,18 +140,23 @@ variables:
     description: "Workspace-specific cluster policy id injected into every job cluster. Empty default; set per target below or override with --var=cluster_policy_id=<id> whenever a pipeline uses job_cluster compute. Workspace-specific: dev deploys go to each engineer's own workspace."
     default: ""
 
-  # OPTIONAL per-target cluster id for existing_cluster compute. A pipeline that runs on an existing
-  # (interactive/all-purpose) cluster names a variable here via `compute.cluster_config: <name>` in its
-  # _pipelines/pipeline_configs/<name>.yml; the generator emits existing_cluster_id: ${var.<name>}, so the
-  # id is resolved PER TARGET at deploy - a cluster id is WORKSPACE-SPECIFIC, like cluster_policy_id, so one
-  # pipeline config attaches to a different cluster per environment. Shipped COMMENTED because no pipeline
-  # uses existing_cluster out of the box: to use it, uncomment this declaration AND the per-target
-  # placeholders below, then set `compute: {type: existing_cluster, cluster_config: interactive_primary}` in
-  # the pipeline. An empty value fails closed at deploy (the Jobs API rejects an empty cluster id). Add more
-  # (interactive_secondary, ...) the same way for pipelines that attach to different clusters.
+  # OPTIONAL cluster config for existing_cluster compute. Like an ES host config, it is a `type: complex`
+  # variable (a single cluster_id field) so the generator can tell cluster configs apart from other
+  # variables. A pipeline that runs on an existing (interactive/all-purpose) cluster names one via
+  # `compute.cluster_config: <name>` in its _pipelines/pipeline_configs/<name>.yml; the generator emits
+  # existing_cluster_id: ${var.<name>.cluster_id}, resolved PER TARGET at deploy - a cluster id is
+  # WORKSPACE-SPECIFIC, like cluster_policy_id, so one pipeline attaches to a different cluster per
+  # environment. Shipped COMMENTED because no pipeline uses existing_cluster out of the box: to use it,
+  # uncomment this declaration AND the per-target placeholders below, then set
+  # `compute: {type: existing_cluster, cluster_config: interactive_primary}` in the pipeline. An empty
+  # value fails closed at deploy (the Jobs API rejects an empty cluster id). A cluster_config that does not
+  # name a declared cluster config fails at generation (scripts/gen_jobs.py). Add more (interactive_secondary,
+  # ...) the same way for pipelines that attach to different clusters.
   # interactive_primary:
-  #   description: "Existing (interactive) cluster id for existing_cluster pipelines that name it via compute.cluster_config. Per-target; empty fails closed."
-  #   default: ""
+  #   type: complex
+  #   description: "Existing (interactive) cluster config for existing_cluster pipelines that name it via compute.cluster_config. Per-target; empty cluster_id fails closed."
+  #   default:
+  #     cluster_id: ""
 
 # Three targets: dev, stg, prd. The workspace HOST is intentionally not hardcoded here: it is taken
 # from your Databricks CLI profile (pass `-p <profile>`) or the DATABRICKS_HOST env var, so the bundle
@@ -198,7 +203,8 @@ targets:
       #   checkpoint_base_path: /Volumes/<catalog>/<schema>/<volume>/checkpoints/${workspace.current_user.short_name}
       checkpoint_base_path: ""
       cluster_policy_id: ""        # e.g. 00156D2098BE864B - workspace-specific; in dev each engineer uses their own
-      # interactive_primary: ""    # e.g. 0123-456789-abcde - existing/interactive cluster id (uncomment with the declaration above)
+      # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
+      #   cluster_id: ""           # e.g. 0123-456789-abcde
       # DEV Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-dev-es-host:9200
@@ -217,7 +223,8 @@ targets:
       wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
       checkpoint_base_path: ""     # e.g. /Volumes/<catalog>/<schema>/<volume>/checkpoints (UC Volume; required only for streaming)
       cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
-      # interactive_primary: ""    # existing/interactive cluster id (uncomment with the declaration above)
+      # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
+      #   cluster_id: ""
       # STG Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-stg-es-host:9200
@@ -239,7 +246,8 @@ targets:
       wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
       checkpoint_base_path: ""     # e.g. /Volumes/<catalog>/<schema>/<volume>/checkpoints (UC Volume; required only for streaming)
       cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
-      # interactive_primary: ""    # existing/interactive cluster id (uncomment with the declaration above)
+      # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
+      #   cluster_id: ""
       # PRD Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-prd-es-host:9200
