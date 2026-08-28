@@ -26,12 +26,24 @@ import yaml
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Import the shared config schema from the repo root, so validation is not re-implemented here.
 sys.path.insert(0, _REPO_ROOT)
-from pipeline_lib.config import PipelineConfigError, job_base_parameters, job_parameters, load_config  # noqa: E402
+from pipeline_lib.config import (  # noqa: E402
+    PipelineConfigError,
+    _require_identifier,
+    job_base_parameters,
+    job_parameters,
+    load_config,
+)
 
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "pipeline_configs")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
 # Reusable job-cluster specs referenced by a config's compute.job_cluster_config key (see load_job_cluster_spec).
 _JOB_CLUSTER_CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "job_cluster_configs")
+# Bundle root; the Elasticsearch host configs are declared here (see load_es_host_configs).
+_DATABRICKS_YML = os.path.join(_REPO_ROOT, "databricks.yml")
+
+# The three fields every Elasticsearch host config carries. A host config is declared in databricks.yml
+# as a `type: complex` variable whose default mapping has exactly these keys (see the variables block there).
+_ES_HOST_CONFIG_FIELDS = frozenset({"es_host_url", "secret_scope_name", "secret_key_name"})
 
 # Config files may use either extension; both are treated identically.
 _CONFIG_GLOBS = ("*.yml", "*.yaml")
@@ -85,6 +97,70 @@ def load_job_cluster_spec(key: str) -> dict:
     return spec
 
 
+def load_es_host_configs(path: str = _DATABRICKS_YML) -> set:
+    """The set of declared Elasticsearch host-config names, read from databricks.yml. Fail closed.
+
+    A host config is a bundle variable with `type: complex` whose default mapping's keys are exactly
+    _ES_HOST_CONFIG_FIELDS (es_host_url + secret_scope_name + secret_key_name). This is the SINGLE
+    SOURCE OF TRUTH for which host configs exist: a pipeline's `es_host_config` must name one of these
+    (enforced by require_es_host_config), and the generated job references ${var.<name>.<field>}, which
+    the bundle resolves per target at deploy. A complex variable whose default has a DIFFERENT key set is
+    not a host config and is ignored, so unrelated complex variables never collide with this scan.
+    """
+    with open(path) as fh:
+        doc = yaml.safe_load(fh) or {}
+    variables = doc.get("variables") or {}
+    names = set()
+    for var_name, spec in variables.items():
+        if not isinstance(spec, dict) or spec.get("type") != "complex":
+            continue
+        default = spec.get("default")
+        if isinstance(default, dict) and set(default) == _ES_HOST_CONFIG_FIELDS:
+            names.add(var_name)
+    return names
+
+
+def load_default_es_host_config(path: str = _DATABRICKS_YML):
+    """The bundle's default host-config name, from databricks.yml `variables.default_es_host_config.default`
+    (or None if not declared). A pipeline that OMITS es_host_config falls back to this (see main).
+
+    Read at GENERATION time from the variable's static `default:`; per-target and --var overrides are
+    deploy-time and deliberately not visible here (the default host-config NAME is a repo-level choice,
+    while its per-environment VALUES live on the host config itself). The value is returned as-is; whether
+    it names a real declared host config is enforced by require_es_host_config once a pipeline resolves to it.
+    """
+    with open(path) as fh:
+        doc = yaml.safe_load(fh) or {}
+    spec = (doc.get("variables") or {}).get("default_es_host_config")
+    if not isinstance(spec, dict):
+        return None
+    default = spec.get("default")
+    if not (isinstance(default, str) and default):
+        return None
+    # A pipeline that omits es_host_config falls back to this name, which the generator emits as
+    # ${var.<name>.es_host_url}. Hold it to the SAME identifier rule as a pipeline's own es_host_config
+    # (config.py _require_identifier), so a malformed default (e.g. a hyphen) fails here with a clear
+    # message rather than a confusing "not declared" error or a broken ${var.bad-name.*} ref downstream.
+    _require_identifier(default, "default_es_host_config (databricks.yml)")
+    return default
+
+
+def require_es_host_config(name: str, declared: set) -> None:
+    """Fail closed if a pipeline's es_host_config `name` is not declared in databricks.yml.
+
+    Mirrors load_job_cluster_spec's role for job_cluster_config: a reference to a host config that was
+    never declared (a typo, or one removed from databricks.yml) aborts generation with a clear message,
+    rather than emitting a job whose ${var.<name>.*} references would fail only later, at deploy.
+    """
+    if name not in declared:
+        raise ValueError(
+            f"es_host_config '{name}' is not declared in databricks.yml "
+            f"(declared host configs: {', '.join(sorted(declared)) or '<none>'}); add it as a "
+            f"`type: complex` variable with es_host_url/secret_scope_name/secret_key_name fields, "
+            f"or fix the pipeline's es_host_config"
+        )
+
+
 def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec: dict | None = None) -> str:
     """Render the resources/<name>.job.yml content for one index config.
 
@@ -134,18 +210,31 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
         task["existing_cluster_id"] = compute["existing_cluster_id"]
     elif ctype == "job_cluster":
         task["job_cluster_key"] = compute["job_cluster_config"]
+    # The ES connection is a per-pipeline choice: cfg["es_host_config"] names a `type: complex` bundle
+    # variable (declared in databricks.yml, with per-target values) whose fields carry the endpoint and
+    # the secret scope/key. Emit references to that variable's fields; the bundle resolves them per
+    # target at deploy. main() has already resolved any omitted es_host_config to the bundle default and
+    # validated the name is declared (require_es_host_config), so by here it is safe to build the refs.
+    # Fail closed if it is still unset (a caller bug: the default was not resolved), like the job_cluster
+    # spec guard below - never emit a ${var.None.*} ref. Built with format purely for clarity.
+    hc = cfg["es_host_config"]
+    if not hc:
+        raise ValueError(
+            f"es_host_config for '{name}' is unset; the caller must resolve the default "
+            f"(default_es_host_config) before rendering"
+        )
     task["notebook_task"] = {
         "notebook_path": "../notebooks/run_index_pipeline.py",
         # The notebook loads its own config at runtime (the generator can't know the deploy-time
         # values), so it just needs the config name plus the deploy-time bundle-variable refs
-        # (environment, wheel_path, and the global ES connection settings).
+        # (environment, wheel_path, this pipeline's ES host-config fields, and the checkpoint base).
         "base_parameters": job_base_parameters(
             name,
             "${var.environment}",
             "${var.wheel_path}",
-            "${var.es_host_url}",
-            "${var.secret_scope_name}",
-            "${var.secret_key_name}",
+            f"${{var.{hc}.es_host_url}}",
+            f"${{var.{hc}.secret_scope_name}}",
+            f"${{var.{hc}.secret_key_name}}",
             "${var.checkpoint_base_path}",
         ),
     }
@@ -289,6 +378,13 @@ def main(argv: list[str] | None = None) -> int:
     # config aborts here with nothing written, never leaving resources/ half-regenerated. Also refuse
     # up front to write over a hand-authored resource - the symmetric guard to orphan deletion: a
     # config named e.g. `deploy_views` targets the existing resources/deploy_views.job.yml (no marker).
+    # The declared ES host configs (single source of truth: databricks.yml). Loaded once, up front, so
+    # every pipeline's es_host_config is validated against the same set (and a bundle with none declared
+    # fails each referencing pipeline with a clear message). default_es_host_config is the fallback used
+    # when a pipeline omits es_host_config (may be None if the bundle declares no default).
+    es_host_configs = load_es_host_configs()
+    default_es_host_config = load_default_es_host_config()
+
     rendered: dict[str, str] = {}
     collisions = []
     for path in config_paths:
@@ -298,6 +394,19 @@ def main(argv: list[str] | None = None) -> int:
             collisions.append(name)
             continue
         cfg = load_config(path)  # raises ValueError on any invalid config (fail closed)
+        # Resolve the host config: the pipeline's own es_host_config, or the bundle default when it omits
+        # one. If neither is set there is no ES host to write to, so fail closed here (nothing written).
+        hc = cfg["es_host_config"] or default_es_host_config
+        if not hc:
+            raise ValueError(
+                f"pipeline '{name}' omits es_host_config and no default_es_host_config is declared in "
+                f"databricks.yml; set es_host_config in the pipeline, or declare a default_es_host_config"
+            )
+        # The resolved name must name a host config declared in databricks.yml; fail closed here rather
+        # than emit a job whose ${var.<name>.*} refs would break at deploy. Store it back so
+        # render_job_yaml emits the right refs whether it came from the pipeline or the default.
+        cfg["es_host_config"] = hc
+        require_es_host_config(hc, es_host_configs)
         # For a job_cluster compute, resolve its reusable new_cluster spec now (during the pre-write
         # render pass), so a missing/invalid job_cluster_config aborts here with nothing written -
         # same all-or-nothing guarantee as an invalid config.

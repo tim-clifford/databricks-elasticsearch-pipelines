@@ -6,6 +6,7 @@
 # used as-is.
 es_index_name: ecs-dns-activity   # target Elasticsearch index (hyphens allowed)
 es_id_field: dsl_id               # view output column passed to the connector as the ES document _id
+es_host_config: es_host_primary   # which ES host config (endpoint + secret scope/key) to write to; declared in databricks.yml
 pipeline_mode: batch              # default export mode: batch | streaming (override per run with --params)
 # filter_condition: "action = 'allowed'"   # OPTIONAL default row filter (Spark SQL); override per run
 # chunk_size: 1000                # OPTIONAL EsWriteConfig tuning: docs per bulk request (override per run)
