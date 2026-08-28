@@ -201,8 +201,8 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
 
     Compute (cfg["compute"], per-index) decides WHERE the notebook task runs:
     - serverless (default): no cluster block => serverless notebook task.
-    - existing_cluster: the task gets existing_cluster_id - either the literal from the config, or, when
-      the config names a cluster_config, a ${var.<name>} reference the bundle resolves per target.
+    - existing_cluster: the task gets existing_cluster_id: ${var.<name>}, from the config's cluster_config
+      bundle-variable name, which the bundle resolves to the per-target cluster id at deploy.
     - job_cluster: the job gets a job_clusters entry (job_cluster_key + the inlined new_cluster spec,
       passed in as `job_cluster_spec`) and the task references it by job_cluster_key. `job_cluster_spec`
       is REQUIRED for a job_cluster compute (the caller loads it via load_job_cluster_spec) and unused
@@ -220,14 +220,11 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     compute = cfg["compute"]
     ctype = compute["type"]
 
-    # For existing_cluster, the cluster id is either a literal or a ${var.<name>} reference (when the
-    # config names a cluster_config bundle variable), resolved per target by the bundle at deploy.
+    # For existing_cluster, the cluster id is a ${var.<name>} reference to the config's cluster_config
+    # bundle variable, which the bundle resolves to the per-target cluster id at deploy.
     existing_cluster_ref = None
     if ctype == "existing_cluster":
-        existing_cluster_ref = (
-            compute["existing_cluster_id"] if "existing_cluster_id" in compute
-            else f"${{var.{compute['cluster_config']}}}"
-        )
+        existing_cluster_ref = f"${{var.{compute['cluster_config']}}}"
 
     if ctype == "serverless":
         compute_desc = "No cluster block => serverless notebook task."

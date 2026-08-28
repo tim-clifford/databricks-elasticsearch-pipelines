@@ -150,7 +150,7 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
     table: dns_activity
 # compute:                        # OPTIONAL: where this job runs. Omit for serverless (see Compute)
 #   type: existing_cluster
-#   existing_cluster_id: "0123-456789-abcde"
+#   cluster_config: interactive_primary   # names a per-target databricks.yml variable holding the cluster id
 # schedule:                        # OPTIONAL: when this job runs. Omit for on-demand (see Scheduling)
 #   quartz_cron_expression: "0 0 8 * * ?"   # 08:00 UTC daily
 ```
@@ -234,17 +234,13 @@ on different compute. `type` is one of:
 | `type` | Extra key | Runs on |
 |---|---|---|
 | `serverless` (default; also when `compute` is omitted) | none | serverless notebook task |
-| `existing_cluster` | exactly one of `existing_cluster_id` or `cluster_config` | an existing all-purpose/interactive cluster, by a literal id or a per-target variable name |
+| `existing_cluster` | `cluster_config` | an existing all-purpose/interactive cluster, named by a per-target bundle variable |
 | `job_cluster` | `job_cluster_config` | a job cluster created per run from a reusable spec (see below) |
 
 ```yaml
-# attach to an existing interactive cluster by a literal id (same cluster in every environment):
-compute:
-  type: existing_cluster
-  existing_cluster_id: "0123-456789-abcde"
-
-# ...or, since a cluster id is workspace-specific, name a per-target bundle variable so one config
-# attaches to a different cluster per environment (dev/stg/prd):
+# attach to an existing interactive cluster. A cluster id is workspace-specific, so you name a
+# per-target bundle variable (never a literal id), so one config attaches to a different cluster per
+# environment (dev/stg/prd):
 compute:
   type: existing_cluster
   cluster_config: interactive_primary   # -> existing_cluster_id: ${var.interactive_primary}
@@ -258,10 +254,10 @@ compute:
 `cluster_config` names a `databricks.yml` bundle variable (declared with per-target values, empty
 placeholders on `main` like the other environment values); the generator emits
 `existing_cluster_id: ${var.<name>}` and the bundle resolves the right cluster id per target at deploy.
-A `cluster_config` naming a variable not declared in `databricks.yml` fails **at generation**
-(`scripts/gen_jobs.py`), before deploy. See the commented `interactive_primary` example in
-`databricks.yml`. Use `existing_cluster_id` (a literal) only when the same cluster id is valid in every
-environment you deploy to; otherwise prefer `cluster_config`.
+This mirrors `es_host_config`: a workspace-specific value is always a per-target variable, never a
+literal baked into the config. A `cluster_config` naming a variable not declared in `databricks.yml`
+fails **at generation** (`scripts/gen_jobs.py`), before deploy. See the commented `interactive_primary`
+example in `databricks.yml`.
 
 **Reusable job-cluster specs** live in `_pipelines/job_cluster_configs/<key>.yml`. Each file is a
 Databricks [`new_cluster`](https://docs.databricks.com/api/workspace/jobs/create) spec

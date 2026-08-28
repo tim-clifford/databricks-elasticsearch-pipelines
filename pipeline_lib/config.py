@@ -78,9 +78,9 @@ _VALID_PIPELINE_MODES = ("batch", "streaming")
 # Compute options for a per-index job: WHERE its notebook task runs. Allow-list, fail closed: an
 # unrecognized type is rejected, never silently treated as serverless.
 # - serverless (DEFAULT, also when `compute` is omitted): no cluster block => serverless notebook task.
-# - existing_cluster: attach to an existing all-purpose/interactive cluster, named either by a literal
-#   id (existing_cluster_id, same cluster in every environment) or by a bundle-variable name
-#   (cluster_config, a per-target id set in databricks.yml, since a cluster id is workspace-specific).
+# - existing_cluster: attach to an existing all-purpose/interactive cluster named by cluster_config (a
+#   bundle-variable name whose per-target value is the cluster id, set in databricks.yml). Never a literal
+#   id: a cluster id is workspace-specific, so it is always a per-target variable (mirrors es_host_config).
 # - job_cluster: run on a job cluster whose new_cluster spec is defined once under
 #   _pipelines/job_cluster_configs/<key>.yml and referenced here by that key (the generator inlines it).
 # Only the generator (scripts/gen_jobs.py) acts on compute (it wires the job's cluster); the on-cluster
@@ -542,10 +542,10 @@ def _validate_compute(node: object, where: str = "compute") -> dict:
     cluster block, the framework default. Otherwise `type` is allow-listed and each type carries exactly
     its own required key (unknown keys for that type are rejected, so a typo can't be silently ignored):
       - serverless:       no other keys.
-      - existing_cluster: exactly one of existing_cluster_id (a non-empty literal cluster id, the same in
-                          every environment) or cluster_config (an identifier naming a databricks.yml
-                          bundle variable that holds a per-target id, so the generator emits
-                          ${var.<name>} and each target resolves its own workspace-specific cluster id).
+      - existing_cluster: cluster_config (an identifier naming a databricks.yml bundle variable that
+                          holds a per-target cluster id) - the generator emits existing_cluster_id:
+                          ${var.<name>}, so each target resolves its own workspace-specific id. Never a
+                          literal (a cluster id is workspace-specific), matching es_host_config's pattern.
       - job_cluster:      job_cluster_config (a job_cluster_configs/<key> stem) - the generator inlines
                           that reusable new_cluster spec into the job's job_clusters block.
     """
@@ -561,10 +561,10 @@ def _validate_compute(node: object, where: str = "compute") -> dict:
         )
 
     # Per-type allow-list of keys: reject anything else so a misplaced/typo'd key fails closed rather
-    # than being silently dropped (e.g. an existing_cluster_id under a job_cluster compute).
+    # than being silently dropped (e.g. a cluster_config under a job_cluster compute).
     allowed = {
         "serverless": {"type"},
-        "existing_cluster": {"type", "existing_cluster_id", "cluster_config"},
+        "existing_cluster": {"type", "cluster_config"},
         "job_cluster": {"type", "job_cluster_config"},
     }[ctype]
     unknown = sorted(set(node) - allowed)
@@ -576,32 +576,13 @@ def _validate_compute(node: object, where: str = "compute") -> dict:
 
     result = {"type": ctype}
     if ctype == "existing_cluster":
-        # Exactly one of: a literal existing_cluster_id (same cluster in every environment) OR a
-        # cluster_config naming a bundle variable (a per-target id set in databricks.yml, so one config
-        # can attach to a different, workspace-specific cluster per environment). Requiring exactly one
-        # fails closed on both (ambiguous) and on neither (no cluster named).
-        has_id = "existing_cluster_id" in node
-        has_cfg = "cluster_config" in node
-        if has_id == has_cfg:
-            raise PipelineConfigError(
-                f"{where} (type 'existing_cluster') needs exactly one of 'existing_cluster_id' "
-                f"(a literal cluster id) or 'cluster_config' (a bundle-variable name for a per-target "
-                f"id), got {'both' if has_id else 'neither'}"
-            )
-        if has_id:
-            cid = node.get("existing_cluster_id")
-            if not isinstance(cid, str) or not cid.strip():
-                raise PipelineConfigError(
-                    f"{where}.existing_cluster_id must be a non-empty string, got {cid!r}"
-                )
-            result["existing_cluster_id"] = cid.strip()
-        else:
-            # A bundle-variable NAME (the generator emits ${var.<name>}); held to the identifier rule so a
-            # malformed name can't produce a broken ${var.bad-name} ref. That it names a DECLARED variable
-            # is enforced at generation by gen_jobs.require_cluster_config (single source of truth: databricks.yml).
-            result["cluster_config"] = _require_identifier(
-                node.get("cluster_config"), f"{where}.cluster_config"
-            )
+        # cluster_config is a bundle-variable NAME whose per-target value is the cluster id; the generator
+        # emits ${var.<name>}. Held to the identifier rule (required, so a missing/malformed name fails
+        # closed here) so it can't produce a broken ${var.bad-name} ref. That it names a DECLARED variable
+        # is enforced at generation by gen_jobs.require_cluster_config (single source of truth: databricks.yml).
+        result["cluster_config"] = _require_identifier(
+            node.get("cluster_config"), f"{where}.cluster_config"
+        )
     elif ctype == "job_cluster":
         key = node.get("job_cluster_config")
         if not isinstance(key, str) or not _VALID_JOB_CLUSTER_KEY.match(key):
