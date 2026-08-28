@@ -26,7 +26,13 @@ import yaml
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Import the shared config schema from the repo root, so validation is not re-implemented here.
 sys.path.insert(0, _REPO_ROOT)
-from pipeline_lib.config import PipelineConfigError, job_base_parameters, job_parameters, load_config  # noqa: E402
+from pipeline_lib.config import (  # noqa: E402
+    PipelineConfigError,
+    _require_identifier,
+    job_base_parameters,
+    job_parameters,
+    load_config,
+)
 
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "pipeline_configs")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
@@ -129,7 +135,14 @@ def load_default_es_host_config(path: str = _DATABRICKS_YML):
     if not isinstance(spec, dict):
         return None
     default = spec.get("default")
-    return default if isinstance(default, str) and default else None
+    if not (isinstance(default, str) and default):
+        return None
+    # A pipeline that omits es_host_config falls back to this name, which the generator emits as
+    # ${var.<name>.es_host_url}. Hold it to the SAME identifier rule as a pipeline's own es_host_config
+    # (config.py _require_identifier), so a malformed default (e.g. a hyphen) fails here with a clear
+    # message rather than a confusing "not declared" error or a broken ${var.bad-name.*} ref downstream.
+    _require_identifier(default, "default_es_host_config (databricks.yml)")
+    return default
 
 
 def require_es_host_config(name: str, declared: set) -> None:

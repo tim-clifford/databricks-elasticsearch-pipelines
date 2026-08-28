@@ -251,6 +251,16 @@ def test_load_default_es_host_config_absent_is_none(tmp_path):
     assert gen_jobs.load_default_es_host_config(str(yml)) is None
 
 
+@pytest.mark.parametrize("bad", ["bad-name", "a.b", "1leading", "has space"])
+def test_load_default_es_host_config_rejects_bad_identifier(tmp_path, bad):
+    # The default name is held to the SAME identifier rule as a pipeline's own es_host_config, so a
+    # malformed default fails closed with a clear message (not a confusing "not declared" downstream).
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  default_es_host_config:\n    default: {bad!r}\n")
+    with pytest.raises(ValueError, match="identifier"):
+        gen_jobs.load_default_es_host_config(str(yml))
+
+
 def test_omitted_es_host_config_resolves_to_bundle_default():
     # A pipeline that omits es_host_config (validate returns None) must render the BUNDLE DEFAULT's refs,
     # mirroring how main() resolves it (cfg["es_host_config"] or the default) before rendering.
