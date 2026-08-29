@@ -181,9 +181,10 @@ set it whenever you need a stable 1:1 row→document mapping. To get auto-ids yo
 entirely** or comment it out; a present-but-blank `es_id_field:` or `es_id_field: null` is treated as
 an invalid value and fails the config, not as a request for auto-ids.
 
-Conversely, if `es_id_field` *is* set but two input rows share its value, the later row upserts over the
-earlier one, so ES ends up with *fewer* documents than rows sent. Ensure the column is unique across the
-input when you need a 1:1 mapping.
+Conversely, if `es_id_field` *is* set but two input rows share its value, they collapse to a single
+document (they share one `_id`), so ES ends up with *fewer* documents than rows sent. Which of the
+duplicates survives is **not** guaranteed: the write is partitioned and runs in parallel, so there is no
+defined "last" row. Ensure the column is unique across the input when you need a 1:1 mapping.
 
 ### Configuring Elasticsearch host connections
 
