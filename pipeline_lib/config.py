@@ -7,7 +7,9 @@ the on-cluster notebooks (deploy_views.py, run_index_pipeline.py) import it, so 
 Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
 
     es_index_name: <es index>            # ES index name (hyphens allowed; NOT a SQL identifier)
-    es_id_field:   <column>              # view output column passed to the connector as the ES _id
+    es_id_field:   <column>              # OPTIONAL view output column passed to the connector as the ES
+                                         #   _id (idempotent upserts). Omit => ES assigns random _ids,
+                                         #   so replays can duplicate documents. See below.
     pipeline_mode: batch | streaming     # THIS index's DEFAULT export mode (required); a job parameter,
                                          #   so it is overridable per run with --params pipeline_mode=...
     filter_condition: <sql predicate>    # OPTIONAL default row filter (a Spark SQL boolean expr);
@@ -34,6 +36,10 @@ TWO DISTINCT KEYS, TWO CONTEXTS
 VIEW's output, handed to the ES connector as the document _id. primary_key is a column of the SOURCE
 table, used by the streaming read to identify a unique row. They often share a name but need not, and
 neither defaults to the other. Both are plain column identifiers (no ${environment} token).
+es_id_field is OPTIONAL (primary_key is required): omit it and no id_field is passed to the connector,
+so ES generates a random _id per document. That means an at-least-once replay (retried batch, restarted
+stream) re-inserts rows as NEW documents instead of upserting, so the index can accumulate DUPLICATES.
+Set it whenever you need idempotent writes; omit it only when duplicates are acceptable.
 
 ENVIRONMENT SUBSTITUTION
 A `catalog` or `schema` value may embed the token `${environment}`, folded in by the runner when the job
@@ -418,12 +424,23 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
 
-    for required in ("es_index_name", "es_id_field", "pipeline_mode", "view", "source"):
+    for required in ("es_index_name", "pipeline_mode", "view", "source"):
         if required not in raw:
             raise PipelineConfigError(f"{source}: missing required key '{required}'")
 
     es_index_name = _require_es_index(raw["es_index_name"], f"{source}: es_index_name")
-    es_id_field = _require_identifier(raw["es_id_field"], f"{source}: es_id_field")
+    # es_id_field names the view output column handed to the connector as each document's ES _id, which
+    # makes writes idempotent (a replay/backfill upserts over the same _id instead of duplicating). It is
+    # OPTIONAL: OMIT it and the pipeline passes no id_field to the connector, so ES assigns a random _id
+    # per document. That trades idempotency for zero-config: an at-least-once replay (a retried batch,
+    # a restarted stream) then re-inserts rows as NEW documents rather than overwriting, so the index can
+    # accumulate DUPLICATES. Only omit it when duplicates are acceptable or the source guarantees no
+    # replay. A PRESENT value must be a legal column identifier; an explicit empty/invalid value still
+    # fails closed here (only OMISSION defers to ES auto-ids).
+    es_id_field = (
+        _require_identifier(raw["es_id_field"], f"{source}: es_id_field")
+        if "es_id_field" in raw else None
+    )
     # es_host_config names the Elasticsearch host config (endpoint + secret scope/key) this pipeline
     # writes to; the generator wires the job to the matching complex bundle variable (${var.<name>.*}
     # in databricks.yml) and fails closed if the name is not declared there. It becomes part of a bundle

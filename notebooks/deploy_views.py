@@ -184,19 +184,27 @@ for filename in sql_files:
         # runs here rather than in the offline generator because the generator has no Spark. A typo'd
         # es_id_field or a view that renamed the column would otherwise only surface much later, when
         # the connector is handed a nonexistent _id column. Fail closed per-view (collected below).
+        # es_id_field is OPTIONAL: when it is unset (None) the pipeline lets ES auto-generate the _id,
+        # so there is no column to verify - skip the check.
         fqn = subs["view"]  # catalog.schema.name, ${environment} already folded in
         es_id_field = cfg["es_id_field"]
-        view_columns = spark.table(fqn).columns
-        # column_present matches Spark's default (case-INSENSITIVE) column resolution, so a view
-        # emitting e.g. `DSL_ID` for a config `dsl_id` is not false-rejected. Original casing is kept
-        # in the error text. See pipeline_lib.config.column_present (unit-tested there).
-        if not column_present(es_id_field, view_columns):
-            raise ValueError(
-                f"es_id_field '{es_id_field}' is not an output column of view {fqn}; "
-                f"available columns: {view_columns}"
-            )
+        if es_id_field is None:
+            # No _id column to verify: the pipeline lets ES auto-generate the _id.
+            id_note = "no es_id_field: ES auto-generates _id"
+        else:
+            # column_present matches Spark's default (case-INSENSITIVE) column resolution, so a view
+            # emitting e.g. `DSL_ID` for a config `dsl_id` is not false-rejected. Original casing is kept
+            # in the error text. See pipeline_lib.config.column_present (unit-tested there). A missing
+            # column fails closed (raises) and is collected by the except below.
+            view_columns = spark.table(fqn).columns
+            if not column_present(es_id_field, view_columns):
+                raise ValueError(
+                    f"es_id_field '{es_id_field}' is not an output column of view {fqn}; "
+                    f"available columns: {view_columns}"
+                )
+            id_note = f"es_id_field '{es_id_field}' present"
         created.append(filename)
-        print(f"    created {view_name} (es_id_field '{es_id_field}' present)")
+        print(f"    created {view_name} ({id_note})")
     except Exception as exc:  # noqa: BLE001 - deliberately continue to the next view
         failed.append((filename, exc))
         print(f"    FAILED {view_name}: {type(exc).__name__}: {exc}")

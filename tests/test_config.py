@@ -98,7 +98,7 @@ def test_environment_token_accepted_as_template():
 # --------------------------------------------------------------------------- fail-closed: structure
 
 
-@pytest.mark.parametrize("missing", ["es_index_name", "es_id_field", "pipeline_mode", "view", "source"])
+@pytest.mark.parametrize("missing", ["es_index_name", "pipeline_mode", "view", "source"])
 def test_missing_required_key(missing):
     cfg = _base()
     del cfg[missing]
@@ -134,10 +134,30 @@ def test_es_id_field_and_primary_key_independent():
 
 @pytest.mark.parametrize("bad", ["has-hyphen", "has space", "1leading", "", None, 5])
 def test_illegal_es_id_field_rejected(bad):
+    # A PRESENT es_id_field must be a legal identifier. An explicit empty/null/invalid value still fails
+    # closed (only OMISSION - the key absent entirely - defers to ES auto-ids; see the next test).
     cfg = _base()
     cfg["es_id_field"] = bad
     with pytest.raises(PipelineConfigError, match="es_id_field"):
         validate_config(cfg)
+
+
+def test_es_id_field_optional_when_omitted():
+    # es_id_field is optional: OMITTING the key validates and returns None, which the runner passes to
+    # the connector as its "no id_field" default (ES auto-generates each _id). Distinct from an explicit
+    # empty/null value, which fails closed above.
+    cfg = _base()
+    del cfg["es_id_field"]
+    assert validate_config(cfg)["es_id_field"] is None
+
+
+def test_es_id_field_none_survives_resolve():
+    # An omitted es_id_field (None) must pass through resolve_config unchanged (it is a passthrough, not
+    # an object name), so the resolved config the notebook reads still carries None.
+    cfg = _with_env()
+    del cfg["es_id_field"]
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["es_id_field"] is None
 
 
 @pytest.mark.parametrize("mode", ["batch", "streaming"])

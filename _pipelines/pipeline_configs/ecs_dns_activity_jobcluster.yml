@@ -5,7 +5,7 @@
 #
 # See ecs_dns_activity.yml for the full field reference. ${environment} folding works the same here.
 es_index_name: ecs-dns-activity-jobcluster   # own ES index (separate from the serverless pipeline's)
-es_id_field: dsl_id                          # view output column used as the ES document _id
+es_id_field: dsl_id                          # OPTIONAL: view output column used as the ES document _id (idempotent upserts). Omit => ES auto-generates _ids, so replays may duplicate documents
 es_host_config: es_host_primary              # ES host config (endpoint + secret scope/key); declared in databricks.yml
 pipeline_mode: batch                         # default export mode: batch | streaming
 

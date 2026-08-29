@@ -223,7 +223,7 @@ SOURCE_FQN = f"{source['catalog']}.{source['schema']}.{source['table']}"
 print(f"config_name        = {CONFIG_NAME}")
 print(f"environment        = {ENVIRONMENT!r}")
 print(f"es_index_name      = {cfg['es_index_name']}")
-print(f"es_id_field        = {cfg['es_id_field']}")
+print(f"es_id_field        = {cfg['es_id_field'] or '<unset> (ES auto-generates _id)'}")
 print(f"pipeline_mode      = {PIPELINE_MODE}")
 print(f"filter_condition   = {FILTER_CONDITION!r}")
 print(f"write_overrides    = {write_overrides}")
@@ -234,6 +234,18 @@ print(f"source             = {SOURCE_FQN}")
 print(f"es_host_url        = {ES_HOST_URL}")
 if PIPELINE_MODE == "streaming":
     print(f"streaming_start    = {STREAMING_START}")
+# Loud warning for omitting es_id_field. BOTH modes are at-least-once, so a replay re-writes the same
+# source rows with fresh auto-generated _ids and the index accumulates DUPLICATES: for batch, a
+# failed-then-retried run re-exports the whole view; for streaming, micro-batch retries, stream
+# restarts, and the "new"-mode last-commit re-export below are ROUTINE, so duplication is far more
+# likely there. This is ALLOWED (duplicates may be fine for an append-only sink), so it is a warning,
+# not a failure - but it must be loud, because idempotency is the safe default.
+if cfg["es_id_field"] is None:
+    _stream_note = (" Streaming replays (micro-batch retries, restarts) are routine, so this is "
+                    "especially likely." if PIPELINE_MODE == "streaming" else "")
+    print(f"WARNING: {PIPELINE_MODE} pipeline with no es_id_field - ES auto-generates _ids, so a replay "
+          f"(a retry or restart) re-inserts rows as NEW documents and accumulates DUPLICATES.{_stream_note} "
+          f"Set es_id_field for idempotent upserts; leave it unset only if duplicates are acceptable.")
 
 # Tune read/scan parallelism for BOTH modes by setting spark.sql.files.maxPartitionBytes before any
 # read below (smaller => more, smaller source-file splits => the scan+view-transform fans out across
@@ -261,12 +273,15 @@ if MAX_PARTITION_BYTES != "0":
 #
 # write_overrides splats in only the tuning knobs that were set this run (chunk_size /
 # require_existing_index / verify_certs); an unset knob is absent, leaving the connector's own
-# default in force. index and id_field come from the (validated, resolved) config.
+# default in force. index and id_field come from the (validated, resolved) config. es_id_field is
+# OPTIONAL: an omitted one resolves to None, which is exactly the connector's "no id_field" default
+# (id_field: Optional[str] = None) - ES then assigns a random _id per doc, so at-least-once replays
+# can duplicate documents. A set es_id_field gives deterministic _ids => idempotent upserts.
 es_write_config = EsWriteConfig(
     hosts=ES_HOST_URL,
     api_key=dbutils.secrets.get(SECRET_SCOPE_NAME, SECRET_KEY_NAME),
     index=cfg["es_index_name"],
-    id_field=cfg["es_id_field"],
+    id_field=cfg["es_id_field"],  # None when unset == connector default (auto _id)
     **write_overrides,
 )
 
@@ -389,9 +404,13 @@ if PIPELINE_MODE == "streaming":
         # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
         # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
         # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
-        # micro-batch here: the checkpoint does not advance, Spark retries (idempotent via deterministic
-        # _id), and if it never recovers the run fails with no summary. So the record step below is only
-        # reached for a batch that wrote every row cleanly, and result['written'] is the true count.
+        # micro-batch here: the checkpoint does not advance and Spark reprocesses the batch. That retry
+        # is an idempotent upsert ONLY when es_id_field is set (deterministic _id); with es_id_field
+        # OMITTED, ES assigns fresh random _ids, so the reprocessed rows land as NEW documents and the
+        # retry DUPLICATES them - streaming replays are routine, so omit es_id_field only for a stream
+        # where duplicates are acceptable. If it never recovers the run fails with no summary. So the
+        # record step below is only reached for a batch that wrote every row cleanly, and
+        # result['written'] is the true count.
         result = bulk_write(transformed, es_write_config, raise_on_error=True)
         # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
         # the summary can dedup a retried batch (write mode append; each batch is its own small file).
@@ -414,8 +433,9 @@ if PIPELINE_MODE == "streaming":
 #   real, persisted offset even on a zero-row first batch, so the next run resumes correctly.
 #   startingVersion is INCLUSIVE and must be an EXISTING version, so we use the current version
 #   (current+1 is rejected when it does not exist yet). One consequence: if the current commit is an
-#   append, the first "new" run re-exports that single commit's rows - a harmless idempotent upsert via
-#   the deterministic _id, bounded to one commit.
+#   append, the first "new" run re-exports that single commit's rows. That is a harmless idempotent
+#   upsert (bounded to one commit) ONLY when es_id_field is set; with es_id_field OMITTED those rows get
+#   fresh random _ids and are re-inserted as NEW documents (duplicates).
 # - "full": omit startingVersion, so the first micro-batches backfill the whole existing table.
 if PIPELINE_MODE == "streaming":
     reader = spark.readStream.option("skipChangeCommits", "true")
