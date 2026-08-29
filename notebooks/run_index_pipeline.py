@@ -223,7 +223,7 @@ SOURCE_FQN = f"{source['catalog']}.{source['schema']}.{source['table']}"
 print(f"config_name        = {CONFIG_NAME}")
 print(f"environment        = {ENVIRONMENT!r}")
 print(f"es_index_name      = {cfg['es_index_name']}")
-print(f"es_id_field        = {cfg['es_id_field']}" + ("" if cfg["es_id_field"] else " (unset: ES auto-generates _id; replays may duplicate)"))
+print(f"es_id_field        = {cfg['es_id_field']}" + ("" if cfg["es_id_field"] else " (unset: ES auto-generates _id)"))
 print(f"pipeline_mode      = {PIPELINE_MODE}")
 print(f"filter_condition   = {FILTER_CONDITION!r}")
 print(f"write_overrides    = {write_overrides}")
@@ -234,16 +234,18 @@ print(f"source             = {SOURCE_FQN}")
 print(f"es_host_url        = {ES_HOST_URL}")
 if PIPELINE_MODE == "streaming":
     print(f"streaming_start    = {STREAMING_START}")
-    # Loud warning for the one combination where omitting es_id_field is especially hazardous. Streaming
-    # replays are ROUTINE, not exceptional (a micro-batch retry, a stream restart, the "new"-mode
-    # last-commit re-export below), and with no es_id_field ES auto-generates a fresh _id on every
-    # replay, so the same source rows re-land as NEW documents and the index accumulates DUPLICATES over
-    # the life of the stream. This is ALLOWED (duplicates may be fine for an append-only sink), so it is
-    # a warning, not a failure - but it must be loud, because idempotency is the safe default here.
-    if not cfg["es_id_field"]:
-        print("WARNING: pipeline_mode=streaming with no es_id_field - ES auto-generates _ids, so routine "
-              "stream replays (micro-batch retries, restarts) will accumulate DUPLICATE documents. Set "
-              "es_id_field for idempotent upserts; leave it unset only if duplicates are acceptable.")
+# Loud warning for omitting es_id_field. BOTH modes are at-least-once, so a replay re-writes the same
+# source rows with fresh auto-generated _ids and the index accumulates DUPLICATES: for batch, a
+# failed-then-retried run re-exports the whole view; for streaming, micro-batch retries, stream
+# restarts, and the "new"-mode last-commit re-export below are ROUTINE, so duplication is far more
+# likely there. This is ALLOWED (duplicates may be fine for an append-only sink), so it is a warning,
+# not a failure - but it must be loud, because idempotency is the safe default.
+if not cfg["es_id_field"]:
+    _stream_note = (" Streaming replays (micro-batch retries, restarts) are routine, so this is "
+                    "especially likely." if PIPELINE_MODE == "streaming" else "")
+    print(f"WARNING: {PIPELINE_MODE} pipeline with no es_id_field - ES auto-generates _ids, so a replay "
+          f"(a retry or restart) re-inserts rows as NEW documents and accumulates DUPLICATES.{_stream_note} "
+          f"Set es_id_field for idempotent upserts; leave it unset only if duplicates are acceptable.")
 
 # Tune read/scan parallelism for BOTH modes by setting spark.sql.files.maxPartitionBytes before any
 # read below (smaller => more, smaller source-file splits => the scan+view-transform fans out across
