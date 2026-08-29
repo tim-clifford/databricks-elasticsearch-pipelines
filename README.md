@@ -177,7 +177,9 @@ restarted stream that reprocesses its last micro-batch), the same source rows ca
 `pipeline_mode: streaming`, where restarts and micro-batch retries are routine rather than
 exceptional, so an omitted `es_id_field` will typically accumulate duplicates over the life of the
 stream. Omit `es_id_field` only when duplicates are acceptable (or the source guarantees no replay);
-set it whenever you need a stable 1:1 row→document mapping. (Conversely, if `es_id_field` is set but two input rows share its value, the later row upserts
+set it whenever you need a stable 1:1 row→document mapping. (To get auto-ids you must **omit the key
+entirely** or comment it out; a present-but-blank `es_id_field:` or `es_id_field: null` is treated as
+an invalid value and fails the config, not as a request for auto-ids.) (Conversely, if `es_id_field` is set but two input rows share its value, the later row upserts
 over the earlier one, so ES ends up with *fewer* documents than rows sent - ensure the column is unique
 across the input.)
 

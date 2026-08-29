@@ -234,6 +234,16 @@ print(f"source             = {SOURCE_FQN}")
 print(f"es_host_url        = {ES_HOST_URL}")
 if PIPELINE_MODE == "streaming":
     print(f"streaming_start    = {STREAMING_START}")
+    # Loud warning for the one combination where omitting es_id_field is especially hazardous. Streaming
+    # replays are ROUTINE, not exceptional (a micro-batch retry, a stream restart, the "new"-mode
+    # last-commit re-export below), and with no es_id_field ES auto-generates a fresh _id on every
+    # replay, so the same source rows re-land as NEW documents and the index accumulates DUPLICATES over
+    # the life of the stream. This is ALLOWED (duplicates may be fine for an append-only sink), so it is
+    # a warning, not a failure - but it must be loud, because idempotency is the safe default here.
+    if not cfg["es_id_field"]:
+        print("WARNING: pipeline_mode=streaming with no es_id_field - ES auto-generates _ids, so routine "
+              "stream replays (micro-batch retries, restarts) will accumulate DUPLICATE documents. Set "
+              "es_id_field for idempotent upserts; leave it unset only if duplicates are acceptable.")
 
 # Tune read/scan parallelism for BOTH modes by setting spark.sql.files.maxPartitionBytes before any
 # read below (smaller => more, smaller source-file splits => the scan+view-transform fans out across
