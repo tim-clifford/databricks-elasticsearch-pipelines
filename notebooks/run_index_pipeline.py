@@ -223,7 +223,7 @@ SOURCE_FQN = f"{source['catalog']}.{source['schema']}.{source['table']}"
 print(f"config_name        = {CONFIG_NAME}")
 print(f"environment        = {ENVIRONMENT!r}")
 print(f"es_index_name      = {cfg['es_index_name']}")
-print("es_id_field        = " + (cfg["es_id_field"] or "<unset> (ES auto-generates _id)"))
+print(f"es_id_field        = {cfg['es_id_field'] or '<unset> (ES auto-generates _id)'}")
 print(f"pipeline_mode      = {PIPELINE_MODE}")
 print(f"filter_condition   = {FILTER_CONDITION!r}")
 print(f"write_overrides    = {write_overrides}")
@@ -240,7 +240,7 @@ if PIPELINE_MODE == "streaming":
 # restarts, and the "new"-mode last-commit re-export below are ROUTINE, so duplication is far more
 # likely there. This is ALLOWED (duplicates may be fine for an append-only sink), so it is a warning,
 # not a failure - but it must be loud, because idempotency is the safe default.
-if not cfg["es_id_field"]:
+if cfg["es_id_field"] is None:
     _stream_note = (" Streaming replays (micro-batch retries, restarts) are routine, so this is "
                     "especially likely." if PIPELINE_MODE == "streaming" else "")
     print(f"WARNING: {PIPELINE_MODE} pipeline with no es_id_field - ES auto-generates _ids, so a replay "
