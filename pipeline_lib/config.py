@@ -25,7 +25,8 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
       catalog: <c>
       schema:  <s>
       table:   <t>
-      primary_key: <column>              # source-table column identifying a unique row (streaming read)
+      primary_key: <column>              # OPTIONAL, informational only: names the source's unique-row
+                                         #   column. Not used at runtime today (streams are append-only).
     reference_tables:                    # OPTIONAL: extra tables the view joins
       <alias>:                           # key is caller-chosen; matches ${ref_<alias>} in the SQL
         catalog: <c>
@@ -33,14 +34,20 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
         table:   <t>
 
 TWO DISTINCT KEYS, TWO CONTEXTS
-`es_id_field` and `source.primary_key` are deliberately separate. es_id_field is a column of the
-VIEW's output, handed to the ES connector as the document _id. primary_key is a column of the SOURCE
-table, used by the streaming read to identify a unique row. They often share a name but need not, and
+`es_id_field` and `source.primary_key` are deliberately separate, and BOTH are optional. es_id_field is
+a column of the VIEW's output, handed to the ES connector as the document _id. primary_key is a column
+of the SOURCE table that names its unique-row identity. They often share a name but need not, and
 neither defaults to the other. Both are plain column identifiers (no ${environment} token).
-es_id_field is OPTIONAL (primary_key is required): omit it and no id_field is passed to the connector,
-so ES generates a random _id per document. That means an at-least-once replay (retried batch, restarted
-stream) re-inserts rows as NEW documents instead of upserting, so the index can accumulate DUPLICATES.
-Set it whenever you need idempotent writes; omit it only when duplicates are acceptable.
+
+primary_key is INFORMATIONAL ONLY today: no runtime code reads it. All streaming pipelines assume
+append-only streams (no updates or deletes are processed), so no de-duping is needed. It is documented
+here so a config records the source's real key; if the repo ever grows full CDC support, it would
+become required for any pipeline that must apply updates/deletes.
+
+es_id_field is OPTIONAL: omit it and no id_field is passed to the connector, so ES generates a random
+_id per document. That means an at-least-once replay (retried batch, restarted stream) re-inserts rows
+as NEW documents instead of upserting, so the index can accumulate DUPLICATES. Set it whenever you need
+idempotent writes; omit it only when duplicates are acceptable.
 
 ENVIRONMENT SUBSTITUTION
 A `catalog` or `schema` value may embed the token `${environment}`, folded in by the runner when the job
@@ -486,12 +493,13 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # "" into _DEFAULT_MAX_PARTITION_BYTES). It governs read/scan parallelism; "0" means leave it unset.
     max_partition_bytes = require_max_partition_bytes(raw.get("max_partition_bytes", ""), f"{source}: max_partition_bytes")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
-    # source carries primary_key in addition to catalog/schema/table: it is a column of the SOURCE
-    # table (unique-row identity for the streaming read), so it lives with the source, not at top level.
+    # source may carry an OPTIONAL primary_key in addition to catalog/schema/table: it names the
+    # SOURCE table's unique-row column. It is informational only today (all streams are append-only,
+    # so no de-duping is done); it lives with the source, not at top level, and defaults to None.
     source_map = _validate_object(
         raw["source"], f"{source}: source", name_key="table",
         allowed={"catalog", "schema", "table", "primary_key"},
-        extra_identifiers=("primary_key",),
+        optional_identifiers=("primary_key",),
     )
     reference_tables = _validate_reference_tables(raw.get("reference_tables"), source)
     # compute is OPTIONAL: absent -> serverless (the default). It says WHERE the job runs; carries no
@@ -521,13 +529,14 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     }
 
 
-def _validate_object(node: object, where: str, name_key: str, allowed: set, extra_identifiers: tuple = ()) -> dict:
-    """Validate a {catalog, schema, <name_key>} object, plus any `extra_identifiers` columns.
+def _validate_object(node: object, where: str, name_key: str, allowed: set, optional_identifiers: tuple = ()) -> dict:
+    """Validate a {catalog, schema, <name_key>} object, plus any `optional_identifiers` columns.
 
     catalog and schema are name TEMPLATES (may contain ${environment}); the name/table is a plain
     identifier (no token), so an object's name is fixed and, for a view, always equals its filename.
-    `extra_identifiers` are additional REQUIRED plain-identifier keys (e.g. source.primary_key): they
-    are column names, not object names, so they carry no ${environment} token.
+    `optional_identifiers` are extra plain-identifier keys (e.g. source.primary_key): they are column
+    names, not object names, so they carry no ${environment} token. Each is OPTIONAL - present => it
+    must be a legal identifier; absent => stored as None.
     """
     if not isinstance(node, dict):
         raise PipelineConfigError(f"{where} must be a mapping with catalog, schema, and {name_key}, got {type(node).__name__}")
@@ -539,8 +548,11 @@ def _validate_object(node: object, where: str, name_key: str, allowed: set, extr
         "schema": _require_name_template(node.get("schema"), f"{where}.schema"),
         name_key: _require_identifier(node.get(name_key), f"{where}.{name_key}"),
     }
-    for field_name in extra_identifiers:
-        result[field_name] = _require_identifier(node.get(field_name), f"{where}.{field_name}")
+    for field_name in optional_identifiers:
+        result[field_name] = (
+            _require_identifier(node[field_name], f"{where}.{field_name}")
+            if field_name in node else None
+        )
     return result
 
 
@@ -679,8 +691,8 @@ def resolve_config(cfg: dict, environment: str) -> dict:
             "schema": resolve_name(o["schema"], environment, f"{where}.schema"),
             name_key: resolve_name(o[name_key], environment, f"{where}.{name_key}"),
         }
-        # `passthrough` fields (e.g. source.primary_key) are plain column identifiers, not object
-        # names: they carry no ${environment} token, so they are copied through unchanged, not resolved.
+        # `passthrough` fields (e.g. source.primary_key, which may be None) are plain column
+        # identifiers, not object names: no ${environment} token, so copied through unchanged.
         for field_name in passthrough:
             resolved[field_name] = o[field_name]
         return resolved

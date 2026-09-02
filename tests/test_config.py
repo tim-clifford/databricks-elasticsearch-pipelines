@@ -118,16 +118,17 @@ def test_missing_required_key(missing):
         validate_config(cfg)
 
 
-def test_missing_source_primary_key():
-    # primary_key now lives inside source; a source without it must fail closed.
+def test_source_primary_key_optional():
+    # primary_key is OPTIONAL (informational only, not read at runtime): a source that omits it
+    # validates fine and stores None, rather than failing closed.
     cfg = _base()
     del cfg["source"]["primary_key"]
-    with pytest.raises(PipelineConfigError, match="source.primary_key"):
-        validate_config(cfg)
+    out = validate_config(cfg)
+    assert out["source"]["primary_key"] is None
 
 
 def test_source_primary_key_rejects_environment_token():
-    # primary_key is a column identifier, not an object name: no ${environment} token.
+    # A PRESENT primary_key is a column identifier, not an object name: no ${environment} token.
     cfg = _base()
     cfg["source"]["primary_key"] = "id_${environment}"
     with pytest.raises(PipelineConfigError, match="source.primary_key"):
@@ -369,6 +370,14 @@ def test_resolve_config_carries_source_primary_key():
     out = resolve_config(validate_config(_with_env()), environment="prod")
     assert out["source"]["primary_key"] == "dsl_id"
     assert out["es_id_field"] == "dsl_id"
+
+
+def test_resolve_config_carries_omitted_primary_key_as_none():
+    # An omitted primary_key stays None through resolve (it is informational only, never resolved).
+    cfg = _with_env()
+    del cfg["source"]["primary_key"]
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["source"]["primary_key"] is None
 
 
 # --------------------------------------------------------------------------- view_substitutions

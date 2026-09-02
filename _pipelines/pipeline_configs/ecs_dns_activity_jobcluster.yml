@@ -18,7 +18,7 @@ source:                           # the single source table the view reads from 
   catalog: tim_clifford_classic_dsl_lite_${environment}
   schema: ocsf
   table: dns_activity
-  primary_key: dsl_id             # source-table column identifying a unique row (for the streaming read)
+  primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column (not used at runtime today)
 
 # Internal testing note (not a customer concern): a job cluster reaches ES over classic-compute egress,
 # which our internal test ES endpoint does not allow-list (it trusts only serverless egress). So there
