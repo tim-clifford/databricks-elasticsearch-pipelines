@@ -126,8 +126,13 @@ _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 # rejected here rather than looping at .start().
 _TRIGGER_INTERVAL_FRAC_UNIT = r"seconds?"  # 'second(s)' only: the sole unit Spark lets carry a decimal
 _TRIGGER_INTERVAL_INT_UNIT = r"(?:microseconds?|milliseconds?|minutes?|hours?|days?|weeks?)"  # integer only
+# The quantity is BOUNDED: at most 7 integer digits and (for seconds) 6 fractional digits. An unbounded
+# quantity ("999999999999 weeks") satisfies the format but overflows the Long microseconds stringToInterval
+# accumulates into, throwing at .start() and looping on a continuous run; 7 digits stays under Long.MAX
+# even for the largest unit (weeks), and 6 fractional digits is Spark's microsecond precision. Both are
+# vastly larger than any real micro-batch cadence, so the bound only excludes absurd/overflowing values.
 _TRIGGER_INTERVAL_TERM = (
-    r"\d+(?:(?:\.\d+)?\s+" + _TRIGGER_INTERVAL_FRAC_UNIT + r"|\s+" + _TRIGGER_INTERVAL_INT_UNIT + r")"
+    r"\d{1,7}(?:(?:\.\d{1,6})?\s+" + _TRIGGER_INTERVAL_FRAC_UNIT + r"|\s+" + _TRIGGER_INTERVAL_INT_UNIT + r")"
 )  # <number> then EITHER optional-decimal + ws + 'seconds', OR ws + an integer-only unit (\s+ : ws REQUIRED)
 _VALID_TRIGGER_INTERVAL = re.compile(
     r"^" + _TRIGGER_INTERVAL_TERM + r"(?:\s+" + _TRIGGER_INTERVAL_TERM + r")*$", re.IGNORECASE

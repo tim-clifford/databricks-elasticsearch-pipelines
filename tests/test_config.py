@@ -1187,6 +1187,7 @@ def test_continuous_trigger_interval_allowed_forms(good):
     "5s", "2h", "250us", "10 mins", "500 ms", "30seconds",  # abbreviated / space-less: Spark-invalid, would loop
     "1.5 minutes", "1.5 hours", "1.5 days",             # fractional on a non-second unit: Spark-invalid
     "1.5 milliseconds", "1.5 microseconds",             # fractional allowed ONLY for 'second' (Spark: b=='s')
+    "999999999999 weeks", "12345678 seconds", "1.1234567 seconds",  # unbounded quantity/precision: overflows Spark
     "30 fortnights", "30 secondz", "5 blah",            # unknown / malformed unit
     "-5 seconds", "-1 minute", "1 minute -30 seconds",  # negative duration
 ])
