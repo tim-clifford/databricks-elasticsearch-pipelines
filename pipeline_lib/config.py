@@ -107,6 +107,20 @@ _VALID_COMPUTE_TYPES = ("serverless", "existing_cluster", "job_cluster")
 # generator resolves the key to a file.
 _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# A continuous pipeline's ProcessingTime trigger interval. Spark ultimately parses this at query start,
+# but on an ALWAYS-ON run a bad interval fails only at .start() and the Jobs continuous trigger then
+# restarts the run in a loop - so we validate the FORMAT up front with an ALLOW-LIST of the supported
+# duration units (reject anything not recognized rather than admit it and loop; a deny-list would let an
+# unknown unit like "30 fortnights" through). One or more whitespace-separated "<number> <unit>" terms
+# (compound like "1 minute 30 seconds" allowed); a decimal quantity is allowed ("1.5 seconds"); a
+# negative sign or unknown unit is rejected. Units longest-first so a term consumes its whole unit. "0
+# seconds" is allowed (Spark reads it as "run micro-batches as fast as possible").
+_TRIGGER_INTERVAL_UNIT = r"(?:microseconds?|us|milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)"
+_TRIGGER_INTERVAL_TERM = r"\d+(?:\.\d+)?\s*" + _TRIGGER_INTERVAL_UNIT
+_VALID_TRIGGER_INTERVAL = re.compile(
+    r"^" + _TRIGGER_INTERVAL_TERM + r"(?:\s+" + _TRIGGER_INTERVAL_TERM + r")*$", re.IGNORECASE
+)
+
 # Streaming start positions (a run-time job parameter, streaming mode only). Allow-list, fail closed.
 # - "new"  (DEFAULT): the stream starts at the source table's CURRENT version (readStream
 #   startingVersion=latest), so nothing already in the table is exported; only commits after the
@@ -802,20 +816,12 @@ def _validate_continuous(node: object, where: str = "continuous") -> dict | None
             f"'30 seconds' or '1 minute', got {interval!r}"
         )
     interval = interval.strip()
-    if not (any(c.isdigit() for c in interval) and any(c.isalpha() for c in interval)):
+    if not _VALID_TRIGGER_INTERVAL.match(interval):
         raise PipelineConfigError(
-            f"{where}.trigger_interval must be a Spark ProcessingTime interval with a number and a "
-            f"unit, e.g. '30 seconds' or '1 minute', got {interval!r}"
-        )
-    # Reject a NEGATIVE duration. No valid positive ProcessingTime interval contains a '-', and a
-    # negative one is only caught by Spark at query .start() - which, on an always-on continuous run,
-    # the Jobs continuous trigger then restarts in a loop. Failing closed here surfaces it at config
-    # load / gen_jobs --check / deploy instead. ("0 seconds" stays valid: Spark reads it as "run
-    # micro-batches as fast as possible", so it is left for Spark to honor.)
-    if "-" in interval:
-        raise PipelineConfigError(
-            f"{where}.trigger_interval must be a positive duration; a negative interval like "
-            f"'-5 seconds' is invalid, got {interval!r}"
+            f"{where}.trigger_interval must be a Spark ProcessingTime interval: one or more "
+            f"'<number> <unit>' terms with a supported unit (ms, s/seconds, m/minutes, h/hours, "
+            f"d/days), e.g. '30 seconds', '1 minute', '500 ms'. A negative or unknown-unit value "
+            f"(it would fail only at stream start and loop on a continuous run) is rejected. Got {interval!r}"
         )
     return {"trigger_interval": interval}
 

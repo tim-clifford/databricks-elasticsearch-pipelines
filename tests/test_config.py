@@ -1169,23 +1169,30 @@ def test_continuous_trigger_interval_required(bad):
         validate_config(cfg)
 
 
-@pytest.mark.parametrize("bad", ["30", "0", "seconds", "minute"])
-def test_continuous_trigger_interval_needs_number_and_unit(bad):
-    # A bare number (no unit) or a lone unit (no number) is the common mistake; fail closed with a clear
-    # message rather than a cryptic Spark parse error at query start.
+@pytest.mark.parametrize("good", [
+    "30 seconds", "1 minute", "500 ms", "5s", "0 seconds", "1.5 seconds",
+    "1 minute 30 seconds", "2h", "10 mins", "1 day", "250us",
+])
+def test_continuous_trigger_interval_allowed_forms(good):
+    # The allow-list accepts one-or-more "<number> <unit>" terms across the supported duration units,
+    # including compact ("5s"), compound ("1 minute 30 seconds"), decimal, and 0 (as-fast-as-possible).
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": good}
+    assert validate_config(cfg)["continuous"] == {"trigger_interval": good}
+
+
+@pytest.mark.parametrize("bad", [
+    "30", "0", "seconds", "minute",            # missing a number or a unit
+    "30 fortnights", "30 secondz", "5 blah",   # unknown / malformed unit (would loop on continuous)
+    "-5 seconds", "-1 minute", "1 minute -30 seconds",  # negative duration
+])
+def test_continuous_trigger_interval_rejects_malformed(bad):
+    # An interval that is not a recognized "<number> <unit>" form is rejected at config load, so a value
+    # that Spark would reject only at .start() (and the continuous trigger would then restart in a loop)
+    # fails closed at deploy instead.
     cfg = _continuous_ready()
     cfg["continuous"] = {"trigger_interval": bad}
     with pytest.raises(PipelineConfigError, match="trigger_interval"):
-        validate_config(cfg)
-
-
-@pytest.mark.parametrize("bad", ["-5 seconds", "-1 minute", "1 minute -30 seconds"])
-def test_continuous_trigger_interval_rejects_negative(bad):
-    # A negative duration validates the digit+letter heuristic but is invalid; on a continuous run it
-    # would only fail at stream .start() and restart in a loop, so reject it at config load.
-    cfg = _continuous_ready()
-    cfg["continuous"] = {"trigger_interval": bad}
-    with pytest.raises(PipelineConfigError, match="positive duration"):
         validate_config(cfg)
 
 
