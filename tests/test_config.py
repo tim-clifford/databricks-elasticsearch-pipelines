@@ -1170,26 +1170,28 @@ def test_continuous_trigger_interval_required(bad):
 
 
 @pytest.mark.parametrize("good", [
-    "30 seconds", "1 minute", "500 ms", "5s", "0 seconds", "1.5 seconds",
-    "1 minute 30 seconds", "2h", "10 mins", "1 day", "250us",
+    "30 seconds", "1 minute", "500 milliseconds", "2 hours", "0 seconds", "1.5 seconds",
+    "1 minute 30 seconds", "1 day", "250 microseconds",
 ])
 def test_continuous_trigger_interval_allowed_forms(good):
-    # The allow-list accepts one-or-more "<number> <unit>" terms across the supported duration units,
-    # including compact ("5s"), compound ("1 minute 30 seconds"), decimal, and 0 (as-fast-as-possible).
+    # The allow-list accepts one-or-more "<number> <full-word-unit>" terms (Spark's stringToInterval
+    # grammar): compound ("1 minute 30 seconds"), decimal, and 0 (as-fast-as-possible) are all valid.
     cfg = _continuous_ready()
     cfg["continuous"] = {"trigger_interval": good}
     assert validate_config(cfg)["continuous"] == {"trigger_interval": good}
 
 
 @pytest.mark.parametrize("bad", [
-    "30", "0", "seconds", "minute",            # missing a number or a unit
-    "30 fortnights", "30 secondz", "5 blah",   # unknown / malformed unit (would loop on continuous)
+    "30", "0", "seconds", "minute",                     # missing a number or a unit
+    "5s", "2h", "250us", "10 mins", "500 ms", "30seconds",  # abbreviated / space-less: Spark-invalid, would loop
+    "30 fortnights", "30 secondz", "5 blah",            # unknown / malformed unit
     "-5 seconds", "-1 minute", "1 minute -30 seconds",  # negative duration
 ])
 def test_continuous_trigger_interval_rejects_malformed(bad):
-    # An interval that is not a recognized "<number> <unit>" form is rejected at config load, so a value
-    # that Spark would reject only at .start() (and the continuous trigger would then restart in a loop)
-    # fails closed at deploy instead.
+    # Anything that is not a full-word, whitespace-separated "<number> <unit>" term is rejected at config
+    # load - including abbreviated/space-less forms that Spark's ProcessingTime parser rejects. This
+    # closes the gap where such a value would pass validation, fail only at .start(), and (on a
+    # continuous run) restart in an endless loop.
     cfg = _continuous_ready()
     cfg["continuous"] = {"trigger_interval": bad}
     with pytest.raises(PipelineConfigError, match="trigger_interval"):

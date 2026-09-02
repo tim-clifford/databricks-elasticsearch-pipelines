@@ -107,16 +107,19 @@ _VALID_COMPUTE_TYPES = ("serverless", "existing_cluster", "job_cluster")
 # generator resolves the key to a file.
 _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
-# A continuous pipeline's ProcessingTime trigger interval. Spark ultimately parses this at query start,
-# but on an ALWAYS-ON run a bad interval fails only at .start() and the Jobs continuous trigger then
-# restarts the run in a loop - so we validate the FORMAT up front with an ALLOW-LIST of the supported
-# duration units (reject anything not recognized rather than admit it and loop; a deny-list would let an
-# unknown unit like "30 fortnights" through). One or more whitespace-separated "<number> <unit>" terms
-# (compound like "1 minute 30 seconds" allowed); a decimal quantity is allowed ("1.5 seconds"); a
-# negative sign or unknown unit is rejected. Units longest-first so a term consumes its whole unit. "0
-# seconds" is allowed (Spark reads it as "run micro-batches as fast as possible").
-_TRIGGER_INTERVAL_UNIT = r"(?:microseconds?|us|milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)"
-_TRIGGER_INTERVAL_TERM = r"\d+(?:\.\d+)?\s*" + _TRIGGER_INTERVAL_UNIT
+# A continuous pipeline's ProcessingTime trigger interval. Spark ultimately parses this at query start
+# (via IntervalUtils.stringToInterval), but on an ALWAYS-ON run a bad interval fails only at .start() and
+# the Jobs continuous trigger then restarts the run in a loop - so we validate the FORMAT up front with
+# an ALLOW-LIST matching what that parser actually accepts (reject anything else rather than admit it and
+# loop; a deny-list would let an unknown unit like "30 fortnights" through). stringToInterval (Spark 3.2+,
+# incl. Spark 4.0 / DBR 17.3) is STRICT: it requires a FULL-WORD unit and WHITESPACE between the number
+# and the unit, so abbreviated ("5s", "10 mins", "500 ms") and space-less ("30seconds") forms are Spark-
+# invalid and must be rejected here, not passed through to loop. So: one or more whitespace-separated
+# "<number> <full-word-unit>" terms (compound like "1 minute 30 seconds" allowed), a decimal quantity
+# allowed ("1.5 seconds"). Months/years are omitted (ProcessingTime rejects a month-bearing interval).
+# "0 seconds" is allowed (Spark reads it as "run micro-batches as fast as possible").
+_TRIGGER_INTERVAL_UNIT = r"(?:microseconds?|milliseconds?|seconds?|minutes?|hours?|days?|weeks?)"
+_TRIGGER_INTERVAL_TERM = r"\d+(?:\.\d+)?\s+" + _TRIGGER_INTERVAL_UNIT  # \s+ : whitespace REQUIRED
 _VALID_TRIGGER_INTERVAL = re.compile(
     r"^" + _TRIGGER_INTERVAL_TERM + r"(?:\s+" + _TRIGGER_INTERVAL_TERM + r")*$", re.IGNORECASE
 )
@@ -819,9 +822,10 @@ def _validate_continuous(node: object, where: str = "continuous") -> dict | None
     if not _VALID_TRIGGER_INTERVAL.match(interval):
         raise PipelineConfigError(
             f"{where}.trigger_interval must be a Spark ProcessingTime interval: one or more "
-            f"'<number> <unit>' terms with a supported unit (ms, s/seconds, m/minutes, h/hours, "
-            f"d/days), e.g. '30 seconds', '1 minute', '500 ms'. A negative or unknown-unit value "
-            f"(it would fail only at stream start and loop on a continuous run) is rejected. Got {interval!r}"
+            f"'<number> <unit>' terms with a FULL-WORD unit and a space, e.g. '30 seconds', '1 minute', "
+            f"'500 milliseconds', '1 minute 30 seconds'. Abbreviated or space-less forms ('5s', '10 "
+            f"mins', '30seconds') are Spark-invalid and rejected (they would fail only at stream start "
+            f"and loop on a continuous run). Got {interval!r}"
         )
     return {"trigger_interval": interval}
 
