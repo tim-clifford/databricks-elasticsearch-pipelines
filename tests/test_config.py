@@ -40,6 +40,7 @@ def _job_base_parameters(config_name):
         secret_scope_name_ref="${var.es_host_primary.secret_scope_name}",
         secret_key_name_ref="${var.es_host_primary.secret_key_name}",
         checkpoint_base_path_ref="${var.checkpoint_base_path}",
+        ca_certs_ref="${var.ca_certs}",
     )
 
 
@@ -490,6 +491,7 @@ def test_job_base_parameters():
         "secret_scope_name": "${var.es_host_primary.secret_scope_name}",
         "secret_key_name": "${var.es_host_primary.secret_key_name}",
         "checkpoint_base_path": "${var.checkpoint_base_path}",
+        "ca_certs": "${var.ca_certs}",
     }
 
 

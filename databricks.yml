@@ -115,6 +115,25 @@ variables:
     description: "UC Volume base path for streaming checkpoints; the runner appends /<config_name> per job. Empty default; set per target below or override with --var. Required for streaming runs (fails closed if empty)."
     default: ""
 
+  # GLOBAL path to a CA certificate bundle (a PEM file on a UC Volume) the connector uses to verify the
+  # Elasticsearch server's TLS certificate. Global like wheel_path / checkpoint_base_path (ONE bundle for
+  # every job); the runner passes it to EsWriteConfig, which loads it as a local file on the driver AND
+  # every executor (the connector opens it per-partition when it builds the ES client). Empty default so
+  # a deployment that trusts the system CA store - or that turns TLS verification off via verify_certs -
+  # resolves without it; when empty the runner omits ca_certs entirely and the connector falls back to
+  # the system CAs. Set it PER TARGET below (targets.<env>.variables); it ships empty on main. Override
+  # at deploy if needed, e.g.
+  #   --var="ca_certs=/Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem"
+  # Setting ca_certs together with verify_certs=false is a contradiction the connector rejects at run
+  # (EsWriteConfig.__post_init__ raises), so pick one. This is a SINGLE GLOBAL bundle: every host config
+  # shares it. Per-ENDPOINT CA pinning (a different bundle per es_host_*) is NOT supported here - it would
+  # require moving ca_certs onto the es_host_* complex variables (alongside es_host_url) and refactoring
+  # the generator's host-config recognizer (scripts/gen_jobs.py:_ES_HOST_CONFIG_FIELDS, which matches a
+  # host config by its EXACT three-field key set) plus the field wiring. File a change if you need that.
+  ca_certs:
+    description: "UC Volume path to a CA bundle (PEM) the connector uses to verify the ES TLS cert. Empty default (system CAs); set per target below or override with --var. One global bundle for all host configs; incompatible with verify_certs=false."
+    default: ""
+
   # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
   # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
   # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds
@@ -164,10 +183,11 @@ variables:
 #
 # Every other environment-specific value is bound PER TARGET below (targets.<env>.variables): the
 # `environment` token, the connector `wheel_path`, the streaming `checkpoint_base_path`, the
-# `cluster_policy_id`, and the Elasticsearch HOST CONFIGS. All ship as EMPTY placeholders on main - fill
-# in the environments you deploy to. An empty value fails closed where the value is required. This
-# replaces the older model of passing environment / wheel_path / checkpoint_base_path / cluster_policy_id
-# as --var on every deploy: those four SIMPLE STRING vars still accept a --var=<name>=<value> override at
+# `cluster_policy_id`, the optional `ca_certs` bundle, and the Elasticsearch HOST CONFIGS. All ship as
+# EMPTY placeholders on main - fill in the environments you deploy to. An empty value fails closed where
+# the value is required. This replaces the older model of passing environment / wheel_path /
+# checkpoint_base_path / cluster_policy_id / ca_certs as --var on every deploy: those five SIMPLE STRING
+# vars still accept a --var=<name>=<value> override at
 # deploy (precedence highest first: --var > BUNDLE_VAR_<name> env var >
 # .databricks/bundle/<target>/variable-overrides.json > per-target value > top-level default, so a local
 # overrides file or an exported BUNDLE_VAR_ env var also silently outranks the committed per-target
@@ -205,6 +225,7 @@ targets:
       cluster_policy_id: ""        # e.g. 00156D2098BE864B - workspace-specific; in dev each engineer uses their own
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""           # e.g. 0123-456789-abcde
+      ca_certs: ""                 # e.g. /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
       # DEV Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-dev-es-host:9200
@@ -225,6 +246,7 @@ targets:
       cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""
+      ca_certs: ""                 # /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
       # STG Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-stg-es-host:9200
@@ -248,6 +270,7 @@ targets:
       cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""
+      ca_certs: ""                 # /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
       # PRD Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-prd-es-host:9200

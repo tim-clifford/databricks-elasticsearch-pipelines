@@ -98,6 +98,7 @@ dbutils.widgets.text("environment", "", "Environment folded into ${environment} 
 dbutils.widgets.text("es_host_url", "", "Elasticsearch endpoint, e.g. https://<host>:9200")
 dbutils.widgets.text("secret_scope_name", "", "Databricks secret scope holding the ES api_key")
 dbutils.widgets.text("secret_key_name", "", "Key in the scope whose value is the ES api_key")
+dbutils.widgets.text("ca_certs", "", "UC Volume path to a CA bundle (PEM) verifying the ES TLS cert (empty => system CAs)")
 dbutils.widgets.text("pipeline_mode", "", "Export mode: batch | streaming (job parameter; overridable per run)")
 dbutils.widgets.text("filter_condition", "", "Optional row filter, a Spark SQL predicate (overridable per run)")
 dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty => connector default)")
@@ -115,6 +116,7 @@ ENVIRONMENT = dbutils.widgets.get("environment").strip()
 ES_HOST_URL = dbutils.widgets.get("es_host_url").strip()
 SECRET_SCOPE_NAME = dbutils.widgets.get("secret_scope_name").strip()
 SECRET_KEY_NAME = dbutils.widgets.get("secret_key_name").strip()
+CA_CERTS = dbutils.widgets.get("ca_certs").strip()
 PIPELINE_MODE = dbutils.widgets.get("pipeline_mode").strip()
 FILTER_CONDITION = dbutils.widgets.get("filter_condition").strip()
 CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
@@ -234,6 +236,7 @@ print(f"max_partition_bytes= {MAX_PARTITION_BYTES}" + (" (leave engine default)"
 print(f"view               = {VIEW_FQN}")
 print(f"source             = {SOURCE_FQN}")
 print(f"es_host_url        = {ES_HOST_URL}")
+print(f"ca_certs           = {CA_CERTS or '<unset> (system CA store)'}")
 if PIPELINE_MODE == "streaming":
     print(f"streaming_start    = {STREAMING_START}")
 # Loud warning for omitting es_id_field. BOTH modes are at-least-once, so a replay re-writes the same
@@ -279,11 +282,19 @@ if MAX_PARTITION_BYTES != "0":
 # OPTIONAL: an omitted one resolves to None, which is exactly the connector's "no id_field" default
 # (id_field: Optional[str] = None) - ES then assigns a random _id per doc, so at-least-once replays
 # can duplicate documents. A set es_id_field gives deterministic _ids => idempotent upserts.
+#
+# ca_certs is the global CA-bundle variable (a UC Volume PEM path): pass it straight through as
+# an EsConnection field. Empty widget => None => the connector omits it (client_kwargs only injects
+# ca_certs when non-None) and falls back to the system CA store. The connector loads it as a local file
+# on the driver and every executor. verify_certs=false together with a set ca_certs is a contradiction
+# the connector rejects in EsWriteConfig.__post_init__ (raised on the driver here), so we don't
+# re-check it pipeline-side - the connector is the single source of truth for that rule.
 es_write_config = EsWriteConfig(
     hosts=ES_HOST_URL,
     api_key=dbutils.secrets.get(SECRET_SCOPE_NAME, SECRET_KEY_NAME),
     index=cfg["es_index_name"],
     id_field=cfg["es_id_field"],  # None when unset == connector default (auto _id)
+    ca_certs=CA_CERTS or None,    # "" => None => connector falls back to system CAs
     **write_overrides,
 )
 

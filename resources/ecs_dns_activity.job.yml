@@ -43,6 +43,7 @@ resources:
             secret_scope_name: ${var.es_host_primary.secret_scope_name}
             secret_key_name: ${var.es_host_primary.secret_key_name}
             checkpoint_base_path: ${var.checkpoint_base_path}
+            ca_certs: ${var.ca_certs}
       permissions:
       - level: CAN_MANAGE_RUN
         group_name: users

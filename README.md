@@ -82,13 +82,13 @@ columns, and any tuning such as a `/*+ BROADCAST(alias) */` hint, written direct
 
 The **workspace** is not a bundle variable: it comes from your Databricks CLI profile (`-p <profile>`)
 or `DATABRICKS_HOST`. The environment-specific connection, path, and policy variables (`environment`,
-`wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, and the ES host configs) are set **per
+`wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, `ca_certs`, and the ES host configs) are set **per
 target** in `databricks.yml` (`targets.<env>.variables`), shipping **empty** on `main` for you to fill
 in for the environments you deploy to, so a routine deploy needs no `--var`. (`schedule_pause_status` is
 also per-environment but is the exception: it defaults to `PAUSED` globally and only `prd` overrides it,
-and it is `--var`-settable too; see [Scheduling](#scheduling).) The four simple per-target string
-variables (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`) can still be
-overridden at deploy with `--var=<name>=<value>`; the `type: complex` variables (the ES host configs, and any `cluster_config`)
+and it is `--var`-settable too; see [Scheduling](#scheduling).) The five simple per-target string
+variables (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, `ca_certs`) can still
+be overridden at deploy with `--var=<name>=<value>`; the `type: complex` variables (the ES host configs, and any `cluster_config`)
 **cannot** be set via `--var` at all (the CLI rejects it: *"setting variables of complex type via --var
 flag is not supported"*), so override those through the git-ignored `variable-overrides.json` (see
 [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). Precedence,
@@ -106,6 +106,7 @@ value fails closed wherever the value is required. The bundle variables are:
 | `wheel_path` | UC Volume path to the `databricks-es-connector` wheel each **index job** installs (the connector version lives here, in the wheel filename); a global prerequisite, not created by this bundle (see [the connector repo](https://github.com/tim-clifford/es-databricks-connector) for building/uploading it). Set per target (empty on `main`). An index job deployed with an empty `wheel_path` fails closed at run; `deploy_views` doesn't need it |
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Set per target (empty on `main`). Required for a streaming run (fails closed if empty); unused by batch and `deploy_views`. The `dev` target shows how to append `${workspace.current_user.short_name}` to isolate each developer's checkpoints (see [Streaming](#streaming)) |
 | `cluster_policy_id` | workspace-specific cluster policy id injected into every job cluster (see [Compute](#compute)). Set per target (empty on `main`); required only when a pipeline uses `job_cluster` compute |
+| `ca_certs` | UC Volume path to a CA bundle (PEM) the connector uses to verify the ES server's TLS certificate. One global bundle shared by every host config. Set per target (empty on `main`); empty means fall back to the system CA store. Incompatible with `verify_certs: false` (the connector rejects that combination at run). Per-endpoint CA pinning is not supported (would need `ca_certs` moved onto the `es_host_*` complex variables) |
 | `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy schedules without firing them; only `prd` binds `UNPAUSED` to actually run them. Only affects jobs that declare a `schedule` (see [Scheduling](#scheduling)) |
 
 The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
@@ -344,10 +345,10 @@ point at any workspace.
 
 Two different mechanisms carry values into a job, and they resolve at different times:
 
-- **Bundle variables** (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, and
-  the ES host configs) are resolved into the job at **deploy** time. Each is set **per target** in
-  `databricks.yml` (`targets.<env>.variables`), so a routine deploy takes no `--var` at all. The four
-  simple string variables can still be overridden at deploy with `--var=<name>=<value>`, which wins over
+- **Bundle variables** (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`,
+  `ca_certs`, and the ES host configs) are resolved into the job at **deploy** time. Each is set **per
+  target** in `databricks.yml` (`targets.<env>.variables`), so a routine deploy takes no `--var` at all.
+  The five simple string variables can still be overridden at deploy with `--var=<name>=<value>`, which wins over
   the per-target value; the `type: complex` variables (the ES host configs, and any `cluster_config`)
   cannot be set via `--var` at all (the CLI rejects it: *"setting variables of complex type via --var
   flag is not supported"*), so override those through the git-ignored `variable-overrides.json`. A
@@ -390,14 +391,14 @@ Two different mechanisms carry values into a job, and they resolve at different 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
-# Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, and the
-# ES host config) come from this target's variables block in databricks.yml. Fill in the target you
+# Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, ca_certs,
+# and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
 # deploy to BEFORE running an index pipeline: the shipped configs embed ${environment} and install the
 # connector wheel, so an index run with those still empty fails closed (deploy itself always succeeds).
 # Filled in, the deploy needs no --var:
 databricks bundle deploy -t dev -p <profile>
 
-# The four simple string vars can still be overridden ad hoc, e.g. a one-off wheel:
+# The five simple string vars can still be overridden ad hoc, e.g. a one-off wheel:
 databricks bundle deploy -t dev -p <profile> \
   --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
 
