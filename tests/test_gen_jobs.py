@@ -196,6 +196,82 @@ def test_render_schedule_composes_with_compute():
     assert job["tasks"][0]["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
 
 
+# --------------------------------------------------------------------------- render: continuous
+
+_JC_SPEC = {"spark_version": "17.3.x-scala2.13", "node_type_id": "i3.xlarge", "num_workers": 1}
+
+
+def _continuous_cfg(interval="30 seconds"):
+    """A validated continuous config (streaming + job_cluster + a continuous block)."""
+    raw = {
+        "es_index_name": "ecs-dns-activity",
+        "es_id_field": "dsl_id",
+        "es_host_config": "es_host_primary",
+        "pipeline_mode": "streaming",
+        "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
+        "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity"},
+        "compute": {"type": "job_cluster", "job_cluster_config": "standard_batch"},
+        "continuous": {"trigger_interval": interval},
+    }
+    return validate_config(raw)
+
+
+def test_render_no_continuous_omits_block_and_empties_interval():
+    # A non-continuous job has no continuous block, and its streaming_trigger_interval base param is ""
+    # (so the notebook uses Trigger.availableNow).
+    job = _render_job(_cfg())
+    assert "continuous" not in job
+    assert job["tasks"][0]["notebook_task"]["base_parameters"]["streaming_trigger_interval"] == ""
+
+
+def test_render_continuous_emits_trigger_and_no_schedule():
+    # A continuous config emits a Databricks Jobs continuous trigger (pause bound to the shared
+    # schedule_pause_status var) INSTEAD of a schedule.
+    job = _render_job(_continuous_cfg(), _JC_SPEC)
+    assert job["continuous"] == {"pause_status": "${var.schedule_pause_status}"}
+    assert "schedule" not in job
+
+
+def test_render_continuous_wires_trigger_interval_base_param():
+    # The ProcessingTime cadence reaches the notebook as the streaming_trigger_interval base parameter.
+    job = _render_job(_continuous_cfg("1 minute"), _JC_SPEC)
+    assert job["tasks"][0]["notebook_task"]["base_parameters"]["streaming_trigger_interval"] == "1 minute"
+
+
+def test_render_continuous_existing_cluster():
+    # Continuous is valid on existing_cluster too (not just job_cluster): the continuous trigger and the
+    # trigger-interval base param render alongside the existing_cluster_id, with no job_clusters block.
+    raw = {
+        "es_index_name": "ecs-dns-activity",
+        "es_id_field": "dsl_id",
+        "es_host_config": "es_host_primary",
+        "pipeline_mode": "streaming",
+        "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
+        "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity"},
+        "compute": {"type": "existing_cluster", "cluster_config": "interactive_primary"},
+        "continuous": {"trigger_interval": "30 seconds"},
+    }
+    job = _render_job(validate_config(raw))  # existing_cluster needs no new_cluster spec
+    assert job["continuous"] == {"pause_status": "${var.schedule_pause_status}"}
+    assert "job_clusters" not in job
+    assert job["tasks"][0]["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
+    assert job["tasks"][0]["notebook_task"]["base_parameters"]["streaming_trigger_interval"] == "30 seconds"
+
+
+def test_render_continuous_keeps_max_concurrent_runs_1():
+    # Databricks continuous jobs require exactly one active run; the framework fixes this at 1 for all jobs.
+    assert _render_job(_continuous_cfg(), _JC_SPEC)["max_concurrent_runs"] == 1
+
+
+def test_render_continuous_on_serverless_fails_closed():
+    # Defense in depth: even if a continuous+serverless config reached the generator (config rejects it
+    # first), render must refuse rather than emit a continuous job on serverless.
+    cfg = _cfg()  # batch/serverless
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}  # hand-set, bypassing validate_config's guard
+    with pytest.raises(ValueError, match="continuous.*requires classic compute"):
+        gen_jobs.render_job_yaml("x.yml", "x", cfg, None)
+
+
 def test_load_job_cluster_spec_missing_fails_closed():
     with pytest.raises(ValueError, match="not found"):
         gen_jobs.load_job_cluster_spec("definitely_no_such_cluster_config_key")

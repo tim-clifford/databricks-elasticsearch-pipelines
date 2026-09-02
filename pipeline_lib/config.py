@@ -107,6 +107,40 @@ _VALID_COMPUTE_TYPES = ("serverless", "existing_cluster", "job_cluster")
 # generator resolves the key to a file.
 _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# A continuous pipeline's ProcessingTime trigger interval. Spark ultimately parses this at query start
+# (via IntervalUtils.stringToInterval), but on an ALWAYS-ON run a bad interval fails only at .start() and
+# the Jobs continuous trigger then restarts the run in a loop - so we validate the FORMAT up front with
+# an ALLOW-LIST matching what that parser actually accepts (reject anything else rather than admit it and
+# loop; a deny-list would let an unknown unit like "30 fortnights" through). stringToInterval (Spark 3.2+,
+# incl. Spark 4.0 / DBR 17.3) is STRICT: it requires a FULL-WORD unit and WHITESPACE between the number
+# and the unit, so abbreviated ("5s", "10 mins", "500 ms") and space-less ("30seconds") forms are Spark-
+# invalid and must be rejected here, not passed through to loop. So: one or more whitespace-separated
+# "<number> <full-word-unit>" terms (compound like "1 minute 30 seconds" allowed), a decimal quantity
+# allowed ("1.5 seconds"). Months/years are omitted (ProcessingTime rejects a month-bearing interval).
+# "0 seconds" is allowed (Spark reads it as "run micro-batches as fast as possible"). One more
+# stringToInterval subtlety: a FRACTIONAL quantity is accepted ONLY for the `second` unit - the parser
+# throws INVALID_FRACTION_OF_SECOND when a non-'s' unit carries a decimal (`if (b != 's' && fractionScale
+# >= 0)`). So "1.5 seconds" is valid but "1.5 minutes"/"1.5 milliseconds" are not. The term therefore
+# splits in two: only `second(s)` may carry an optional decimal; every other unit (millisecond, minute,
+# hour, day, week) takes an INTEGER - matching the parser, so a fractional non-second value is rejected
+# here rather than looping at .start(). `microsecond` is deliberately NOT allowed: Trigger.ProcessingTime
+# has MILLISECOND granularity, so a sub-millisecond interval truncates to 0 (a misleading no-op); the
+# smallest meaningful unit is millisecond, and sub-second cadences below that are expressible as a
+# fractional-second ("0.5 seconds") if ever needed.
+_TRIGGER_INTERVAL_FRAC_UNIT = r"seconds?"  # 'second(s)' only: the sole unit Spark lets carry a decimal
+_TRIGGER_INTERVAL_INT_UNIT = r"(?:milliseconds?|minutes?|hours?|days?|weeks?)"  # integer only (no sub-ms microseconds)
+# The quantity is BOUNDED: at most 7 integer digits and (for seconds) 6 fractional digits. An unbounded
+# quantity ("999999999999 weeks") satisfies the format but overflows the Long microseconds stringToInterval
+# accumulates into, throwing at .start() and looping on a continuous run; 7 digits stays under Long.MAX
+# even for the largest unit (weeks), and 6 fractional digits is Spark's microsecond precision. Both are
+# vastly larger than any real micro-batch cadence, so the bound only excludes absurd/overflowing values.
+_TRIGGER_INTERVAL_TERM = (
+    r"\d{1,7}(?:(?:\.\d{1,6})?\s+" + _TRIGGER_INTERVAL_FRAC_UNIT + r"|\s+" + _TRIGGER_INTERVAL_INT_UNIT + r")"
+)  # <number> then EITHER optional-decimal + ws + 'seconds', OR ws + an integer-only unit (\s+ : ws REQUIRED)
+_VALID_TRIGGER_INTERVAL = re.compile(
+    r"^" + _TRIGGER_INTERVAL_TERM + r"(?:\s+" + _TRIGGER_INTERVAL_TERM + r")*$", re.IGNORECASE
+)
+
 # Streaming start positions (a run-time job parameter, streaming mode only). Allow-list, fail closed.
 # - "new"  (DEFAULT): the stream starts at the source table's CURRENT version (readStream
 #   startingVersion=latest), so nothing already in the table is exported; only commits after the
@@ -196,6 +230,35 @@ def require_streaming_start(value: object, where: str = "streaming_start") -> st
             f"{where} must be one of {', '.join(_VALID_STREAMING_STARTS)}, got {value!r}"
         )
     return value
+
+
+def require_trigger_interval(value: object, where: str = "trigger_interval") -> str:
+    """A continuous pipeline's ProcessingTime cadence: a Spark interval string in the full-word grammar
+    Spark's parser accepts (see _VALID_TRIGGER_INTERVAL). Returns the stripped value; fail closed on an
+    empty/non-string/malformed one.
+
+    Public because it validates two things (like require_pipeline_mode): the config's
+    continuous.trigger_interval (checked at config load by _validate_continuous) AND the deploy-time
+    streaming_trigger_interval base_parameter the runner notebook receives. Re-validating in the notebook
+    matters because that base_parameter is baked by the generator: a stale-generated or hand-edited value
+    (e.g. an abbreviated '5s' from before this grammar was tightened) would otherwise reach
+    Trigger.ProcessingTime and, on an always-on run, fail at .start() and loop under the Jobs continuous
+    trigger. One shared validator means both apply the identical grammar (single source of truth)."""
+    if not isinstance(value, str) or not value.strip():
+        raise PipelineConfigError(
+            f"{where} is required and must be a non-empty Spark interval string like '30 seconds' or "
+            f"'1 minute', got {value!r}"
+        )
+    interval = value.strip()
+    if not _VALID_TRIGGER_INTERVAL.match(interval):
+        raise PipelineConfigError(
+            f"{where} must be a Spark ProcessingTime interval: one or more '<number> <unit>' terms with "
+            f"a FULL-WORD unit and a space, e.g. '30 seconds', '1 minute', '500 milliseconds', "
+            f"'1 minute 30 seconds'. Abbreviated or space-less forms ('5s', '10 mins', '30seconds'), a "
+            f"fractional non-second quantity ('1.5 minutes'), and unknown units are rejected (they would "
+            f"fail only at stream start and loop on a continuous run). Got {interval!r}"
+        )
+    return interval
 
 
 def require_filter_condition(value: object, where: str = "filter_condition") -> str:
@@ -379,6 +442,49 @@ def require_max_partition_bytes(value: object, where: str = "max_partition_bytes
     raise PipelineConfigError(f"{where} must be a Spark byte-size like '32m' or a byte count (0 to leave unset), got {value!r}")
 
 
+def require_max_files_per_trigger(value: object, where: str = "max_files_per_trigger") -> str:
+    """OPTIONAL streaming read rate-limit: max Delta files per micro-batch, a positive integer or ""
+    (unset => Spark's own default of 1000 files). Bounds how much each streaming micro-batch pulls from
+    the source read. It applies in BOTH triggers (availableNow splits the backlog into multiple batches
+    of this size; continuous/ProcessingTime caps each interval's batch), but matters most for throttling
+    a first-run backfill (streaming_start=full) or a large post-restart catch-up so one micro-batch does
+    not try to read the whole table at once. Same positive-int rule and canonical-string form as
+    require_chunk_size, delegated so the one parse never forks; a bool/float/non-numeric/zero/negative
+    value fails closed. Empty/absent => "" (leave Spark's default)."""
+    return require_chunk_size(value, where)
+
+
+def require_max_bytes_per_trigger(value: object, where: str = "max_bytes_per_trigger") -> str:
+    """OPTIONAL streaming read rate-limit: max bytes per micro-batch, a Spark byte-size ("128m", "1g")
+    or "" (unset => no byte cap, Spark's default). A SOFT cap: Delta always admits at least one file per
+    batch, so a single file larger than this still forms one batch. Complements max_files_per_trigger
+    for bounding a backfill/catch-up. Accepts a byte-size string ("128m"/"512mb"/"1g"; unit k/m/g/t/p,
+    optional trailing 'b', case-insensitive) or a raw positive byte count; returned canonical
+    (lowercased). Empty/absent, or a zero size, => "" (unset => the option is omitted). A bool (int
+    subclass), a float, a negative value, or a malformed size string is rejected (fail closed)."""
+    if isinstance(value, bool):
+        raise PipelineConfigError(f"{where} must be a Spark byte-size like '128m' (or empty to leave unset), got {value!r}")
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "":
+        return ""
+    if isinstance(value, int):
+        if value < 0:
+            raise PipelineConfigError(f"{where} must be non-negative (empty to leave unset), got {value!r}")
+        return "" if value == 0 else str(value)  # a zero byte cap is meaningless == unset
+    if isinstance(value, str):
+        m = _MAX_PARTITION_BYTES_RE.match(value)
+        if not m:
+            raise PipelineConfigError(
+                f"{where} must be a Spark byte-size like '128m'/'512mb'/'1g' or a raw byte count "
+                f"(empty to leave unset), got {value!r}"
+            )
+        if int(m.group(1)) == 0:
+            return ""  # normalize "0"/"0m"/"0b" to the unset sentinel (no byte cap)
+        return value.lower()
+    raise PipelineConfigError(f"{where} must be a Spark byte-size like '128m' (or empty to leave unset), got {value!r}")
+
+
 def _require_es_index(value: object, where: str) -> str:
     """A valid Elasticsearch index name. Enforces the char/leading-char rules via the regex, plus the
     255-BYTE length bound and no-trailing-dot rule (which a single regex can't express well)."""
@@ -439,7 +545,8 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     allowed_top = {
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
         "chunk_size", "write_concurrency", "require_existing_index", "verify_certs", "write_repartition", "max_partition_bytes",
-        "view", "source", "reference_tables", "compute", "schedule",
+        "max_files_per_trigger", "max_bytes_per_trigger",
+        "view", "source", "reference_tables", "compute", "schedule", "continuous",
     }
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
@@ -492,6 +599,11 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # max_partition_bytes is OPTIONAL: absent -> the built-in default (require_max_partition_bytes turns
     # "" into _DEFAULT_MAX_PARTITION_BYTES). It governs read/scan parallelism; "0" means leave it unset.
     max_partition_bytes = require_max_partition_bytes(raw.get("max_partition_bytes", ""), f"{source}: max_partition_bytes")
+    # max_files_per_trigger / max_bytes_per_trigger are OPTIONAL streaming read rate-limits: absent -> ""
+    # (leave Spark's own default). They bound each streaming micro-batch (see the require_* helpers);
+    # ignored by a batch run. Stored in canonical string form (a job-parameter default).
+    max_files_per_trigger = require_max_files_per_trigger(raw.get("max_files_per_trigger", ""), f"{source}: max_files_per_trigger")
+    max_bytes_per_trigger = require_max_bytes_per_trigger(raw.get("max_bytes_per_trigger", ""), f"{source}: max_bytes_per_trigger")
     view = _validate_object(raw["view"], f"{source}: view", name_key="name", allowed={"catalog", "schema", "name"})
     # source may carry an OPTIONAL primary_key in addition to catalog/schema/table: it names the
     # SOURCE table's unique-row column. It is informational only today (all streams are append-only,
@@ -508,6 +620,38 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # schedule is OPTIONAL: absent -> None (on-demand, the default). It says WHEN the job runs (a Quartz
     # cron), carries no object names or ${environment}, so it is validated here and passed through resolve.
     schedule = _validate_schedule(raw.get("schedule"), f"{source}: schedule")
+    # continuous is OPTIONAL: absent -> None (not always-on, the default). Present -> the job runs
+    # always-on (a Databricks Jobs continuous trigger + a ProcessingTime stream; see _validate_continuous).
+    # A deploy-time job property, validated here and passed through resolve unchanged.
+    continuous = _validate_continuous(raw.get("continuous"), f"{source}: continuous")
+    # Cross-field rules for continuous (always-on) mode, all fail-closed - the three constraints that
+    # make an always-on stream valid, checked here so an illegal combo fails at config load (and thus at
+    # generation / deploy), never producing a job that would only break when the stream tries to start:
+    #  - continuous requires pipeline_mode: streaming. An always-on run only makes sense for a stream;
+    #    a "continuous batch" has nothing to keep running. Reject rather than silently downgrade.
+    #  - continuous is CLASSIC-COMPUTE ONLY. Serverless notebooks/jobs support only Trigger.availableNow
+    #    (and the deprecated once), never the ProcessingTime trigger an always-on stream needs, so
+    #    continuous on serverless would fail at the stream's .start(). Enumerate the ACCEPTABLE compute
+    #    types (allow-list) so any future/unknown type also fails closed here.
+    #  - continuous and schedule are mutually exclusive. A Databricks job has EITHER a continuous trigger
+    #    OR a schedule, never both; setting both is ambiguous.
+    if continuous is not None:
+        if pipeline_mode != "streaming":
+            raise PipelineConfigError(
+                f"{source}: continuous requires pipeline_mode: streaming (an always-on run only applies "
+                f"to a stream), got pipeline_mode={pipeline_mode!r}"
+            )
+        if compute["type"] not in ("job_cluster", "existing_cluster"):
+            raise PipelineConfigError(
+                f"{source}: continuous requires classic compute (compute.type job_cluster or "
+                f"existing_cluster); serverless supports only Trigger.availableNow, not the "
+                f"ProcessingTime trigger an always-on stream needs. Got compute.type={compute['type']!r}"
+            )
+        if schedule is not None:
+            raise PipelineConfigError(
+                f"{source}: continuous and schedule are mutually exclusive (a job has either an "
+                f"always-on continuous trigger or a schedule, not both); remove one"
+            )
 
     return {
         "es_index_name": es_index_name,
@@ -521,11 +665,14 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "verify_certs": verify_certs,
         "write_repartition": write_repartition,
         "max_partition_bytes": max_partition_bytes,
+        "max_files_per_trigger": max_files_per_trigger,
+        "max_bytes_per_trigger": max_bytes_per_trigger,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
         "compute": compute,
         "schedule": schedule,
+        "continuous": continuous,
     }
 
 
@@ -680,6 +827,42 @@ def _validate_schedule(node: object, where: str = "schedule") -> dict | None:
     return {"quartz_cron_expression": cron.strip()}
 
 
+def _validate_continuous(node: object, where: str = "continuous") -> dict | None:
+    """Validate the OPTIONAL per-index `continuous` block; return a normalized dict or None. Fail closed.
+
+    Absent (node is None) => None: the job is NOT always-on (it runs on-demand, or on `schedule`), the
+    default. Present => the job runs ALWAYS-ON: the generator emits a Databricks Jobs `continuous`
+    trigger (one perpetual, auto-restarting run) instead of a `schedule`, and the runner drives the
+    stream with a Spark ProcessingTime micro-batch trigger (never-terminating) instead of
+    Trigger.availableNow. Continuous streaming is CLASSIC-COMPUTE ONLY (serverless supports only
+    Trigger.availableNow/once), requires pipeline_mode: streaming, and is mutually exclusive with
+    `schedule` - all three are cross-field rules enforced in validate_config, not here (this validates
+    the block's OWN shape).
+
+    Carries one required key, trigger_interval: the ProcessingTime cadence, a Spark interval string
+    (e.g. "30 seconds", "1 minute", "5 seconds"). It is the target gap between the START of one
+    micro-batch and the next; batches never overlap, and a shorter interval trades ES/Delta efficiency
+    (more, smaller bulk writes and index refreshes) for lower latency. Spark parses the exact interval
+    at query start (like a Quartz cron is validated at deploy), so here we only enforce a non-empty
+    string carrying both a number and a unit, which catches the common mistakes (empty, a bare number
+    with no unit, a lone unit with no number) with a clear message rather than a cryptic parse error.
+    """
+    if node is None:
+        return None
+    if not isinstance(node, dict):
+        raise PipelineConfigError(f"{where} must be a mapping with trigger_interval, got {type(node).__name__}")
+
+    unknown = sorted(set(node) - {"trigger_interval"})
+    if unknown:
+        raise PipelineConfigError(
+            f"{where} has unknown key(s): {', '.join(unknown)}; allowed: trigger_interval"
+        )
+
+    # Validate trigger_interval with the SHARED helper (the same one the runner notebook re-applies to
+    # its deploy-time base_parameter), so config load and run time enforce one grammar.
+    return {"trigger_interval": require_trigger_interval(node.get("trigger_interval"), f"{where}.trigger_interval")}
+
+
 def resolve_config(cfg: dict, environment: str) -> dict:
     """Fold `environment` into every name template in a validated config, returning resolved names.
 
@@ -718,6 +901,10 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # string form), like the tuning knobs.
         "write_repartition": cfg["write_repartition"],
         "max_partition_bytes": cfg["max_partition_bytes"],
+        # The streaming read rate-limits are run behaviors, not object names: passed through verbatim
+        # (canonical string form), like max_partition_bytes.
+        "max_files_per_trigger": cfg["max_files_per_trigger"],
+        "max_bytes_per_trigger": cfg["max_bytes_per_trigger"],
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
@@ -729,6 +916,8 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "compute": cfg["compute"],
         # schedule (when the job runs) is likewise a deploy-time job property: passed through verbatim.
         "schedule": cfg["schedule"],
+        # continuous (always-on trigger) is likewise a deploy-time job property: passed through verbatim.
+        "continuous": cfg["continuous"],
     }
 
 
@@ -842,6 +1031,7 @@ def job_base_parameters(
     secret_key_name_ref: str,
     checkpoint_base_path_ref: str,
     ca_certs_ref: str,
+    streaming_trigger_interval: str = "",
 ) -> dict:
     """The DEPLOY-TIME values the generated per-index job passes to run_index_pipeline.py as widgets.
 
@@ -862,6 +1052,14 @@ def job_base_parameters(
     - `ca_certs_ref` (e.g. "${var.ca_certs}"): the global path to a CA bundle (PEM) the connector uses
       to verify the ES TLS cert. One global bundle for every host config; empty => the runner omits it
       and the connector falls back to the system CAs.
+    - `streaming_trigger_interval` (e.g. "30 seconds", or "" for none): a LITERAL from the config's
+      `continuous` block (NOT a bundle variable), the single signal that couples the job's shape to the
+      notebook's trigger. Non-empty => this is a continuous (always-on) pipeline, so the notebook drives
+      the stream with Trigger.ProcessingTime(interval) (never-terminating) and the generated job carries
+      a Databricks Jobs `continuous` trigger. Empty (the default) => the notebook uses
+      Trigger.availableNow (drain-and-stop, today's behavior), scheduled or on-demand. A deploy-time
+      property, not overridable per run (continuous is a per-pipeline config choice), so it is a
+      base_parameter, not a job parameter. Ignored by a batch run.
     All values are strings, as job base_parameters must be.
 
     Run-time-overridable knobs (pipeline_mode, filter_condition, streaming_start, the EsWriteConfig
@@ -877,6 +1075,7 @@ def job_base_parameters(
         "secret_key_name": secret_key_name_ref,
         "checkpoint_base_path": checkpoint_base_path_ref,
         "ca_certs": ca_certs_ref,
+        "streaming_trigger_interval": streaming_trigger_interval,
     }
 
 
@@ -906,6 +1105,9 @@ def job_parameters(cfg: dict) -> list:
     - write_repartition: how many partitions to repartition the write input into before bulk_write; 0
       (the default) leaves the read's partitioning in place (see max_partition_bytes). DEFAULT from the
       config, which defaults to _DEFAULT_WRITE_REPARTITION. Applies to both modes.
+    - max_files_per_trigger / max_bytes_per_trigger: streaming read rate-limits that bound each
+      micro-batch; DEFAULT from the config ("" when the config omits it => Spark's own default).
+      Streaming only; ignored by batch. Overridable per run to throttle a backfill/catch-up.
 
     Returns the list shape DAB expects under a job's `parameters:` key.
     """
@@ -919,4 +1121,6 @@ def job_parameters(cfg: dict) -> list:
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": cfg["write_repartition"]},
         {"name": "max_partition_bytes", "default": cfg["max_partition_bytes"]},
+        {"name": "max_files_per_trigger", "default": cfg["max_files_per_trigger"]},
+        {"name": "max_bytes_per_trigger", "default": cfg["max_bytes_per_trigger"]},
     ]

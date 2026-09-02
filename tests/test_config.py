@@ -16,9 +16,12 @@ from pipeline_lib.config import (
     require_chunk_size,
     require_es_flag,
     require_filter_condition,
+    require_max_bytes_per_trigger,
+    require_max_files_per_trigger,
     require_max_partition_bytes,
     require_pipeline_mode,
     require_streaming_start,
+    require_trigger_interval,
     require_write_concurrency,
     require_write_repartition,
     resolve_config,
@@ -501,7 +504,20 @@ def test_job_base_parameters():
         "secret_key_name": "${var.es_host_primary.secret_key_name}",
         "checkpoint_base_path": "${var.checkpoint_base_path}",
         "ca_certs": "${var.ca_certs}",
+        "streaming_trigger_interval": "",
     }
+
+
+def test_job_base_parameters_streaming_trigger_interval():
+    # streaming_trigger_interval is a base_parameter (deploy-time, from the continuous block): it takes
+    # the passed literal, and defaults to "" (availableNow) when omitted.
+    assert _job_base_parameters("x")["streaming_trigger_interval"] == ""
+    params = job_base_parameters(
+        "x", "${var.environment}", "${var.wheel_path}", "${var.es_host_primary.es_host_url}",
+        "${var.es_host_primary.secret_scope_name}", "${var.es_host_primary.secret_key_name}",
+        "${var.checkpoint_base_path}", "${var.ca_certs}", "30 seconds",
+    )
+    assert params["streaming_trigger_interval"] == "30 seconds"
 
 
 def test_job_base_parameters_excludes_run_time_params():
@@ -541,6 +557,8 @@ def test_job_parameters_full_shape_and_order():
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": "0"},
         {"name": "max_partition_bytes", "default": "2m"},
+        {"name": "max_files_per_trigger", "default": ""},
+        {"name": "max_bytes_per_trigger", "default": ""},
     ]
 
 
@@ -1112,3 +1130,227 @@ def test_schedule_carried_through_resolve():
 def test_schedule_none_carried_through_resolve():
     out = resolve_config(validate_config(_base()), environment="")
     assert out["schedule"] is None
+
+
+# --------------------------------------------------------------------------- continuous (always-on)
+
+
+def _continuous_ready():
+    """A config that satisfies the continuous cross-field rules (streaming + classic compute), so a
+    `continuous` block can be added without tripping an unrelated rule."""
+    cfg = _base()
+    cfg["pipeline_mode"] = "streaming"
+    cfg["compute"] = {"type": "job_cluster", "job_cluster_config": "standard_batch"}
+    return cfg
+
+
+def test_continuous_absent_defaults_none():
+    # No continuous block => None (not always-on, the default: scheduled/on-demand availableNow).
+    assert validate_config(_base())["continuous"] is None
+
+
+def test_continuous_valid():
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    assert validate_config(cfg)["continuous"] == {"trigger_interval": "30 seconds"}
+
+
+def test_continuous_trigger_interval_trimmed():
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": "  1 minute  "}
+    assert validate_config(cfg)["continuous"] == {"trigger_interval": "1 minute"}
+
+
+@pytest.mark.parametrize("bad", [None, "", "   ", 30, 1.5, True])
+def test_continuous_trigger_interval_required(bad):
+    # trigger_interval is required within the block and must be a non-empty string.
+    cfg = _continuous_ready()
+    cfg["continuous"] = {} if bad is None else {"trigger_interval": bad}
+    with pytest.raises(PipelineConfigError, match="trigger_interval"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("good", [
+    "30 seconds", "1 minute", "500 milliseconds", "2 hours", "0 seconds", "1.5 seconds",
+    "1 minute 30 seconds", "1 day", "1 week",
+])
+def test_continuous_trigger_interval_allowed_forms(good):
+    # The allow-list accepts one-or-more "<number> <full-word-unit>" terms (Spark's stringToInterval
+    # grammar): compound ("1 minute 30 seconds"), decimal, and 0 (as-fast-as-possible) are all valid.
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": good}
+    assert validate_config(cfg)["continuous"] == {"trigger_interval": good}
+
+
+@pytest.mark.parametrize("bad", [
+    "30", "0", "seconds", "minute",                     # missing a number or a unit
+    "5s", "2h", "250us", "10 mins", "500 ms", "30seconds",  # abbreviated / space-less: Spark-invalid, would loop
+    "1.5 minutes", "1.5 hours", "1.5 days",             # fractional on a non-second unit: Spark-invalid
+    "1.5 milliseconds",                                 # fractional allowed ONLY for 'second' (Spark: b=='s')
+    "250 microseconds", "1 microsecond",                # sub-millisecond: below ProcessingTime granularity
+    "999999999999 weeks", "12345678 seconds", "1.1234567 seconds",  # unbounded quantity/precision: overflows Spark
+    "30 fortnights", "30 secondz", "5 blah",            # unknown / malformed unit
+    "-5 seconds", "-1 minute", "1 minute -30 seconds",  # negative duration
+])
+def test_continuous_trigger_interval_rejects_malformed(bad):
+    # Anything that is not a full-word, whitespace-separated "<number> <unit>" term is rejected at config
+    # load - including abbreviated/space-less forms that Spark's ProcessingTime parser rejects. This
+    # closes the gap where such a value would pass validation, fail only at .start(), and (on a
+    # continuous run) restart in an endless loop.
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": bad}
+    with pytest.raises(PipelineConfigError, match="trigger_interval"):
+        validate_config(cfg)
+
+
+def test_require_trigger_interval_returns_stripped():
+    # The shared helper (also called by the runner notebook on its base_parameter) returns the trimmed
+    # value on a valid interval.
+    assert require_trigger_interval("  30 seconds  ", "streaming_trigger_interval") == "30 seconds"
+
+
+@pytest.mark.parametrize("bad", ["", "5s", "30seconds", "1.5 minutes", "10 mins", None, 30])
+def test_require_trigger_interval_fails_closed(bad):
+    # The notebook re-validates the deploy-time base_parameter through this same helper, so a stale or
+    # hand-edited value fails closed here rather than looping at Trigger.ProcessingTime.
+    with pytest.raises(PipelineConfigError, match="streaming_trigger_interval"):
+        require_trigger_interval(bad, "streaming_trigger_interval")
+
+
+@pytest.mark.parametrize("bad", ["nope", 5, ["30 seconds"]])
+def test_continuous_non_mapping_rejected(bad):
+    cfg = _continuous_ready()
+    cfg["continuous"] = bad
+    with pytest.raises(PipelineConfigError, match="continuous"):
+        validate_config(cfg)
+
+
+def test_continuous_unknown_key_rejected():
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": "30 seconds", "pause_status": "UNPAUSED"}
+    with pytest.raises(PipelineConfigError, match="unknown key"):
+        validate_config(cfg)
+
+
+def test_continuous_requires_streaming():
+    # An always-on run only applies to a stream; continuous + batch is a config error, not a downgrade.
+    cfg = _continuous_ready()
+    cfg["pipeline_mode"] = "batch"
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    with pytest.raises(PipelineConfigError, match="continuous requires pipeline_mode: streaming"):
+        validate_config(cfg)
+
+
+def test_continuous_rejects_serverless():
+    # Serverless supports only Trigger.availableNow, not the ProcessingTime trigger an always-on stream
+    # needs, so continuous on serverless (the default compute) fails closed at config load.
+    cfg = _base()
+    cfg["pipeline_mode"] = "streaming"  # serverless default compute
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    with pytest.raises(PipelineConfigError, match="continuous requires classic compute"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("compute", [
+    {"type": "job_cluster", "job_cluster_config": "standard_batch"},
+    {"type": "existing_cluster", "cluster_config": "interactive_primary"},
+])
+def test_continuous_accepts_classic_compute(compute):
+    cfg = _base()
+    cfg["pipeline_mode"] = "streaming"
+    cfg["compute"] = compute
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    assert validate_config(cfg)["continuous"] == {"trigger_interval": "30 seconds"}
+
+
+def test_continuous_and_schedule_mutually_exclusive():
+    # A job has EITHER a continuous trigger OR a schedule, never both.
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    cfg["schedule"] = {"quartz_cron_expression": "0 0 8 * * ?"}
+    with pytest.raises(PipelineConfigError, match="mutually exclusive"):
+        validate_config(cfg)
+
+
+def test_continuous_carried_through_resolve():
+    # continuous is a deploy-time job property, not an object name: resolve passes it through unchanged.
+    cfg = _continuous_ready()
+    cfg["view"]["catalog"] = "acme_${environment}"
+    cfg["source"]["catalog"] = "acme_${environment}"
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["continuous"] == {"trigger_interval": "30 seconds"}
+
+
+def test_continuous_none_carried_through_resolve():
+    assert resolve_config(validate_config(_base()), environment="")["continuous"] is None
+
+
+# ------------------------------------------------- max_files_per_trigger / max_bytes_per_trigger
+
+
+@pytest.mark.parametrize("value,expected", [(500, "500"), ("250", "250"), ("", ""), (None, "")])
+def test_require_max_files_per_trigger_canonical(value, expected):
+    assert require_max_files_per_trigger(value) == expected
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True, "abc", "12.5"])
+def test_require_max_files_per_trigger_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="max_files_per_trigger"):
+        require_max_files_per_trigger(bad)
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("128m", "128m"), ("512MB", "512mb"), ("1g", "1g"), (1048576, "1048576"),
+    ("", ""), (None, ""), ("0", ""), ("0m", ""), (0, ""),
+])
+def test_require_max_bytes_per_trigger_canonical(value, expected):
+    # A byte-size is canonicalized (lowercased); empty OR a zero size => "" (unset, no cap).
+    assert require_max_bytes_per_trigger(value) == expected
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "128x", "abc"])
+def test_require_max_bytes_per_trigger_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="max_bytes_per_trigger"):
+        require_max_bytes_per_trigger(bad)
+
+
+def test_rate_limits_absent_default_empty_in_config():
+    out = validate_config(_base())
+    assert out["max_files_per_trigger"] == "" and out["max_bytes_per_trigger"] == ""
+
+
+def test_rate_limits_from_config():
+    cfg = _base()
+    cfg["max_files_per_trigger"] = 200
+    cfg["max_bytes_per_trigger"] = "256m"
+    out = validate_config(cfg)
+    assert out["max_files_per_trigger"] == "200" and out["max_bytes_per_trigger"] == "256m"
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("max_files_per_trigger", 0), ("max_files_per_trigger", "abc"),
+    ("max_bytes_per_trigger", "128x"), ("max_bytes_per_trigger", -1),
+])
+def test_rate_limits_bad_config_value_fails_closed(field, bad):
+    cfg = _base()
+    cfg[field] = bad
+    with pytest.raises(PipelineConfigError, match=field):
+        validate_config(cfg)
+
+
+def test_rate_limits_carried_through_resolve():
+    cfg = _with_env()
+    cfg["max_files_per_trigger"] = 200
+    cfg["max_bytes_per_trigger"] = "256m"
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["max_files_per_trigger"] == "200" and out["max_bytes_per_trigger"] == "256m"
+
+
+def test_job_parameters_rate_limits_default_from_config():
+    cfg = _base()
+    cfg["max_files_per_trigger"] = 200
+    cfg["max_bytes_per_trigger"] = "256m"
+    params = job_parameters(validate_config(cfg))
+    assert {"name": "max_files_per_trigger", "default": "200"} in params
+    assert {"name": "max_bytes_per_trigger", "default": "256m"} in params

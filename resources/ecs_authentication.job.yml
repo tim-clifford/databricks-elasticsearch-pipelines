@@ -27,6 +27,10 @@ resources:
         default: '0'
       - name: max_partition_bytes
         default: 2m
+      - name: max_files_per_trigger
+        default: ''
+      - name: max_bytes_per_trigger
+        default: ''
       tasks:
       - task_key: index_pipeline_ecs_authentication
         notebook_task:
@@ -40,6 +44,7 @@ resources:
             secret_key_name: ${var.es_host_primary.secret_key_name}
             checkpoint_base_path: ${var.checkpoint_base_path}
             ca_certs: ${var.ca_certs}
+            streaming_trigger_interval: ''
       permissions:
       - level: CAN_MANAGE_RUN
         group_name: users

@@ -1,0 +1,40 @@
+# Continuous (always-on) streaming example pipeline. Same export as ecs_dns_activity, but this one runs
+# ALWAYS-ON: a Databricks Jobs continuous trigger keeps a single run perpetually alive (auto-restarting
+# on failure), and the runner drives the stream with a Spark ProcessingTime micro-batch trigger that
+# never terminates, instead of the drain-and-stop Trigger.availableNow a scheduled job uses.
+#
+# CLASSIC COMPUTE ONLY. Serverless notebooks/jobs support only Trigger.availableNow, not the
+# ProcessingTime trigger an always-on stream needs, so a continuous pipeline MUST declare a job_cluster
+# (or existing_cluster) compute. config validation rejects continuous + serverless (and continuous +
+# schedule, and continuous + pipeline_mode: batch) at load, so an illegal combo fails before deploy.
+#
+# See ecs_dns_activity.yml for the full field reference. ${environment} folding works the same here.
+es_index_name: ecs-dns-activity-continuous   # own ES index (separate from the other dns pipelines)
+es_id_field: dsl_id                          # OPTIONAL: view output column used as the ES document _id (idempotent upserts). Strongly recommended for streaming: restarts/retries are routine, so a deterministic _id keeps replays idempotent
+es_host_config: es_host_primary              # ES host config (endpoint + secret scope/key); declared in databricks.yml
+pipeline_mode: streaming                     # continuous requires streaming (an always-on run only applies to a stream)
+
+# max_files_per_trigger: 1000                # OPTIONAL streaming read rate-limit: max Delta files per micro-batch (empty => Spark default 1000). Useful to throttle a streaming_start=full backfill or a large post-restart catch-up
+# max_bytes_per_trigger: 128m                # OPTIONAL streaming read rate-limit: max bytes per micro-batch (empty => no cap)
+
+view:                             # the view this pipeline creates and exports
+  catalog: tim_clifford_classic_dsl_lite_${environment}
+  schema: es_poc
+  name: ecs_dns_activity_continuous
+
+source:                           # the single source table the view reads from (same as the other dns pipelines)
+  catalog: tim_clifford_classic_dsl_lite_${environment}
+  schema: ocsf
+  table: dns_activity
+  primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column (not used at runtime today)
+
+# Internal testing note (not a customer concern): a job cluster reaches ES over classic-compute egress,
+# which our internal test ES endpoint does not allow-list (it trusts only serverless egress). So there
+# this example deploys, the cluster boots, and the stream runs its micro-batches, but the bulk write
+# cannot reach ES; serverless pipelines are unaffected (but serverless cannot run continuous).
+compute:                          # continuous is classic-compute only: run on a JOB CLUSTER, not serverless
+  type: job_cluster
+  job_cluster_config: standard_batch   # -> _pipelines/job_cluster_configs/standard_batch.yml (new_cluster spec)
+
+continuous:                       # ALWAYS-ON: emit a Databricks Jobs continuous trigger (mutually exclusive with schedule)
+  trigger_interval: 30 seconds    # Spark ProcessingTime cadence: the target gap between the START of one micro-batch and the next. Shorter => lower latency to ES but more, smaller bulk writes and index refreshes

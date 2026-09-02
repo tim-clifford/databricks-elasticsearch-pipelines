@@ -7,10 +7,13 @@
 # MAGIC names, and exports the config's view to Elasticsearch via the connector's `bulk_write`.
 # MAGIC
 # MAGIC Both modes are implemented. `pipeline_mode=batch` reads the whole deployed view, optionally
-# MAGIC filters, and bulk-writes it. `pipeline_mode=streaming` reads the RAW source table as a stream
-# MAGIC (Trigger.availableNow), renders the view's OWN SELECT over each micro-batch (so the view logic
-# MAGIC runs against batch-sized data, never a join back to the full view), and bulk-writes per batch
-# MAGIC through the connector's foreachBatch writer with a checkpoint.
+# MAGIC filters, and bulk-writes it. `pipeline_mode=streaming` reads the RAW source table as a stream,
+# MAGIC renders the view's OWN SELECT over each micro-batch (so the view logic runs against batch-sized
+# MAGIC data, never a join back to the full view), and bulk-writes per batch through the connector's
+# MAGIC foreachBatch writer with a checkpoint. The streaming trigger is set by `streaming_trigger_interval`
+# MAGIC (below): empty => `Trigger.availableNow` (drain the backlog and STOP, for scheduled/on-demand
+# MAGIC runs); non-empty => `Trigger.ProcessingTime(interval)`, an ALWAYS-ON stream that never terminates
+# MAGIC (for a `continuous` pipeline on classic compute, wrapped by a Databricks Jobs continuous trigger).
 # MAGIC
 # MAGIC Why load the config here rather than receive resolved values: the job resources are generated
 # MAGIC offline by scripts/gen_jobs.py, which cannot know the deploy-time environment, so it cannot bake
@@ -24,6 +27,8 @@
 # MAGIC   secret scope/key holding the ES api_key (all required for an index-job run).
 # MAGIC - `checkpoint_base_path`: UC Volume base for streaming checkpoints; the runner appends
 # MAGIC   `/<config_name>` (required for a streaming run; unused by batch).
+# MAGIC - `streaming_trigger_interval`: the continuous ProcessingTime cadence (e.g. `30 seconds`) from the
+# MAGIC   config's `continuous` block, or empty for availableNow (drain-and-stop). Deploy-time, not per-run.
 # MAGIC
 # MAGIC Run-time parameters (job parameters; overridable per run with `--params <name>=<value>`):
 # MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config).
@@ -32,6 +37,8 @@
 # MAGIC   omitted there and unset per run => connector default).
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
 # MAGIC   streaming only, honored on the first run before a checkpoint exists.
+# MAGIC - `max_files_per_trigger`, `max_bytes_per_trigger`: streaming read rate-limits that bound each
+# MAGIC   micro-batch (default from config; empty => Spark defaults). Streaming only; useful for a backfill.
 
 # COMMAND ----------
 # FIRST, install the connector wheel and restart Python. This cell handles ONLY the wheel, because
@@ -111,6 +118,13 @@ dbutils.widgets.text("max_partition_bytes", "", "spark.sql.files.maxPartitionByt
 # streaming_start is a run-time job parameter (default "new"). Both are ignored by a batch run.
 dbutils.widgets.text("checkpoint_base_path", "", "UC Volume base for streaming checkpoints (runner appends /<config_name>)")
 dbutils.widgets.text("streaming_start", "", "Streaming start: new (only new commits) | full (backfill whole table)")
+# streaming_trigger_interval is a DEPLOY-TIME base_parameter (from the config's continuous block), not a
+# per-run job parameter: empty => Trigger.availableNow (drain-and-stop); non-empty => an always-on
+# ProcessingTime stream at that cadence. max_files/max_bytes_per_trigger are per-run streaming read
+# rate-limits (empty => Spark defaults).
+dbutils.widgets.text("streaming_trigger_interval", "", "Continuous ProcessingTime cadence, e.g. '30 seconds' (empty => availableNow drain-and-stop)")
+dbutils.widgets.text("max_files_per_trigger", "", "Streaming: max Delta files per micro-batch (empty => Spark default 1000)")
+dbutils.widgets.text("max_bytes_per_trigger", "", "Streaming: max bytes per micro-batch, e.g. 128m (empty => no cap)")
 CONFIG_NAME = dbutils.widgets.get("config_name").strip()
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
 ES_HOST_URL = dbutils.widgets.get("es_host_url").strip()
@@ -127,6 +141,9 @@ WRITE_REPARTITION = dbutils.widgets.get("write_repartition").strip()
 MAX_PARTITION_BYTES = dbutils.widgets.get("max_partition_bytes").strip()
 CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
 STREAMING_START = dbutils.widgets.get("streaming_start").strip()
+STREAMING_TRIGGER_INTERVAL = dbutils.widgets.get("streaming_trigger_interval").strip()
+MAX_FILES_PER_TRIGGER = dbutils.widgets.get("max_files_per_trigger").strip()
+MAX_BYTES_PER_TRIGGER = dbutils.widgets.get("max_bytes_per_trigger").strip()
 if not CONFIG_NAME:
     raise ValueError("missing required parameter: config_name")
 
@@ -145,9 +162,12 @@ from pipeline_lib.config import (  # noqa: E402
     load_config,
     render_view_sql,
     require_filter_condition,
+    require_max_bytes_per_trigger,
+    require_max_files_per_trigger,
     require_max_partition_bytes,
     require_pipeline_mode,
     require_streaming_start,
+    require_trigger_interval,
     require_write_repartition,
     resolve_config,
     view_select_body,
@@ -170,6 +190,29 @@ from pipeline_lib.config import (  # noqa: E402
 #   validator turns "" into _DEFAULT_WRITE_REPARTITION), so a standalone run still parallelizes. Parsed
 #   to int here since it feeds df.repartition(N).
 PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
+# A continuous (always-on) job carries a Databricks Jobs continuous trigger and hands the notebook a
+# non-empty streaming_trigger_interval (a deploy-time base_parameter). pipeline_mode stays run-time
+# overridable, so guard the one override that would misbehave: a batch (or any non-streaming) run under
+# a continuous trigger is a TERMINATING export, which the continuous trigger then auto-restarts - an
+# endless loop of full re-exports to ES. Fail closed so the mismatch surfaces as one clear run failure.
+# (validate_config already forbids continuous + non-streaming at DEPLOY; this closes the RUN-TIME
+# override gap that a deploy-time config check cannot see.)
+if STREAMING_TRIGGER_INTERVAL and PIPELINE_MODE != "streaming":
+    raise ValueError(
+        f"continuous job (streaming_trigger_interval={STREAMING_TRIGGER_INTERVAL!r}) requires "
+        f"pipeline_mode=streaming, got {PIPELINE_MODE!r}: a terminating {PIPELINE_MODE} run under a "
+        f"continuous trigger would auto-restart in an endless loop. Remove the pipeline_mode override, "
+        f"or run this config's batch export as a separate, non-continuous job."
+    )
+# Re-validate the continuous ProcessingTime cadence against the SAME grammar the config schema uses,
+# BEFORE it reaches Trigger.ProcessingTime. streaming_trigger_interval is a deploy-time base_parameter
+# baked by the generator, so a stale-generated (from before the grammar was tightened) or hand-edited
+# value would otherwise slip through to .start() and, under the Jobs continuous trigger, loop instead of
+# failing once. Empty => availableNow, nothing to validate.
+if STREAMING_TRIGGER_INTERVAL:
+    STREAMING_TRIGGER_INTERVAL = require_trigger_interval(
+        STREAMING_TRIGGER_INTERVAL, "streaming_trigger_interval base parameter"
+    )
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY)
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
@@ -177,6 +220,11 @@ WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repa
 # - max_partition_bytes: Spark byte-size (or "0" = leave unset). Validated unconditionally; applied to
 #   the source read below (both modes). Empty widget -> the built-in default via the validator.
 MAX_PARTITION_BYTES = require_max_partition_bytes(MAX_PARTITION_BYTES, "max_partition_bytes job parameter")
+# - max_files_per_trigger / max_bytes_per_trigger: streaming read rate-limits, validated unconditionally
+#   (a bad --params value fails closed regardless of mode) but only APPLIED by the streaming reader
+#   below. Empty widget -> "" (leave Spark's default), so an unset knob is simply omitted from the read.
+MAX_FILES_PER_TRIGGER = require_max_files_per_trigger(MAX_FILES_PER_TRIGGER, "max_files_per_trigger job parameter")
+MAX_BYTES_PER_TRIGGER = require_max_bytes_per_trigger(MAX_BYTES_PER_TRIGGER, "max_bytes_per_trigger job parameter")
 
 # The ES connection settings are required for any index-job run: fail closed on an empty one rather
 # than constructing a broken EsWriteConfig. These come from this pipeline's es_host_config (a complex
@@ -239,6 +287,11 @@ print(f"es_host_url        = {ES_HOST_URL}")
 print(f"ca_certs           = {CA_CERTS or '<unset> (system CA store)'}")
 if PIPELINE_MODE == "streaming":
     print(f"streaming_start    = {STREAMING_START}")
+    print("streaming_trigger  = " + (
+        f"continuous / ProcessingTime {STREAMING_TRIGGER_INTERVAL!r} (always-on)"
+        if STREAMING_TRIGGER_INTERVAL else "availableNow (drain-and-stop)"))
+    print(f"max_files_per_trigger = {MAX_FILES_PER_TRIGGER or '<unset> (Spark default)'}")
+    print(f"max_bytes_per_trigger = {MAX_BYTES_PER_TRIGGER or '<unset> (no cap)'}")
 # Loud warning for omitting es_id_field. BOTH modes are at-least-once, so a replay re-writes the same
 # source rows with fresh auto-generated _ids and the index accumulates DUPLICATES: for batch, a
 # failed-then-retried run re-exports the whole view; for streaming, micro-batch retries, stream
@@ -475,6 +528,15 @@ if PIPELINE_MODE == "streaming":
         return any(e.name.rstrip("/").isdigit() for e in entries)
 
     reader = spark.readStream.option("skipChangeCommits", "true")
+    # Optional read rate-limits: bound how much each micro-batch pulls from the source. Applied to BOTH
+    # triggers (availableNow splits the backlog into multiple batches of this size; ProcessingTime caps
+    # each interval's batch), but most valuable for throttling a first-run backfill (streaming_start=full)
+    # or a large post-restart catch-up so one micro-batch does not read the whole table. Empty => omitted,
+    # so Spark's own defaults stand (maxFilesPerTrigger 1000, no byte cap). Validated above.
+    if MAX_FILES_PER_TRIGGER:
+        reader = reader.option("maxFilesPerTrigger", MAX_FILES_PER_TRIGGER)
+    if MAX_BYTES_PER_TRIGGER:
+        reader = reader.option("maxBytesPerTrigger", MAX_BYTES_PER_TRIGGER)
     if STREAMING_START == "new":
         if _checkpoint_has_committed_offset(checkpoint_location):
             # A prior run already persisted an offset: Spark resumes from the checkpoint and
@@ -486,64 +548,90 @@ if PIPELINE_MODE == "streaming":
             reader = reader.option("startingVersion", str(current_version))
     stream_df = reader.table(SOURCE_FQN)
 
-    # Trigger.availableNow: drain every currently-available source commit in one or more micro-batches,
-    # then stop. This is the supported serverless streaming trigger (processingTime is rejected) and
-    # fits the DAB job model - each job RUN exports the new data since the last run and terminates,
-    # rather than holding an always-on cluster. Schedule the job (or run on demand) to pick up new data.
-    query = (
+    # The trigger is chosen by streaming_trigger_interval (a deploy-time base_parameter from the config's
+    # `continuous` block), which is the SINGLE signal that keeps the job's shape and this trigger in step:
+    # - EMPTY => Trigger.availableNow: drain every currently-available source commit in one or more
+    #   micro-batches, then STOP. The supported serverless trigger, and it fits the scheduled/on-demand
+    #   DAB job model - each RUN exports the new data since the last run and terminates. availableNow
+    #   still honors the rate-limits above (multiple batches) and startingVersion (first-run seed).
+    # - NON-EMPTY => Trigger.ProcessingTime(interval): an ALWAYS-ON micro-batch stream that never
+    #   terminates. Set only by a continuous pipeline, which config restricts to CLASSIC compute
+    #   (serverless rejects ProcessingTime). The generated job carries a Databricks Jobs `continuous`
+    #   trigger that keeps this run perpetually alive (auto-restarting on failure); each restart resumes
+    #   from the checkpoint (the startingVersion seed above is skipped once an offset exists).
+    writer = (
         stream_df.writeStream
         .option("checkpointLocation", checkpoint_location)
-        .trigger(availableNow=True)
         .foreachBatch(foreach_batch)
-        .start()
     )
-    query.awaitTermination()
-
-    # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
-    # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
-    # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
-    # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that was
-    # retried within this run is counted once, not summed twice - then total. A run with no new source
-    # data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid outcome, not a
-    # failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch that did not fully
-    # succeed failed the run instead of recording, and a TERMINATED-SUCCESS total is exact.
-    from pyspark.sql import functions as _F  # noqa: E402
-
-    def _metrics_dir_missing():
-        # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
-        # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
-        # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
-        # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
-        # run that already pushed rows is exactly the fail-open bug this must avoid.
-        try:
-            dbutils.fs.ls(metrics_dir)
-            return False  # path exists
-        except Exception as _e:
-            # Verified on this runtime: a missing path raises ExecutionError wrapping
-            # CloudFileNotFoundException with text "No such file or directory". Match the not-found
-            # signal explicitly; re-raise everything else.
-            _msg = str(_e)
-            if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
-                return True  # positively not-found: no batches wrote metrics
-            raise  # anything else is a real failure - do not swallow it
-
-    if _metrics_dir_missing():
-        # No metric files => the stream drained zero micro-batches (no new source data since the last
-        # run). A valid outcome, reported as 0, not a failure.
-        num_batches, rows_pushed = 0, 0
+    if STREAMING_TRIGGER_INTERVAL:
+        print(f"continuous streaming: ProcessingTime trigger every {STREAMING_TRIGGER_INTERVAL!r} "
+              f"(always-on; this run does not self-terminate)")
+        query = writer.trigger(processingTime=STREAMING_TRIGGER_INTERVAL).start()
+        # awaitTermination BLOCKS for the life of an always-on run, returning ONLY if the stream stops:
+        # on a FAILURE it re-raises (the run fails and the Jobs continuous trigger auto-restarts it, so a
+        # lost batch never passes silently), and on a GRACEFUL stop (job cancel, redeploy, cluster
+        # shutdown) it returns normally. Either way there is NO drain-and-stop reconciliation for an
+        # always-on run - observability is the per-batch metrics foreachBatch writes as each batch commits
+        # plus the Databricks Jobs continuous-run state (RUNNING / restart count / failure notifications).
+        # So set a summary noting the stop and do NOT run the availableNow summary below (this branch owns
+        # its own RUN_SUMMARY; the drain-and-stop reconciliation is the else branch's, for availableNow).
+        query.awaitTermination()
+        RUN_SUMMARY = (
+            f"streaming_trigger=continuous({STREAMING_TRIGGER_INTERVAL}) stopped; "
+            f"checkpoint={checkpoint_location}"
+        )
+        print(f"CONTINUOUS STREAM STOPPED: {RUN_SUMMARY}")
     else:
-        # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the run
-        # rather than being silently reported as 0.
-        _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
-        _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
-        num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
-    RUN_SUMMARY = (
-        f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
-        f"checkpoint={checkpoint_location}"
-    )
-    if rows_pushed == 0:
-        print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
-    print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
+        # availableNow (drain-and-stop): start, drain to completion, then summarize THIS run.
+        query = writer.trigger(availableNow=True).start()
+        query.awaitTermination()
+
+        # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
+        # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
+        # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
+        # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that
+        # was retried within this run is counted once, not summed twice - then total. A run with no new
+        # source data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid
+        # outcome, not a failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch
+        # that did not fully succeed failed the run instead of recording, and the total is exact.
+        from pyspark.sql import functions as _F  # noqa: E402
+
+        def _metrics_dir_missing():
+            # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
+            # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
+            # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
+            # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
+            # run that already pushed rows is exactly the fail-open bug this must avoid.
+            try:
+                dbutils.fs.ls(metrics_dir)
+                return False  # path exists
+            except Exception as _e:
+                # Verified on this runtime: a missing path raises ExecutionError wrapping
+                # CloudFileNotFoundException with text "No such file or directory". Match the not-found
+                # signal explicitly; re-raise everything else.
+                _msg = str(_e)
+                if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
+                    return True  # positively not-found: no batches wrote metrics
+                raise  # anything else is a real failure - do not swallow it
+
+        if _metrics_dir_missing():
+            # No metric files => the stream drained zero micro-batches (no new source data since the last
+            # run). A valid outcome, reported as 0, not a failure.
+            num_batches, rows_pushed = 0, 0
+        else:
+            # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the
+            # run rather than being silently reported as 0.
+            _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
+            _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
+            num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
+        RUN_SUMMARY = (
+            f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
+            f"checkpoint={checkpoint_location}"
+        )
+        if rows_pushed == 0:
+            print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
+        print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
 
 # COMMAND ----------
 # Fail-closed backstop: every supported mode's cell above sets RUN_SUMMARY. If it is still None, the

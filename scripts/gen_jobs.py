@@ -240,9 +240,34 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     Schedule (cfg["schedule"], per-index) decides WHEN the job runs: None => on-demand (no schedule
     block); otherwise a job `schedule` with the config's quartz_cron_expression, timezone_id UTC, and
     pause_status bound to the schedule_pause_status bundle variable (so a target can pause its schedules).
+
+    Continuous (cfg["continuous"], per-index) is the always-on alternative to schedule (config enforces
+    they are mutually exclusive). When set, the job gets a Databricks Jobs `continuous` trigger instead
+    of a `schedule` - the orchestrator keeps exactly one run perpetually active, auto-restarting it on
+    completion or failure - and the notebook is handed the ProcessingTime cadence via the
+    streaming_trigger_interval base_parameter so it drives a never-terminating micro-batch stream rather
+    than Trigger.availableNow. Continuous is classic-compute only (config rejects serverless); a guard
+    below re-checks that as defense in depth. pause_status reuses the SAME schedule_pause_status bundle
+    variable as schedule (default PAUSED), so dev/stg deploy-but-paused and only prd runs the stream.
     """
     compute = cfg["compute"]
     ctype = compute["type"]
+
+    # Defense in depth: an always-on stream needs the ProcessingTime trigger, which serverless does not
+    # support, so continuous is classic-compute only. validate_config already rejects continuous+
+    # serverless at config load (so the generator never actually sees this combo), but re-check here so
+    # the generator never emits a continuous job on serverless even if that guard were ever bypassed.
+    if cfg["continuous"] is not None and ctype not in ("job_cluster", "existing_cluster"):
+        raise ValueError(
+            f"continuous pipeline '{name}' requires classic compute (job_cluster or existing_cluster), "
+            f"not '{ctype}': serverless supports only Trigger.availableNow, not the ProcessingTime "
+            f"trigger an always-on stream needs"
+        )
+    # The ProcessingTime cadence for a continuous pipeline, passed to the notebook as a base_parameter;
+    # "" for a non-continuous pipeline (notebook then uses Trigger.availableNow). This literal is the
+    # single signal that keeps the job's shape (continuous trigger, below) and the notebook's trigger
+    # in lockstep - one config concept driving both.
+    streaming_trigger_interval = cfg["continuous"]["trigger_interval"] if cfg["continuous"] else ""
 
     # For existing_cluster, the cluster id is a ${var.<name>.cluster_id} reference into the config's
     # cluster_config complex variable, which the bundle resolves to the per-target cluster id at deploy.
@@ -294,6 +319,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
             f"${{var.{hc}.secret_key_name}}",
             "${var.checkpoint_base_path}",
             "${var.ca_certs}",
+            streaming_trigger_interval,
         ),
     }
 
@@ -309,6 +335,10 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
         "description": (
             f"Export pipeline for the {cfg['es_index_name']} Elasticsearch index. Runs the shared "
             f"notebook notebooks/run_index_pipeline.py with this index's config. {compute_desc}"
+            + (
+                f" Runs ALWAYS-ON (continuous trigger; ProcessingTime {streaming_trigger_interval})."
+                if cfg["continuous"] is not None else ""
+            )
         ),
         # Never run two copies of the same index pipeline at once (double-write / checkpoint
         # contention). Fixed at 1 for all jobs, deliberately not parameterized.
@@ -331,6 +361,12 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
             "timezone_id": "UTC",
             "pause_status": "${var.schedule_pause_status}",
         }
+    # Always-on: emit a Databricks Jobs `continuous` trigger (one perpetual, auto-restarting run)
+    # INSTEAD of a schedule (config guarantees the two are mutually exclusive, so at most one block is
+    # emitted). pause_status reuses schedule_pause_status (default PAUSED) so dev/stg deploy-but-paused
+    # and only prd runs the stream - the same fail-safe pause model as scheduled jobs.
+    if cfg["continuous"] is not None:
+        job_def["continuous"] = {"pause_status": "${var.schedule_pause_status}"}
     if ctype == "job_cluster":
         if job_cluster_spec is None:
             raise ValueError(
