@@ -130,6 +130,7 @@ filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
+write_concurrency: 4              # OPTIONAL EsWriteConfig tuning (parallel bulk streams per partition; connector >= 0.7.0); omit for connector default 1
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
 view:                             # the view this pipeline uses
@@ -359,10 +360,16 @@ Two different mechanisms carry values into a job, and they resolve at different 
 - **Job parameters** are `--params` values applied at **run** time, overridable per run without
   redeploying (an invalid value fails the run closed):
   - `pipeline_mode` (`batch` | `streaming`), `filter_condition` (a Spark SQL predicate), and the
-    connector-write tuning knobs `chunk_size`, `require_existing_index`, `verify_certs` all default to
-    their config values (each is an optional config key; see [Configuration](#configuration)).
+    connector-write tuning knobs `chunk_size`, `write_concurrency`, `require_existing_index`,
+    `verify_certs` all default to their config values (each is an optional config key; see
+    [Configuration](#configuration)).
   - For the tuning knobs, a config that omits a knob (and a run that doesn't override it) leaves the
     connector's own default in force.
+  - `write_concurrency` (a positive integer, default the connector's `1`) runs that many bulk request
+    streams in parallel *within each write partition* (requires connector **>= 0.7.0**). Raise it when
+    the write is latency-bound on ES round-trips (executors idle, CPU and network both under-used)
+    rather than CPU/bandwidth-bound; it multiplies with the partition count, so raise it gradually and
+    watch for 429s. Applies to **both** modes.
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).

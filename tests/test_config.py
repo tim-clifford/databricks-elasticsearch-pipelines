@@ -19,6 +19,7 @@ from pipeline_lib.config import (
     require_max_partition_bytes,
     require_pipeline_mode,
     require_streaming_start,
+    require_write_concurrency,
     require_write_repartition,
     resolve_config,
     resolve_name,
@@ -79,6 +80,7 @@ def test_minimal_valid():
     assert out["reference_tables"] == {}
     # The optional tuning knobs, omitted here, default to "" (canonical "unset" => connector default).
     assert out["chunk_size"] == ""
+    assert out["write_concurrency"] == ""
     assert out["require_existing_index"] == ""
     assert out["verify_certs"] == ""
     # write_repartition and max_partition_bytes are the exceptions: omitted, they take a built-in
@@ -86,6 +88,15 @@ def test_minimal_valid():
     # lever); max_partition_bytes defaults to the built-in scan-parallelism size.
     assert out["write_repartition"] == "0"
     assert out["max_partition_bytes"] == "2m"
+
+
+def test_write_concurrency_config_default_parsed_and_validated():
+    cfg = _base()
+    cfg["write_concurrency"] = 8
+    assert validate_config(cfg)["write_concurrency"] == "8"   # YAML int -> canonical string form
+    cfg["write_concurrency"] = 0                              # not a positive int
+    with pytest.raises(PipelineConfigError, match="write_concurrency"):
+        validate_config(cfg)
 
 
 def test_environment_token_accepted_as_template():
@@ -487,7 +498,7 @@ def test_job_base_parameters_excludes_run_time_params():
     # tuning knobs) must NOT leak into base_parameters, which would re-fix them at deploy and defeat
     # per-run override.
     params = _job_base_parameters("x")
-    for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "require_existing_index",
+    for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "write_concurrency", "require_existing_index",
                      "verify_certs", "streaming_start", "write_repartition", "max_partition_bytes"):
         assert run_time not in params
 
@@ -513,6 +524,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "pipeline_mode", "default": "batch"},
         {"name": "filter_condition", "default": "action = 'allowed'"},
         {"name": "chunk_size", "default": ""},
+        {"name": "write_concurrency", "default": ""},
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
         {"name": "streaming_start", "default": "new"},
@@ -594,6 +606,17 @@ def test_write_config_overrides_bad_chunk_size_fails_closed(bad):
         write_config_overrides(bad, "", "")
 
 
+def test_write_config_overrides_write_concurrency_parsed():
+    assert write_config_overrides("", "", "", "4") == {"write_concurrency": 4}
+    assert write_config_overrides("", "", "", " 8 ") == {"write_concurrency": 8}
+
+
+@pytest.mark.parametrize("bad", ["abc", "2.5", "0", "-1", "1e2"])
+def test_write_config_overrides_bad_write_concurrency_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="write_concurrency"):
+        write_config_overrides("", "", "", bad)
+
+
 @pytest.mark.parametrize("value,expected", [("true", True), ("false", False), ("True", True), ("FALSE", False), (" true ", True)])
 def test_write_config_overrides_booleans_parsed(value, expected):
     assert write_config_overrides("", value, "") == {"require_existing_index": expected}
@@ -610,8 +633,9 @@ def test_write_config_overrides_bad_boolean_fails_closed(bad):
 
 
 def test_write_config_overrides_combined():
-    assert write_config_overrides("500", "false", "false") == {
+    assert write_config_overrides("500", "false", "false", "4") == {
         "chunk_size": 500,
+        "write_concurrency": 4,
         "require_existing_index": False,
         "verify_certs": False,
     }
