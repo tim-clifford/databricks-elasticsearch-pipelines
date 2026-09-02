@@ -167,6 +167,7 @@ from pipeline_lib.config import (  # noqa: E402
     require_max_partition_bytes,
     require_pipeline_mode,
     require_streaming_start,
+    require_trigger_interval,
     require_write_repartition,
     resolve_config,
     view_select_body,
@@ -202,6 +203,15 @@ if STREAMING_TRIGGER_INTERVAL and PIPELINE_MODE != "streaming":
         f"pipeline_mode=streaming, got {PIPELINE_MODE!r}: a terminating {PIPELINE_MODE} run under a "
         f"continuous trigger would auto-restart in an endless loop. Remove the pipeline_mode override, "
         f"or run this config's batch export as a separate, non-continuous job."
+    )
+# Re-validate the continuous ProcessingTime cadence against the SAME grammar the config schema uses,
+# BEFORE it reaches Trigger.ProcessingTime. streaming_trigger_interval is a deploy-time base_parameter
+# baked by the generator, so a stale-generated (from before the grammar was tightened) or hand-edited
+# value would otherwise slip through to .start() and, under the Jobs continuous trigger, loop instead of
+# failing once. Empty => availableNow, nothing to validate.
+if STREAMING_TRIGGER_INTERVAL:
+    STREAMING_TRIGGER_INTERVAL = require_trigger_interval(
+        STREAMING_TRIGGER_INTERVAL, "streaming_trigger_interval base parameter"
     )
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY)

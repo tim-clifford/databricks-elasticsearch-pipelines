@@ -21,6 +21,7 @@ from pipeline_lib.config import (
     require_max_partition_bytes,
     require_pipeline_mode,
     require_streaming_start,
+    require_trigger_interval,
     require_write_concurrency,
     require_write_repartition,
     resolve_config,
@@ -1184,6 +1185,7 @@ def test_continuous_trigger_interval_allowed_forms(good):
 @pytest.mark.parametrize("bad", [
     "30", "0", "seconds", "minute",                     # missing a number or a unit
     "5s", "2h", "250us", "10 mins", "500 ms", "30seconds",  # abbreviated / space-less: Spark-invalid, would loop
+    "1.5 minutes", "1.5 hours", "1.5 days",             # fractional on a non-second unit: Spark-invalid
     "30 fortnights", "30 secondz", "5 blah",            # unknown / malformed unit
     "-5 seconds", "-1 minute", "1 minute -30 seconds",  # negative duration
 ])
@@ -1196,6 +1198,20 @@ def test_continuous_trigger_interval_rejects_malformed(bad):
     cfg["continuous"] = {"trigger_interval": bad}
     with pytest.raises(PipelineConfigError, match="trigger_interval"):
         validate_config(cfg)
+
+
+def test_require_trigger_interval_returns_stripped():
+    # The shared helper (also called by the runner notebook on its base_parameter) returns the trimmed
+    # value on a valid interval.
+    assert require_trigger_interval("  30 seconds  ", "streaming_trigger_interval") == "30 seconds"
+
+
+@pytest.mark.parametrize("bad", ["", "5s", "30seconds", "1.5 minutes", "10 mins", None, 30])
+def test_require_trigger_interval_fails_closed(bad):
+    # The notebook re-validates the deploy-time base_parameter through this same helper, so a stale or
+    # hand-edited value fails closed here rather than looping at Trigger.ProcessingTime.
+    with pytest.raises(PipelineConfigError, match="streaming_trigger_interval"):
+        require_trigger_interval(bad, "streaming_trigger_interval")
 
 
 @pytest.mark.parametrize("bad", ["nope", 5, ["30 seconds"]])

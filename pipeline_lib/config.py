@@ -117,9 +117,16 @@ _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 # invalid and must be rejected here, not passed through to loop. So: one or more whitespace-separated
 # "<number> <full-word-unit>" terms (compound like "1 minute 30 seconds" allowed), a decimal quantity
 # allowed ("1.5 seconds"). Months/years are omitted (ProcessingTime rejects a month-bearing interval).
-# "0 seconds" is allowed (Spark reads it as "run micro-batches as fast as possible").
-_TRIGGER_INTERVAL_UNIT = r"(?:microseconds?|milliseconds?|seconds?|minutes?|hours?|days?|weeks?)"
-_TRIGGER_INTERVAL_TERM = r"\d+(?:\.\d+)?\s+" + _TRIGGER_INTERVAL_UNIT  # \s+ : whitespace REQUIRED
+# "0 seconds" is allowed (Spark reads it as "run micro-batches as fast as possible"). One more
+# stringToInterval subtlety: a FRACTIONAL quantity is accepted only for the SUB-SECOND units (a decimal
+# second like "1.5 seconds"); minute/hour/day/week parse an INTEGER and reject a decimal. So the term
+# splits in two: a sub-second unit may carry an optional decimal, a whole unit may not - matching what
+# the parser accepts, so "1.5 minutes" is rejected here rather than looping at .start().
+_TRIGGER_INTERVAL_SUBSEC_UNIT = r"(?:microseconds?|milliseconds?|seconds?)"  # fractional quantity allowed
+_TRIGGER_INTERVAL_WHOLE_UNIT = r"(?:minutes?|hours?|days?|weeks?)"          # integer quantity only
+_TRIGGER_INTERVAL_TERM = (
+    r"\d+(?:(?:\.\d+)?\s+" + _TRIGGER_INTERVAL_SUBSEC_UNIT + r"|\s+" + _TRIGGER_INTERVAL_WHOLE_UNIT + r")"
+)  # <number> then EITHER optional-decimal + ws + sub-second unit, OR ws + whole unit (\s+ : ws REQUIRED)
 _VALID_TRIGGER_INTERVAL = re.compile(
     r"^" + _TRIGGER_INTERVAL_TERM + r"(?:\s+" + _TRIGGER_INTERVAL_TERM + r")*$", re.IGNORECASE
 )
@@ -213,6 +220,35 @@ def require_streaming_start(value: object, where: str = "streaming_start") -> st
             f"{where} must be one of {', '.join(_VALID_STREAMING_STARTS)}, got {value!r}"
         )
     return value
+
+
+def require_trigger_interval(value: object, where: str = "trigger_interval") -> str:
+    """A continuous pipeline's ProcessingTime cadence: a Spark interval string in the full-word grammar
+    Spark's parser accepts (see _VALID_TRIGGER_INTERVAL). Returns the stripped value; fail closed on an
+    empty/non-string/malformed one.
+
+    Public because it validates two things (like require_pipeline_mode): the config's
+    continuous.trigger_interval (checked at config load by _validate_continuous) AND the deploy-time
+    streaming_trigger_interval base_parameter the runner notebook receives. Re-validating in the notebook
+    matters because that base_parameter is baked by the generator: a stale-generated or hand-edited value
+    (e.g. an abbreviated '5s' from before this grammar was tightened) would otherwise reach
+    Trigger.ProcessingTime and, on an always-on run, fail at .start() and loop under the Jobs continuous
+    trigger. One shared validator means both apply the identical grammar (single source of truth)."""
+    if not isinstance(value, str) or not value.strip():
+        raise PipelineConfigError(
+            f"{where} is required and must be a non-empty Spark interval string like '30 seconds' or "
+            f"'1 minute', got {value!r}"
+        )
+    interval = value.strip()
+    if not _VALID_TRIGGER_INTERVAL.match(interval):
+        raise PipelineConfigError(
+            f"{where} must be a Spark ProcessingTime interval: one or more '<number> <unit>' terms with "
+            f"a FULL-WORD unit and a space, e.g. '30 seconds', '1 minute', '500 milliseconds', "
+            f"'1 minute 30 seconds'. Abbreviated or space-less forms ('5s', '10 mins', '30seconds'), a "
+            f"fractional non-second quantity ('1.5 minutes'), and unknown units are rejected (they would "
+            f"fail only at stream start and loop on a continuous run). Got {interval!r}"
+        )
+    return interval
 
 
 def require_filter_condition(value: object, where: str = "filter_condition") -> str:
@@ -812,22 +848,9 @@ def _validate_continuous(node: object, where: str = "continuous") -> dict | None
             f"{where} has unknown key(s): {', '.join(unknown)}; allowed: trigger_interval"
         )
 
-    interval = node.get("trigger_interval")
-    if not isinstance(interval, str) or not interval.strip():
-        raise PipelineConfigError(
-            f"{where}.trigger_interval is required and must be a non-empty Spark interval string like "
-            f"'30 seconds' or '1 minute', got {interval!r}"
-        )
-    interval = interval.strip()
-    if not _VALID_TRIGGER_INTERVAL.match(interval):
-        raise PipelineConfigError(
-            f"{where}.trigger_interval must be a Spark ProcessingTime interval: one or more "
-            f"'<number> <unit>' terms with a FULL-WORD unit and a space, e.g. '30 seconds', '1 minute', "
-            f"'500 milliseconds', '1 minute 30 seconds'. Abbreviated or space-less forms ('5s', '10 "
-            f"mins', '30seconds') are Spark-invalid and rejected (they would fail only at stream start "
-            f"and loop on a continuous run). Got {interval!r}"
-        )
-    return {"trigger_interval": interval}
+    # Validate trigger_interval with the SHARED helper (the same one the runner notebook re-applies to
+    # its deploy-time base_parameter), so config load and run time enforce one grammar.
+    return {"trigger_interval": require_trigger_interval(node.get("trigger_interval"), f"{where}.trigger_interval")}
 
 
 def resolve_config(cfg: dict, environment: str) -> dict:
