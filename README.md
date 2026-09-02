@@ -107,7 +107,7 @@ value fails closed wherever the value is required. The bundle variables are:
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Set per target (empty on `main`). Required for a streaming run (fails closed if empty); unused by batch and `deploy_views`. The `dev` target shows how to append `${workspace.current_user.short_name}` to isolate each developer's checkpoints (see [Streaming](#streaming)) |
 | `cluster_policy_id` | workspace-specific cluster policy id injected into every job cluster (see [Compute](#compute)). Set per target (empty on `main`); required only when a pipeline uses `job_cluster` compute |
 | `ca_certs` | UC Volume path to a CA bundle (PEM) the connector uses to verify the ES server's TLS certificate. One global bundle shared by every host config. Set per target (empty on `main`); empty means fall back to the system CA store. Incompatible with `verify_certs: false` (the connector rejects that combination at run). Per-endpoint CA pinning is not supported (would need `ca_certs` moved onto the `es_host_*` complex variables) |
-| `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy schedules without firing them; only `prd` binds `UNPAUSED` to actually run them. Only affects jobs that declare a `schedule` (see [Scheduling](#scheduling)) |
+| `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
 
 The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
 pipeline selects, with values that differ per environment. See
@@ -134,6 +134,8 @@ verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES
 write_concurrency: 4              # OPTIONAL EsWriteConfig tuning (parallel bulk streams per partition; connector >= 0.7.0); omit for connector default 1
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
+max_files_per_trigger: 1000       # OPTIONAL streaming read rate-limit: max Delta files per micro-batch; omit for Spark default 1000. Useful to throttle a full backfill / post-restart catch-up
+max_bytes_per_trigger: 128m       # OPTIONAL streaming read rate-limit: max bytes per micro-batch; omit for no cap
 view:                             # the view this pipeline uses
   catalog: acme_${environment}
   schema: es_poc
@@ -155,6 +157,8 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
 #   cluster_config: interactive_primary   # names a per-target databricks.yml cluster config (complex var with a cluster_id field)
 # schedule:                        # OPTIONAL: when this job runs. Omit for on-demand (see Scheduling)
 #   quartz_cron_expression: "0 0 8 * * ?"   # 08:00 UTC daily
+# continuous:                      # OPTIONAL: run always-on instead of scheduled (see Continuous streaming).
+#   trigger_interval: 30 seconds   #   streaming + classic compute only; mutually exclusive with schedule
 ```
 
 A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token
@@ -341,6 +345,48 @@ without touching configs: `dev` and `stg` inherit the paused default, so schedul
 **dormant** in both; only `prd` binds `UNPAUSED` and actually fires them. Unpause a single job in the
 UI/API for a one-off test, or set `--var=schedule_pause_status=UNPAUSED` at deploy to override.
 
+### Continuous (always-on) streaming
+
+A scheduled `streaming` job drains the new commits and stops on each tick. For lower latency you can
+instead run a stream **always-on** with a `continuous` block (mutually exclusive with `schedule`):
+
+```yaml
+pipeline_mode: streaming
+compute:
+  type: job_cluster            # classic compute REQUIRED (see below)
+  job_cluster_config: standard_batch
+continuous:
+  trigger_interval: 30 seconds  # Spark ProcessingTime cadence
+```
+
+This emits a Databricks Jobs **continuous** trigger: the orchestrator keeps exactly one run perpetually
+active and auto-restarts it on completion or failure (self-healing), and the runner drives the stream
+with `Trigger.ProcessingTime(interval)` instead of `Trigger.availableNow`, so it never terminates.
+`trigger_interval` is the target gap between the **start** of one micro-batch and the next (batches
+never overlap); a shorter interval trades ES/Delta efficiency (more, smaller bulk writes and index
+refreshes) for lower latency.
+
+**Classic compute only.** Serverless notebooks/jobs support only `Trigger.availableNow`, not the
+`ProcessingTime` trigger an always-on stream needs. So `continuous` requires `compute.type`
+`job_cluster` or `existing_cluster`; `continuous` on serverless, `continuous` with `pipeline_mode:
+batch`, and `continuous` together with `schedule` are each rejected at config load (and by
+`gen_jobs.py --check`), before deploy. Each restart resumes from the checkpoint, so `streaming_start`
+matters only on the very first run.
+
+**Pausing.** Like a schedule, the continuous trigger's `pause_status` is bound to
+`schedule_pause_status` (default `PAUSED`), so `dev`/`stg` deploy the always-on job **dormant** and
+only `prd` (or an explicit `--var=schedule_pause_status=UNPAUSED`) actually runs it. One always-on run
+holds its job cluster for as long as it is unpaused, so treat it as a running-cost commitment.
+
+**Observability.** An always-on run never reaches the end-of-run summary (it never terminates), so
+health comes from the Databricks Jobs continuous-run state (RUNNING / restart count / failure
+notifications) plus the per-batch metrics the runner writes as each batch commits. Bound a first-run
+backfill or a large post-restart catch-up with `max_files_per_trigger` / `max_bytes_per_trigger` so one
+micro-batch does not try to read the whole table.
+
+See [`_pipelines/pipeline_configs/ecs_dns_activity_continuous.yml`](_pipelines/pipeline_configs/ecs_dns_activity_continuous.yml)
+for a worked example.
+
 ## Deploy and run
 
 The bundle defines three **targets**, selected with `-t`: `dev` (the default), `stg`, and `prd`.
@@ -380,6 +426,10 @@ Two different mechanisms carry values into a job, and they resolve at different 
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).
+  - `max_files_per_trigger` / `max_bytes_per_trigger` (a count and a Spark byte-size; default unset)
+    bound each **streaming** micro-batch (Spark defaults: 1000 files, no byte cap). Most useful to
+    throttle a `streaming_start=full` backfill or a large post-restart catch-up so one micro-batch does
+    not read the whole table. Ignored by batch.
   - `max_partition_bytes` (a Spark byte-size such as `2m`, default `2m`) sets
     `spark.sql.files.maxPartitionBytes` for the source read. Smaller values produce more, smaller file
     splits, so the scan and the view transform fan out across more cores. This is the primary
@@ -429,10 +479,12 @@ commit even placeholder paths? Put the per-target values in the git-ignored
 
 ## Streaming
 
-A `pipeline_mode=streaming` run reads the **raw source table** as a Delta stream
-(`Trigger.availableNow`: it drains all currently-available new commits, then stops, so each job run
-exports what's arrived since the last run), applies the view's own transform to each micro-batch, and
-bulk-writes it. Schedule the job (or run it on demand) to keep an index current.
+A `pipeline_mode=streaming` run reads the **raw source table** as a Delta stream, applies the view's own
+transform to each micro-batch, and bulk-writes it. By default it uses `Trigger.availableNow`: it drains
+all currently-available new commits, then stops, so each job run exports what's arrived since the last
+run. Schedule the job (or run it on demand) to keep an index current, or make it **always-on** with a
+[`continuous`](#continuous-always-on-streaming) block, which drives the same stream with a
+never-terminating `Trigger.ProcessingTime` micro-batch trigger on classic compute instead.
 
 Key behaviors:
 
