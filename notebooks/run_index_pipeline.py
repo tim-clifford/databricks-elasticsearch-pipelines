@@ -558,65 +558,70 @@ if PIPELINE_MODE == "streaming":
         print(f"continuous streaming: ProcessingTime trigger every {STREAMING_TRIGGER_INTERVAL!r} "
               f"(always-on; this run does not self-terminate)")
         query = writer.trigger(processingTime=STREAMING_TRIGGER_INTERVAL).start()
-        # awaitTermination BLOCKS for the life of the run (a continuous stream never terminates on its
-        # own). Observability is therefore NOT the end-of-run summary below - it can't be reached while
-        # the stream runs - but the per-batch metrics foreachBatch writes to the metrics table as each
-        # batch commits, plus the Databricks Jobs continuous-run state (RUNNING / restart count /
-        # failure notifications). If the stream ever fails, awaitTermination re-raises and the run fails
-        # (the Jobs continuous trigger then auto-restarts it), so a lost batch never passes silently.
+        # awaitTermination BLOCKS for the life of an always-on run, returning ONLY if the stream stops:
+        # on a FAILURE it re-raises (the run fails and the Jobs continuous trigger auto-restarts it, so a
+        # lost batch never passes silently), and on a GRACEFUL stop (job cancel, redeploy, cluster
+        # shutdown) it returns normally. Either way there is NO drain-and-stop reconciliation for an
+        # always-on run - observability is the per-batch metrics foreachBatch writes as each batch commits
+        # plus the Databricks Jobs continuous-run state (RUNNING / restart count / failure notifications).
+        # So set a summary noting the stop and do NOT run the availableNow summary below (this branch owns
+        # its own RUN_SUMMARY; the drain-and-stop reconciliation is the else branch's, for availableNow).
         query.awaitTermination()
+        RUN_SUMMARY = (
+            f"streaming_trigger=continuous({STREAMING_TRIGGER_INTERVAL}) stopped; "
+            f"checkpoint={checkpoint_location}"
+        )
+        print(f"CONTINUOUS STREAM STOPPED: {RUN_SUMMARY}")
     else:
-        # availableNow (drain-and-stop): start and drain to completion, then fall through to summarize.
+        # availableNow (drain-and-stop): start, drain to completion, then summarize THIS run.
         query = writer.trigger(availableNow=True).start()
         query.awaitTermination()
 
-    # SUMMARY (availableNow path only). In continuous mode the branch above blocks in awaitTermination
-    # and never reaches here, so this end-of-run reconciliation is for the drain-and-stop path.
-    # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
-    # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
-    # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
-    # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that was
-    # retried within this run is counted once, not summed twice - then total. A run with no new source
-    # data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid outcome, not a
-    # failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch that did not fully
-    # succeed failed the run instead of recording, and a TERMINATED-SUCCESS total is exact.
-    from pyspark.sql import functions as _F  # noqa: E402
+        # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
+        # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
+        # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
+        # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that
+        # was retried within this run is counted once, not summed twice - then total. A run with no new
+        # source data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid
+        # outcome, not a failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch
+        # that did not fully succeed failed the run instead of recording, and the total is exact.
+        from pyspark.sql import functions as _F  # noqa: E402
 
-    def _metrics_dir_missing():
-        # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
-        # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
-        # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
-        # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
-        # run that already pushed rows is exactly the fail-open bug this must avoid.
-        try:
-            dbutils.fs.ls(metrics_dir)
-            return False  # path exists
-        except Exception as _e:
-            # Verified on this runtime: a missing path raises ExecutionError wrapping
-            # CloudFileNotFoundException with text "No such file or directory". Match the not-found
-            # signal explicitly; re-raise everything else.
-            _msg = str(_e)
-            if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
-                return True  # positively not-found: no batches wrote metrics
-            raise  # anything else is a real failure - do not swallow it
+        def _metrics_dir_missing():
+            # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
+            # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
+            # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
+            # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
+            # run that already pushed rows is exactly the fail-open bug this must avoid.
+            try:
+                dbutils.fs.ls(metrics_dir)
+                return False  # path exists
+            except Exception as _e:
+                # Verified on this runtime: a missing path raises ExecutionError wrapping
+                # CloudFileNotFoundException with text "No such file or directory". Match the not-found
+                # signal explicitly; re-raise everything else.
+                _msg = str(_e)
+                if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
+                    return True  # positively not-found: no batches wrote metrics
+                raise  # anything else is a real failure - do not swallow it
 
-    if _metrics_dir_missing():
-        # No metric files => the stream drained zero micro-batches (no new source data since the last
-        # run). A valid outcome, reported as 0, not a failure.
-        num_batches, rows_pushed = 0, 0
-    else:
-        # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the run
-        # rather than being silently reported as 0.
-        _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
-        _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
-        num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
-    RUN_SUMMARY = (
-        f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
-        f"checkpoint={checkpoint_location}"
-    )
-    if rows_pushed == 0:
-        print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
-    print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
+        if _metrics_dir_missing():
+            # No metric files => the stream drained zero micro-batches (no new source data since the last
+            # run). A valid outcome, reported as 0, not a failure.
+            num_batches, rows_pushed = 0, 0
+        else:
+            # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the
+            # run rather than being silently reported as 0.
+            _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
+            _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
+            num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
+        RUN_SUMMARY = (
+            f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
+            f"checkpoint={checkpoint_location}"
+        )
+        if rows_pushed == 0:
+            print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
+        print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
 
 # COMMAND ----------
 # Fail-closed backstop: every supported mode's cell above sets RUN_SUMMARY. If it is still None, the
