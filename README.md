@@ -142,7 +142,7 @@ source:                           # the single source table the pipeline reads f
   catalog: acme_${environment}
   schema: ocsf
   table: dns_activity
-  primary_key: dsl_id             # source-table column identifying a unique row (for the streaming read)
+  primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column (not used at runtime today)
 reference_tables:                 # OPTIONAL: holds one alias entry per joined table (add as many
                                   # alias entries below as you have reference tables)
   validation:                     # 'validation' is an EXAMPLE alias you choose; it is the
@@ -162,14 +162,20 @@ fails closed at **run** (the runner folds the token in when the job runs; `bundl
 don't resolve it) if `environment` is empty or would produce an illegal identifier (e.g. one containing
 a hyphen).
 
-`es_id_field` and `source.primary_key` are two distinct keys for two distinct contexts: `es_id_field`
-is a column of the **view's** output, handed to the connector as the ES document `_id`; `primary_key`
-is a column of the **source table**, used by the streaming read to identify a unique row. They often
-share a value but need not, and neither defaults to the other. When `es_id_field` is set and
-`deploy_views` creates a view it verifies `es_id_field` is actually one of that view's output columns
-(against Spark's resolved schema), so a typo fails the deploy rather than surfacing later at export time.
+`es_id_field` and `source.primary_key` are two distinct keys for two distinct contexts, and **both are
+optional**: `es_id_field` is a column of the **view's** output, handed to the connector as the ES
+document `_id`; `primary_key` names the **source table's** unique-row column. They often share a value
+but need not, and neither defaults to the other. When `es_id_field` is set and `deploy_views` creates a
+view it verifies `es_id_field` is actually one of that view's output columns (against Spark's resolved
+schema), so a typo fails the deploy rather than surfacing later at export time.
 
-`es_id_field` is **optional** (unlike `source.primary_key`, which is required). Set it and each
+`source.primary_key` is **informational only**: no code reads it at runtime. Every streaming pipeline
+assumes an **append-only** stream (updates and deletes are not processed), so there is nothing to
+de-duplicate against a key. It's recorded so a config documents the source's real key. If the repo ever
+gains full CDC support, `primary_key` would become **required** for any pipeline that has to apply
+updates or deletes; until then you can set it or omit it freely.
+
+`es_id_field` is likewise **optional**. Set it and each
 document's `_id` is that column's value, so a re-run **upserts** over the same documents: the write is
 idempotent and a retried batch or restarted stream converges to one document per id. **Omit it and the
 pipeline passes no id_field to the connector, so ES assigns a random `_id` to every document.** That is
@@ -479,7 +485,7 @@ You edit these, one pair per pipeline (all under _pipelines/, the pipeline-confi
       <view_name>.sql           The view: what gets exported (filename == view.name)
     pipeline_configs/
       <config_name>.yml         The config: view/source/reference locations + es_index_name,
-                                pipeline_mode, source.primary_key, optional es_id_field/compute
+                                pipeline_mode, optional es_id_field/source.primary_key/compute
                                 + schedule (see Configuration)
     job_cluster_configs/
       <key>.yml                 OPTIONAL reusable new_cluster specs, referenced by key from a
