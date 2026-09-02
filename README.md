@@ -386,7 +386,9 @@ Two different mechanisms carry values into a job, and they resolve at different 
     default because `max_partition_bytes` already parallelizes the read and that partitioning flows
     through to the write. Set it `> 0` (a good target is ~2-3x total worker cores) only when the write
     needs parallelism the read does not supply, e.g. a view that **shuffles** (a non-broadcast join,
-    `GROUP BY`, `DISTINCT`, window) resets the post-shuffle partition count. Applies to **both** modes.
+    `GROUP BY`, `DISTINCT`, window) resets the post-shuffle partition count, or **large source files**
+    that read into too few partitions to spread the write across the cluster (a smaller
+    `max_partition_bytes` splits them further, but repartitioning also fixes it). Applies to **both** modes.
 
 ```bash
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
