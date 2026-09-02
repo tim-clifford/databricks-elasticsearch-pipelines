@@ -118,15 +118,17 @@ _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 # "<number> <full-word-unit>" terms (compound like "1 minute 30 seconds" allowed), a decimal quantity
 # allowed ("1.5 seconds"). Months/years are omitted (ProcessingTime rejects a month-bearing interval).
 # "0 seconds" is allowed (Spark reads it as "run micro-batches as fast as possible"). One more
-# stringToInterval subtlety: a FRACTIONAL quantity is accepted only for the SUB-SECOND units (a decimal
-# second like "1.5 seconds"); minute/hour/day/week parse an INTEGER and reject a decimal. So the term
-# splits in two: a sub-second unit may carry an optional decimal, a whole unit may not - matching what
-# the parser accepts, so "1.5 minutes" is rejected here rather than looping at .start().
-_TRIGGER_INTERVAL_SUBSEC_UNIT = r"(?:microseconds?|milliseconds?|seconds?)"  # fractional quantity allowed
-_TRIGGER_INTERVAL_WHOLE_UNIT = r"(?:minutes?|hours?|days?|weeks?)"          # integer quantity only
+# stringToInterval subtlety: a FRACTIONAL quantity is accepted ONLY for the `second` unit - the parser
+# throws INVALID_FRACTION_OF_SECOND when a non-'s' unit carries a decimal (`if (b != 's' && fractionScale
+# >= 0)`). So "1.5 seconds" is valid but "1.5 minutes"/"1.5 milliseconds" are not. The term therefore
+# splits in two: only `second(s)` may carry an optional decimal; every other unit (micro/millisecond,
+# minute, hour, day, week) takes an INTEGER - matching the parser, so a fractional non-second value is
+# rejected here rather than looping at .start().
+_TRIGGER_INTERVAL_FRAC_UNIT = r"seconds?"  # 'second(s)' only: the sole unit Spark lets carry a decimal
+_TRIGGER_INTERVAL_INT_UNIT = r"(?:microseconds?|milliseconds?|minutes?|hours?|days?|weeks?)"  # integer only
 _TRIGGER_INTERVAL_TERM = (
-    r"\d+(?:(?:\.\d+)?\s+" + _TRIGGER_INTERVAL_SUBSEC_UNIT + r"|\s+" + _TRIGGER_INTERVAL_WHOLE_UNIT + r")"
-)  # <number> then EITHER optional-decimal + ws + sub-second unit, OR ws + whole unit (\s+ : ws REQUIRED)
+    r"\d+(?:(?:\.\d+)?\s+" + _TRIGGER_INTERVAL_FRAC_UNIT + r"|\s+" + _TRIGGER_INTERVAL_INT_UNIT + r")"
+)  # <number> then EITHER optional-decimal + ws + 'seconds', OR ws + an integer-only unit (\s+ : ws REQUIRED)
 _VALID_TRIGGER_INTERVAL = re.compile(
     r"^" + _TRIGGER_INTERVAL_TERM + r"(?:\s+" + _TRIGGER_INTERVAL_TERM + r")*$", re.IGNORECASE
 )
