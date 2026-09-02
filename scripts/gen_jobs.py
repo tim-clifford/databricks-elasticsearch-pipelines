@@ -283,7 +283,8 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
         "notebook_path": "../notebooks/run_index_pipeline.py",
         # The notebook loads its own config at runtime (the generator can't know the deploy-time
         # values), so it just needs the config name plus the deploy-time bundle-variable refs
-        # (environment, wheel_path, this pipeline's ES host-config fields, and the checkpoint base).
+        # (environment, wheel_path, this pipeline's ES host-config fields, the checkpoint base, and the
+        # global ca_certs bundle).
         "base_parameters": job_base_parameters(
             name,
             "${var.environment}",
@@ -292,6 +293,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
             f"${{var.{hc}.secret_scope_name}}",
             f"${{var.{hc}.secret_key_name}}",
             "${var.checkpoint_base_path}",
+            "${var.ca_certs}",
         ),
     }
 

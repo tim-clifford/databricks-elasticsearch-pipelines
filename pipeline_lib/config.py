@@ -829,6 +829,7 @@ def job_base_parameters(
     secret_scope_name_ref: str,
     secret_key_name_ref: str,
     checkpoint_base_path_ref: str,
+    ca_certs_ref: str,
 ) -> dict:
     """The DEPLOY-TIME values the generated per-index job passes to run_index_pipeline.py as widgets.
 
@@ -846,6 +847,9 @@ def job_base_parameters(
     - `checkpoint_base_path_ref` (e.g. "${var.checkpoint_base_path}"): the global base path (a UC
       Volume) under which each STREAMING job keeps its checkpoint; the runner appends /<config_name>
       so each stream gets a stable, unique subfolder. Unused by batch runs.
+    - `ca_certs_ref` (e.g. "${var.ca_certs}"): the global path to a CA bundle (PEM) the connector uses
+      to verify the ES TLS cert. One global bundle for every host config; empty => the runner omits it
+      and the connector falls back to the system CAs.
     All values are strings, as job base_parameters must be.
 
     Run-time-overridable knobs (pipeline_mode, filter_condition, streaming_start, the EsWriteConfig
@@ -860,6 +864,7 @@ def job_base_parameters(
         "secret_scope_name": secret_scope_name_ref,
         "secret_key_name": secret_key_name_ref,
         "checkpoint_base_path": checkpoint_base_path_ref,
+        "ca_certs": ca_certs_ref,
     }
 
 

@@ -77,6 +77,15 @@ def test_render_wires_es_host_config_fields():
     assert bp["secret_key_name"] == "${var.es_host_secondary.secret_key_name}"
 
 
+def test_render_wires_global_deploy_vars():
+    # wheel_path, checkpoint_base_path and ca_certs are GLOBAL bundle variables (one value for every
+    # job), so every generated task references them verbatim, independent of the pipeline's host config.
+    bp = _render_job(_cfg())["tasks"][0]["notebook_task"]["base_parameters"]
+    assert bp["wheel_path"] == "${var.wheel_path}"
+    assert bp["checkpoint_base_path"] == "${var.checkpoint_base_path}"
+    assert bp["ca_certs"] == "${var.ca_certs}"
+
+
 def test_render_all_jobs_max_concurrent_runs_1():
     for compute, spec in (
         (None, None),
