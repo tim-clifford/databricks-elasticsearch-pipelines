@@ -121,11 +121,14 @@ _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 # stringToInterval subtlety: a FRACTIONAL quantity is accepted ONLY for the `second` unit - the parser
 # throws INVALID_FRACTION_OF_SECOND when a non-'s' unit carries a decimal (`if (b != 's' && fractionScale
 # >= 0)`). So "1.5 seconds" is valid but "1.5 minutes"/"1.5 milliseconds" are not. The term therefore
-# splits in two: only `second(s)` may carry an optional decimal; every other unit (micro/millisecond,
-# minute, hour, day, week) takes an INTEGER - matching the parser, so a fractional non-second value is
-# rejected here rather than looping at .start().
+# splits in two: only `second(s)` may carry an optional decimal; every other unit (millisecond, minute,
+# hour, day, week) takes an INTEGER - matching the parser, so a fractional non-second value is rejected
+# here rather than looping at .start(). `microsecond` is deliberately NOT allowed: Trigger.ProcessingTime
+# has MILLISECOND granularity, so a sub-millisecond interval truncates to 0 (a misleading no-op); the
+# smallest meaningful unit is millisecond, and sub-second cadences below that are expressible as a
+# fractional-second ("0.5 seconds") if ever needed.
 _TRIGGER_INTERVAL_FRAC_UNIT = r"seconds?"  # 'second(s)' only: the sole unit Spark lets carry a decimal
-_TRIGGER_INTERVAL_INT_UNIT = r"(?:microseconds?|milliseconds?|minutes?|hours?|days?|weeks?)"  # integer only
+_TRIGGER_INTERVAL_INT_UNIT = r"(?:milliseconds?|minutes?|hours?|days?|weeks?)"  # integer only (no sub-ms microseconds)
 # The quantity is BOUNDED: at most 7 integer digits and (for seconds) 6 fractional digits. An unbounded
 # quantity ("999999999999 weeks") satisfies the format but overflows the Long microseconds stringToInterval
 # accumulates into, throwing at .start() and looping on a continuous run; 7 digits stays under Long.MAX

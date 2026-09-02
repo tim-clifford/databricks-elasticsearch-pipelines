@@ -1172,7 +1172,7 @@ def test_continuous_trigger_interval_required(bad):
 
 @pytest.mark.parametrize("good", [
     "30 seconds", "1 minute", "500 milliseconds", "2 hours", "0 seconds", "1.5 seconds",
-    "1 minute 30 seconds", "1 day", "250 microseconds",
+    "1 minute 30 seconds", "1 day", "1 week",
 ])
 def test_continuous_trigger_interval_allowed_forms(good):
     # The allow-list accepts one-or-more "<number> <full-word-unit>" terms (Spark's stringToInterval
@@ -1186,7 +1186,8 @@ def test_continuous_trigger_interval_allowed_forms(good):
     "30", "0", "seconds", "minute",                     # missing a number or a unit
     "5s", "2h", "250us", "10 mins", "500 ms", "30seconds",  # abbreviated / space-less: Spark-invalid, would loop
     "1.5 minutes", "1.5 hours", "1.5 days",             # fractional on a non-second unit: Spark-invalid
-    "1.5 milliseconds", "1.5 microseconds",             # fractional allowed ONLY for 'second' (Spark: b=='s')
+    "1.5 milliseconds",                                 # fractional allowed ONLY for 'second' (Spark: b=='s')
+    "250 microseconds", "1 microsecond",                # sub-millisecond: below ProcessingTime granularity
     "999999999999 weeks", "12345678 seconds", "1.1234567 seconds",  # unbounded quantity/precision: overflows Spark
     "30 fortnights", "30 secondz", "5 blah",            # unknown / malformed unit
     "-5 seconds", "-1 minute", "1 minute -30 seconds",  # negative duration
