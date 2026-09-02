@@ -189,6 +189,20 @@ from pipeline_lib.config import (  # noqa: E402
 #   validator turns "" into _DEFAULT_WRITE_REPARTITION), so a standalone run still parallelizes. Parsed
 #   to int here since it feeds df.repartition(N).
 PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
+# A continuous (always-on) job carries a Databricks Jobs continuous trigger and hands the notebook a
+# non-empty streaming_trigger_interval (a deploy-time base_parameter). pipeline_mode stays run-time
+# overridable, so guard the one override that would misbehave: a batch (or any non-streaming) run under
+# a continuous trigger is a TERMINATING export, which the continuous trigger then auto-restarts - an
+# endless loop of full re-exports to ES. Fail closed so the mismatch surfaces as one clear run failure.
+# (validate_config already forbids continuous + non-streaming at DEPLOY; this closes the RUN-TIME
+# override gap that a deploy-time config check cannot see.)
+if STREAMING_TRIGGER_INTERVAL and PIPELINE_MODE != "streaming":
+    raise ValueError(
+        f"continuous job (streaming_trigger_interval={STREAMING_TRIGGER_INTERVAL!r}) requires "
+        f"pipeline_mode=streaming, got {PIPELINE_MODE!r}: a terminating {PIPELINE_MODE} run under a "
+        f"continuous trigger would auto-restart in an endless loop. Remove the pipeline_mode override, "
+        f"or run this config's batch export as a separate, non-continuous job."
+    )
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY)
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")

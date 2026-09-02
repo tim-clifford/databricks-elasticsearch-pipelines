@@ -807,6 +807,16 @@ def _validate_continuous(node: object, where: str = "continuous") -> dict | None
             f"{where}.trigger_interval must be a Spark ProcessingTime interval with a number and a "
             f"unit, e.g. '30 seconds' or '1 minute', got {interval!r}"
         )
+    # Reject a NEGATIVE duration. No valid positive ProcessingTime interval contains a '-', and a
+    # negative one is only caught by Spark at query .start() - which, on an always-on continuous run,
+    # the Jobs continuous trigger then restarts in a loop. Failing closed here surfaces it at config
+    # load / gen_jobs --check / deploy instead. ("0 seconds" stays valid: Spark reads it as "run
+    # micro-batches as fast as possible", so it is left for Spark to honor.)
+    if "-" in interval:
+        raise PipelineConfigError(
+            f"{where}.trigger_interval must be a positive duration; a negative interval like "
+            f"'-5 seconds' is invalid, got {interval!r}"
+        )
     return {"trigger_interval": interval}
 
 

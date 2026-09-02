@@ -238,6 +238,26 @@ def test_render_continuous_wires_trigger_interval_base_param():
     assert job["tasks"][0]["notebook_task"]["base_parameters"]["streaming_trigger_interval"] == "1 minute"
 
 
+def test_render_continuous_existing_cluster():
+    # Continuous is valid on existing_cluster too (not just job_cluster): the continuous trigger and the
+    # trigger-interval base param render alongside the existing_cluster_id, with no job_clusters block.
+    raw = {
+        "es_index_name": "ecs-dns-activity",
+        "es_id_field": "dsl_id",
+        "es_host_config": "es_host_primary",
+        "pipeline_mode": "streaming",
+        "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
+        "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity"},
+        "compute": {"type": "existing_cluster", "cluster_config": "interactive_primary"},
+        "continuous": {"trigger_interval": "30 seconds"},
+    }
+    job = _render_job(validate_config(raw))  # existing_cluster needs no new_cluster spec
+    assert job["continuous"] == {"pause_status": "${var.schedule_pause_status}"}
+    assert "job_clusters" not in job
+    assert job["tasks"][0]["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
+    assert job["tasks"][0]["notebook_task"]["base_parameters"]["streaming_trigger_interval"] == "30 seconds"
+
+
 def test_render_continuous_keeps_max_concurrent_runs_1():
     # Databricks continuous jobs require exactly one active run; the framework fixes this at 1 for all jobs.
     assert _render_job(_continuous_cfg(), _JC_SPEC)["max_concurrent_runs"] == 1

@@ -1179,6 +1179,16 @@ def test_continuous_trigger_interval_needs_number_and_unit(bad):
         validate_config(cfg)
 
 
+@pytest.mark.parametrize("bad", ["-5 seconds", "-1 minute", "1 minute -30 seconds"])
+def test_continuous_trigger_interval_rejects_negative(bad):
+    # A negative duration validates the digit+letter heuristic but is invalid; on a continuous run it
+    # would only fail at stream .start() and restart in a loop, so reject it at config load.
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": bad}
+    with pytest.raises(PipelineConfigError, match="positive duration"):
+        validate_config(cfg)
+
+
 @pytest.mark.parametrize("bad", ["nope", 5, ["30 seconds"]])
 def test_continuous_non_mapping_rejected(bad):
     cfg = _continuous_ready()
