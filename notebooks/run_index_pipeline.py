@@ -28,7 +28,7 @@
 # MAGIC Run-time parameters (job parameters; overridable per run with `--params <name>=<value>`):
 # MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config).
 # MAGIC - `filter_condition`: optional Spark SQL predicate applied before the write (default from config).
-# MAGIC - `chunk_size`, `require_existing_index`, `verify_certs`: EsWriteConfig tuning (default from config;
+# MAGIC - `chunk_size`, `write_concurrency`, `require_existing_index`, `verify_certs`: EsWriteConfig tuning (default from config;
 # MAGIC   omitted there and unset per run => connector default).
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
 # MAGIC   streaming only, honored on the first run before a checkpoint exists.
@@ -101,6 +101,7 @@ dbutils.widgets.text("secret_key_name", "", "Key in the scope whose value is the
 dbutils.widgets.text("pipeline_mode", "", "Export mode: batch | streaming (job parameter; overridable per run)")
 dbutils.widgets.text("filter_condition", "", "Optional row filter, a Spark SQL predicate (overridable per run)")
 dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty => connector default)")
+dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
 dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
@@ -117,6 +118,7 @@ SECRET_KEY_NAME = dbutils.widgets.get("secret_key_name").strip()
 PIPELINE_MODE = dbutils.widgets.get("pipeline_mode").strip()
 FILTER_CONDITION = dbutils.widgets.get("filter_condition").strip()
 CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
+WRITE_CONCURRENCY = dbutils.widgets.get("write_concurrency").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
 WRITE_REPARTITION = dbutils.widgets.get("write_repartition").strip()
@@ -167,7 +169,7 @@ from pipeline_lib.config import (  # noqa: E402
 #   to int here since it feeds df.repartition(N).
 PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
-write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS)
+write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY)
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
 WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repartition job parameter"))
 # - max_partition_bytes: Spark byte-size (or "0" = leave unset). Validated unconditionally; applied to

@@ -15,9 +15,10 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
     filter_condition: <sql predicate>    # OPTIONAL default row filter (a Spark SQL boolean expr);
                                          #   also a job parameter, overridable per run. Empty => no filter.
     chunk_size: <positive int>           # OPTIONAL EsWriteConfig tuning: docs per bulk request.
+    write_concurrency: <positive int>    # OPTIONAL EsWriteConfig tuning: parallel bulk streams per partition.
     require_existing_index: true | false # OPTIONAL EsWriteConfig tuning: require the index to exist.
     verify_certs: true | false           # OPTIONAL EsWriteConfig tuning: verify the ES TLS certificate.
-                                         #   All three: config DEFAULT, also a job parameter overridable
+                                         #   All four: config DEFAULT, also a job parameter overridable
                                          #   per run. Omitted => the connector's own default stands.
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
@@ -242,6 +243,14 @@ def require_chunk_size(value: object, where: str = "chunk_size") -> str:
     return str(parsed)
 
 
+def require_write_concurrency(value: object, where: str = "write_concurrency") -> str:
+    """OPTIONAL EsWriteConfig write_concurrency (parallel bulk streams per partition): a positive
+    integer, or "" for unset. Same shape and fail-closed rule as require_chunk_size (a positive int;
+    bool refused, being an int subclass), so the config schema and the runner's --params value apply
+    the identical parse. Delegates to require_chunk_size so the one positive-int rule never forks."""
+    return require_chunk_size(value, where)
+
+
 def require_es_flag(value: object, where: str) -> str:
     """OPTIONAL EsWriteConfig boolean knob (require_existing_index / verify_certs): the canonical
     string "true"/"false", or "" for unset.
@@ -264,7 +273,8 @@ def require_es_flag(value: object, where: str) -> str:
     raise PipelineConfigError(f"{where} must be 'true' or 'false', got {value!r}")
 
 
-def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object) -> dict:
+def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
+                           write_concurrency: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
     Called by the runner on the effective (config-default or --params override) widget values. Each
@@ -279,6 +289,10 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     canonical_chunk_size = require_chunk_size(chunk_size)
     if canonical_chunk_size:
         overrides["chunk_size"] = int(canonical_chunk_size)
+
+    canonical_write_concurrency = require_write_concurrency(write_concurrency)
+    if canonical_write_concurrency:
+        overrides["write_concurrency"] = int(canonical_write_concurrency)
 
     for name, value in (("require_existing_index", require_existing_index), ("verify_certs", verify_certs)):
         flag = require_es_flag(value, name)
@@ -417,7 +431,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
 
     allowed_top = {
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
-        "chunk_size", "require_existing_index", "verify_certs", "write_repartition", "max_partition_bytes",
+        "chunk_size", "write_concurrency", "require_existing_index", "verify_certs", "write_repartition", "max_partition_bytes",
         "view", "source", "reference_tables", "compute", "schedule",
     }
     unknown = sorted(set(raw) - allowed_top)
@@ -460,6 +474,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # is stored in its CANONICAL STRING form (the require_* helpers accept the YAML-native int/bool and
     # return a string), because it becomes a string-valued job-parameter default in job_parameters.
     chunk_size = require_chunk_size(raw.get("chunk_size", ""), f"{source}: chunk_size")
+    write_concurrency = require_write_concurrency(raw.get("write_concurrency", ""), f"{source}: write_concurrency")
     require_existing_index = require_es_flag(raw.get("require_existing_index", ""), f"{source}: require_existing_index")
     verify_certs = require_es_flag(raw.get("verify_certs", ""), f"{source}: verify_certs")
     # write_repartition is OPTIONAL but, unlike the tuning knobs above, an absent value does NOT mean
@@ -493,6 +508,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "pipeline_mode": pipeline_mode,
         "filter_condition": filter_condition,
         "chunk_size": chunk_size,
+        "write_concurrency": write_concurrency,
         "require_existing_index": require_existing_index,
         "verify_certs": verify_certs,
         "write_repartition": write_repartition,
@@ -682,6 +698,7 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # The EsWriteConfig tuning knobs are connector settings, not object names: passed through
         # verbatim (canonical string form), like filter_condition.
         "chunk_size": cfg["chunk_size"],
+        "write_concurrency": cfg["write_concurrency"],
         "require_existing_index": cfg["require_existing_index"],
         "verify_certs": cfg["verify_certs"],
         # write_repartition (partitions for the pre-write repartition) and max_partition_bytes (read
@@ -857,7 +874,7 @@ def job_parameters(cfg: dict) -> list:
       for one run without redeploying.
     - filter_condition: DEFAULT from the config ("" if the config omits it); an optional row filter
       applied before the write, overridable per run.
-    - chunk_size / require_existing_index / verify_certs: EsWriteConfig tuning knobs. DEFAULT from the
+    - chunk_size / write_concurrency / require_existing_index / verify_certs: EsWriteConfig tuning knobs. DEFAULT from the
       config ("" if the config omits it, meaning "use the connector's own default"); overridable per
       run. The config stores each in canonical string form (see validate_config), which is exactly the
       string a job-parameter default must be. Parsed + validated by write_config_overrides at run time
@@ -879,6 +896,7 @@ def job_parameters(cfg: dict) -> list:
         {"name": "pipeline_mode", "default": cfg["pipeline_mode"]},
         {"name": "filter_condition", "default": cfg["filter_condition"]},
         {"name": "chunk_size", "default": cfg["chunk_size"]},
+        {"name": "write_concurrency", "default": cfg["write_concurrency"]},
         {"name": "require_existing_index", "default": cfg["require_existing_index"]},
         {"name": "verify_certs", "default": cfg["verify_certs"]},
         {"name": "streaming_start", "default": "new"},
