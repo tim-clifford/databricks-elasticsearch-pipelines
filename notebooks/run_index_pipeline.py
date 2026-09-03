@@ -364,6 +364,21 @@ if MAX_PARTITION_BYTES != "0":
         print(f"WARNING: could not set spark.sql.files.maxPartitionBytes={MAX_PARTITION_BYTES} "
               f"({type(_e).__name__}: {_e}); continuing on the engine default")
 
+# === THROUGHPUT DIAGNOSTIC (EXPERIMENT - DO NOT MERGE) ===
+# Raise the mapInPandas Arrow batch size to amortize the JVM<->Python handoff on the ES write path.
+# The connector writes via df.mapInPandas, which ships rows to the Python worker in Arrow batches of
+# spark.sql.execution.arrow.maxRecordsPerBatch (engine default 10000). A larger batch means fewer,
+# bigger transfers into Python. Edit the value below and re-run to sweep. Guarded like the
+# maxPartitionBytes set above (a perf conf, not correctness), so a runtime that rejects it warns and
+# continues on the default rather than failing the run.
+_ARROW_MAX_RECORDS_PER_BATCH = "50000"
+try:
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", _ARROW_MAX_RECORDS_PER_BATCH)
+    print(f"set spark.sql.execution.arrow.maxRecordsPerBatch = {_ARROW_MAX_RECORDS_PER_BATCH}")
+except Exception as _e:
+    print(f"WARNING: could not set spark.sql.execution.arrow.maxRecordsPerBatch="
+          f"{_ARROW_MAX_RECORDS_PER_BATCH} ({type(_e).__name__}: {_e}); continuing on the engine default")
+
 # COMMAND ----------
 # Build the connector write config + the shared filter helper. Both are MODE-INDEPENDENT (batch and
 # streaming write through the same EsWriteConfig and apply the same filter), so they are prepared once
