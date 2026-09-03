@@ -176,8 +176,10 @@ def test_es_id_field_none_survives_resolve():
     assert out["es_id_field"] is None
 
 
-@pytest.mark.parametrize("mode", ["batch", "streaming"])
+@pytest.mark.parametrize("mode", ["batch", "streaming", "reset_checkpoint"])
 def test_pipeline_mode_allowed_values(mode):
+    # reset_checkpoint is a valid pipeline_mode (a run-time maintenance override); the allow-list
+    # accepts it alongside batch/streaming.
     cfg = _base()
     cfg["pipeline_mode"] = mode
     assert validate_config(cfg)["pipeline_mode"] == mode
@@ -887,10 +889,11 @@ def test_job_parameters_max_partition_bytes_default_from_config():
 # --------------------------------------------------------------------------- require_pipeline_mode
 
 
-@pytest.mark.parametrize("mode", ["batch", "streaming"])
+@pytest.mark.parametrize("mode", ["batch", "streaming", "reset_checkpoint"])
 def test_require_pipeline_mode_accepts_allowed(mode):
     # The run-time override validator (used by the notebook on the job-parameter value) accepts the
-    # allow-listed modes and returns them unchanged.
+    # allow-listed modes and returns them unchanged - including reset_checkpoint, the run-time-only
+    # maintenance override.
     assert require_pipeline_mode(mode, "pipeline_mode job parameter") == mode
 
 
