@@ -12,6 +12,8 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   so replays can duplicate documents. See below.
     pipeline_mode: batch | streaming     # THIS index's DEFAULT export mode (required); a job parameter,
                                          #   so it is overridable per run with --params pipeline_mode=...
+                                         #   (a third value, reset_checkpoint, is a run-time-only
+                                         #   maintenance override that clears the checkpoint and exits).
     filter_condition: <sql predicate>    # OPTIONAL default row filter (a Spark SQL boolean expr);
                                          #   also a job parameter, overridable per run. Empty => no filter.
     chunk_size: <positive int>           # OPTIONAL EsWriteConfig tuning: docs per bulk request.
@@ -88,7 +90,12 @@ _ES_INDEX_MAX_BYTES = 255
 
 # Export modes the runner supports. Allow-list: an unrecognized/absent mode is rejected (fail closed),
 # never silently defaulted.
-_VALID_PIPELINE_MODES = ("batch", "streaming")
+# - batch / streaming: the two export modes.
+# - reset_checkpoint: a maintenance mode, meant as a run-time override (--params pipeline_mode=
+#   reset_checkpoint), that clears this pipeline's streaming checkpoint directory and exits WITHOUT
+#   exporting to ES, so the next streaming run starts fresh (governed by streaming_start) as if the
+#   pipeline were brand new. Use it to discard a stale/old checkpoint.
+_VALID_PIPELINE_MODES = ("batch", "streaming", "reset_checkpoint")
 
 # Compute options for a per-index job: WHERE its notebook task runs. Allow-list, fail closed: an
 # unrecognized type is rejected, never silently treated as serverless.
@@ -207,7 +214,8 @@ def _require_identifier(value: object, where: str) -> str:
 
 
 def require_pipeline_mode(value: object, where: str = "pipeline_mode") -> str:
-    """An export mode, restricted to the allow-list (batch|streaming). No default: absent/unknown fails.
+    """An export mode, restricted to the allow-list (batch|streaming|reset_checkpoint). No default:
+    absent/unknown fails.
 
     Public because it validates two things: the config's pipeline_mode (the per-index DEFAULT, checked
     at config load) AND the run-time job-parameter override the runner notebook receives (a bad

@@ -31,7 +31,9 @@
 # MAGIC   config's `continuous` block, or empty for availableNow (drain-and-stop). Deploy-time, not per-run.
 # MAGIC
 # MAGIC Run-time parameters (job parameters; overridable per run with `--params <name>=<value>`):
-# MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config).
+# MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config), or the run-time-only maintenance
+# MAGIC   value `reset_checkpoint`, which clears this pipeline's streaming checkpoint directory and exits
+# MAGIC   without exporting, so the next streaming run starts fresh (as if brand new).
 # MAGIC - `filter_condition`: optional Spark SQL predicate applied before the write (default from config).
 # MAGIC - `chunk_size`, `write_concurrency`, `require_existing_index`, `verify_certs`: EsWriteConfig tuning (default from config;
 # MAGIC   omitted there and unset per run => connector default).
@@ -106,7 +108,7 @@ dbutils.widgets.text("es_host_url", "", "Elasticsearch endpoint, e.g. https://<h
 dbutils.widgets.text("secret_scope_name", "", "Databricks secret scope holding the ES api_key")
 dbutils.widgets.text("secret_key_name", "", "Key in the scope whose value is the ES api_key")
 dbutils.widgets.text("ca_certs", "", "UC Volume path to a CA bundle (PEM) verifying the ES TLS cert (empty => system CAs)")
-dbutils.widgets.text("pipeline_mode", "", "Export mode: batch | streaming (job parameter; overridable per run)")
+dbutils.widgets.text("pipeline_mode", "", "Export mode: batch | streaming | reset_checkpoint (job parameter; overridable per run)")
 dbutils.widgets.text("filter_condition", "", "Optional row filter, a Spark SQL predicate (overridable per run)")
 dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty => connector default)")
 dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
@@ -197,12 +199,17 @@ PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job paramete
 # endless loop of full re-exports to ES. Fail closed so the mismatch surfaces as one clear run failure.
 # (validate_config already forbids continuous + non-streaming at DEPLOY; this closes the RUN-TIME
 # override gap that a deploy-time config check cannot see.)
-if STREAMING_TRIGGER_INTERVAL and PIPELINE_MODE != "streaming":
+# reset_checkpoint is exempt: it clears the checkpoint and exits WITHOUT exporting to ES, so the
+# "endless loop of full re-exports" harm this guard prevents does not apply. Resetting a continuous
+# pipeline is a legitimate maintenance action (pause the continuous trigger, run once in
+# reset_checkpoint mode, then resume), so allow it here.
+if STREAMING_TRIGGER_INTERVAL and PIPELINE_MODE not in ("streaming", "reset_checkpoint"):
     raise ValueError(
         f"continuous job (streaming_trigger_interval={STREAMING_TRIGGER_INTERVAL!r}) requires "
-        f"pipeline_mode=streaming, got {PIPELINE_MODE!r}: a terminating {PIPELINE_MODE} run under a "
-        f"continuous trigger would auto-restart in an endless loop. Remove the pipeline_mode override, "
-        f"or run this config's batch export as a separate, non-continuous job."
+        f"pipeline_mode=streaming (or reset_checkpoint to clear it), got {PIPELINE_MODE!r}: a "
+        f"terminating {PIPELINE_MODE} run under a continuous trigger would auto-restart in an endless "
+        f"loop. Remove the pipeline_mode override, or run this config's batch export as a separate, "
+        f"non-continuous job."
     )
 # Re-validate the continuous ProcessingTime cadence against the SAME grammar the config schema uses,
 # BEFORE it reaches Trigger.ProcessingTime. streaming_trigger_interval is a deploy-time base_parameter
@@ -241,13 +248,14 @@ for _param, _value in (
             f"for this target in databricks.yml)"
         )
 
-# checkpoint_base_path is required for a STREAMING run only (batch and deploy_views never stream, so
-# their runs leave it empty). Validated here, at the validation stage, so a streaming run with no
-# checkpoint location fails closed immediately rather than after the config load and stream setup.
-if PIPELINE_MODE == "streaming" and not CHECKPOINT_BASE_PATH:
+# checkpoint_base_path is required for a STREAMING run and a RESET_CHECKPOINT run (batch and
+# deploy_views never touch a checkpoint, so their runs leave it empty). Validated here so a run that
+# needs a checkpoint location but has none fails closed immediately rather than after the config load;
+# for reset it also guards against composing (and rm-ing) a root path from an empty base.
+if PIPELINE_MODE in ("streaming", "reset_checkpoint") and not CHECKPOINT_BASE_PATH:
     raise ValueError(
-        "missing required parameter: checkpoint_base_path (set the bundle variable at deploy); "
-        "a streaming run needs a UC Volume checkpoint location"
+        f"missing required parameter: checkpoint_base_path (set the bundle variable at deploy); "
+        f"a {PIPELINE_MODE} run needs a UC Volume checkpoint location"
     )
 
 # Resolve the config file, accepting either extension: gen_jobs.py and deploy_views.py both discover
@@ -264,6 +272,48 @@ if config_path is None:
 # load_config validates the schema; resolve_config folds ${environment} in and validates the result
 # (both fail closed). After this, every catalog/schema/name is a concrete identifier.
 cfg = resolve_config(load_config(config_path), ENVIRONMENT)
+
+# COMMAND ----------
+# RESET_CHECKPOINT maintenance mode. Clear THIS pipeline's streaming checkpoint directory, then EXIT
+# without any ES export. Purpose: discard a stale/old checkpoint so the NEXT streaming run starts fresh
+# (that run's streaming_start then governs where it begins), exactly as if the pipeline were brand new.
+#
+# It is a run-time-only override (--params pipeline_mode=reset_checkpoint) on an otherwise-normal
+# streaming job; every other job parameter is irrelevant here. This branch runs BEFORE the ES-connection
+# setup and es_write_config below and exits inline, so a reset never reads the ES secret or builds a
+# writer - it does one thing and stops. (Exiting mid-notebook is deliberate: it is how the reset bypasses
+# all the export cells; the ES-param non-empty check above still ran, but on a real job those base
+# parameters are always present, so it simply passes.)
+#
+# Blast radius: the delete is scoped to the ONE composed path {checkpoint_base_path}/{config_name} -
+# built the IDENTICAL way the streaming branch builds checkpoint_location (single source of truth), so a
+# reset can only ever clear the checkpoint the stream would resume from - never the shared base, so
+# resetting one pipeline cannot touch another's checkpoint. checkpoint_base_path was validated non-empty
+# above for this mode.
+if PIPELINE_MODE == "reset_checkpoint":
+    checkpoint_location = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
+    # Look before deleting: report whether a checkpoint is actually present, so the log distinguishes a
+    # real reset from a no-op (clearing a path that was never created). The probe fails SAFE - if the
+    # existence check itself errors, we still attempt the (idempotent) rm and report from its result.
+    try:
+        _existed = bool(dbutils.fs.ls(checkpoint_location))
+    except Exception:
+        _existed = False
+    print(f"reset_checkpoint: clearing checkpoint directory {checkpoint_location} "
+          f"(currently {'present' if _existed else 'absent/empty'})")
+    # dbutils.fs.rm(recurse=True) removes the directory and everything under it (offsets, commits,
+    # sources, and the _run_metrics subdir). It returns True if it deleted a path, False if the path did
+    # not exist - so clearing an absent checkpoint is a harmless no-op, not a failure.
+    _removed = dbutils.fs.rm(checkpoint_location, recurse=True)
+    RESET_SUMMARY = (
+        f"reset_checkpoint {'cleared' if _removed else 'no-op (nothing to clear)'} "
+        f"checkpoint={checkpoint_location}"
+    )
+    print(f"RESET CHECKPOINT COMPLETE: {RESET_SUMMARY}")
+    dbutils.notebook.exit(
+        f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; "
+        f"pipeline_mode={PIPELINE_MODE}; {RESET_SUMMARY}"
+    )
 
 # COMMAND ----------
 # Echo the resolved configuration + effective run-time settings before the export, so a run's log
