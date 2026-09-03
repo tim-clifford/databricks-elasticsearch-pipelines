@@ -296,23 +296,14 @@ cfg = resolve_config(load_config(config_path), ENVIRONMENT)
 # above for this mode.
 if PIPELINE_MODE == "reset_checkpoint":
     checkpoint_location = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
-    # Look before deleting: report whether a checkpoint is actually present, so the log distinguishes a
-    # real reset from a no-op (clearing a path that was never created). The probe fails SAFE - if the
-    # existence check itself errors, we still attempt the (idempotent) rm and report from its result.
-    try:
-        _existed = bool(dbutils.fs.ls(checkpoint_location))
-    except Exception:
-        _existed = False
-    print(f"reset_checkpoint: clearing checkpoint directory {checkpoint_location} "
-          f"(currently {'present' if _existed else 'absent/empty'})")
+    # Log the exact target before deleting (so the run log shows what is being removed), then delete.
+    print(f"reset_checkpoint: deleting checkpoint directory {checkpoint_location}")
     # dbutils.fs.rm(recurse=True) removes the directory and everything under it (offsets, commits,
-    # sources, and the _run_metrics subdir). It returns True if it deleted a path, False if the path did
-    # not exist - so clearing an absent checkpoint is a harmless no-op, not a failure.
+    # sources, and the _run_metrics subdir). It returns True if it removed a path and False if the path
+    # did not exist, so clearing an absent checkpoint is a harmless no-op, not a failure. We report that
+    # boolean verbatim (removed=...) rather than interpreting it, so the log states exactly what rm did.
     _removed = dbutils.fs.rm(checkpoint_location, recurse=True)
-    RESET_SUMMARY = (
-        f"reset_checkpoint {'cleared' if _removed else 'no-op (nothing to clear)'} "
-        f"checkpoint={checkpoint_location}"
-    )
+    RESET_SUMMARY = f"reset_checkpoint checkpoint={checkpoint_location} removed={_removed}"
     print(f"RESET CHECKPOINT COMPLETE: {RESET_SUMMARY}")
     dbutils.notebook.exit(
         f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; "
