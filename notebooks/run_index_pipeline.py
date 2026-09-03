@@ -191,7 +191,9 @@ from pipeline_lib.config import (  # noqa: E402
 #   (the batch export and each streaming micro-batch). Empty widget -> the built-in default (the
 #   validator turns "" into _DEFAULT_WRITE_REPARTITION), so a standalone run still parallelizes. Parsed
 #   to int here since it feeds df.repartition(N).
-PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
+# allow_reset_checkpoint=True: this is the RUN-TIME override path, where reset_checkpoint is a valid
+# one-off maintenance mode (config defaults reject it, so it can only ever arrive as a --params override).
+PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter", allow_reset_checkpoint=True)
 # A continuous (always-on) job carries a Databricks Jobs continuous trigger and hands the notebook a
 # non-empty streaming_trigger_interval (a deploy-time base_parameter). pipeline_mode stays run-time
 # overridable, so guard the one override that would misbehave: a batch (or any non-streaming) run under
@@ -233,20 +235,23 @@ MAX_PARTITION_BYTES = require_max_partition_bytes(MAX_PARTITION_BYTES, "max_part
 MAX_FILES_PER_TRIGGER = require_max_files_per_trigger(MAX_FILES_PER_TRIGGER, "max_files_per_trigger job parameter")
 MAX_BYTES_PER_TRIGGER = require_max_bytes_per_trigger(MAX_BYTES_PER_TRIGGER, "max_bytes_per_trigger job parameter")
 
-# The ES connection settings are required for any index-job run: fail closed on an empty one rather
-# than constructing a broken EsWriteConfig. These come from this pipeline's es_host_config (a complex
-# bundle variable in databricks.yml, resolved per target); an empty value means that host config's
-# fields were never filled in for the target being deployed - the common cause on a fresh checkout.
-for _param, _value in (
-    ("es_host_url", ES_HOST_URL),
-    ("secret_scope_name", SECRET_SCOPE_NAME),
-    ("secret_key_name", SECRET_KEY_NAME),
-):
-    if not _value:
-        raise ValueError(
-            f"missing required parameter: {_param} (fill in this pipeline's es_host_config values "
-            f"for this target in databricks.yml)"
-        )
+# The ES connection settings are required for any run that WRITES to ES: fail closed on an empty one
+# rather than constructing a broken EsWriteConfig. These come from this pipeline's es_host_config (a
+# complex bundle variable in databricks.yml, resolved per target); an empty value means that host
+# config's fields were never filled in for the target being deployed - the common cause on a fresh
+# checkout. Skipped for reset_checkpoint, which only clears a checkpoint directory and never touches ES,
+# so it must not demand ES connection settings it never uses (e.g. a reset on a partly-configured target).
+if PIPELINE_MODE != "reset_checkpoint":
+    for _param, _value in (
+        ("es_host_url", ES_HOST_URL),
+        ("secret_scope_name", SECRET_SCOPE_NAME),
+        ("secret_key_name", SECRET_KEY_NAME),
+    ):
+        if not _value:
+            raise ValueError(
+                f"missing required parameter: {_param} (fill in this pipeline's es_host_config values "
+                f"for this target in databricks.yml)"
+            )
 
 # checkpoint_base_path is required for a STREAMING run and a RESET_CHECKPOINT run (batch and
 # deploy_views never touch a checkpoint, so their runs leave it empty). Validated here so a run that
@@ -279,11 +284,10 @@ cfg = resolve_config(load_config(config_path), ENVIRONMENT)
 # (that run's streaming_start then governs where it begins), exactly as if the pipeline were brand new.
 #
 # It is a run-time-only override (--params pipeline_mode=reset_checkpoint) on an otherwise-normal
-# streaming job; every other job parameter is irrelevant here. This branch runs BEFORE the ES-connection
-# setup and es_write_config below and exits inline, so a reset never reads the ES secret or builds a
-# writer - it does one thing and stops. (Exiting mid-notebook is deliberate: it is how the reset bypasses
-# all the export cells; the ES-param non-empty check above still ran, but on a real job those base
-# parameters are always present, so it simply passes.)
+# streaming job; every other job parameter is irrelevant here. The ES-param check above is skipped for
+# this mode, and this branch runs BEFORE the es_write_config setup below and exits inline, so a reset
+# never requires, reads, or uses any ES connection setting - it does one thing and stops. (Exiting
+# mid-notebook is deliberate: it is how the reset bypasses all the export cells.)
 #
 # Blast radius: the delete is scoped to the ONE composed path {checkpoint_base_path}/{config_name} -
 # built the IDENTICAL way the streaming branch builds checkpoint_location (single source of truth), so a

@@ -176,13 +176,21 @@ def test_es_id_field_none_survives_resolve():
     assert out["es_id_field"] is None
 
 
-@pytest.mark.parametrize("mode", ["batch", "streaming", "reset_checkpoint"])
+@pytest.mark.parametrize("mode", ["batch", "streaming"])
 def test_pipeline_mode_allowed_values(mode):
-    # reset_checkpoint is a valid pipeline_mode (a run-time maintenance override); the allow-list
-    # accepts it alongside batch/streaming.
     cfg = _base()
     cfg["pipeline_mode"] = mode
     assert validate_config(cfg)["pipeline_mode"] == mode
+
+
+def test_pipeline_mode_reset_checkpoint_rejected_as_config_default():
+    # reset_checkpoint is a RUN-TIME-only maintenance mode. As a config DEFAULT it would deploy a job
+    # that silently clears its checkpoint and exits on every un-overridden run, never exporting, so
+    # validate_config must fail it closed (it is only valid via a --params run-time override).
+    cfg = _base()
+    cfg["pipeline_mode"] = "reset_checkpoint"
+    with pytest.raises(PipelineConfigError, match="pipeline_mode"):
+        validate_config(cfg)
 
 
 @pytest.mark.parametrize("bad", ["Batch", "BATCH", "stream", "micro-batch", "", None, 5, True])
@@ -889,12 +897,22 @@ def test_job_parameters_max_partition_bytes_default_from_config():
 # --------------------------------------------------------------------------- require_pipeline_mode
 
 
-@pytest.mark.parametrize("mode", ["batch", "streaming", "reset_checkpoint"])
+@pytest.mark.parametrize("mode", ["batch", "streaming"])
 def test_require_pipeline_mode_accepts_allowed(mode):
-    # The run-time override validator (used by the notebook on the job-parameter value) accepts the
-    # allow-listed modes and returns them unchanged - including reset_checkpoint, the run-time-only
-    # maintenance override.
+    # batch/streaming are valid in BOTH contexts: the config default (allow_reset_checkpoint=False, the
+    # default) and the run-time override. The validator returns them unchanged.
     assert require_pipeline_mode(mode, "pipeline_mode job parameter") == mode
+
+
+def test_require_pipeline_mode_reset_checkpoint_run_time_only():
+    # reset_checkpoint is accepted ONLY on the run-time-override path (allow_reset_checkpoint=True, as
+    # the runner notebook calls it); the config-default path (the default flag) rejects it, so a config
+    # can never default to reset_checkpoint. Both directions are asserted here.
+    assert require_pipeline_mode(
+        "reset_checkpoint", "pipeline_mode job parameter", allow_reset_checkpoint=True
+    ) == "reset_checkpoint"
+    with pytest.raises(PipelineConfigError, match="pipeline_mode"):
+        require_pipeline_mode("reset_checkpoint", "pipeline_mode config default")
 
 
 @pytest.mark.parametrize("bad", ["turbo", "Batch", "", None, "streaming ", 5])

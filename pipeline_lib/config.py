@@ -90,12 +90,17 @@ _ES_INDEX_MAX_BYTES = 255
 
 # Export modes the runner supports. Allow-list: an unrecognized/absent mode is rejected (fail closed),
 # never silently defaulted.
-# - batch / streaming: the two export modes.
-# - reset_checkpoint: a maintenance mode, meant as a run-time override (--params pipeline_mode=
-#   reset_checkpoint), that clears this pipeline's streaming checkpoint directory and exits WITHOUT
-#   exporting to ES, so the next streaming run starts fresh (governed by streaming_start) as if the
-#   pipeline were brand new. Use it to discard a stale/old checkpoint.
-_VALID_PIPELINE_MODES = ("batch", "streaming", "reset_checkpoint")
+# - batch / streaming: the two EXPORT modes. These are the only values valid as a config's pipeline_mode
+#   DEFAULT (a per-index config choice, baked as the job-parameter default by the generator).
+# - reset_checkpoint: a maintenance mode that clears this pipeline's streaming checkpoint directory and
+#   exits WITHOUT exporting to ES, so the next streaming run starts fresh (governed by streaming_start)
+#   as if the pipeline were brand new. Use it to discard a stale/old checkpoint. It is RUN-TIME ONLY
+#   (--params pipeline_mode=reset_checkpoint) and is deliberately NOT valid as a config default: a config
+#   defaulting to reset_checkpoint would deploy a job that silently clears-and-exits on every un-overridden
+#   run, never exporting, so require_pipeline_mode fails it closed at config load (allow_reset_checkpoint
+#   defaults to False; only the runner's run-time-override call opts in).
+_VALID_PIPELINE_MODES = ("batch", "streaming")
+_RESET_CHECKPOINT_MODE = "reset_checkpoint"
 
 # Compute options for a per-index job: WHERE its notebook task runs. Allow-list, fail closed: an
 # unrecognized type is rejected, never silently treated as serverless.
@@ -213,16 +218,23 @@ def _require_identifier(value: object, where: str) -> str:
     return value
 
 
-def require_pipeline_mode(value: object, where: str = "pipeline_mode") -> str:
-    """An export mode, restricted to the allow-list (batch|streaming|reset_checkpoint). No default:
-    absent/unknown fails.
+def require_pipeline_mode(
+    value: object, where: str = "pipeline_mode", allow_reset_checkpoint: bool = False
+) -> str:
+    """A pipeline mode, restricted to an allow-list. No default: absent/unknown fails.
 
     Public because it validates two things: the config's pipeline_mode (the per-index DEFAULT, checked
     at config load) AND the run-time job-parameter override the runner notebook receives (a bad
-    `--params pipeline_mode=...` must fail closed, not silently run the wrong mode)."""
-    if value not in _VALID_PIPELINE_MODES:
+    `--params pipeline_mode=...` must fail closed, not silently run the wrong mode).
+
+    allow_reset_checkpoint distinguishes those two contexts. It is False for the config default (which
+    accepts only batch|streaming), so a config defaulting to reset_checkpoint - a job that would silently
+    clear-and-exit without ever exporting - fails closed at load. The runner passes True for the run-time
+    override, since reset_checkpoint is a legitimate one-off maintenance run."""
+    allowed = _VALID_PIPELINE_MODES + ((_RESET_CHECKPOINT_MODE,) if allow_reset_checkpoint else ())
+    if value not in allowed:
         raise PipelineConfigError(
-            f"{where} must be one of {', '.join(_VALID_PIPELINE_MODES)}, got {value!r}"
+            f"{where} must be one of {', '.join(allowed)}, got {value!r}"
         )
     return value
 
