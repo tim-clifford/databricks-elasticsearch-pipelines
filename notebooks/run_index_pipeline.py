@@ -640,7 +640,23 @@ if PIPELINE_MODE == "streaming":
             except Exception as _e:
                 print(f"WARNING: {PROGRESS_TAG} onQueryTerminated logging failed ({type(_e).__name__}: {_e})")
 
-    spark.streams.addListener(_ProgressLogger())
+    # De-dup listener registration so a REUSED SparkSession (persistent cluster, cell re-run, or repeated
+    # runs sharing one session) does not ACCUMULATE _ProgressLogger instances and emit STREAM_PROGRESS
+    # 2x/3x per micro-batch: remove the listener THIS notebook stashed on a prior run, then add a fresh
+    # one and re-stash it. A fresh session (a normal job run) finds none and just adds one. Fail-soft
+    # throughout - listener bookkeeping must never disturb the export.
+    try:
+        _prior_listener = getattr(spark, "_es_progress_listener", None)
+        if _prior_listener is not None:
+            spark.streams.removeListener(_prior_listener)
+    except Exception as _e:
+        print(f"WARNING: {PROGRESS_TAG} could not remove a prior listener ({type(_e).__name__}: {_e})")
+    _progress_listener = _ProgressLogger()
+    spark.streams.addListener(_progress_listener)
+    try:
+        spark._es_progress_listener = _progress_listener  # best-effort handle for the next run's de-dup
+    except Exception:
+        pass
     print(f"{PROGRESS_TAG} listener registered (per-batch progress logging)")
 
     # The trigger is chosen by streaming_trigger_interval (a deploy-time base_parameter from the config's
