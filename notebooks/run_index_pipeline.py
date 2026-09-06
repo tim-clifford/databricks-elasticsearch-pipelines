@@ -176,6 +176,10 @@ from pipeline_lib.config import (  # noqa: E402
     view_substitutions,
     write_config_overrides,
 )
+# Ephemeral per-batch streaming observability (pure Python, no Spark): the STREAM_PROGRESS log-line
+# formatter and the Jobs-UI batch label. Kept in pipeline_lib so it is unit-tested off-cluster.
+import json  # noqa: E402
+from pipeline_lib.observability import PROGRESS_TAG, batch_job_description, format_progress  # noqa: E402
 
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
 # override fails closed immediately without wasting the config load/resolve on a run that can't
@@ -512,6 +516,18 @@ if PIPELINE_MODE == "streaming":
         # shuffles), targeting ~2-3x worker cores, the same target as the batch path.
         if WRITE_REPARTITION > 0:
             transformed = transformed.repartition(WRITE_REPARTITION)
+        # Label this micro-batch's Spark jobs in the Jobs/Stages UI (batch id + target index) so an
+        # always-on run is legible there. Set on the batch session's context, BEFORE the write launches
+        # its jobs (it applies to jobs started on this micro-batch thread). FAIL-SOFT: this is
+        # observability only, and sparkContext access can be restricted on some cluster access modes, so
+        # a failure here must warn and continue, never fail the batch.
+        try:
+            session.sparkContext.setJobDescription(
+                batch_job_description(CONFIG_NAME, es_write_config.index, batch_id)
+            )
+        except Exception as _e:
+            print(f"WARNING: {PROGRESS_TAG} could not set job description "
+                  f"({type(_e).__name__}: {_e}); continuing")
         # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
         # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
         # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
@@ -593,6 +609,40 @@ if PIPELINE_MODE == "streaming":
             reader = reader.option("startingVersion", str(current_version))
     stream_df = reader.table(SOURCE_FQN)
 
+    # Ephemeral per-batch observability. Register a StreamingQueryListener BEFORE .start() (so it also
+    # catches the query-started event) that logs one STREAM_PROGRESS line per micro-batch - backlog
+    # (numFilesOutstanding/numBytesOutstanding), the durationMs breakdown, rates, and Delta offset
+    # progress - via the shared, unit-tested format_progress. This is the per-batch visibility an
+    # always-on continuous run otherwise lacks; the lines land in the driver log and complement the
+    # Spark UI Structured Streaming tab. Registered for BOTH triggers (availableNow too). OBSERVABILITY
+    # ONLY and FAIL-SOFT: every callback swallows its own errors, so a logging fault can never fail or
+    # slow the export - a listener exception must not touch the stream.
+    from pyspark.sql.streaming import StreamingQueryListener  # noqa: E402
+
+    class _ProgressLogger(StreamingQueryListener):
+        def onQueryStarted(self, event):
+            try:
+                print(f"{PROGRESS_TAG} query started: name={event.name!r} id={event.id} runId={event.runId}")
+            except Exception as _e:  # never let observability disturb the stream
+                print(f"WARNING: {PROGRESS_TAG} onQueryStarted logging failed ({type(_e).__name__}: {_e})")
+
+        def onQueryProgress(self, event):
+            try:
+                print(format_progress(json.loads(event.progress.json)))
+            except Exception as _e:
+                print(f"WARNING: {PROGRESS_TAG} onQueryProgress logging failed ({type(_e).__name__}: {_e})")
+
+        def onQueryTerminated(self, event):
+            try:
+                _exc = getattr(event, "exception", None)
+                print(f"{PROGRESS_TAG} query terminated: id={event.id} runId={event.runId}"
+                      + (f" exception={_exc}" if _exc else ""))
+            except Exception as _e:
+                print(f"WARNING: {PROGRESS_TAG} onQueryTerminated logging failed ({type(_e).__name__}: {_e})")
+
+    spark.streams.addListener(_ProgressLogger())
+    print(f"{PROGRESS_TAG} listener registered (per-batch progress logging)")
+
     # The trigger is chosen by streaming_trigger_interval (a deploy-time base_parameter from the config's
     # `continuous` block), which is the SINGLE signal that keeps the job's shape and this trigger in step:
     # - EMPTY => Trigger.availableNow: drain every currently-available source commit in one or more
@@ -606,6 +656,7 @@ if PIPELINE_MODE == "streaming":
     #   from the checkpoint (the startingVersion seed above is skipped once an offset exists).
     writer = (
         stream_df.writeStream
+        .queryName(CONFIG_NAME)  # names the query in the Spark UI streaming tab and in progress.name
         .option("checkpointLocation", checkpoint_location)
         .foreachBatch(foreach_batch)
     )
