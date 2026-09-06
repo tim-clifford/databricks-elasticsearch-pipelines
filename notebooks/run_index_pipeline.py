@@ -179,6 +179,7 @@ from pipeline_lib.config import (  # noqa: E402
 # Ephemeral per-batch streaming observability (pure Python, no Spark): the STREAM_PROGRESS log-line
 # formatter and the Jobs-UI batch label. Kept in pipeline_lib so it is unit-tested off-cluster.
 import json  # noqa: E402
+import uuid  # noqa: E402
 from pipeline_lib.observability import PROGRESS_TAG, batch_job_description, format_progress  # noqa: E402
 
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
@@ -618,6 +619,14 @@ if PIPELINE_MODE == "streaming":
             reader = reader.option("startingVersion", str(current_version))
     stream_df = reader.table(SOURCE_FQN)
 
+    # The Spark-UI query name: CONFIG_NAME (readable identifier of THIS pipeline) plus a short unique
+    # per-run suffix. The suffix keeps the name UNIQUE among a session's active queries so a re-run on a
+    # REUSED/interactive SparkSession cannot collide with a still-active prior query (Spark rejects a
+    # duplicate active query name at .start()). It also scopes the listener's filter below: a leftover
+    # listener from a prior run carries that run's name, so it can never match this run's progress and
+    # emit duplicate lines. The CONFIG_NAME prefix keeps the streaming tab legible.
+    _QUERY_NAME = f"{CONFIG_NAME}-{uuid.uuid4().hex[:8]}"
+
     # Ephemeral per-batch observability. Register a StreamingQueryListener BEFORE .start() (so it also
     # catches the query-started event) that logs one STREAM_PROGRESS line per micro-batch - backlog
     # (numFilesOutstanding/numBytesOutstanding), the durationMs breakdown, rates, and Delta offset
@@ -638,7 +647,7 @@ if PIPELINE_MODE == "streaming":
 
         def onQueryStarted(self, event):
             try:
-                if event.name != CONFIG_NAME:
+                if event.name != _QUERY_NAME:
                     return
                 print(f"{PROGRESS_TAG} query started: name={event.name!r} id={event.id} runId={event.runId}")
             except Exception as _e:  # never let observability disturb the stream
@@ -647,7 +656,7 @@ if PIPELINE_MODE == "streaming":
         def onQueryProgress(self, event):
             try:
                 progress = json.loads(event.progress.json)
-                if progress.get("name") != CONFIG_NAME:
+                if progress.get("name") != _QUERY_NAME:
                     return
                 print(format_progress(progress))
             except Exception as _e:
@@ -691,7 +700,7 @@ if PIPELINE_MODE == "streaming":
     try:
         writer = (
             stream_df.writeStream
-            .queryName(CONFIG_NAME)  # names the query in the Spark UI streaming tab and in progress.name
+            .queryName(_QUERY_NAME)  # unique per-run name (CONFIG_NAME + suffix): legible + collision-free
             .option("checkpointLocation", checkpoint_location)
             .foreachBatch(foreach_batch)
         )
