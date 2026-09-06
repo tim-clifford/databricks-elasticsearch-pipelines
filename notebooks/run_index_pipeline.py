@@ -629,29 +629,53 @@ if PIPELINE_MODE == "streaming":
     from pyspark.sql.streaming import StreamingQueryListener  # noqa: E402
 
     class _ProgressLogger(StreamingQueryListener):
+        # Filter every callback to THIS run's query, so a shared/reused SparkSession running other
+        # StreamingQueries never gets logged under this config's trail. onQueryStarted/onQueryProgress
+        # match on the query NAME (we set queryName=CONFIG_NAME and it rides on both events); the
+        # terminated event carries no name, so it matches on the runId captured after .start() (until
+        # that is set - only this query's own startup window - it does not filter, which is harmless).
+        our_run_id = None  # set on the instance to this run's query.runId once it has started
+
         def onQueryStarted(self, event):
             try:
+                if event.name != CONFIG_NAME:
+                    return
                 print(f"{PROGRESS_TAG} query started: name={event.name!r} id={event.id} runId={event.runId}")
             except Exception as _e:  # never let observability disturb the stream
                 print(f"WARNING: {PROGRESS_TAG} onQueryStarted logging failed ({type(_e).__name__}: {_e})")
 
         def onQueryProgress(self, event):
             try:
-                print(format_progress(json.loads(event.progress.json)))
+                progress = json.loads(event.progress.json)
+                if progress.get("name") != CONFIG_NAME:
+                    return
+                print(format_progress(progress))
             except Exception as _e:
                 print(f"WARNING: {PROGRESS_TAG} onQueryProgress logging failed ({type(_e).__name__}: {_e})")
 
         def onQueryTerminated(self, event):
             try:
+                if self.our_run_id is not None and str(event.runId) != str(self.our_run_id):
+                    return
                 _exc = getattr(event, "exception", None)
                 print(f"{PROGRESS_TAG} query terminated: id={event.id} runId={event.runId}"
                       + (f" exception={_exc}" if _exc else ""))
             except Exception as _e:
                 print(f"WARNING: {PROGRESS_TAG} onQueryTerminated logging failed ({type(_e).__name__}: {_e})")
 
+    # Register FAIL-SOFT: on a cluster access mode where the streaming-listener API is unsupported or
+    # restricted, addListener itself could raise - which must NOT fail the export. Warn and continue
+    # WITHOUT progress logging. Track whether registration actually succeeded so the finally below only
+    # removes a listener that was added.
     _progress_listener = _ProgressLogger()
-    spark.streams.addListener(_progress_listener)
-    print(f"{PROGRESS_TAG} listener registered (per-batch progress logging)")
+    _listener_registered = False
+    try:
+        spark.streams.addListener(_progress_listener)
+        _listener_registered = True
+        print(f"{PROGRESS_TAG} listener registered (per-batch progress logging)")
+    except Exception as _e:
+        print(f"WARNING: {PROGRESS_TAG} could not register progress listener "
+              f"({type(_e).__name__}: {_e}); continuing WITHOUT per-batch progress logging")
 
     # The trigger is chosen by streaming_trigger_interval (a deploy-time base_parameter from the config's
     # `continuous` block), which is the SINGLE signal that keeps the job's shape and this trigger in step:
@@ -675,6 +699,7 @@ if PIPELINE_MODE == "streaming":
             print(f"continuous streaming: ProcessingTime trigger every {STREAMING_TRIGGER_INTERVAL!r} "
                   f"(always-on; this run does not self-terminate)")
             query = writer.trigger(processingTime=STREAMING_TRIGGER_INTERVAL).start()
+            _progress_listener.our_run_id = query.runId  # scope the terminated-event filter to this run
             # awaitTermination BLOCKS for the life of an always-on run, returning ONLY if the stream stops:
             # on a FAILURE it re-raises (the run fails and the Jobs continuous trigger auto-restarts it, so a
             # lost batch never passes silently), and on a GRACEFUL stop (job cancel, redeploy, cluster
@@ -692,6 +717,7 @@ if PIPELINE_MODE == "streaming":
         else:
             # availableNow (drain-and-stop): start, drain to completion, then summarize THIS run.
             query = writer.trigger(availableNow=True).start()
+            _progress_listener.our_run_id = query.runId  # scope the terminated-event filter to this run
             query.awaitTermination()
 
             # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
@@ -744,12 +770,15 @@ if PIPELINE_MODE == "streaming":
         # stop, OR failure) so it does not survive on a reused SparkSession and keep logging unrelated
         # queries, and so repeated runs do not accumulate listeners. Removing on termination (rather
         # than stashing a session-global handle) also means one config's cleanup can never touch
-        # another config's live listener. Fail-soft: cleanup must not mask a real run error.
-        try:
-            spark.streams.removeListener(_progress_listener)
-            print(f"{PROGRESS_TAG} listener removed")
-        except Exception as _e:
-            print(f"WARNING: {PROGRESS_TAG} could not remove listener ({type(_e).__name__}: {_e})")
+        # another config's live listener. Guarded by _listener_registered so we never try to remove a
+        # listener that was never added (registration is fail-soft above). Fail-soft: cleanup must not
+        # mask a real run error.
+        if _listener_registered:
+            try:
+                spark.streams.removeListener(_progress_listener)
+                print(f"{PROGRESS_TAG} listener removed")
+            except Exception as _e:
+                print(f"WARNING: {PROGRESS_TAG} could not remove listener ({type(_e).__name__}: {_e})")
 
 # COMMAND ----------
 # Fail-closed backstop: every supported mode's cell above sets RUN_SUMMARY. If it is still None, the
