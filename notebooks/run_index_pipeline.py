@@ -518,9 +518,10 @@ if PIPELINE_MODE == "streaming":
             transformed = transformed.repartition(WRITE_REPARTITION)
         # Label this micro-batch's Spark jobs in the Jobs/Stages UI (batch id + target index) so an
         # always-on run is legible there. Set on the batch session's context, BEFORE the write launches
-        # its jobs (it applies to jobs started on this micro-batch thread). FAIL-SOFT: this is
-        # observability only, and sparkContext access can be restricted on some cluster access modes, so
-        # a failure here must warn and continue, never fail the batch.
+        # its jobs (it applies to jobs started on this micro-batch thread), and CLEAR it in the finally
+        # below so the 'batch N' label does not bleed onto later jobs on this thread or the idle window
+        # before the next batch. FAIL-SOFT: this is observability only, and sparkContext access can be
+        # restricted on some cluster access modes, so a set/clear failure must warn and continue.
         try:
             session.sparkContext.setJobDescription(
                 batch_job_description(CONFIG_NAME, es_write_config.index, batch_id)
@@ -528,22 +529,30 @@ if PIPELINE_MODE == "streaming":
         except Exception as _e:
             print(f"WARNING: {PROGRESS_TAG} could not set job description "
                   f"({type(_e).__name__}: {_e}); continuing")
-        # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
-        # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
-        # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
-        # micro-batch here: the checkpoint does not advance and Spark reprocesses the batch. That retry
-        # is an idempotent upsert ONLY when es_id_field is set (deterministic _id); with es_id_field
-        # OMITTED, ES assigns fresh random _ids, so the reprocessed rows land as NEW documents and the
-        # retry DUPLICATES them - streaming replays are routine, so omit es_id_field only for a stream
-        # where duplicates are acceptable. If it never recovers the run fails with no summary. So the
-        # record step below is only reached for a batch that wrote every row cleanly, and
-        # result['written'] is the true count.
-        result = bulk_write(transformed, es_write_config, raise_on_error=True)
-        # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
-        # the summary can dedup a retried batch (write mode append; each batch is its own small file).
-        session.createDataFrame(
-            [(int(batch_id), int(result.get("written", 0) or 0))], "batch_id bigint, written bigint"
-        ).coalesce(1).write.mode("append").json(metrics_dir)
+        try:
+            # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
+            # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
+            # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
+            # micro-batch here: the checkpoint does not advance and Spark reprocesses the batch. That retry
+            # is an idempotent upsert ONLY when es_id_field is set (deterministic _id); with es_id_field
+            # OMITTED, ES assigns fresh random _ids, so the reprocessed rows land as NEW documents and the
+            # retry DUPLICATES them - streaming replays are routine, so omit es_id_field only for a stream
+            # where duplicates are acceptable. If it never recovers the run fails with no summary. So the
+            # record step below is only reached for a batch that wrote every row cleanly, and
+            # result['written'] is the true count.
+            result = bulk_write(transformed, es_write_config, raise_on_error=True)
+            # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
+            # the summary can dedup a retried batch (write mode append; each batch is its own small file).
+            session.createDataFrame(
+                [(int(batch_id), int(result.get("written", 0) or 0))], "batch_id bigint, written bigint"
+            ).coalesce(1).write.mode("append").json(metrics_dir)
+        finally:
+            # Clear the batch label so it does not persist onto later jobs on this thread/session or the
+            # idle window before the next batch (cosmetic only). Fail-soft.
+            try:
+                session.sparkContext.setJobDescription(None)
+            except Exception:
+                pass
 
 # COMMAND ----------
 # STREAMING run (streaming mode only). Read the RAW source as a Delta stream and drain it once.
@@ -640,23 +649,8 @@ if PIPELINE_MODE == "streaming":
             except Exception as _e:
                 print(f"WARNING: {PROGRESS_TAG} onQueryTerminated logging failed ({type(_e).__name__}: {_e})")
 
-    # De-dup listener registration so a REUSED SparkSession (persistent cluster, cell re-run, or repeated
-    # runs sharing one session) does not ACCUMULATE _ProgressLogger instances and emit STREAM_PROGRESS
-    # 2x/3x per micro-batch: remove the listener THIS notebook stashed on a prior run, then add a fresh
-    # one and re-stash it. A fresh session (a normal job run) finds none and just adds one. Fail-soft
-    # throughout - listener bookkeeping must never disturb the export.
-    try:
-        _prior_listener = getattr(spark, "_es_progress_listener", None)
-        if _prior_listener is not None:
-            spark.streams.removeListener(_prior_listener)
-    except Exception as _e:
-        print(f"WARNING: {PROGRESS_TAG} could not remove a prior listener ({type(_e).__name__}: {_e})")
     _progress_listener = _ProgressLogger()
     spark.streams.addListener(_progress_listener)
-    try:
-        spark._es_progress_listener = _progress_listener  # best-effort handle for the next run's de-dup
-    except Exception:
-        pass
     print(f"{PROGRESS_TAG} listener registered (per-batch progress logging)")
 
     # The trigger is chosen by streaming_trigger_interval (a deploy-time base_parameter from the config's
@@ -670,80 +664,92 @@ if PIPELINE_MODE == "streaming":
     #   (serverless rejects ProcessingTime). The generated job carries a Databricks Jobs `continuous`
     #   trigger that keeps this run perpetually alive (auto-restarting on failure); each restart resumes
     #   from the checkpoint (the startingVersion seed above is skipped once an offset exists).
-    writer = (
-        stream_df.writeStream
-        .queryName(CONFIG_NAME)  # names the query in the Spark UI streaming tab and in progress.name
-        .option("checkpointLocation", checkpoint_location)
-        .foreachBatch(foreach_batch)
-    )
-    if STREAMING_TRIGGER_INTERVAL:
-        print(f"continuous streaming: ProcessingTime trigger every {STREAMING_TRIGGER_INTERVAL!r} "
-              f"(always-on; this run does not self-terminate)")
-        query = writer.trigger(processingTime=STREAMING_TRIGGER_INTERVAL).start()
-        # awaitTermination BLOCKS for the life of an always-on run, returning ONLY if the stream stops:
-        # on a FAILURE it re-raises (the run fails and the Jobs continuous trigger auto-restarts it, so a
-        # lost batch never passes silently), and on a GRACEFUL stop (job cancel, redeploy, cluster
-        # shutdown) it returns normally. Either way there is NO drain-and-stop reconciliation for an
-        # always-on run - observability is the per-batch metrics foreachBatch writes as each batch commits
-        # plus the Databricks Jobs continuous-run state (RUNNING / restart count / failure notifications).
-        # So set a summary noting the stop and do NOT run the availableNow summary below (this branch owns
-        # its own RUN_SUMMARY; the drain-and-stop reconciliation is the else branch's, for availableNow).
-        query.awaitTermination()
-        RUN_SUMMARY = (
-            f"streaming_trigger=continuous({STREAMING_TRIGGER_INTERVAL}) stopped; "
-            f"checkpoint={checkpoint_location}"
+    try:
+        writer = (
+            stream_df.writeStream
+            .queryName(CONFIG_NAME)  # names the query in the Spark UI streaming tab and in progress.name
+            .option("checkpointLocation", checkpoint_location)
+            .foreachBatch(foreach_batch)
         )
-        print(f"CONTINUOUS STREAM STOPPED: {RUN_SUMMARY}")
-    else:
-        # availableNow (drain-and-stop): start, drain to completion, then summarize THIS run.
-        query = writer.trigger(availableNow=True).start()
-        query.awaitTermination()
-
-        # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
-        # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
-        # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
-        # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that
-        # was retried within this run is counted once, not summed twice - then total. A run with no new
-        # source data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid
-        # outcome, not a failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch
-        # that did not fully succeed failed the run instead of recording, and the total is exact.
-        from pyspark.sql import functions as _F  # noqa: E402
-
-        def _metrics_dir_missing():
-            # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
-            # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
-            # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
-            # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
-            # run that already pushed rows is exactly the fail-open bug this must avoid.
-            try:
-                dbutils.fs.ls(metrics_dir)
-                return False  # path exists
-            except Exception as _e:
-                # Verified on this runtime: a missing path raises ExecutionError wrapping
-                # CloudFileNotFoundException with text "No such file or directory". Match the not-found
-                # signal explicitly; re-raise everything else.
-                _msg = str(_e)
-                if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
-                    return True  # positively not-found: no batches wrote metrics
-                raise  # anything else is a real failure - do not swallow it
-
-        if _metrics_dir_missing():
-            # No metric files => the stream drained zero micro-batches (no new source data since the last
-            # run). A valid outcome, reported as 0, not a failure.
-            num_batches, rows_pushed = 0, 0
+        if STREAMING_TRIGGER_INTERVAL:
+            print(f"continuous streaming: ProcessingTime trigger every {STREAMING_TRIGGER_INTERVAL!r} "
+                  f"(always-on; this run does not self-terminate)")
+            query = writer.trigger(processingTime=STREAMING_TRIGGER_INTERVAL).start()
+            # awaitTermination BLOCKS for the life of an always-on run, returning ONLY if the stream stops:
+            # on a FAILURE it re-raises (the run fails and the Jobs continuous trigger auto-restarts it, so a
+            # lost batch never passes silently), and on a GRACEFUL stop (job cancel, redeploy, cluster
+            # shutdown) it returns normally. Either way there is NO drain-and-stop reconciliation for an
+            # always-on run - observability is the per-batch metrics foreachBatch writes as each batch commits
+            # plus the Databricks Jobs continuous-run state (RUNNING / restart count / failure notifications).
+            # So set a summary noting the stop and do NOT run the availableNow summary below (this branch owns
+            # its own RUN_SUMMARY; the drain-and-stop reconciliation is the else branch's, for availableNow).
+            query.awaitTermination()
+            RUN_SUMMARY = (
+                f"streaming_trigger=continuous({STREAMING_TRIGGER_INTERVAL}) stopped; "
+                f"checkpoint={checkpoint_location}"
+            )
+            print(f"CONTINUOUS STREAM STOPPED: {RUN_SUMMARY}")
         else:
-            # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the
-            # run rather than being silently reported as 0.
-            _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
-            _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
-            num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
-        RUN_SUMMARY = (
-            f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
-            f"checkpoint={checkpoint_location}"
-        )
-        if rows_pushed == 0:
-            print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
-        print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
+            # availableNow (drain-and-stop): start, drain to completion, then summarize THIS run.
+            query = writer.trigger(availableNow=True).start()
+            query.awaitTermination()
+
+            # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
+            # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
+            # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
+            # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that
+            # was retried within this run is counted once, not summed twice - then total. A run with no new
+            # source data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid
+            # outcome, not a failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch
+            # that did not fully succeed failed the run instead of recording, and the total is exact.
+            from pyspark.sql import functions as _F  # noqa: E402
+
+            def _metrics_dir_missing():
+                # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
+                # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
+                # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
+                # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
+                # run that already pushed rows is exactly the fail-open bug this must avoid.
+                try:
+                    dbutils.fs.ls(metrics_dir)
+                    return False  # path exists
+                except Exception as _e:
+                    # Verified on this runtime: a missing path raises ExecutionError wrapping
+                    # CloudFileNotFoundException with text "No such file or directory". Match the not-found
+                    # signal explicitly; re-raise everything else.
+                    _msg = str(_e)
+                    if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
+                        return True  # positively not-found: no batches wrote metrics
+                    raise  # anything else is a real failure - do not swallow it
+
+            if _metrics_dir_missing():
+                # No metric files => the stream drained zero micro-batches (no new source data since the last
+                # run). A valid outcome, reported as 0, not a failure.
+                num_batches, rows_pushed = 0, 0
+            else:
+                # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the
+                # run rather than being silently reported as 0.
+                _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
+                _agg = _per_batch.agg(_F.count("*").alias("batches"), _F.coalesce(_F.sum("written"), _F.lit(0)).alias("rows")).collect()[0]
+                num_batches, rows_pushed = int(_agg["batches"]), int(_agg["rows"])
+            RUN_SUMMARY = (
+                f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
+                f"checkpoint={checkpoint_location}"
+            )
+            if rows_pushed == 0:
+                print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
+            print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
+    finally:
+        # Remove our listener when the run ends (availableNow drain-and-stop, graceful continuous
+        # stop, OR failure) so it does not survive on a reused SparkSession and keep logging unrelated
+        # queries, and so repeated runs do not accumulate listeners. Removing on termination (rather
+        # than stashing a session-global handle) also means one config's cleanup can never touch
+        # another config's live listener. Fail-soft: cleanup must not mask a real run error.
+        try:
+            spark.streams.removeListener(_progress_listener)
+            print(f"{PROGRESS_TAG} listener removed")
+        except Exception as _e:
+            print(f"WARNING: {PROGRESS_TAG} could not remove listener ({type(_e).__name__}: {_e})")
 
 # COMMAND ----------
 # Fail-closed backstop: every supported mode's cell above sets RUN_SUMMARY. If it is still None, the
