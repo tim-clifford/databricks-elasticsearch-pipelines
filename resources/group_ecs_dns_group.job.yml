@@ -9,6 +9,8 @@ resources:
         notebooks/run_index_pipeline.py with its own config. Members naming the same job_cluster_config
         share one job cluster.'
       max_concurrent_runs: 1
+      queue:
+        enabled: false
       job_clusters:
       - job_cluster_key: standard_batch
         new_cluster:

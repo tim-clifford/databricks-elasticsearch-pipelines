@@ -12,6 +12,12 @@ resources:
       # Never run two copies at once, consistent with every index job. Fixed at 1, not parameterized.
       max_concurrent_runs: 1
 
+      # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
+      # rather than queued. The Jobs API defaults queue.enabled to true, so this makes single-flight actually
+      # skip overlaps, matching every generated job (see scripts/gen_jobs.py _assemble_job).
+      queue:
+        enabled: false
+
       tasks:
         - task_key: deploy_views
           notebook_task:

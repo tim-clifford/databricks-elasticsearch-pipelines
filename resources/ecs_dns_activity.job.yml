@@ -8,6 +8,8 @@ resources:
         notebooks/run_index_pipeline.py with this index's config. No cluster block => serverless notebook
         task.
       max_concurrent_runs: 1
+      queue:
+        enabled: false
       parameters:
       - name: pipeline_mode
         default: batch

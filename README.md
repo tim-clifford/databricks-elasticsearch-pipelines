@@ -339,9 +339,13 @@ clear message rather than failing at deploy. Omitting `schedule` leaves the job 
 
 The schedule pairs naturally with either export mode: a `batch` job re-exports the view on each tick,
 and a `streaming` job drains new source commits since its last run on each tick (it uses
-`Trigger.availableNow`, so a scheduled run processes the delta and stops). Because every job sets
-`max_concurrent_runs: 1`, a scheduled run that fires while the previous one is still going is skipped
-rather than overlapping.
+`Trigger.availableNow`, so a scheduled run processes the delta and stops). Every job sets
+`max_concurrent_runs: 1` **and** `queue: {enabled: false}`, so a scheduled tick that fires while the
+previous run is still going is **skipped** (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or
+piling up. The `queue` disable is load-bearing: the Jobs API defaults `queue.enabled` to `true`, which
+would otherwise *queue* the overlapping tick (waiting up to 48h for the slot) instead of dropping it.
+Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint,
+and a batch job's next tick re-exports the whole view.
 
 **Where schedules actually fire.** Every generated schedule's `pause_status` is bound to the
 `schedule_pause_status` variable, which defaults to `PAUSED` (fail-safe), so a target controls firing
