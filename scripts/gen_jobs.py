@@ -385,20 +385,26 @@ def _job_clusters_for(members: list) -> list | None:
 def _assemble_job(display_name: str, description: str, job_params: list | None,
                   trigger: dict | None, job_clusters: list | None, tasks: list) -> dict:
     """Assemble one job dict with deterministic key order: name, description, max_concurrent_runs,
-    [parameters], [schedule|continuous], [job_clusters], tasks, permissions.
+    queue, [parameters], [schedule|continuous], [job_clusters], tasks, permissions.
 
     job_params: the job-level `parameters:` list (singleton) or None to omit it (a grouped job carries
     the run-time knobs in each task's base_parameters instead - job parameters can't hold per-member
     defaults). trigger: a single-key {"schedule"|"continuous": ...} dict, or None (on-demand).
     job_clusters: the list or None. max_concurrent_runs is fixed at 1 for every job (no double-write /
     checkpoint contention; a group's members write different indices, so one shared serial run is still
-    correct). On-demand CAN_MANAGE_RUN to `users`, consistent across the bundle. sort_keys=False keeps
-    this insertion order so --check compares byte-for-byte.
+    correct). `queue: {enabled: false}` pairs with it so a trigger that fires while a run is active is
+    SKIPPED (MAX_CONCURRENT_RUNS_EXCEEDED), not queued: the Jobs API defaults queue.enabled to true, so
+    without this a scheduled tick landing on a still-running drain would pile up (queued up to 48h)
+    instead of being dropped. Skipping loses no data - a streaming tick's next availableNow run drains
+    the full backlog since the last checkpoint, and a batch tick re-exports the whole view. On-demand
+    CAN_MANAGE_RUN to `users`, consistent across the bundle. sort_keys=False keeps this insertion order
+    so --check compares byte-for-byte.
     """
     job_def: dict = {
         "name": display_name,
         "description": description,
         "max_concurrent_runs": 1,
+        "queue": {"enabled": False},
     }
     if job_params is not None:
         job_def["parameters"] = job_params

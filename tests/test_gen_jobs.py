@@ -97,6 +97,25 @@ def test_render_all_jobs_max_concurrent_runs_1():
         assert _render_job(_cfg(compute), spec)["max_concurrent_runs"] == 1
 
 
+def test_render_all_jobs_disable_queue():
+    # queue.enabled=false pairs with max_concurrent_runs=1 so a trigger firing on a still-running job is
+    # SKIPPED, not queued (the Jobs API defaults queue.enabled to true, which would pile runs up). Holds
+    # for every compute; independent of schedule/continuous since it is a job-level, always-on guard.
+    for compute, spec in (
+        (None, None),
+        ({"type": "existing_cluster", "cluster_config": "interactive_primary"}, None),
+        ({"type": "job_cluster", "job_cluster_config": "std"}, {"spark_version": "15.4.x-scala2.12", "num_workers": 1}),
+    ):
+        assert _render_job(_cfg(compute), spec)["queue"] == {"enabled": False}
+
+
+def test_render_scheduled_job_disables_queue():
+    # The pile-up scenario in the wild: a cron job whose run outlasts the interval. queue off => the
+    # overlapping tick is dropped rather than queued behind the running drain.
+    job = _render_job(_cfg(schedule={"quartz_cron_expression": "0 0 8 * * ?"}))
+    assert "schedule" in job and job["queue"] == {"enabled": False}
+
+
 # --------------------------------------------------------------------------- render: existing_cluster
 
 
@@ -449,6 +468,16 @@ def test_shipped_databricks_yml_declares_job_name_prefix():
     gen_jobs.require_job_name_prefix_declared()  # the repo's databricks.yml declares it
 
 
+def test_shipped_deploy_views_job_disables_queue():
+    # deploy_views is hand-authored (not generated), so guard its skip-not-queue setting against drift
+    # back to the queuing default, matching every generated job.
+    path = os.path.join(_REPO_ROOT, "resources", "deploy_views.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["deploy_views"]
+    assert job["max_concurrent_runs"] == 1
+    assert job["queue"] == {"enabled": False}
+
+
 # --------------------------------------------------------------------------- job groups
 
 
@@ -493,6 +522,12 @@ def test_group_one_job_one_task_per_member():
     ])
     # Tasks emitted sorted by config name; each keyed index_pipeline_<member>.
     assert [t["task_key"] for t in job["tasks"]] == ["index_pipeline_a", "index_pipeline_b"]
+
+
+def test_group_disables_queue():
+    # A grouped job is one Databricks job with one trigger, so it needs the same skip-not-queue guard.
+    job = _render_group("g1", [_member("a.yml", "a", "idx-a", mode="batch")])
+    assert job["queue"] == {"enabled": False}
 
 
 def test_group_has_no_job_level_parameters_block():

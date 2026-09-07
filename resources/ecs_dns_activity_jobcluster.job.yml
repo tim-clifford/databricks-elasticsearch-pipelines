@@ -8,6 +8,8 @@ resources:
         notebook notebooks/run_index_pipeline.py with this index's config. Runs on job cluster 'standard_batch'
         (new_cluster spec from _pipelines/job_cluster_configs/).
       max_concurrent_runs: 1
+      queue:
+        enabled: false
       parameters:
       - name: pipeline_mode
         default: batch

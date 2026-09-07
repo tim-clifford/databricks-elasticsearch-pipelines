@@ -9,6 +9,8 @@ resources:
         (new_cluster spec from _pipelines/job_cluster_configs/). Runs ALWAYS-ON (continuous trigger; ProcessingTime
         30 seconds).
       max_concurrent_runs: 1
+      queue:
+        enabled: false
       parameters:
       - name: pipeline_mode
         default: streaming
