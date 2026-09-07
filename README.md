@@ -25,6 +25,8 @@ The bundle deploys:
   [`notebooks/run_index_pipeline.py`](notebooks/run_index_pipeline.py) with that index's config. These
   job resources are **generated** by [`scripts/gen_jobs.py`](scripts/gen_jobs.py) from the config
   files (see [Adding a new pipeline for an ES index](#adding-a-new-pipeline-for-an-es-index)).
+  Configs can instead be merged into a single multi-task job via [Job groups](#job-groups) (e.g. to
+  share one cluster).
 
 ## Adding a new pipeline for an ES index
 
@@ -159,6 +161,8 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
 #   quartz_cron_expression: "0 0 8 * * ?"   # 08:00 UTC daily
 # continuous:                      # OPTIONAL: run always-on instead of scheduled (see Continuous streaming).
 #   trigger_interval: 30 seconds   #   streaming + classic compute only; mutually exclusive with schedule
+# job_group: ecs_streams           # OPTIONAL: merge every config sharing this name into ONE job, one task each (see Job groups)
+# job_name_postfix: "ECS streams"  # OPTIONAL: cosmetic display-name segment (default: config name, or group name in a group)
 ```
 
 A `catalog`/`schema` without an `${environment}` token is used verbatim. One that *uses* the token
@@ -387,6 +391,57 @@ micro-batch does not try to read the whole table.
 See [`_pipelines/pipeline_configs/ecs_dns_activity_continuous.yml`](_pipelines/pipeline_configs/ecs_dns_activity_continuous.yml)
 for a worked example.
 
+### Job groups
+
+By default each config becomes its own Databricks job (`index_pipeline_<config_name>`). Set an
+optional **`job_group`** on two or more configs to merge them into **one** job instead, with each
+member config as an independent task (no inter-task dependencies):
+
+```yaml
+# in each member config
+job_group: ecs_streams
+```
+
+The generator emits a single `resources/group_<job_group>.job.yml` (resource key
+`index_pipeline_group_<job_group>`) with one task per member (`index_pipeline_<config_name>`, unchanged).
+The main reason to group is **compute sharing**: members that name the **same** `job_cluster_config`
+land on **one** physical job cluster (the generator deduplicates the `job_clusters` block), so N
+pipelines run on one cluster instead of N. Members that name *different* cluster configs, or a mix of
+serverless / `existing_cluster`, still coexist as tasks in the one job. Size a shared cluster for the
+**sum** of its concurrent tasks (they run at once, and continuous members run perpetually).
+
+What the group agrees on, all fail-closed at generation (`gen_jobs.py --check`):
+
+- **Trigger** (define-once): a Databricks job has exactly one trigger, so members must not declare
+  *conflicting* ones. Any member may set a `schedule` or `continuous` block (or omit it and inherit);
+  the group is on-demand if none declare one, adopts the single declared trigger if one or more agree,
+  and is **rejected** if members declare different triggers (two different crons, or `schedule` vs
+  `continuous`). A **continuous** group propagates its `trigger_interval` to every member (so a member
+  that omitted `continuous` still runs always-on rather than draining under `availableNow`) and
+  requires **every** member to be `streaming` on classic compute.
+- **`job_name_postfix`** (define-once): same rule (omit on most members and set once); conflicting
+  values are rejected (see [Job naming](#job-naming)).
+
+**Run-time parameters differ in a group.** A standalone job exposes the run-time knobs (`pipeline_mode`,
+`filter_condition`, `chunk_size`, …) as job-level **parameters**, overridable per run with `--params`.
+A job cannot hold *per-member* parameter defaults, so a grouped job instead bakes each member's knobs
+into that **task's** `base_parameters` at deploy. The runner reads the same widgets either way (no
+behavior change), but on a grouped job these are **not** `--params`-overridable per member: change a
+member's value in its config and redeploy. (A run-time `notebook_params` override still applies, but
+job-wide to every task.) If you need per-member run-time overrides, keep those configs standalone.
+
+### Job naming
+
+A job's display name is `[<target>] <prefix>: <postfix>`.
+
+- **`prefix`** is the `job_name_prefix` bundle variable (`databricks.yml`), default
+  `databricks-elasticsearch-pipelines`. The generator emits `${var.job_name_prefix}`, so you can
+  rebrand every job name per target (or with `--var=job_name_prefix=<name>`) without regenerating.
+- **`postfix`** defaults to the config name (standalone) or the group name (group). Set an optional
+  **`job_name_postfix`** on a config to override just the trailing display segment (e.g.
+  `"ECS DNS (serverless)"`). It is purely cosmetic (it never changes any resource key or task key), so
+  it may contain spaces and punctuation. In a group it follows the define-once rule above.
+
 ## Deploy and run
 
 The bundle defines three **targets**, selected with `-t`: `dev` (the default), `stg`, and `prd`.
@@ -411,7 +466,8 @@ Two different mechanisms carry values into a job, and they resolve at different 
   config is empty for its target fails closed at run. The ES host configs have their own section:
   [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections).
 - **Job parameters** are `--params` values applied at **run** time, overridable per run without
-  redeploying (an invalid value fails the run closed):
+  redeploying (an invalid value fails the run closed). This is the standalone-job model; a
+  [job group](#job-groups) instead bakes these per member at deploy (not `--params`-overridable):
   - `pipeline_mode` (`batch` | `streaming`), `filter_condition` (a Spark SQL predicate), and the
     connector-write tuning knobs `chunk_size`, `write_concurrency`, `require_existing_index`,
     `verify_certs` all default to their config values (each is an optional config key; see
