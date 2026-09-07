@@ -45,6 +45,16 @@ variables:
     description: "Environment folded into ${environment} in config names. Empty default; set per target below or override with --var."
     default: ""
 
+  # Branding PREFIX in every generated job's display name: `[<target>] <job_name_prefix>: <postfix>`.
+  # scripts/gen_jobs.py emits ${var.job_name_prefix} into each job name, so the bundle resolves it per
+  # target at deploy - rebrand every job (e.g. to a team/product name) without regenerating any files.
+  # Default is the repo name; a config's or job_group's optional job_name_postfix overrides the trailing
+  # <postfix> segment (default: the config name / group name). Override per target below or with
+  # --var=job_name_prefix=<name>.
+  job_name_prefix:
+    description: "Prefix in every generated job display name ([<target>] <prefix>: <postfix>). Default databricks-elasticsearch-pipelines; per-target/--var overridable."
+    default: databricks-elasticsearch-pipelines
+
   # One GLOBAL connector wheel serves every per-index job, so it is a bundle variable, not per-config.
   # Set it PER TARGET below (targets.<env>.variables); it ships empty on main. Empty default (the path
   # is environment-specific): variable-only commands like `bundle run deploy_views` resolve without it,

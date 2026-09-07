@@ -1375,3 +1375,48 @@ def test_job_parameters_rate_limits_default_from_config():
     params = job_parameters(validate_config(cfg))
     assert {"name": "max_files_per_trigger", "default": "200"} in params
     assert {"name": "max_bytes_per_trigger", "default": "256m"} in params
+
+
+# --------------------------------------------------------------------------- job_group / job_name_postfix
+
+
+def test_job_group_and_postfix_default_none():
+    cfg = validate_config(_base())
+    assert cfg["job_group"] is None
+    assert cfg["job_name_postfix"] is None
+
+
+def test_job_group_valid_identifier_accepted():
+    cfg = _base()
+    cfg["job_group"] = "ecs_streams-1"
+    assert validate_config(cfg)["job_group"] == "ecs_streams-1"
+
+
+@pytest.mark.parametrize("bad", ["has space", "a.b", "grp/sub", ""])
+def test_job_group_bad_identifier_fails_closed(bad):
+    cfg = _base()
+    cfg["job_group"] = bad
+    with pytest.raises(PipelineConfigError, match="job_group"):
+        validate_config(cfg)
+
+
+def test_job_name_postfix_string_accepted_and_stripped():
+    cfg = _base()
+    cfg["job_name_postfix"] = "  ECS DNS + Auth  "
+    assert validate_config(cfg)["job_name_postfix"] == "ECS DNS + Auth"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "line1\nline2", 5, True])
+def test_job_name_postfix_bad_value_fails_closed(bad):
+    cfg = _base()
+    cfg["job_name_postfix"] = bad
+    with pytest.raises(PipelineConfigError, match="job_name_postfix"):
+        validate_config(cfg)
+
+
+def test_job_group_and_postfix_carried_through_resolve():
+    cfg = _base()
+    cfg["job_group"] = "g1"
+    cfg["job_name_postfix"] = "My Group"
+    out = resolve_config(validate_config(cfg), environment="")
+    assert out["job_group"] == "g1" and out["job_name_postfix"] == "My Group"

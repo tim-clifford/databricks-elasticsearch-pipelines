@@ -119,6 +119,14 @@ _VALID_COMPUTE_TYPES = ("serverless", "existing_cluster", "job_cluster")
 # generator resolves the key to a file.
 _VALID_JOB_CLUSTER_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# A job_group name becomes part of a generated resource key (index_pipeline_group_<g>) and filename
+# (resources/group_<g>.job.yml), so it is held to the same charset as a config stem: letters, digits,
+# '_' and '-' only. Configs that share a job_group are merged by the generator into ONE Databricks job,
+# each as an independent task (no inter-task dependencies); members that name the same job_cluster_config
+# then share one physical job cluster. Absent => the config renders as its own standalone job (the
+# default, 1:1 config-to-job). See scripts/gen_jobs.py for the grouping and per-group trigger/postfix rules.
+_VALID_JOB_GROUP = re.compile(r"^[A-Za-z0-9_-]+$")
+
 # A continuous pipeline's ProcessingTime trigger interval. Spark ultimately parses this at query start
 # (via IntervalUtils.stringToInterval), but on an ALWAYS-ON run a bad interval fails only at .start() and
 # the Jobs continuous trigger then restarts the run in a loop - so we validate the FORMAT up front with
@@ -567,6 +575,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "chunk_size", "write_concurrency", "require_existing_index", "verify_certs", "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
+        "job_group", "job_name_postfix",
     }
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
@@ -644,6 +653,20 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # always-on (a Databricks Jobs continuous trigger + a ProcessingTime stream; see _validate_continuous).
     # A deploy-time job property, validated here and passed through resolve unchanged.
     continuous = _validate_continuous(raw.get("continuous"), f"{source}: continuous")
+    # job_group is OPTIONAL: absent -> None (this config renders as its own standalone job, the 1:1
+    # default). Present -> a bare identifier; the generator (scripts/gen_jobs.py) merges every config
+    # sharing this value into ONE Databricks job, one independent task each (no dependencies), and the
+    # per-group trigger/postfix/cluster-sharing rules live there. A deploy-time grouping choice, carrying
+    # no object names or ${environment}, so it is validated here and passed through resolve unchanged.
+    job_group = _require_job_group(raw["job_group"], f"{source}: job_group") if "job_group" in raw else None
+    # job_name_postfix is OPTIONAL: absent -> None. It replaces only the trailing DISPLAY segment of the
+    # job name (cosmetic; never a resource/task key). For a singleton the default segment is the config
+    # name; for a job_group the generator uses the group name unless a member sets this. A deploy-time
+    # display choice, passed through resolve unchanged.
+    job_name_postfix = (
+        require_job_name_postfix(raw["job_name_postfix"], f"{source}: job_name_postfix")
+        if "job_name_postfix" in raw else None
+    )
     # Cross-field rules for continuous (always-on) mode, all fail-closed - the three constraints that
     # make an always-on stream valid, checked here so an illegal combo fails at config load (and thus at
     # generation / deploy), never producing a job that would only break when the stream tries to start:
@@ -693,6 +716,8 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "compute": compute,
         "schedule": schedule,
         "continuous": continuous,
+        "job_group": job_group,
+        "job_name_postfix": job_name_postfix,
     }
 
 
@@ -883,6 +908,37 @@ def _validate_continuous(node: object, where: str = "continuous") -> dict | None
     return {"trigger_interval": require_trigger_interval(node.get("trigger_interval"), f"{where}.trigger_interval")}
 
 
+def _require_job_group(value: object, where: str) -> str:
+    """A job_group name: a bare identifier (letters, digits, '_', '-'). Fail closed.
+
+    It becomes part of a generated resource key and filename (index_pipeline_group_<g> /
+    resources/group_<g>.job.yml), so it is charset-restricted exactly like a config stem and a
+    job_cluster_config key - no dots/slashes/spaces that would break the key or enable path issues."""
+    if not isinstance(value, str) or not _VALID_JOB_GROUP.match(value):
+        raise PipelineConfigError(
+            f"{where} must be an identifier (letters, digits, '_' and '-' only, no dots or spaces), "
+            f"got {value!r}"
+        )
+    return value
+
+
+def require_job_name_postfix(value: object, where: str = "job_name_postfix") -> str:
+    """An OPTIONAL job-name display postfix: a non-empty, single-line string. Returns it stripped.
+
+    Purely COSMETIC - it replaces only the trailing display segment of a job's name
+    (`[<target>] <prefix>: <postfix>`) and never touches any resource key or task key (those stay
+    identifier-safe, derived from the config/group name). So it is not held to the identifier rule:
+    spaces and most characters are fine in a Databricks job name. We reject only an empty/whitespace-only
+    value (which would render a blank name segment) and any newline (job names are single-line), so a
+    malformed value fails closed at config load rather than producing a confusing job name at deploy."""
+    if not isinstance(value, str) or not value.strip():
+        raise PipelineConfigError(f"{where} must be a non-empty string, got {value!r}")
+    stripped = value.strip()
+    if "\n" in stripped or "\r" in stripped:
+        raise PipelineConfigError(f"{where} must be a single line (no newlines), got {value!r}")
+    return stripped
+
+
 def resolve_config(cfg: dict, environment: str) -> dict:
     """Fold `environment` into every name template in a validated config, returning resolved names.
 
@@ -938,6 +994,10 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "schedule": cfg["schedule"],
         # continuous (always-on trigger) is likewise a deploy-time job property: passed through verbatim.
         "continuous": cfg["continuous"],
+        # job_group (which job a config is merged into) and job_name_postfix (a cosmetic display segment)
+        # are deploy-time job properties, not object names: passed through verbatim, no ${environment}.
+        "job_group": cfg["job_group"],
+        "job_name_postfix": cfg["job_name_postfix"],
     }
 
 
