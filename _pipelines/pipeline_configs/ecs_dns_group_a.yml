@@ -1,0 +1,34 @@
+# Job-group example, member A of 2. Demonstrates `job_group`: this config and ecs_dns_group_b.yml share
+# the same `job_group`, so scripts/gen_jobs.py merges them into ONE Databricks job
+# (index_pipeline_group_ecs_dns_group) with one independent task each (no dependencies). Because BOTH
+# members name the same job cluster (compute.job_cluster_config: standard_batch), they run on ONE shared
+# job cluster instead of two - the resource-saving point of grouping. See the README "Job groups" section.
+#
+# This member also sets job_name_postfix (member B omits it and inherits it, per the define-once rule),
+# so the merged job's display name is `[<target>] <prefix>: ECS DNS group (a+b, shared cluster)`.
+#
+# Reads the same OCSF dns_activity source as the other DNS examples but writes its OWN index
+# (ecs-dns-group-a): every group member MUST target a distinct es_index_name (grouped members run as
+# concurrent tasks, so two writing one index would double-write it - the generator fails closed on that).
+es_index_name: ecs-dns-group-a               # this member's own ES index (distinct from member B's)
+es_id_field: dsl_id                          # OPTIONAL: view output column used as the ES document _id (idempotent upserts on re-run)
+es_host_config: es_host_primary              # ES host config (endpoint + secret scope/key); declared in databricks.yml
+pipeline_mode: batch                         # default export mode: batch | streaming
+
+job_group: ecs_dns_group                     # MERGE with every config sharing this job_group into one job
+job_name_postfix: "ECS DNS group (a+b, shared cluster)"  # cosmetic display-name segment for the merged job (member B inherits it)
+
+view:                             # the view this pipeline creates and exports
+  catalog: tim_clifford_classic_dsl_lite_${environment}
+  schema: es_poc
+  name: ecs_dns_group_a
+
+source:                           # the single source table the view reads from
+  catalog: tim_clifford_classic_dsl_lite_${environment}
+  schema: ocsf
+  table: dns_activity
+  primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column
+
+compute:                          # run on a JOB CLUSTER; the SAME job_cluster_config as member B => ONE shared cluster
+  type: job_cluster
+  job_cluster_config: standard_batch   # -> _pipelines/job_cluster_configs/standard_batch.yml (new_cluster spec)
