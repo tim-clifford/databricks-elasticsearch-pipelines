@@ -11,7 +11,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 
 import gen_jobs  # noqa: E402
-from pipeline_lib.config import validate_config  # noqa: E402
+from pipeline_lib.config import job_parameters, validate_config  # noqa: E402
 
 
 def _cfg(compute=None, schedule=None):
@@ -49,7 +49,9 @@ def test_render_job_name_uses_config_name_not_es_index():
     # a job lines up with the config you edit/deploy. es_index_name differs here ("ecs-dns-activity")
     # to prove the name follows the config name; the ES index still appears in the description.
     job = _render_job(_cfg())
-    assert job["name"] == "[${bundle.target}] databricks-elasticsearch-pipelines: ecs_dns_activity"
+    # The prefix is the ${var.job_name_prefix} bundle variable (resolved per target at deploy); the
+    # trailing segment defaults to the config name.
+    assert job["name"] == "[${bundle.target}] ${var.job_name_prefix}: ecs_dns_activity"
     assert "ecs-dns-activity" in job["description"]  # es_index_name still named in the description
 
 
@@ -407,3 +409,238 @@ def test_render_unresolved_es_host_config_fails_closed():
     })
     with pytest.raises(ValueError, match="es_host_config for .* is unset"):
         gen_jobs.render_job_yaml("x.yml", "x", cfg, None)
+
+
+# --------------------------------------------------------------------------- job_name_prefix / postfix
+
+
+def test_render_job_name_prefix_is_bundle_variable():
+    # Every job name embeds ${var.job_name_prefix} (resolved per target at deploy), not a hardcoded literal.
+    assert "${var.job_name_prefix}" in _render_job(_cfg())["name"]
+
+
+def test_render_job_name_postfix_overrides_config_name():
+    # A singleton's optional job_name_postfix replaces only the trailing display segment; the resource
+    # key and task key stay identifier-safe (index_pipeline_<config name>), untouched by the postfix.
+    cfg = _cfg()
+    cfg["job_name_postfix"] = "ECS DNS (serverless)"
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
+    assert job["name"] == "[${bundle.target}] ${var.job_name_prefix}: ECS DNS (serverless)"
+    assert job["tasks"][0]["task_key"] == "index_pipeline_ecs_dns_activity"  # key unaffected
+
+
+def test_require_job_name_prefix_declared_present_passes(tmp_path):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  job_name_prefix:\n    default: acme-pipelines\n")
+    gen_jobs.require_job_name_prefix_declared(str(yml))  # no raise
+
+
+def test_require_job_name_prefix_declared_missing_fails_closed(tmp_path):
+    # The generated names reference ${var.job_name_prefix}; if the variable is not declared, fail closed
+    # at generation rather than let the reference break confusingly at deploy.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
+    with pytest.raises(ValueError, match="job_name_prefix is not declared"):
+        gen_jobs.require_job_name_prefix_declared(str(yml))
+
+
+def test_shipped_databricks_yml_declares_job_name_prefix():
+    gen_jobs.require_job_name_prefix_declared()  # the repo's databricks.yml declares it
+
+
+# --------------------------------------------------------------------------- job groups
+
+
+def _member(config_filename, name, es_index, *, group="g1", postfix=None, mode="streaming",
+            continuous=None, schedule=None, job_cluster_config=None, cluster_config=None):
+    """One (config_filename, name, cfg, spec) group member. spec is a job-cluster new_cluster spec when
+    job_cluster_config is set (mirrors what main() loads), else None."""
+    raw = {
+        "es_index_name": es_index, "es_id_field": "dsl_id", "es_host_config": "es_host_primary",
+        "pipeline_mode": mode, "job_group": group,
+        "view": {"catalog": "c", "schema": "s", "name": "v"},
+        "source": {"catalog": "c", "schema": "s", "table": "t"},
+    }
+    if postfix is not None:
+        raw["job_name_postfix"] = postfix
+    if continuous is not None:
+        raw["continuous"] = {"trigger_interval": continuous}
+    if schedule is not None:
+        raw["schedule"] = {"quartz_cron_expression": schedule}
+    spec = None
+    if job_cluster_config is not None:
+        raw["compute"] = {"type": "job_cluster", "job_cluster_config": job_cluster_config}
+        spec = {"spark_version": "17.3.x-scala2.13", "num_workers": 1}
+    elif cluster_config is not None:
+        raw["compute"] = {"type": "existing_cluster", "cluster_config": cluster_config}
+    return (config_filename, name, validate_config(raw), spec)
+
+
+def _render_group(group, members):
+    """Render and parse a group job; return the single job dict under resources.jobs."""
+    text = gen_jobs.render_group_job_yaml(group, members)
+    assert text.startswith(gen_jobs._GENERATED_MARKER)  # group header carries the generated marker
+    jobs = yaml.safe_load(text)["resources"]["jobs"]
+    assert list(jobs) == [f"index_pipeline_group_{group}"]
+    return jobs[f"index_pipeline_group_{group}"]
+
+
+def test_group_one_job_one_task_per_member():
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch"),
+        _member("b.yml", "b", "idx-b", mode="batch"),
+    ])
+    # Tasks emitted sorted by config name; each keyed index_pipeline_<member>.
+    assert [t["task_key"] for t in job["tasks"]] == ["index_pipeline_a", "index_pipeline_b"]
+
+
+def test_group_has_no_job_level_parameters_block():
+    # Option A: a grouped job carries NO job-level parameters (they can't hold per-member defaults).
+    job = _render_group("g1", [_member("a.yml", "a", "idx-a", mode="batch")])
+    assert "parameters" not in job
+
+
+def test_group_run_time_knobs_move_into_task_base_parameters():
+    # The 11 run-time knobs (from job_parameters) become each task's base_parameters, with per-member
+    # defaults; the notebook reads the same widget names, so no notebook change.
+    cfg = validate_config({
+        "es_index_name": "idx-a", "es_id_field": "dsl_id", "es_host_config": "es_host_primary",
+        "pipeline_mode": "batch", "job_group": "g1", "chunk_size": 500, "write_concurrency": 4,
+        "view": {"catalog": "c", "schema": "s", "name": "v"},
+        "source": {"catalog": "c", "schema": "s", "table": "t"},
+    })
+    job = _render_group("g1", [("a.yml", "a", cfg, None)])
+    bp = job["tasks"][0]["notebook_task"]["base_parameters"]
+    for p in job_parameters(cfg):
+        assert bp[p["name"]] == p["default"]
+    assert bp["chunk_size"] == "500" and bp["write_concurrency"] == "4"  # per-member defaults carried
+
+
+def test_group_shares_one_job_cluster_when_same_config():
+    # Two members naming the SAME job_cluster_config get ONE job_clusters entry; both tasks reference it.
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch", job_cluster_config="shared"),
+        _member("b.yml", "b", "idx-b", mode="batch", job_cluster_config="shared"),
+    ])
+    assert [c["job_cluster_key"] for c in job["job_clusters"]] == ["shared"]
+    assert {t["job_cluster_key"] for t in job["tasks"]} == {"shared"}
+
+
+def test_group_distinct_job_clusters_stay_separate():
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch", job_cluster_config="big"),
+        _member("b.yml", "b", "idx-b", mode="batch", job_cluster_config="small"),
+    ])
+    assert [c["job_cluster_key"] for c in job["job_clusters"]] == ["big", "small"]  # sorted, both present
+
+
+def test_group_on_demand_has_no_trigger_and_postfix_defaults_to_group_name():
+    job = _render_group("mygrp", [_member("a.yml", "a", "idx-a", group="mygrp", mode="batch")])
+    assert "schedule" not in job and "continuous" not in job
+    assert job["name"] == "[${bundle.target}] ${var.job_name_prefix}: mygrp"
+
+
+def test_group_postfix_adopted_from_single_declaring_member():
+    # One member declares job_name_postfix, the other omits it: the declared one is adopted (lenient).
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch", postfix="ECS Group"),
+        _member("b.yml", "b", "idx-b", mode="batch"),
+    ])
+    assert job["name"] == "[${bundle.target}] ${var.job_name_prefix}: ECS Group"
+
+
+def test_group_conflicting_postfix_fails_closed():
+    with pytest.raises(ValueError, match="conflicting job_name_postfix"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "idx-a", mode="batch", postfix="X"),
+            _member("b.yml", "b", "idx-b", mode="batch", postfix="Y"),
+        ])
+
+
+def test_group_scheduled_shares_one_cron():
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch", schedule="0 0 8 * * ?"),
+        _member("b.yml", "b", "idx-b", mode="batch", schedule="0 0 8 * * ?"),
+    ])
+    assert job["schedule"]["quartz_cron_expression"] == "0 0 8 * * ?"
+    assert job["schedule"]["timezone_id"] == "UTC"
+
+
+def test_group_conflicting_cron_fails_closed():
+    with pytest.raises(ValueError, match="conflicting triggers"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "idx-a", mode="batch", schedule="0 0 8 * * ?"),
+            _member("b.yml", "b", "idx-b", mode="batch", schedule="0 0 9 * * ?"),
+        ])
+
+
+def test_group_schedule_and_continuous_conflict_fails_closed():
+    with pytest.raises(ValueError, match="conflicting triggers"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="s"),
+            _member("b.yml", "b", "idx-b", mode="batch", schedule="0 0 8 * * ?"),
+        ])
+
+
+def test_group_continuous_emits_trigger_and_propagates_interval_to_all():
+    # A continuous group: one job-level continuous trigger, and the single interval propagates to EVERY
+    # task's streaming_trigger_interval (including the member that omitted its own continuous block, so it
+    # runs always-on rather than draining under availableNow).
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="shared"),
+        _member("b.yml", "b", "idx-b", job_cluster_config="shared"),  # no continuous block: inherits
+    ])
+    assert job["continuous"] == {"pause_status": "${var.schedule_pause_status}"}
+    for t in job["tasks"]:
+        assert t["notebook_task"]["base_parameters"]["streaming_trigger_interval"] == "30 seconds"
+
+
+def test_group_continuous_conflicting_interval_fails_closed():
+    with pytest.raises(ValueError, match="conflicting triggers"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="s"),
+            _member("b.yml", "b", "idx-b", continuous="1 minute", job_cluster_config="s"),
+        ])
+
+
+def test_group_continuous_nonstreaming_member_fails_closed():
+    # A member that inherits continuous must itself be a streaming pipeline on classic compute; a batch
+    # member (which would drain-and-stop) fails closed.
+    with pytest.raises(ValueError, match="continuous.*every member must be a streaming"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="s"),
+            _member("b.yml", "b", "idx-b", mode="batch", job_cluster_config="s"),
+        ])
+
+
+def test_group_continuous_serverless_member_fails_closed():
+    # A serverless member inheriting continuous is rejected (serverless has no ProcessingTime trigger).
+    with pytest.raises(ValueError, match="continuous.*every member must be a streaming"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="s"),
+            _member("b.yml", "b", "idx-b"),  # streaming but serverless (no compute) -> classic required
+        ])
+
+
+def test_group_duplicate_es_index_name_fails_closed():
+    # Two members writing the SAME es_index_name would run as concurrent tasks and double-write that
+    # index (max_concurrent_runs=1 guards concurrent job runs, not tasks). Fail closed at generation.
+    with pytest.raises(ValueError, match="writing the SAME es_index_name"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "shared-idx", mode="batch"),
+            _member("b.yml", "b", "shared-idx", mode="batch"),
+        ])
+
+
+def test_group_distinct_es_index_names_ok():
+    # Distinct indices are the normal case: no raise.
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch"),
+        _member("b.yml", "b", "idx-b", mode="batch"),
+    ])
+    assert len(job["tasks"]) == 2
+
+
+def test_group_generated_path_uses_group_prefix():
+    assert gen_jobs.group_generated_path("g1").endswith("/resources/group_g1.job.yml")

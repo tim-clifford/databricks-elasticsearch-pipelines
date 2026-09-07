@@ -1,0 +1,30 @@
+# Job-group example, member B of 2. Shares job_group `ecs_dns_group` with ecs_dns_group_a.yml, so the
+# two are merged into ONE job as independent tasks; both name the same job cluster (standard_batch), so
+# they SHARE one cluster. This member OMITS job_name_postfix on purpose - under the define-once rule it
+# inherits member A's postfix, so you set the merged job's display name in exactly one place. See the
+# README "Job groups" section.
+#
+# Its view is a deliberately SMALLER projection than member A's, to show each member carries its own view
+# feeding its own index (ecs-dns-group-b). Same source, distinct index - the required per-member rule.
+es_index_name: ecs-dns-group-b               # this member's own ES index (distinct from member A's)
+es_id_field: dsl_id                          # OPTIONAL: view output column used as the ES document _id (idempotent upserts on re-run)
+es_host_config: es_host_primary              # ES host config (endpoint + secret scope/key); declared in databricks.yml
+pipeline_mode: batch                         # default export mode: batch | streaming
+
+job_group: ecs_dns_group                     # same group as member A => merged into one shared-cluster job
+# job_name_postfix intentionally omitted: inherits member A's under the define-once rule.
+
+view:                             # the view this pipeline creates and exports
+  catalog: tim_clifford_classic_dsl_lite_${environment}
+  schema: es_poc
+  name: ecs_dns_group_b
+
+source:                           # the single source table the view reads from (same source as member A)
+  catalog: tim_clifford_classic_dsl_lite_${environment}
+  schema: ocsf
+  table: dns_activity
+  primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column
+
+compute:                          # run on a JOB CLUSTER; the SAME job_cluster_config as member A => ONE shared cluster
+  type: job_cluster
+  job_cluster_config: standard_batch   # -> _pipelines/job_cluster_configs/standard_batch.yml (new_cluster spec)

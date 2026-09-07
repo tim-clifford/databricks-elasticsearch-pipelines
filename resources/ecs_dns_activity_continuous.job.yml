@@ -3,7 +3,7 @@
 resources:
   jobs:
     index_pipeline_ecs_dns_activity_continuous:
-      name: '[${bundle.target}] databricks-elasticsearch-pipelines: ecs_dns_activity_continuous'
+      name: '[${bundle.target}] ${var.job_name_prefix}: ecs_dns_activity_continuous'
       description: Export pipeline for the ecs-dns-activity-continuous Elasticsearch index. Runs the shared
         notebook notebooks/run_index_pipeline.py with this index's config. Runs on job cluster 'standard_batch'
         (new_cluster spec from _pipelines/job_cluster_configs/). Runs ALWAYS-ON (continuous trigger; ProcessingTime
