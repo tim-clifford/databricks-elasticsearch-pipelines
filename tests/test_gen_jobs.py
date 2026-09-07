@@ -623,5 +623,24 @@ def test_group_continuous_serverless_member_fails_closed():
         ])
 
 
+def test_group_duplicate_es_index_name_fails_closed():
+    # Two members writing the SAME es_index_name would run as concurrent tasks and double-write that
+    # index (max_concurrent_runs=1 guards concurrent job runs, not tasks). Fail closed at generation.
+    with pytest.raises(ValueError, match="writing the SAME es_index_name"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "shared-idx", mode="batch"),
+            _member("b.yml", "b", "shared-idx", mode="batch"),
+        ])
+
+
+def test_group_distinct_es_index_names_ok():
+    # Distinct indices are the normal case: no raise.
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch"),
+        _member("b.yml", "b", "idx-b", mode="batch"),
+    ])
+    assert len(job["tasks"]) == 2
+
+
 def test_group_generated_path_uses_group_prefix():
     assert gen_jobs.group_generated_path("g1").endswith("/resources/group_g1.job.yml")
