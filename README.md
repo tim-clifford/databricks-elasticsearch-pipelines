@@ -437,6 +437,8 @@ A job's display name is `[<target>] <prefix>: <postfix>`.
 - **`prefix`** is the `job_name_prefix` bundle variable (`databricks.yml`), default
   `databricks-elasticsearch-pipelines`. The generator emits `${var.job_name_prefix}`, so you can
   rebrand every job name per target (or with `--var=job_name_prefix=<name>`) without regenerating.
+  The hand-authored `deploy_views` job references the same variable, so it rebrands alongside the
+  generated jobs.
 - **`postfix`** defaults to the config name (standalone) or the group name (group). Set an optional
   **`job_name_postfix`** on a config to override just the trailing display segment (e.g.
   `"ECS DNS (serverless)"`). It is purely cosmetic (it never changes any resource key or task key), so

@@ -52,7 +52,7 @@ variables:
   # <postfix> segment (default: the config name / group name). Override per target below or with
   # --var=job_name_prefix=<name>.
   job_name_prefix:
-    description: "Prefix in every generated job display name ([<target>] <prefix>: <postfix>). Default databricks-elasticsearch-pipelines; per-target/--var overridable."
+    description: "Prefix in every job display name ([<target>] <prefix>: <postfix>). Default databricks-elasticsearch-pipelines; per-target/--var overridable."
     default: databricks-elasticsearch-pipelines
 
   # One GLOBAL connector wheel serves every per-index job, so it is a bundle variable, not per-config.
