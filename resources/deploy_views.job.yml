@@ -1,7 +1,7 @@
 resources:
   jobs:
     deploy_views:
-      name: "[${bundle.target}] databricks-elasticsearch-pipelines: _deploy views"
+      name: "[${bundle.target}] ${var.job_name_prefix}: _deploy views"
       description: >-
         A serverless notebook task that creates or replaces one Databricks view per Elasticsearch
         index. Each view is a .sql file in _pipelines/pipeline_views/ paired with a
