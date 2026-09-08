@@ -87,6 +87,9 @@ def test_minimal_valid():
     assert out["write_concurrency"] == ""
     assert out["require_existing_index"] == ""
     assert out["verify_certs"] == ""
+    # bulk_stats is the exception among the bool knobs: omitted, it defaults to "true" (on for all runs),
+    # not "" - the framework wants the per-partition bulk-send diagnostics by default.
+    assert out["bulk_stats"] == "true"
     # write_repartition and max_partition_bytes are the exceptions: omitted, they take a built-in
     # default (NOT "unset"). write_repartition defaults to 0 (off - read parallelism is the primary
     # lever); max_partition_bytes defaults to the built-in scan-parallelism size.
@@ -101,6 +104,34 @@ def test_write_concurrency_config_default_parsed_and_validated():
     cfg["write_concurrency"] = 0                              # not a positive int
     with pytest.raises(PipelineConfigError, match="write_concurrency"):
         validate_config(cfg)
+
+
+def test_bulk_stats_defaults_true_when_omitted():
+    # Unlike the other bool knobs (which default to "" == connector default), an omitted bulk_stats
+    # defaults to "true": the diagnostics are on for all runs by default.
+    assert validate_config(_base())["bulk_stats"] == "true"
+
+
+@pytest.mark.parametrize("value,expected", [(True, "true"), (False, "false"), ("true", "true"), ("FALSE", "false")])
+def test_bulk_stats_explicit_value_canonicalized(value, expected):
+    cfg = _base()
+    cfg["bulk_stats"] = value
+    assert validate_config(cfg)["bulk_stats"] == expected   # YAML bool / string -> canonical form
+
+
+@pytest.mark.parametrize("bad", ["maybe", "1", 0, "yes"])
+def test_bulk_stats_invalid_rejected(bad):
+    cfg = _base()
+    cfg["bulk_stats"] = bad
+    with pytest.raises(PipelineConfigError, match="bulk_stats"):
+        validate_config(cfg)
+
+
+def test_bulk_stats_carried_through_resolve():
+    # bulk_stats is a connector setting, not an object name: resolve_config passes it through verbatim.
+    cfg = _base()
+    cfg["bulk_stats"] = False
+    assert resolve_config(validate_config(cfg), "")["bulk_stats"] == "false"
 
 
 def test_environment_token_accepted_as_template():
@@ -536,7 +567,7 @@ def test_job_base_parameters_excludes_run_time_params():
     # per-run override.
     params = _job_base_parameters("x")
     for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "write_concurrency", "require_existing_index",
-                     "verify_certs", "streaming_start", "write_repartition", "max_partition_bytes"):
+                     "verify_certs", "bulk_stats", "streaming_start", "write_repartition", "max_partition_bytes"):
         assert run_time not in params
 
 
@@ -564,6 +595,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "write_concurrency", "default": ""},
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
+        {"name": "bulk_stats", "default": "true"},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": "0"},
         {"name": "max_partition_bytes", "default": "2m"},
@@ -671,12 +703,30 @@ def test_write_config_overrides_bad_boolean_fails_closed(bad):
         write_config_overrides("", "", bad)
 
 
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False), ("True", True), ("FALSE", False), (" true ", True)])
+def test_write_config_overrides_bulk_stats_parsed(value, expected):
+    # bulk_stats is the 5th positional arg; parsed to a bool like the other flags.
+    assert write_config_overrides("", "", "", "", value) == {"bulk_stats": expected}
+
+
+def test_write_config_overrides_bulk_stats_empty_omitted():
+    # An empty bulk_stats (widget cleared) is omitted, so the connector's own default stands.
+    assert write_config_overrides("", "", "", "", "") == {}
+
+
+@pytest.mark.parametrize("bad", ["maybe", "1", "0", "yes", "T"])
+def test_write_config_overrides_bad_bulk_stats_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="bulk_stats"):
+        write_config_overrides("", "", "", "", bad)
+
+
 def test_write_config_overrides_combined():
-    assert write_config_overrides("500", "false", "false", "4") == {
+    assert write_config_overrides("500", "false", "false", "4", "true") == {
         "chunk_size": 500,
         "write_concurrency": 4,
         "require_existing_index": False,
         "verify_certs": False,
+        "bulk_stats": True,
     }
 
 

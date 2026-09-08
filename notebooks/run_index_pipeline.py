@@ -114,6 +114,7 @@ dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty
 dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
+dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default on; needs connector 0.9.3+)")
 dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
 dbutils.widgets.text("max_partition_bytes", "", "spark.sql.files.maxPartitionBytes for the source read, e.g. 32m (0 leaves it unset; empty => default)")
 # Streaming-only widgets. checkpoint_base_path is a deploy-time base_parameter (bundle variable);
@@ -139,6 +140,7 @@ CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
 WRITE_CONCURRENCY = dbutils.widgets.get("write_concurrency").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
+BULK_STATS = dbutils.widgets.get("bulk_stats").strip()
 WRITE_REPARTITION = dbutils.widgets.get("write_repartition").strip()
 MAX_PARTITION_BYTES = dbutils.widgets.get("max_partition_bytes").strip()
 CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
@@ -180,7 +182,12 @@ from pipeline_lib.config import (  # noqa: E402
 # formatter and the Jobs-UI batch label. Kept in pipeline_lib so it is unit-tested off-cluster.
 import json  # noqa: E402
 import uuid  # noqa: E402
-from pipeline_lib.observability import PROGRESS_TAG, batch_job_description, format_progress  # noqa: E402
+from pipeline_lib.observability import (  # noqa: E402
+    PROGRESS_TAG,
+    batch_job_description,
+    format_bulk_stats,
+    format_progress,
+)
 
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
 # override fails closed immediately without wasting the config load/resolve on a run that can't
@@ -228,7 +235,22 @@ if STREAMING_TRIGGER_INTERVAL:
         STREAMING_TRIGGER_INTERVAL, "streaming_trigger_interval base parameter"
     )
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
-write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY)
+write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS)
+# bulk_stats requires connector 0.9.3+ (the release that added the EsWriteConfig field). It defaults ON
+# for all runs, so on an OLDER wheel EsWriteConfig(**write_overrides) would raise TypeError on an
+# unexpected kwarg and fail EVERY run. bulk_stats is DIAGNOSTICS ONLY, so it must never break the
+# export: if the installed EsWriteConfig has no such field, drop it from the overrides and warn, rather
+# than failing. Detected against the live dataclass's own field set (the installed wheel is the source
+# of truth), so this is correct whatever version is deployed. The other tuning knobs have existed since
+# well before this framework, so only bulk_stats is guarded.
+if "bulk_stats" in write_overrides:
+    import dataclasses  # noqa: E402
+    _es_fields = {f.name for f in dataclasses.fields(EsWriteConfig)}
+    if "bulk_stats" not in _es_fields:
+        _dropped = write_overrides.pop("bulk_stats")
+        print(f"WARNING: installed connector (databricks_es_connector {_connector_version}) has no "
+              f"EsWriteConfig.bulk_stats field; dropping bulk_stats={_dropped} (requires 0.9.3+). "
+              f"The export proceeds WITHOUT per-partition bulk-send diagnostics.")
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
 WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repartition job parameter"))
 # - max_partition_bytes: Spark byte-size (or "0" = leave unset). Validated unconditionally; applied to
@@ -430,7 +452,14 @@ if PIPELINE_MODE == "batch":
     if WRITE_REPARTITION > 0:
         export_df = export_df.repartition(WRITE_REPARTITION)
     result = bulk_write(export_df, es_write_config)
-    print(f"batch bulk_write result: {result}")
+    # Print the core count dict on one line; when bulk_stats is on, result also carries a per-partition
+    # 'bulk_stats' list, which we render SEPARATELY (below) as readable BULK_STATS lines rather than
+    # dumping the raw list into the result line. reconcile_or_raise reads only the counts, so the extra
+    # key is ignored there.
+    _core_result = {k: v for k, v in result.items() if k != "bulk_stats"}
+    print(f"batch bulk_write result: {_core_result}")
+    if "bulk_stats" in result:
+        print(format_bulk_stats(result["bulk_stats"]))
     reconcile_or_raise(result, index=es_write_config.index)
     RUN_SUMMARY = (
         f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
@@ -542,6 +571,14 @@ if PIPELINE_MODE == "streaming":
             # record step below is only reached for a batch that wrote every row cleanly, and
             # result['written'] is the true count.
             result = bulk_write(transformed, es_write_config, raise_on_error=True)
+            # When bulk_stats is on, log a COMPACT one-line rollup of this micro-batch's ES bulk-send
+            # diagnostics (overall docs/send, rtt, took) so an always-on run has per-batch visibility
+            # without the full per-partition breakdown flooding the log. format_bulk_stats is fail-soft,
+            # so a diagnostic-formatting fault can never disturb the write. (On serverless the
+            # foreachBatch body runs server-side, so this lands in executor logs; on classic/continuous
+            # it is on the driver alongside the STREAM_PROGRESS trail.)
+            if "bulk_stats" in result:
+                print(format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}")
             # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
             # the summary can dedup a retried batch (write mode append; each batch is its own small file).
             session.createDataFrame(
