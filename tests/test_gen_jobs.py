@@ -500,6 +500,24 @@ def test_require_bulk_stats_declared_bad_default_fails_closed(tmp_path, bad):
         gen_jobs.require_bulk_stats_declared(str(yml))
 
 
+@pytest.mark.parametrize("shorthand", ["true", "false", ""])
+def test_require_bulk_stats_declared_accepts_scalar_shorthand(tmp_path, shorthand):
+    # DAB's scalar shorthand (bulk_stats: <v>, no `default:` key) IS the default; a legal shorthand passes.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  bulk_stats: '{shorthand}'\n")
+    gen_jobs.require_bulk_stats_declared(str(yml))  # no raise
+
+
+@pytest.mark.parametrize("bad", ["on", "yes", "1"])
+def test_require_bulk_stats_declared_bad_scalar_shorthand_fails_closed(tmp_path, bad):
+    # A bad shorthand default (bulk_stats: "on") must ALSO fail closed at generation - it would otherwise
+    # bake as ${var.bulk_stats} and fail require_es_flag at every run.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  bulk_stats: '{bad}'\n")
+    with pytest.raises(ValueError, match="bulk_stats"):
+        gen_jobs.require_bulk_stats_declared(str(yml))
+
+
 def test_shipped_databricks_yml_declares_bulk_stats():
     gen_jobs.require_bulk_stats_declared()  # the repo's databricks.yml declares it with a legal default
 

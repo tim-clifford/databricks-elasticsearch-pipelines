@@ -262,8 +262,11 @@ def require_bulk_stats_declared(path: str = _DATABRICKS_YML, doc: dict | None = 
             "bulk_stats job parameter for any pipeline that omits bulk_stats, so the bundle needs the "
             "variable to resolve it at deploy."
         )
+    # DAB accepts BOTH the full form (bulk_stats: {default: <v>}) and the scalar shorthand
+    # (bulk_stats: <v>, which IS the default). Read the default from whichever shape was used, so a bad
+    # shorthand default (bulk_stats: "on") is validated too rather than silently treated as "".
     spec = variables["bulk_stats"]
-    default = spec.get("default") if isinstance(spec, dict) else None
+    default = spec.get("default") if isinstance(spec, dict) else spec
     # Validate the declared default is a legal flag (""/true/false, YAML bool or string). require_es_flag
     # raises PipelineConfigError on anything else; re-raise as ValueError to match this module's generation
     # errors (main treats a bad config/reference uniformly).
