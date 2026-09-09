@@ -590,24 +590,27 @@ def render_group_job_yaml(group_name: str, members: list) -> str:
     postfix = _resolve_group_postfix(group_name, members)
     ordered = sorted(members, key=lambda m: m[1])  # by config name
 
-    # Fail closed on members that write the SAME es_index_name. Grouped members run as CONCURRENT tasks
-    # within one job run, and max_concurrent_runs=1 only serializes job *runs*, not the tasks inside a
-    # run - so two members targeting one index would double-write it (duplicate docs with ES auto-ids, or
-    # redundant/racing upserts with a shared es_id_field). The 1:1 model gave each index its own serial
-    # job; grouping must preserve "one writer per index per run", so reject a duplicate here rather than
-    # emit a job whose tasks silently clobber each other. (Checkpoints are unaffected - each is keyed by
-    # config_name - but the ES write is the hazard.)
+    # WARN (do NOT fail) on members that write the SAME es_index_name. This is now ALLOWED: a common
+    # pattern is two tasks writing one index with disjoint filter_condition subsets (or the same view
+    # fanned to one index from different sources). But it stays a real hazard to flag, because grouped
+    # members run as CONCURRENT tasks within one job run and max_concurrent_runs=1 only serializes job
+    # *runs*, not the tasks inside a run - so two tasks writing one index write it concurrently. That is
+    # fine for DISJOINT subsets, but overlapping rows either duplicate (ES auto-ids) or race on upserts
+    # (a shared es_id_field). So warn loudly with the mitigation and let generation proceed. (Checkpoints
+    # are unaffected - each is keyed by config_name.)
     by_index: dict = {}
     for _, name, cfg, _ in ordered:
         by_index.setdefault(cfg["es_index_name"], []).append(name)
     dupes = {idx: ns for idx, ns in by_index.items() if len(ns) > 1}
     if dupes:
         detail = "; ".join(f"{idx!r} (member(s): {', '.join(sorted(ns))})" for idx, ns in sorted(dupes.items()))
-        raise ValueError(
-            f"job_group '{group_name}' has members writing the SAME es_index_name: {detail}. Grouped "
-            f"members run as concurrent tasks in one run, so two tasks writing one index would "
-            f"double-write it (max_concurrent_runs=1 guards concurrent job runs, not concurrent tasks). "
-            f"Give each member a distinct es_index_name, or keep them in separate jobs."
+        print(
+            f"WARNING: job_group '{group_name}' has members writing the SAME es_index_name: {detail}. "
+            f"Grouped members run as concurrent tasks in one run (max_concurrent_runs=1 guards concurrent "
+            f"job runs, not concurrent tasks), so they write that index concurrently. Ensure they cover "
+            f"DISJOINT rows (a distinct filter_condition per member) and set es_id_field for idempotent "
+            f"upserts; otherwise overlapping rows will duplicate or race.",
+            file=sys.stderr,
         )
     tasks = [
         _build_task(name, cfg, effective_interval, include_run_time_knobs=True)

@@ -447,6 +447,15 @@ What the group agrees on, all fail-closed at generation (`gen_jobs.py --check`):
 - **`job_name_postfix`** (define-once): same rule (omit on most members and set once); conflicting
   values are rejected (see [Job naming](#job-naming)).
 
+**Members may target the same `es_index_name`.** This is allowed (e.g. one task per disjoint
+`filter_condition` subset feeding a single index), so the generator only **warns** rather than failing.
+Be deliberate: grouped members run as **concurrent** tasks in one run (`max_concurrent_runs: 1` serializes
+job *runs*, not the tasks within a run), so two tasks write that index at the same time. That is safe for
+**disjoint** rows; overlapping rows either duplicate (ES auto-ids) or race on upserts (a shared
+`es_id_field`). Give each member a distinct `filter_condition` and set `es_id_field` for idempotency.
+(Separate jobs writing one index have always been allowed and are serialized only within a single job's
+runs, not across jobs.)
+
 **Run-time parameters differ in a group.** A standalone job exposes the run-time knobs (`pipeline_mode`,
 `filter_condition`, `chunk_size`, …) as job-level **parameters**, overridable per run with `--params`.
 A job cannot hold *per-member* parameter defaults, so a grouped job instead bakes each member's knobs

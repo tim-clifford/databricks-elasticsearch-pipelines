@@ -715,14 +715,17 @@ def test_group_continuous_serverless_member_fails_closed():
         ])
 
 
-def test_group_duplicate_es_index_name_fails_closed():
-    # Two members writing the SAME es_index_name would run as concurrent tasks and double-write that
-    # index (max_concurrent_runs=1 guards concurrent job runs, not tasks). Fail closed at generation.
-    with pytest.raises(ValueError, match="writing the SAME es_index_name"):
-        gen_jobs.render_group_job_yaml("g1", [
-            _member("a.yml", "a", "shared-idx", mode="batch"),
-            _member("b.yml", "b", "shared-idx", mode="batch"),
-        ])
+def test_group_duplicate_es_index_name_warns_but_renders(capsys):
+    # Two members writing the SAME es_index_name is now ALLOWED (e.g. disjoint filter_condition subsets):
+    # generation proceeds and emits both tasks, but WARNS about the concurrent-write hazard on stderr.
+    job = _render_group("g1", [
+        _member("a.yml", "a", "shared-idx", mode="batch"),
+        _member("b.yml", "b", "shared-idx", mode="batch"),
+    ])
+    assert len(job["tasks"]) == 2  # both tasks emitted, not rejected
+    warning = capsys.readouterr().err
+    assert "writing the SAME es_index_name" in warning
+    assert "'shared-idx'" in warning and "disjoint" in warning.lower()
 
 
 def test_group_distinct_es_index_names_ok():
