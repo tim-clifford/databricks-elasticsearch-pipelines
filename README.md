@@ -18,9 +18,12 @@ framework code you don't normally edit.
 
 The bundle deploys:
 
-- **One `deploy_views` job**: creates or replaces one Databricks view per index. Each view is a
+- **One `deploy_views` job**: creates or replaces one Databricks view per `.sql` file. Each view is a
   `.sql` file in [`_pipelines/pipeline_views/`](_pipelines/pipeline_views/). The job renders the
-  catalog/schema parameters and runs every file with `spark.sql`.
+  catalog/schema parameters and runs every file with `spark.sql`. A view **can be shared** by more than
+  one pipeline (e.g. to send different subsets to different indices or hosts; see
+  [Sharing a view across pipelines](#sharing-a-view-across-pipelines)) - it is created once, and the
+  sharing pipelines must agree on the view definition.
 - **One job per index** (`index_pipeline_<config_name>`): all run the same shared notebook
   [`notebooks/run_index_pipeline.py`](notebooks/run_index_pipeline.py) with that index's config. These
   job resources are **generated** by [`scripts/gen_jobs.py`](scripts/gen_jobs.py) from the config
@@ -80,6 +83,21 @@ LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id
 The config owns *where* each table is; the SQL owns the join itself (type, `ON` clause, surfaced
 columns, and any tuning such as a `/*+ BROADCAST(alias) */` hint, written directly in the SQL).
 
+### Sharing a view across pipelines
+
+More than one pipeline may point at the **same** view (same `view:` block, so the same `.sql`). This is
+how you fan one transformed view out to several destinations: give each pipeline its own config with a
+different `es_index_name`, `es_host_config`, and/or `filter_condition` (a subset), all reading the one
+view. `deploy_views` creates the view **once** and prints a `WARNING` naming the sharing pipelines (so an
+*accidental* duplicate view name is still visible).
+
+The sharing configs must agree on the **view definition** - the `view:` target, the `source:`, and every
+`reference_tables` entry (i.e. everything that renders into the `CREATE OR REPLACE VIEW` statement). They
+may differ **only** on the ES-write side: `es_index_name`, `es_host_config`, `es_id_field`,
+`filter_condition`, and `pipeline_mode`. If two sharers would render *different* definitions for one view
+name, `deploy_views` **fails that view closed** (you can't deploy two definitions to one object).
+`es_id_field` is checked per pipeline: the shared view must contain every sharer's `_id` column.
+
 ## Configuration
 
 The **workspace** is not a bundle variable: it comes from your Databricks CLI profile (`-p <profile>`)
@@ -88,8 +106,9 @@ or `DATABRICKS_HOST`. The environment-specific connection, path, and policy vari
 target** in `databricks.yml` (`targets.<env>.variables`), shipping **empty** on `main` for you to fill
 in for the environments you deploy to, so a routine deploy needs no `--var`. (`schedule_pause_status` is
 also per-environment but is the exception: it defaults to `PAUSED` globally and only `prd` overrides it,
-and it is `--var`-settable too; see [Scheduling](#scheduling).) The five simple per-target string
-variables (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, `ca_certs`) can still
+and it is `--var`-settable too; see [Scheduling](#scheduling).) The simple per-target string
+variables (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, `ca_certs`, and the
+global `bulk_stats` diagnostics default) can still
 be overridden at deploy with `--var=<name>=<value>`; the `type: complex` variables (the ES host configs, and any `cluster_config`)
 **cannot** be set via `--var` at all (the CLI rejects it: *"setting variables of complex type via --var
 flag is not supported"*), so override those through the git-ignored `variable-overrides.json` (see
@@ -110,6 +129,7 @@ value fails closed wherever the value is required. The bundle variables are:
 | `cluster_policy_id` | workspace-specific cluster policy id injected into every job cluster (see [Compute](#compute)). Set per target (empty on `main`); required only when a pipeline uses `job_cluster` compute |
 | `ca_certs` | UC Volume path to a CA bundle (PEM) the connector uses to verify the ES server's TLS certificate. One global bundle shared by every host config. Set per target (empty on `main`); empty means fall back to the system CA store. Incompatible with `verify_certs: false` (the connector rejects that combination at run). Per-endpoint CA pinning is not supported (would need `ca_certs` moved onto the `es_host_*` complex variables) |
 | `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
+| `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log; connector **>= 0.9.3**). Empty default (off; the connector default stands). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
 
 The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
 pipeline selects, with values that differ per environment. See
@@ -134,7 +154,7 @@ chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
 write_concurrency: 4              # OPTIONAL EsWriteConfig tuning (parallel bulk streams per partition; connector >= 0.7.0); omit for connector default 1
-bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log; connector >= 0.9.3). UNLIKE the knobs above, DEFAULTS ON when omitted; set false to turn off
+bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log; connector >= 0.9.3). Behaves like verify_certs: omit to defer to the global ${var.bulk_stats} default (off), or set true|false here to override it for this pipeline
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
 max_files_per_trigger: 1000       # OPTIONAL streaming read rate-limit: max Delta files per micro-batch; omit for Spark default 1000. Useful to throttle a full backfill / post-restart catch-up
@@ -427,6 +447,15 @@ What the group agrees on, all fail-closed at generation (`gen_jobs.py --check`):
 - **`job_name_postfix`** (define-once): same rule (omit on most members and set once); conflicting
   values are rejected (see [Job naming](#job-naming)).
 
+**Members may target the same `es_index_name`.** This is allowed (e.g. one task per disjoint
+`filter_condition` subset feeding a single index), so the generator only **warns** rather than failing.
+Be deliberate: grouped members run as **concurrent** tasks in one run (`max_concurrent_runs: 1` serializes
+job *runs*, not the tasks within a run), so two tasks write that index at the same time. That is safe for
+**disjoint** rows; overlapping rows either duplicate (ES auto-ids) or race on upserts (a shared
+`es_id_field`). Give each member a distinct `filter_condition` and set `es_id_field` for idempotency.
+(Separate jobs writing one index have always been allowed and are serialized only within a single job's
+runs, not across jobs.)
+
 **Run-time parameters differ in a group.** A standalone job exposes the run-time knobs (`pipeline_mode`,
 `filter_condition`, `chunk_size`, …) as job-level **parameters**, overridable per run with `--params`.
 A job cannot hold *per-member* parameter defaults, so a grouped job instead bakes each member's knobs
@@ -460,7 +489,8 @@ point at any workspace.
 Two different mechanisms carry values into a job, and they resolve at different times:
 
 - **Bundle variables** (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`,
-  `ca_certs`, and the ES host configs) are resolved into the job at **deploy** time. Each is set **per
+  `ca_certs`, the global `bulk_stats` default, and the ES host configs) are resolved into the job at
+  **deploy** time. Each is set **per
   target** in `databricks.yml` (`targets.<env>.variables`), so a routine deploy takes no `--var` at all.
   The five simple string variables can still be overridden at deploy with `--var=<name>=<value>`, which wins over
   the per-target value; the `type: complex` variables (the ES host configs, and any `cluster_config`)
@@ -487,10 +517,14 @@ Two different mechanisms carry values into a job, and they resolve at different 
     the write is latency-bound on ES round-trips (executors idle, CPU and network both under-used)
     rather than CPU/bandwidth-bound; it multiplies with the partition count, so raise it gradually and
     watch for 429s. Applies to **both** modes.
-  - `bulk_stats` (`true` | `false`, **defaults on**; requires connector **>= 0.9.3**) collects
-    per-partition ES bulk-send diagnostics and logs them under the `BULK_STATS` tag. Unlike the tuning
-    knobs above, an omitted `bulk_stats` defaults to **on** (this framework wants the diagnostic by
-    default); set `bulk_stats: false` (or `--params bulk_stats=false`) to turn it off. Batch runs emit
+  - `bulk_stats` (`true` | `false`; requires connector **>= 0.9.3**) collects
+    per-partition ES bulk-send diagnostics and logs them under the `BULK_STATS` tag. It behaves like the
+    other bool knobs, with one extra layer: a **global** default. Precedence, highest first: a per-run
+    `--params bulk_stats=<v>` > a pipeline's own `bulk_stats:` config value > the target-wide
+    `${var.bulk_stats}` databricks.yml variable > the connector's own default (**off**). So set
+    `bulk_stats` in databricks.yml (per target, or `--var=bulk_stats=true`) to turn the diagnostic on for
+    a whole environment without editing each config, and set/clear it in one pipeline's config to
+    override that. Batch runs emit
     an `overall` rollup (`docs/send`, and send-weighted mean / max round-trip `rtt_ms` and ES-reported
     `took_ms`) plus one line per write partition with real p50/p95/max; streaming runs emit the compact
     `overall` line per micro-batch. `rtt_ms - took_ms` is the network/queue overhead and
@@ -525,7 +559,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
 # Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, ca_certs,
-# and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
+# the global bulk_stats default, and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
 # deploy to BEFORE running an index pipeline: the shipped configs embed ${environment} and install the
 # connector wheel, so an index run with those still empty fails closed (deploy itself always succeeds).
 # Filled in, the deploy needs no --var:

@@ -26,6 +26,7 @@ from pipeline_lib.config import (
     require_write_repartition,
     resolve_config,
     resolve_name,
+    shared_view_conflict,
     validate_config,
     view_select_body,
     view_substitutions,
@@ -87,9 +88,10 @@ def test_minimal_valid():
     assert out["write_concurrency"] == ""
     assert out["require_existing_index"] == ""
     assert out["verify_certs"] == ""
-    # bulk_stats is the exception among the bool knobs: omitted, it defaults to "true" (on for all runs),
-    # not "" - the framework wants the per-partition bulk-send diagnostics by default.
-    assert out["bulk_stats"] == "true"
+    # bulk_stats now behaves like the other bool knobs: omitted => "" (unset at the config level), which
+    # defers to the global ${var.bulk_stats} default (baked by the generator) and ultimately the
+    # connector default (off). It is no longer forced "true" here.
+    assert out["bulk_stats"] == ""
     # write_repartition and max_partition_bytes are the exceptions: omitted, they take a built-in
     # default (NOT "unset"). write_repartition defaults to 0 (off - read parallelism is the primary
     # lever); max_partition_bytes defaults to the built-in scan-parallelism size.
@@ -106,10 +108,19 @@ def test_write_concurrency_config_default_parsed_and_validated():
         validate_config(cfg)
 
 
-def test_bulk_stats_defaults_true_when_omitted():
-    # Unlike the other bool knobs (which default to "" == connector default), an omitted bulk_stats
-    # defaults to "true": the diagnostics are on for all runs by default.
-    assert validate_config(_base())["bulk_stats"] == "true"
+def test_bulk_stats_defaults_unset_when_omitted():
+    # bulk_stats now matches verify_certs: an omitted value is "" (unset at the config level), deferring
+    # to the global ${var.bulk_stats} default / connector default (off), NOT forced "true".
+    assert validate_config(_base())["bulk_stats"] == ""
+
+
+@pytest.mark.parametrize("blank", ["", "  ", None])
+def test_bulk_stats_explicit_blank_is_unset(blank):
+    # An explicit empty/blank/null bulk_stats is treated as unset ("") - the same "defer to the global
+    # default" state as omission (only an explicit true/false is a per-pipeline override).
+    cfg = _base()
+    cfg["bulk_stats"] = blank
+    assert validate_config(cfg)["bulk_stats"] == ""
 
 
 @pytest.mark.parametrize("value,expected", [(True, "true"), (False, "false"), ("true", "true"), ("FALSE", "false")])
@@ -464,6 +475,58 @@ def test_view_substitutions_source_override_none_is_real_source():
     assert subs["source"] == "cat.ocsf.dns_activity"
 
 
+# --------------------------------------------------------------------------- shared_view_conflict
+
+
+def test_shared_view_conflict_single_config_is_none():
+    # The trivial case (one pipeline owns the view) is never a conflict.
+    assert shared_view_conflict([("a.yml", validate_config(_base()))], "") is None
+
+
+def test_shared_view_conflict_identical_definition_is_none():
+    # Two pipelines sharing a view but differing ONLY on the ES-write side (index, host, id, filter) is
+    # the supported shared-view case: same view definition => no conflict.
+    a = _base()
+    b = _base()
+    b["es_index_name"] = "ecs-dns-activity-secondary"
+    b["es_host_config"] = "es_host_secondary"
+    b["es_id_field"] = "event_id"
+    b["filter_condition"] = "action = 'blocked'"
+    assert shared_view_conflict(
+        [("a.yml", validate_config(a)), ("b.yml", validate_config(b))], ""
+    ) is None
+
+
+def test_shared_view_conflict_different_source_reported():
+    # Same view NAME but a different source => different CREATE statement => conflict (fail closed).
+    a = _base()
+    b = _base()
+    b["source"]["table"] = "dns_activity_backup"
+    msg = shared_view_conflict([("a.yml", validate_config(a)), ("b.yml", validate_config(b))], "")
+    assert msg is not None
+    assert "CONFLICTING" in msg and "a.yml" in msg and "b.yml" in msg
+
+
+def test_shared_view_conflict_different_reference_tables_reported():
+    # A different reference-table join changes the rendered view definition => conflict.
+    a = _base()
+    b = _base()
+    b["reference_tables"] = {"geo": {"catalog": "cat", "schema": "ref", "table": "geoip"}}
+    msg = shared_view_conflict([("a.yml", validate_config(a)), ("b.yml", validate_config(b))], "")
+    assert msg is not None and "CONFLICTING" in msg
+
+
+def test_shared_view_conflict_env_resolves_identically_is_none():
+    # ${environment} templates that resolve to the same FQNs under the given environment are NOT a
+    # conflict (the comparison is on the resolved substitutions, not the raw templates).
+    a = _with_env()
+    b = _with_env()
+    b["es_index_name"] = "ecs-dns-activity-2"
+    assert shared_view_conflict(
+        [("a.yml", validate_config(a)), ("b.yml", validate_config(b))], "prod"
+    ) is None
+
+
 # --------------------------------------------------------------------------- render_view_sql
 
 
@@ -595,13 +658,37 @@ def test_job_parameters_full_shape_and_order():
         {"name": "write_concurrency", "default": ""},
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
-        {"name": "bulk_stats", "default": "true"},
+        {"name": "bulk_stats", "default": ""},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": "0"},
         {"name": "max_partition_bytes", "default": "2m"},
         {"name": "max_files_per_trigger", "default": ""},
         {"name": "max_bytes_per_trigger", "default": ""},
     ]
+
+
+def test_job_parameters_bulk_stats_defaults_empty_without_ref():
+    # With no ref supplied (the pure/unit-test call), an omitted bulk_stats stays "" - the connector's
+    # own default (off) stands.
+    params = job_parameters(validate_config(_base()))
+    assert {"name": "bulk_stats", "default": ""} in params
+
+
+def test_job_parameters_bulk_stats_omitted_uses_global_ref():
+    # When the config OMITS bulk_stats, the generator's ref becomes the job-parameter default, so an
+    # omitted pipeline defers to the target-wide ${var.bulk_stats} global default.
+    params = job_parameters(validate_config(_base()), "${var.bulk_stats}")
+    assert {"name": "bulk_stats", "default": "${var.bulk_stats}"} in params
+
+
+@pytest.mark.parametrize("value,expected", [(True, "true"), (False, "false")])
+def test_job_parameters_bulk_stats_config_value_overrides_ref(value, expected):
+    # A config that SETS bulk_stats bakes its literal value, overriding the global ref (per-pipeline
+    # wins over the target-wide default).
+    cfg = _base()
+    cfg["bulk_stats"] = value
+    params = job_parameters(validate_config(cfg), "${var.bulk_stats}")
+    assert {"name": "bulk_stats", "default": expected} in params
 
 
 def test_job_parameters_streaming_start_defaults_new():

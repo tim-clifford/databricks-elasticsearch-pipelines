@@ -144,6 +144,20 @@ variables:
     description: "UC Volume path to a CA bundle (PEM) the connector uses to verify the ES TLS cert. Empty default (system CAs); set per target below or override with --var. One global bundle for all host configs; incompatible with verify_certs=false."
     default: ""
 
+  # GLOBAL default for the connector's bulk_stats diagnostics (per-partition ES bulk-send stats -
+  # docs/send, round-trip ms, ES `took` ms - in the run log; requires connector >= 0.9.3). This is the
+  # target-wide DEFAULT: scripts/gen_jobs.py bakes ${var.bulk_stats} as the bulk_stats job-parameter
+  # default for every pipeline that OMITS bulk_stats, so you can turn diagnostics on for a whole target
+  # (e.g. dev) and off for another (e.g. prd) WITHOUT editing each pipeline config. Precedence, highest
+  # first: a per-run `--params bulk_stats=<v>` > a pipeline's own `bulk_stats:` in its config > this
+  # global default > the connector's own default (OFF). Empty default so, out of the box, diagnostics are
+  # off everywhere and the connector default stands; set it "true" per target below (or --var) to turn
+  # them on target-wide. A legal value is "" / true / false (validated at generation and at run). Like
+  # the other simple string vars it accepts --var=bulk_stats=true at deploy.
+  bulk_stats:
+    description: "Global default for connector bulk_stats diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off; connector default stands). A pipeline's own bulk_stats and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.9.3."
+    default: ""
+
   # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
   # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
   # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds
@@ -236,6 +250,9 @@ targets:
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""           # e.g. 0123-456789-abcde
       ca_certs: ""                 # e.g. /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
+      # bulk_stats: "true"         # turn connector bulk-send diagnostics ON for the whole dev target (a
+                                   # pipeline's own bulk_stats or a --params override still wins). Empty
+                                   # default (off) inherited when omitted.
       # DEV Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-dev-es-host:9200

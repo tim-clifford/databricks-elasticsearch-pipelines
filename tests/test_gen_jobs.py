@@ -468,6 +468,78 @@ def test_shipped_databricks_yml_declares_job_name_prefix():
     gen_jobs.require_job_name_prefix_declared()  # the repo's databricks.yml declares it
 
 
+def test_require_bulk_stats_declared_present_passes(tmp_path):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  bulk_stats:\n    default: ''\n")
+    gen_jobs.require_bulk_stats_declared(str(yml))  # no raise
+
+
+@pytest.mark.parametrize("default", ["true", "false", ""])
+def test_require_bulk_stats_declared_accepts_legal_default(tmp_path, default):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  bulk_stats:\n    default: '{default}'\n")
+    gen_jobs.require_bulk_stats_declared(str(yml))  # no raise
+
+
+def test_require_bulk_stats_declared_missing_fails_closed(tmp_path):
+    # An omitted-bulk_stats config bakes ${var.bulk_stats}; if the variable is not declared, fail closed
+    # at generation rather than let the reference break confusingly at deploy.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
+    with pytest.raises(ValueError, match="bulk_stats is not declared"):
+        gen_jobs.require_bulk_stats_declared(str(yml))
+
+
+@pytest.mark.parametrize("bad", ["yes", "on", "1"])
+def test_require_bulk_stats_declared_bad_default_fails_closed(tmp_path, bad):
+    # A mistyped global default is rejected with the same allow-list the runner applies to the effective
+    # value, so it fails at generation rather than at every run.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  bulk_stats:\n    default: '{bad}'\n")
+    with pytest.raises(ValueError, match="bulk_stats"):
+        gen_jobs.require_bulk_stats_declared(str(yml))
+
+
+@pytest.mark.parametrize("shorthand", ["true", "false", ""])
+def test_require_bulk_stats_declared_accepts_scalar_shorthand(tmp_path, shorthand):
+    # DAB's scalar shorthand (bulk_stats: <v>, no `default:` key) IS the default; a legal shorthand passes.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  bulk_stats: '{shorthand}'\n")
+    gen_jobs.require_bulk_stats_declared(str(yml))  # no raise
+
+
+@pytest.mark.parametrize("bad", ["on", "yes", "1"])
+def test_require_bulk_stats_declared_bad_scalar_shorthand_fails_closed(tmp_path, bad):
+    # A bad shorthand default (bulk_stats: "on") must ALSO fail closed at generation - it would otherwise
+    # bake as ${var.bulk_stats} and fail require_es_flag at every run.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  bulk_stats: '{bad}'\n")
+    with pytest.raises(ValueError, match="bulk_stats"):
+        gen_jobs.require_bulk_stats_declared(str(yml))
+
+
+def test_shipped_databricks_yml_declares_bulk_stats():
+    gen_jobs.require_bulk_stats_declared()  # the repo's databricks.yml declares it with a legal default
+
+
+def test_render_singleton_omitted_bulk_stats_bakes_global_ref():
+    # A singleton config that omits bulk_stats gets ${var.bulk_stats} as the bulk_stats job-parameter
+    # default, so it defers to the target-wide global default at deploy.
+    cfg = _cfg()
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
+    assert {"name": "bulk_stats", "default": "${var.bulk_stats}"} in job["parameters"]
+
+
+def test_render_singleton_set_bulk_stats_bakes_literal():
+    # A singleton that SETS bulk_stats bakes its literal value, overriding the global ref.
+    cfg = _cfg()
+    cfg["bulk_stats"] = "false"
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
+    assert {"name": "bulk_stats", "default": "false"} in job["parameters"]
+
+
 def test_shipped_deploy_views_job_disables_queue():
     # deploy_views is hand-authored (not generated), so guard its skip-not-queue setting against drift
     # back to the queuing default, matching every generated job.
@@ -547,9 +619,12 @@ def test_group_run_time_knobs_move_into_task_base_parameters():
     })
     job = _render_group("g1", [("a.yml", "a", cfg, None)])
     bp = job["tasks"][0]["notebook_task"]["base_parameters"]
-    for p in job_parameters(cfg):
+    # The grouped task bakes the SAME defaults the generator uses, including the ${var.bulk_stats} ref
+    # for an omitted bulk_stats (so grouped tasks defer to the global default too).
+    for p in job_parameters(cfg, gen_jobs._BULK_STATS_VAR_REF):
         assert bp[p["name"]] == p["default"]
     assert bp["chunk_size"] == "500" and bp["write_concurrency"] == "4"  # per-member defaults carried
+    assert bp["bulk_stats"] == "${var.bulk_stats}"  # omitted => defers to the global default
 
 
 def test_group_shares_one_job_cluster_when_same_config():
@@ -658,14 +733,17 @@ def test_group_continuous_serverless_member_fails_closed():
         ])
 
 
-def test_group_duplicate_es_index_name_fails_closed():
-    # Two members writing the SAME es_index_name would run as concurrent tasks and double-write that
-    # index (max_concurrent_runs=1 guards concurrent job runs, not tasks). Fail closed at generation.
-    with pytest.raises(ValueError, match="writing the SAME es_index_name"):
-        gen_jobs.render_group_job_yaml("g1", [
-            _member("a.yml", "a", "shared-idx", mode="batch"),
-            _member("b.yml", "b", "shared-idx", mode="batch"),
-        ])
+def test_group_duplicate_es_index_name_warns_but_renders(capsys):
+    # Two members writing the SAME es_index_name is now ALLOWED (e.g. disjoint filter_condition subsets):
+    # generation proceeds and emits both tasks, but WARNS about the concurrent-write hazard on stderr.
+    job = _render_group("g1", [
+        _member("a.yml", "a", "shared-idx", mode="batch"),
+        _member("b.yml", "b", "shared-idx", mode="batch"),
+    ])
+    assert len(job["tasks"]) == 2  # both tasks emitted, not rejected
+    warning = capsys.readouterr().err
+    assert "writing the SAME es_index_name" in warning
+    assert "'shared-idx'" in warning and "disjoint" in warning.lower()
 
 
 def test_group_distinct_es_index_names_ok():

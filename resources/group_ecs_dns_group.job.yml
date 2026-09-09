@@ -43,7 +43,7 @@ resources:
             write_concurrency: ''
             require_existing_index: ''
             verify_certs: ''
-            bulk_stats: 'true'
+            bulk_stats: ${var.bulk_stats}
             streaming_start: new
             write_repartition: '0'
             max_partition_bytes: 2m
@@ -69,7 +69,7 @@ resources:
             write_concurrency: ''
             require_existing_index: ''
             verify_certs: ''
-            bulk_stats: 'true'
+            bulk_stats: ${var.bulk_stats}
             streaming_start: new
             write_repartition: '0'
             max_partition_bytes: 2m

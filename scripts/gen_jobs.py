@@ -32,7 +32,15 @@ from pipeline_lib.config import (  # noqa: E402
     job_base_parameters,
     job_parameters,
     load_config,
+    require_es_flag,
 )
+
+# The bundle-variable reference the generator bakes as the DEFAULT of the bulk_stats job parameter when a
+# config OMITS bulk_stats: the diagnostics toggle then defers to the target-wide ${var.bulk_stats} global
+# default (resolved per target at deploy). A config that SETS bulk_stats overrides this with its literal
+# value. Mirrors how ca_certs / checkpoint_base_path are threaded as ${var.*} references (see
+# job_base_parameters). require_bulk_stats_declared fails closed at generation if the variable is missing.
+_BULK_STATS_VAR_REF = "${var.bulk_stats}"
 
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "pipeline_configs")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
@@ -234,6 +242,40 @@ def require_job_name_prefix_declared(path: str = _DATABRICKS_YML, doc: dict | No
         )
 
 
+def require_bulk_stats_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION if databricks.yml declares no `bulk_stats` variable (or its default is
+    not a legal true/false/empty flag).
+
+    A config that OMITS bulk_stats has its job-parameter default baked as ${var.bulk_stats} (the global
+    diagnostics default, per target). If the variable is not declared, that reference would fail only at
+    deploy with a confusing error, so require its declaration here (mirrors require_job_name_prefix_declared).
+    We also validate the variable's static `default:` with the SAME allow-list the runner applies to the
+    effective value (require_es_flag: ""/true/false), so a mistyped global default ('on', 'yes') fails at
+    generation rather than at every run. Per-target/--var overrides are deploy-time and not visible here;
+    the runner re-validates the effective value, so a bad per-target value still fails closed at run.
+    """
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
+    if "bulk_stats" not in variables:
+        raise ValueError(
+            "bulk_stats is not declared in databricks.yml; add it under `variables:` with an empty default "
+            "(e.g. bulk_stats: {default: \"\"}). The generator bakes ${var.bulk_stats} as the default of the "
+            "bulk_stats job parameter for any pipeline that omits bulk_stats, so the bundle needs the "
+            "variable to resolve it at deploy."
+        )
+    # DAB accepts BOTH the full form (bulk_stats: {default: <v>}) and the scalar shorthand
+    # (bulk_stats: <v>, which IS the default). Read the default from whichever shape was used, so a bad
+    # shorthand default (bulk_stats: "on") is validated too rather than silently treated as "".
+    spec = variables["bulk_stats"]
+    default = spec.get("default") if isinstance(spec, dict) else spec
+    # Validate the declared default is a legal flag (""/true/false, YAML bool or string). require_es_flag
+    # raises PipelineConfigError on anything else; re-raise as ValueError to match this module's generation
+    # errors (main treats a bad config/reference uniformly).
+    try:
+        require_es_flag(default if default is not None else "", "bulk_stats (databricks.yml) default")
+    except PipelineConfigError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _job_display_name(postfix: str) -> str:
     """The job display name: `[<target>] <prefix>: <postfix>`.
 
@@ -344,7 +386,7 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
         streaming_trigger_interval,
     )
     if include_run_time_knobs:
-        for p in job_parameters(cfg):
+        for p in job_parameters(cfg, _BULK_STATS_VAR_REF):
             base_parameters[p["name"]] = p["default"]
     task["notebook_task"] = {
         "notebook_path": "../notebooks/run_index_pipeline.py",
@@ -446,7 +488,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     job_def = _assemble_job(
         _job_display_name(postfix),
         description,
-        job_parameters(cfg),
+        job_parameters(cfg, _BULK_STATS_VAR_REF),
         _trigger_block(cfg["schedule"], cfg["continuous"]),
         _job_clusters_for([(name, cfg, job_cluster_spec)]),
         [task],
@@ -551,24 +593,27 @@ def render_group_job_yaml(group_name: str, members: list) -> str:
     postfix = _resolve_group_postfix(group_name, members)
     ordered = sorted(members, key=lambda m: m[1])  # by config name
 
-    # Fail closed on members that write the SAME es_index_name. Grouped members run as CONCURRENT tasks
-    # within one job run, and max_concurrent_runs=1 only serializes job *runs*, not the tasks inside a
-    # run - so two members targeting one index would double-write it (duplicate docs with ES auto-ids, or
-    # redundant/racing upserts with a shared es_id_field). The 1:1 model gave each index its own serial
-    # job; grouping must preserve "one writer per index per run", so reject a duplicate here rather than
-    # emit a job whose tasks silently clobber each other. (Checkpoints are unaffected - each is keyed by
-    # config_name - but the ES write is the hazard.)
+    # WARN (do NOT fail) on members that write the SAME es_index_name. This is now ALLOWED: a common
+    # pattern is two tasks writing one index with disjoint filter_condition subsets (or the same view
+    # fanned to one index from different sources). But it stays a real hazard to flag, because grouped
+    # members run as CONCURRENT tasks within one job run and max_concurrent_runs=1 only serializes job
+    # *runs*, not the tasks inside a run - so two tasks writing one index write it concurrently. That is
+    # fine for DISJOINT subsets, but overlapping rows either duplicate (ES auto-ids) or race on upserts
+    # (a shared es_id_field). So warn loudly with the mitigation and let generation proceed. (Checkpoints
+    # are unaffected - each is keyed by config_name.)
     by_index: dict = {}
     for _, name, cfg, _ in ordered:
         by_index.setdefault(cfg["es_index_name"], []).append(name)
     dupes = {idx: ns for idx, ns in by_index.items() if len(ns) > 1}
     if dupes:
         detail = "; ".join(f"{idx!r} (member(s): {', '.join(sorted(ns))})" for idx, ns in sorted(dupes.items()))
-        raise ValueError(
-            f"job_group '{group_name}' has members writing the SAME es_index_name: {detail}. Grouped "
-            f"members run as concurrent tasks in one run, so two tasks writing one index would "
-            f"double-write it (max_concurrent_runs=1 guards concurrent job runs, not concurrent tasks). "
-            f"Give each member a distinct es_index_name, or keep them in separate jobs."
+        print(
+            f"WARNING: job_group '{group_name}' has members writing the SAME es_index_name: {detail}. "
+            f"Grouped members run as concurrent tasks in one run (max_concurrent_runs=1 guards concurrent "
+            f"job runs, not concurrent tasks), so they write that index concurrently. Ensure they cover "
+            f"DISJOINT rows (a distinct filter_condition per member) and set es_id_field for idempotent "
+            f"upserts; otherwise overlapping rows will duplicate or race.",
+            file=sys.stderr,
         )
     tasks = [
         _build_task(name, cfg, effective_interval, include_run_time_knobs=True)
@@ -662,6 +707,7 @@ def main(argv: list[str] | None = None) -> int:
     # job_name_prefix variable is missing (every generated name references ${var.job_name_prefix}).
     bundle_doc = _read_bundle_doc()
     require_job_name_prefix_declared(doc=bundle_doc)
+    require_bulk_stats_declared(doc=bundle_doc)
     es_host_configs = load_es_host_configs(doc=bundle_doc)
     default_es_host_config = load_default_es_host_config(doc=bundle_doc)
     cluster_configs = load_cluster_configs(doc=bundle_doc)

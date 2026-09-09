@@ -24,11 +24,14 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   per run. Omitted => the connector's own default stands.
     bulk_stats: true | false             # OPTIONAL EsWriteConfig diagnostics: collect per-partition
                                          #   ES bulk-send stats (docs/send, round-trip ms, ES `took` ms)
-                                         #   and surface them in the run log. UNLIKE the four above,
-                                         #   omitted => TRUE (on for all runs): a diagnostic this
-                                         #   framework wants by default. Also a job parameter; set false
-                                         #   per run (--params bulk_stats=false) to turn it off. Requires
-                                         #   connector 0.9.3+ (older wheels ignore it, fail-soft).
+                                         #   and surface them in the run log. Behaves like verify_certs:
+                                         #   omitted => the GLOBAL default (the ${var.bulk_stats}
+                                         #   databricks.yml variable, per target) stands, and when THAT
+                                         #   is empty too the connector's own default (OFF) applies. A
+                                         #   config value here OVERRIDES the global default for this
+                                         #   pipeline; the job parameter (--params bulk_stats=...) then
+                                         #   overrides per run. Requires connector 0.9.3+ (older wheels
+                                         #   ignore it, fail-soft).
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -636,13 +639,14 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     write_concurrency = require_write_concurrency(raw.get("write_concurrency", ""), f"{source}: write_concurrency")
     require_existing_index = require_es_flag(raw.get("require_existing_index", ""), f"{source}: require_existing_index")
     verify_certs = require_es_flag(raw.get("verify_certs", ""), f"{source}: verify_certs")
-    # bulk_stats is the diagnostics knob and, UNLIKE the four tuning knobs above (whose absent value ""
-    # means "leave the connector default"), an absent value defaults to TRUE - per-partition bulk-send
-    # stats are on for all runs by default (the framework wants this diagnostic out of the box). An
-    # explicit `bulk_stats: false` turns it off; the run-time job parameter can also flip it per run.
-    # Stored canonical ("true"/"false") like the other bool knobs, so it becomes a string job-parameter
+    # bulk_stats is the diagnostics knob. It now behaves EXACTLY like verify_certs: an absent value is ""
+    # (unset at the config level), which defers to the GLOBAL default - the generator bakes the omitted
+    # job-parameter default as the ${var.bulk_stats} databricks.yml variable (per target), and when that
+    # is empty too the connector's own default (OFF) stands. A config value here (`bulk_stats: true|false`)
+    # OVERRIDES the global default for this pipeline; the run-time job parameter overrides it per run.
+    # Stored canonical ("true"/"false"/"") like the other bool knobs, so it becomes a string job-parameter
     # default. Requires connector 0.9.3+; on an older wheel the runner drops it fail-soft (see runner).
-    bulk_stats = require_es_flag(raw.get("bulk_stats", True), f"{source}: bulk_stats")
+    bulk_stats = require_es_flag(raw.get("bulk_stats", ""), f"{source}: bulk_stats")
     # write_repartition is OPTIONAL but, unlike the tuning knobs above, an absent value does NOT mean
     # "unset": it falls back to the built-in default (require_write_repartition turns "" into
     # _DEFAULT_WRITE_REPARTITION), so a config that omits it still parallelizes the write instead of
@@ -1073,6 +1077,43 @@ def view_substitutions(cfg: dict, environment: str, source_override: str | None 
     return subs
 
 
+def shared_view_conflict(cfgs: list, environment: str) -> str | None:
+    """Detect a conflicting view DEFINITION among configs that share one view name. Fail-closed helper for
+    deploy_views, which allows N pipelines to share a view.
+
+    `cfgs` is a list of (label, validated_cfg) that all declare the SAME view name. Sharing a view is a
+    supported pattern: multiple pipelines can send different SUBSETS (filter_condition) of one view to
+    different indices or hosts. Those pipelines differ only on the ES-WRITE side (es_index_name,
+    es_host_config, es_id_field, filter_condition, pipeline_mode), NONE of which affects the view's CREATE
+    statement. What they MUST agree on is the view DEFINITION - the target view FQN, the source, and every
+    reference-table join, i.e. their view_substitutions (with ${environment} folded in). Two configs that
+    disagree there would render DIFFERENT `CREATE OR REPLACE VIEW <same-name>` statements against one view
+    object (last writer wins), which is incoherent - so this is a hard error even though sharing itself is
+    allowed.
+
+    Returns None when every config renders an IDENTICAL view definition (including the trivial single-config
+    case); otherwise a human-readable message naming each distinct definition and the configs that produced
+    it. Pure (uses view_substitutions; no Spark), so deploy_views calls it per shared view and collects the
+    message into its per-view failures.
+    """
+    by_subs: dict = {}
+    for label, cfg in cfgs:
+        subs = view_substitutions(cfg, environment)
+        key = tuple(sorted(subs.items()))  # hashable, order-independent identity of the view definition
+        by_subs.setdefault(key, []).append(label)
+    if len(by_subs) <= 1:
+        return None
+    detail = "; ".join(
+        f"{dict(key)} (config(s): {', '.join(sorted(labels))})"
+        for key, labels in sorted(by_subs.items())
+    )
+    return (
+        f"configs sharing this view name render CONFLICTING view definitions: {detail}. Pipelines that "
+        f"share a view must agree on the view target, source, and reference-table joins; they may differ "
+        f"only on es_index_name / es_host_config / es_id_field / filter_condition / pipeline_mode."
+    )
+
+
 # The ${token} pattern a view .sql may reference. Shared by every renderer so the substitution rule
 # (which characters form a token) is defined in exactly one place.
 _VIEW_TOKEN = re.compile(r"\$\{(\w+)\}")
@@ -1186,7 +1227,7 @@ def job_base_parameters(
     }
 
 
-def job_parameters(cfg: dict) -> list:
+def job_parameters(cfg: dict, bulk_stats_default_ref: str = "") -> list:
     """The RUN-TIME-overridable job-level parameters for a per-index job, as JobParameterDefinitions.
 
     Unlike base_parameters (fixed at deploy), a job parameter can be overridden per run with
@@ -1202,9 +1243,13 @@ def job_parameters(cfg: dict) -> list:
       run. The config stores each in canonical string form (see validate_config), which is exactly the
       string a job-parameter default must be. Parsed + validated by write_config_overrides at run time
       (an unset one leaves the connector default untouched).
-    - bulk_stats: EsWriteConfig diagnostics toggle. DEFAULT from the config, which (unlike the tuning
-      knobs) defaults to "true" when omitted - on for all runs. Overridable per run
-      (--params bulk_stats=false). Canonical string form, parsed by write_config_overrides.
+    - bulk_stats: EsWriteConfig diagnostics toggle, now behaving like the other bool knobs. DEFAULT from
+      the config when set; when the config OMITS it (stored ""), the default falls back to
+      `bulk_stats_default_ref` - the caller (the generator) passes the ${var.bulk_stats} bundle variable,
+      so an omitted config defers to the target-wide global default, and when NO ref is supplied (unit
+      tests) it stays "" (the connector's own default, off). A config value overrides the global; the
+      job parameter (--params bulk_stats=...) overrides per run. Canonical string form, parsed by
+      write_config_overrides. Requires connector 0.9.3+ (older wheels drop it fail-soft in the runner).
     - streaming_start: new|full, DEFAULT "new" (start the stream at the source's current version, so
       only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
       run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
@@ -1228,7 +1273,9 @@ def job_parameters(cfg: dict) -> list:
         {"name": "write_concurrency", "default": cfg["write_concurrency"]},
         {"name": "require_existing_index", "default": cfg["require_existing_index"]},
         {"name": "verify_certs", "default": cfg["verify_certs"]},
-        {"name": "bulk_stats", "default": cfg["bulk_stats"]},
+        # bulk_stats: the config value when set, else the caller-supplied global ref (${var.bulk_stats},
+        # resolved per target at deploy), else "" (connector default off) when no ref is supplied.
+        {"name": "bulk_stats", "default": cfg["bulk_stats"] or bulk_stats_default_ref},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": cfg["write_repartition"]},
         {"name": "max_partition_bytes", "default": cfg["max_partition_bytes"]},

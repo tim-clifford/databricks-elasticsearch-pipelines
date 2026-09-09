@@ -25,7 +25,7 @@ resources:
       - name: verify_certs
         default: ''
       - name: bulk_stats
-        default: 'true'
+        default: ${var.bulk_stats}
       - name: streaming_start
         default: new
       - name: write_repartition
