@@ -114,7 +114,7 @@ dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty
 dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
-dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default on; needs connector 0.9.3+)")
+dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default from ${var.bulk_stats}/config; empty => connector default off; needs connector 0.9.3+)")
 dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
 dbutils.widgets.text("max_partition_bytes", "", "spark.sql.files.maxPartitionBytes for the source read, e.g. 32m (0 leaves it unset; empty => default)")
 # Streaming-only widgets. checkpoint_base_path is a deploy-time base_parameter (bundle variable);
@@ -236,9 +236,11 @@ if STREAMING_TRIGGER_INTERVAL:
     )
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS)
-# bulk_stats requires connector 0.9.3+ (the release that added the EsWriteConfig field). It defaults ON
-# for all runs, so on an OLDER wheel EsWriteConfig(**write_overrides) would raise TypeError on an
-# unexpected kwarg and fail EVERY run. bulk_stats is DIAGNOSTICS ONLY, so it must never break the
+# bulk_stats requires connector 0.9.3+ (the release that added the EsWriteConfig field). Its effective
+# value is the global ${var.bulk_stats} default (or a per-pipeline config value / --params override); it
+# is only present in write_overrides when that resolves to a non-empty true/false. On an OLDER wheel, a
+# present bulk_stats would make EsWriteConfig(**write_overrides) raise TypeError on an unexpected kwarg
+# and fail EVERY such run. bulk_stats is DIAGNOSTICS ONLY, so it must never break the
 # export: if the installed EsWriteConfig has no such field, drop it from the overrides and warn, rather
 # than failing. Detected against the live dataclass's own field set (the installed wheel is the source
 # of truth), so this is correct whatever version is deployed. The other tuning knobs have existed since
