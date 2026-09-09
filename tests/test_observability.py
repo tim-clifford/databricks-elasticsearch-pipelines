@@ -6,9 +6,13 @@ rest exercise the fail-soft contract: format_progress must never raise, whatever
 """
 import json
 
+import pytest
+
 from pipeline_lib.observability import (
+    BULK_STATS_TAG,
     PROGRESS_TAG,
     batch_job_description,
+    format_bulk_stats,
     format_progress,
 )
 
@@ -133,3 +137,72 @@ def test_batch_job_description_shape():
     assert "ecs_dns_activity_continuous" in desc
     assert "ecs-dns-activity-continuous" in desc
     assert "batch 42" in desc
+
+
+# --------------------------------------------------------------------------- format_bulk_stats
+
+# Two partitions, shaped exactly like the connector's per-partition bulk_stats aggregate. Chosen so the
+# derived figures come out to round numbers the tests can pin: send-weighted rtt mean =
+# (12.5*40 + 10.0*60)/100 = 11.0; took mean = (8.0*40 + 6.0*60)/100 = 6.8; docs/send = 1_000_000/100 =
+# 10000.0; bytes/doc = 2_000_000_000/1_000_000 = 2000.0; per-partition conc = busy/wall (2.0 and 3.0).
+_BULK_STATS = [
+    {"n_sends": 40, "docs_sent": 400000, "bytes_sent": 800_000_000,
+     "send_busy_ms": 480.0, "partition_wall_ms": 240.0,   # conc = 2.0
+     "rtt_ms_mean": 12.5, "rtt_ms_p50": 11.0, "rtt_ms_p95": 22.0, "rtt_ms_max": 89.0,
+     "took_ms_mean": 8.0, "took_ms_p50": 7.0, "took_ms_p95": 15.0, "took_ms_max": 64.0},
+    {"n_sends": 60, "docs_sent": 600000, "bytes_sent": 1_200_000_000,
+     "send_busy_ms": 600.0, "partition_wall_ms": 200.0,   # conc = 3.0
+     "rtt_ms_mean": 10.0, "rtt_ms_p50": 9.0, "rtt_ms_p95": 18.0, "rtt_ms_max": 50.0,
+     "took_ms_mean": 6.0, "took_ms_p50": 5.0, "took_ms_p95": 12.0, "took_ms_max": 40.0},
+]
+
+
+def test_format_bulk_stats_overall_rollup_is_exact():
+    # The overall line reports figures that recombine EXACTLY across partitions: total sends/docs,
+    # docs/send, the send-weighted mean, and the max. Pin those to the hand-computed values.
+    line = format_bulk_stats(_BULK_STATS).splitlines()[0]
+    assert line.startswith(f"{BULK_STATS_TAG} overall:")
+    assert "partitions=2" in line
+    assert "sends=100" in line
+    assert "docs=1000000" in line
+    assert "docs/send=10000.00" in line
+    assert "bytes/doc=2000.0" in line                       # 2e9 bytes / 1e6 docs
+    assert "conc(busy/wall)=2.45" in line                   # 1080ms busy / 440ms wall
+    assert "rtt_ms(mean=11.00 max=89.00)" in line
+    assert "took_ms(mean=6.80 max=64.00)" in line
+
+
+def test_format_bulk_stats_per_partition_lines_carry_real_percentiles():
+    lines = format_bulk_stats(_BULK_STATS).splitlines()
+    assert len(lines) == 3  # overall + one per partition
+    assert "part0:" in lines[1] and "sends=40" in lines[1] and "docs=400000" in lines[1]
+    assert "bytes/doc=2000.0" in lines[1] and "conc=2.00" in lines[1]   # 8e8/4e5; 480/240
+    assert "rtt_ms(p50=11.00 p95=22.00 max=89.00)" in lines[1]
+    assert "took_ms(p50=7.00 p95=15.00 max=64.00)" in lines[1]
+    assert "part1:" in lines[2] and "rtt_ms(p50=9.00 p95=18.00 max=50.00)" in lines[2]
+    assert "conc=3.00" in lines[2]                                       # 600/200
+
+
+def test_format_bulk_stats_oneline_is_overall_only():
+    line = format_bulk_stats(_BULK_STATS, oneline=True)
+    assert "\n" not in line
+    assert line.startswith(f"{BULK_STATS_TAG} overall:")
+    assert "part0" not in line
+
+
+def test_format_bulk_stats_none_took_renders_na_not_raises():
+    # A partition whose sends carried no ES `took` (connector emits None) must render n/a, and with ALL
+    # tooks None the overall took mean/max are n/a too - never a crash, never a fabricated 0.
+    stats = [{"n_sends": 10, "docs_sent": 100000,
+              "rtt_ms_mean": 5.0, "rtt_ms_p50": 5.0, "rtt_ms_p95": 5.0, "rtt_ms_max": 5.0,
+              "took_ms_mean": None, "took_ms_p50": None, "took_ms_p95": None, "took_ms_max": None}]
+    out = format_bulk_stats(stats)
+    assert "took_ms(mean=n/a max=n/a)" in out.splitlines()[0]
+    assert "took_ms(p50=n/a p95=n/a max=n/a)" in out.splitlines()[1]
+
+
+@pytest.mark.parametrize("bad", [None, "not a list", 42, {}, [], [None, "x", 7], [{"n_sends": "oops"}]])
+def test_format_bulk_stats_never_raises_on_bad_input(bad):
+    out = format_bulk_stats(bad)
+    assert isinstance(out, str)
+    assert BULK_STATS_TAG in out

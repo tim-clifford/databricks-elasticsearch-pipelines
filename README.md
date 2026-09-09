@@ -134,6 +134,7 @@ chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
 write_concurrency: 4              # OPTIONAL EsWriteConfig tuning (parallel bulk streams per partition; connector >= 0.7.0); omit for connector default 1
+bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log; connector >= 0.9.3). UNLIKE the knobs above, DEFAULTS ON when omitted; set false to turn off
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
 max_files_per_trigger: 1000       # OPTIONAL streaming read rate-limit: max Delta files per micro-batch; omit for Spark default 1000. Useful to throttle a full backfill / post-restart catch-up
@@ -486,6 +487,17 @@ Two different mechanisms carry values into a job, and they resolve at different 
     the write is latency-bound on ES round-trips (executors idle, CPU and network both under-used)
     rather than CPU/bandwidth-bound; it multiplies with the partition count, so raise it gradually and
     watch for 429s. Applies to **both** modes.
+  - `bulk_stats` (`true` | `false`, **defaults on**; requires connector **>= 0.9.3**) collects
+    per-partition ES bulk-send diagnostics and logs them under the `BULK_STATS` tag. Unlike the tuning
+    knobs above, an omitted `bulk_stats` defaults to **on** (this framework wants the diagnostic by
+    default); set `bulk_stats: false` (or `--params bulk_stats=false`) to turn it off. Batch runs emit
+    an `overall` rollup (`docs/send`, and send-weighted mean / max round-trip `rtt_ms` and ES-reported
+    `took_ms`) plus one line per write partition with real p50/p95/max; streaming runs emit the compact
+    `overall` line per micro-batch. `rtt_ms - took_ms` is the network/queue overhead and
+    `docs/send` is the real docs-per-bulk, so this is the tool for diagnosing whether more
+    `write_concurrency` or cores would help. On a connector older than 0.9.3 the runner drops it with a
+    warning and the export proceeds without the diagnostic (it never fails the run). Applies to **both**
+    modes.
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).

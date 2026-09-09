@@ -18,6 +18,17 @@ import json
 # (e.g. `grep STREAM_PROGRESS`). Do not change it casually: it is the documented handle for the trail.
 PROGRESS_TAG = "STREAM_PROGRESS"
 
+# Log-line prefix for the per-partition ES bulk-send diagnostics (the connector's `bulk_stats`, on by
+# default; see pipeline_lib.config). Distinct from PROGRESS_TAG so the two trails grep independently
+# (`grep BULK_STATS`). Stable: it is the documented handle for the bulk-send trail.
+BULK_STATS_TAG = "BULK_STATS"
+
+# The per-partition percentile keys the connector emits under each `bulk_stats` entry. Named here (not
+# re-typed inline) so the formatter and its tests read the same set; a key the connector renames simply
+# renders as n/a rather than raising (fail-soft).
+_RTT_KEYS = ("rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max")
+_TOOK_KEYS = ("took_ms_p50", "took_ms_p95", "took_ms_max")
+
 # The backlog metrics we call out by name (the "am I caught up or behind" signal). Any OTHER metric key
 # the runtime emits is still surfaced generically after these, so this is a highlight list, not a filter.
 _HEADLINE_SOURCE_METRICS = ("numFilesOutstanding", "numBytesOutstanding")
@@ -79,6 +90,125 @@ def _source_tokens(idx, source):
         if key not in _HEADLINE_SOURCE_METRICS:
             tokens.append(f"{key}={metrics[key]}")
     return tokens
+
+
+def _num(value):
+    """Format a numeric stat compactly: an int stays an int, a float rounds to 2 decimals, None (a
+    took value the connector could not record) renders as 'n/a'. Any other/oddly-typed value is
+    stringified as-is (fail-soft - never raise from a formatter)."""
+    if value is None:
+        return "n/a"
+    if isinstance(value, bool):  # bool is an int subclass; show it literally, don't format as a number
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return str(value)
+
+
+def format_bulk_stats(bulk_stats, oneline=False):
+    """Render the connector's per-partition `bulk_stats` as greppable BULK_STATS log line(s).
+
+    `bulk_stats` is the list the connector returns under result['bulk_stats'] when EsWriteConfig
+    bulk_stats is on: one dict per DataFrame partition, each with n_sends, docs_sent, bytes_sent,
+    send_busy_ms, partition_wall_ms, and the rtt_ms_*/took_ms_* percentiles (see pipeline_lib.config /
+    the connector). rtt_ms is the full client-observed round trip per bulk send; took_ms is
+    Elasticsearch's own reported service time, so rtt - took is the network/queue overhead and
+    docs_sent/n_sends the real docs-per-bulk. bytes_sent is the uncompressed NDJSON size, so
+    bytes_sent/docs_sent is the real per-document size (no ES query) and bytes_sent/n_sends the
+    per-request size - comparing rtt against these tells a fixed per-request latency apart from a
+    transfer-bound write. send_busy_ms/partition_wall_ms is the effective in-flight concurrency the
+    partition reached (~1 == sends ran serially, ~write_concurrency == fully overlapped).
+
+    Returns a multi-line string: an `overall` line (cluster-wide rollup) followed by one line per
+    partition, OR just the overall line when oneline=True (used by the streaming per-batch log to avoid
+    flooding). The overall rollup reports only figures that recombine EXACTLY across partitions: total
+    sends/docs/bytes, docs-per-send, bytes-per-doc/send, the wall-weighted concurrency, the
+    send-weighted MEAN rtt/took, and the MAX rtt/took. It deliberately does NOT synthesize a global
+    p50/p95 (percentiles cannot be exactly recombined from per-partition percentiles) - the real
+    per-partition percentiles are in the per-partition lines below.
+
+    FAIL-SOFT by contract, like format_progress: this is observability only and is called from the
+    export path, so any missing/renamed/oddly-typed field is tolerated (rendered n/a) and a non-list or
+    empty input yields a marker line rather than an exception."""
+    try:
+        if not isinstance(bulk_stats, list) or not bulk_stats:
+            return f"{BULK_STATS_TAG} <no bulk stats: {type(bulk_stats).__name__}>"
+
+        parts = [p if isinstance(p, dict) else {} for p in bulk_stats]
+
+        def _sum(key):
+            total = 0
+            for p in parts:
+                v = p.get(key)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    total += v
+            return total
+
+        total_sends = _sum("n_sends")
+        total_docs = _sum("docs_sent")
+        total_bytes = _sum("bytes_sent")
+        total_busy = _sum("send_busy_ms")
+        total_wall = _sum("partition_wall_ms")
+        docs_per_send = (total_docs / total_sends) if total_sends else 0.0
+
+        def _pair_ratio(num, den):
+            """num/den as a float, or None when either is non-numeric or den is falsy (renders n/a)."""
+            ok = (isinstance(num, (int, float)) and not isinstance(num, bool)
+                  and isinstance(den, (int, float)) and not isinstance(den, bool) and den)
+            return (num / den) if ok else None
+
+        def _rounded(value, ndigits):
+            """None-safe round for _num: keep None as None so it renders n/a, else round."""
+            return round(value, ndigits) if value is not None else None
+
+        # Send-weighted mean of a per-partition mean: sum(mean_i * n_i) / sum(n_i), which is the exact
+        # overall mean when every send is counted. Partitions with a non-numeric mean or zero sends are
+        # skipped. Returns None when nothing weighed in (so it renders n/a).
+        def _weighted_mean(mean_key):
+            num = 0.0
+            den = 0
+            for p in parts:
+                m = p.get(mean_key)
+                n = p.get("n_sends")
+                if (isinstance(m, (int, float)) and not isinstance(m, bool)
+                        and isinstance(n, int) and not isinstance(n, bool) and n > 0):
+                    num += m * n
+                    den += n
+            return (num / den) if den else None
+
+        def _max(max_key):
+            vals = [p.get(max_key) for p in parts]
+            vals = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            return max(vals) if vals else None
+
+        overall = (
+            f"{BULK_STATS_TAG} overall: partitions={len(parts)} sends={total_sends} docs={total_docs} "
+            f"docs/send={_num(round(docs_per_send, 2))} "
+            f"bytes/doc={_num(_rounded(_pair_ratio(total_bytes, total_docs), 1))} "
+            f"bytes/send={_num(_rounded(_pair_ratio(total_bytes, total_sends), 1))} "
+            f"conc(busy/wall)={_num(_rounded(_pair_ratio(total_busy, total_wall), 2))} "
+            f"rtt_ms(mean={_num(_weighted_mean('rtt_ms_mean'))} max={_num(_max('rtt_ms_max'))}) "
+            f"took_ms(mean={_num(_weighted_mean('took_ms_mean'))} max={_num(_max('took_ms_max'))})"
+        )
+        if oneline:
+            return overall
+
+        lines = [overall]
+        for i, p in enumerate(parts):
+            rtt = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _RTT_KEYS)
+            took = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _TOOK_KEYS)
+            bytes_per_doc = _pair_ratio(p.get("bytes_sent"), p.get("docs_sent"))
+            conc = _pair_ratio(p.get("send_busy_ms"), p.get("partition_wall_ms"))
+            lines.append(
+                f"{BULK_STATS_TAG}   part{i}: sends={_num(p.get('n_sends'))} "
+                f"docs={_num(p.get('docs_sent'))} bytes/doc={_num(_rounded(bytes_per_doc, 1))} "
+                f"conc={_num(_rounded(conc, 2))} rtt_ms({rtt}) took_ms({took})"
+            )
+        return "\n".join(lines)
+    except Exception as _e:  # never let a diagnostic formatter disturb the export
+        return f"{BULK_STATS_TAG} <formatting failed: {type(_e).__name__}: {_e}>"
 
 
 def format_progress(progress):

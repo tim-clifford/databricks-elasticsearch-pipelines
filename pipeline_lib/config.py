@@ -22,6 +22,13 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
     verify_certs: true | false           # OPTIONAL EsWriteConfig tuning: verify the ES TLS certificate.
                                          #   All four: config DEFAULT, also a job parameter overridable
                                          #   per run. Omitted => the connector's own default stands.
+    bulk_stats: true | false             # OPTIONAL EsWriteConfig diagnostics: collect per-partition
+                                         #   ES bulk-send stats (docs/send, round-trip ms, ES `took` ms)
+                                         #   and surface them in the run log. UNLIKE the four above,
+                                         #   omitted => TRUE (on for all runs): a diagnostic this
+                                         #   framework wants by default. Also a job parameter; set false
+                                         #   per run (--params bulk_stats=false) to turn it off. Requires
+                                         #   connector 0.9.3+ (older wheels ignore it, fail-soft).
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -372,7 +379,7 @@ def require_es_flag(value: object, where: str) -> str:
 
 
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
-                           write_concurrency: object = "") -> dict:
+                           write_concurrency: object = "", bulk_stats: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
     Called by the runner on the effective (config-default or --params override) widget values. Each
@@ -381,7 +388,14 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     is delegated to the shared require_chunk_size / require_es_flag helpers (the same ones the config
     schema uses), so a bad value (chunk_size=abc, verify_certs=maybe) fails closed BEFORE any write.
     The set knobs are converted from their canonical string form to the typed value EsWriteConfig
-    expects (int / bool) and splatted into EsWriteConfig(**...)."""
+    expects (int / bool) and splatted into EsWriteConfig(**...).
+
+    bulk_stats follows the same shape as the two bool knobs (canonical "true"/"false"/"" via
+    require_es_flag). Its effective value normally arrives "true" (its job-parameter default is on for
+    all runs), so it is included as bulk_stats=True unless explicitly overridden to false; an empty
+    value (widget cleared) falls back to the connector's own default. It requires connector 0.9.3+, so
+    the runner drops it from these overrides fail-soft when the installed EsWriteConfig lacks the field
+    (an older wheel) rather than failing the run - this function stays a pure value parser."""
     overrides: dict = {}
 
     canonical_chunk_size = require_chunk_size(chunk_size)
@@ -392,7 +406,8 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     if canonical_write_concurrency:
         overrides["write_concurrency"] = int(canonical_write_concurrency)
 
-    for name, value in (("require_existing_index", require_existing_index), ("verify_certs", verify_certs)):
+    for name, value in (("require_existing_index", require_existing_index),
+                        ("verify_certs", verify_certs), ("bulk_stats", bulk_stats)):
         flag = require_es_flag(value, name)
         if flag:
             overrides[name] = flag == "true"
@@ -572,7 +587,8 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
 
     allowed_top = {
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
-        "chunk_size", "write_concurrency", "require_existing_index", "verify_certs", "write_repartition", "max_partition_bytes",
+        "chunk_size", "write_concurrency", "require_existing_index", "verify_certs", "bulk_stats",
+        "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
         "job_group", "job_name_postfix",
@@ -620,6 +636,13 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     write_concurrency = require_write_concurrency(raw.get("write_concurrency", ""), f"{source}: write_concurrency")
     require_existing_index = require_es_flag(raw.get("require_existing_index", ""), f"{source}: require_existing_index")
     verify_certs = require_es_flag(raw.get("verify_certs", ""), f"{source}: verify_certs")
+    # bulk_stats is the diagnostics knob and, UNLIKE the four tuning knobs above (whose absent value ""
+    # means "leave the connector default"), an absent value defaults to TRUE - per-partition bulk-send
+    # stats are on for all runs by default (the framework wants this diagnostic out of the box). An
+    # explicit `bulk_stats: false` turns it off; the run-time job parameter can also flip it per run.
+    # Stored canonical ("true"/"false") like the other bool knobs, so it becomes a string job-parameter
+    # default. Requires connector 0.9.3+; on an older wheel the runner drops it fail-soft (see runner).
+    bulk_stats = require_es_flag(raw.get("bulk_stats", True), f"{source}: bulk_stats")
     # write_repartition is OPTIONAL but, unlike the tuning knobs above, an absent value does NOT mean
     # "unset": it falls back to the built-in default (require_write_repartition turns "" into
     # _DEFAULT_WRITE_REPARTITION), so a config that omits it still parallelizes the write instead of
@@ -706,6 +729,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "write_concurrency": write_concurrency,
         "require_existing_index": require_existing_index,
         "verify_certs": verify_certs,
+        "bulk_stats": bulk_stats,
         "write_repartition": write_repartition,
         "max_partition_bytes": max_partition_bytes,
         "max_files_per_trigger": max_files_per_trigger,
@@ -972,6 +996,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "write_concurrency": cfg["write_concurrency"],
         "require_existing_index": cfg["require_existing_index"],
         "verify_certs": cfg["verify_certs"],
+        # bulk_stats (diagnostics toggle) is a connector setting, not an object name: passed through
+        # verbatim (canonical string form), like the tuning knobs.
+        "bulk_stats": cfg["bulk_stats"],
         # write_repartition (partitions for the pre-write repartition) and max_partition_bytes (read
         # scan parallelism) are run behaviors, not object names: passed through verbatim (canonical
         # string form), like the tuning knobs.
@@ -1175,6 +1202,9 @@ def job_parameters(cfg: dict) -> list:
       run. The config stores each in canonical string form (see validate_config), which is exactly the
       string a job-parameter default must be. Parsed + validated by write_config_overrides at run time
       (an unset one leaves the connector default untouched).
+    - bulk_stats: EsWriteConfig diagnostics toggle. DEFAULT from the config, which (unlike the tuning
+      knobs) defaults to "true" when omitted - on for all runs. Overridable per run
+      (--params bulk_stats=false). Canonical string form, parsed by write_config_overrides.
     - streaming_start: new|full, DEFAULT "new" (start the stream at the source's current version, so
       only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
       run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
@@ -1198,6 +1228,7 @@ def job_parameters(cfg: dict) -> list:
         {"name": "write_concurrency", "default": cfg["write_concurrency"]},
         {"name": "require_existing_index", "default": cfg["require_existing_index"]},
         {"name": "verify_certs", "default": cfg["verify_certs"]},
+        {"name": "bulk_stats", "default": cfg["bulk_stats"]},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": cfg["write_repartition"]},
         {"name": "max_partition_bytes", "default": cfg["max_partition_bytes"]},
