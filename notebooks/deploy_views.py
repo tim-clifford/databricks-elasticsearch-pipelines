@@ -38,29 +38,40 @@ VIEWS_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_views")
 CONFIG_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_configs")
 print("files root:", FILES_ROOT)
 
-from pipeline_lib.config import column_present, load_config, render_view_sql, view_substitutions  # noqa: E402
+from pipeline_lib.config import column_present, load_config, render_view_sql, shared_view_conflict, view_substitutions  # noqa: E402
 
 # COMMAND ----------
-# Load every pipeline definition and key it by the view name it declares, so a view .sql file can be
-# matched to its config. A duplicate view name across configs is an error (two pipelines can't own
-# the same view).
+# Load every pipeline definition and GROUP them by the view name each declares, so a view .sql file can be
+# matched to the pipeline(s) that use it. A view may be SHARED by multiple pipelines - e.g. to send
+# different subsets (filter_condition) of one view to different indices or hosts - so this is a
+# view_name -> list mapping, not 1:1. Sharing is allowed and only WARNED (a genuinely CONFLICTING view
+# definition among sharers is caught per-view when deploying, via shared_view_conflict).
 import glob
 
 configs_by_view = {}
 for cfg_path in sorted(glob.glob(os.path.join(CONFIG_DIR, "*.yml")) + glob.glob(os.path.join(CONFIG_DIR, "*.yaml"))):
     cfg = load_config(cfg_path)  # validates; raises on any invalid config (fail closed)
     view_name = cfg["view"]["name"]
-    if view_name in configs_by_view:
-        raise ValueError(f"two pipeline definitions declare view '{view_name}'; view names must be unique")
-    configs_by_view[view_name] = cfg
-print(f"loaded {len(configs_by_view)} pipeline definition(s)")
+    configs_by_view.setdefault(view_name, []).append((os.path.basename(cfg_path), cfg))
+_total_configs = sum(len(v) for v in configs_by_view.values())
+print(f"loaded {_total_configs} pipeline definition(s) across {len(configs_by_view)} view(s)")
+
+# Warn (do NOT fail) when a view is shared by more than one pipeline: the view is created ONCE, and the
+# sharing pipelines each write their own index/host/subset. Loud so an UNINTENDED share (a duplicated
+# view name by mistake) is visible; an intended share (the whole point of this feature) is fine.
+for view_name, entries in sorted(configs_by_view.items()):
+    if len(entries) > 1:
+        print(f"WARNING: view '{view_name}' is shared by {len(entries)} pipelines "
+              f"({', '.join(sorted(label for label, _ in entries))}); it is deployed ONCE. Confirm this is "
+              f"intended and that the pipelines send the subsets you expect (filter_condition per pipeline).")
 
 sql_files = sorted(f for f in os.listdir(VIEWS_DIR) if f.endswith(".sql"))
 if not sql_files:
     raise ValueError(f"no .sql view files found in {VIEWS_DIR}")
 
-# Every view .sql must have a matching config, and vice versa: an unpaired file on either side is a
-# wiring mistake that would otherwise deploy a view with unresolved parameters, or silently skip one.
+# Every view .sql must have at least one matching config, and vice versa: an unpaired file on either side
+# is a wiring mistake that would otherwise deploy a view with unresolved parameters, or silently skip one.
+# (A view with MULTIPLE configs is fine - the shared-view case above.)
 sql_view_names = {os.path.splitext(f)[0] for f in sql_files}
 missing_config = sorted(sql_view_names - set(configs_by_view))
 missing_sql = sorted(set(configs_by_view) - sql_view_names)
@@ -161,7 +172,15 @@ for filename in sql_files:
     view_name = os.path.splitext(filename)[0]
     print(f"--- {filename} ---")
     try:
-        cfg = configs_by_view[view_name]
+        entries = configs_by_view[view_name]  # one or more pipelines that share this view
+        # Fail closed (per-view) if pipelines sharing this view render CONFLICTING definitions: they must
+        # agree on the view target/source/reference joins, differing only on the ES-write side. None for
+        # the single-config case and for a benign share. See pipeline_lib.config.shared_view_conflict.
+        conflict = shared_view_conflict(entries, ENVIRONMENT)
+        if conflict is not None:
+            raise ValueError(conflict)
+        # Every sharer renders the same definition (just proven), so deploy from a representative config.
+        _rep_label, cfg = entries[0]
         subs = view_substitutions(cfg, ENVIRONMENT)
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
             rendered = render_view_sql(fh.read(), subs, filename)
@@ -179,32 +198,36 @@ for filename in sql_files:
             print("    [debug print suppressed: cumulative SQL-print budget reached; view still deploys]")
         # A view file holds exactly one CREATE OR REPLACE VIEW statement; run it as one statement.
         spark.sql(rendered)
-        # Verify the config's es_id_field is an actual output column of the view just created. This
-        # is the ground-truth check (Spark's own resolved schema, not a parse of the .sql), and it
+        # Verify each sharing pipeline's es_id_field is an actual output column of the view just created.
+        # This is the ground-truth check (Spark's own resolved schema, not a parse of the .sql), and it
         # runs here rather than in the offline generator because the generator has no Spark. A typo'd
         # es_id_field or a view that renamed the column would otherwise only surface much later, when
-        # the connector is handed a nonexistent _id column. Fail closed per-view (collected below).
-        # es_id_field is OPTIONAL: when it is unset (None) the pipeline lets ES auto-generate the _id,
-        # so there is no column to verify - skip the check.
+        # the connector is handed a nonexistent _id column. With a SHARED view, every sharer may set its
+        # OWN es_id_field, so verify them ALL: the one view must contain each one's _id column. Fail closed
+        # per-view (collected below). es_id_field is OPTIONAL per pipeline: when unset (None) that pipeline
+        # lets ES auto-generate the _id, so there is no column to verify for it.
         fqn = subs["view"]  # catalog.schema.name, ${environment} already folded in
-        es_id_field = cfg["es_id_field"]
-        if es_id_field is None:
-            # No _id column to verify: the pipeline lets ES auto-generate the _id.
-            id_note = "no es_id_field: ES auto-generates _id"
-        else:
+        view_columns = None  # fetched lazily (once) only if some sharer sets es_id_field
+        id_notes = []
+        for label, entry_cfg in entries:
+            es_id_field = entry_cfg["es_id_field"]
+            if es_id_field is None:
+                id_notes.append(f"{label}: no es_id_field (ES auto _id)")
+                continue
             # column_present matches Spark's default (case-INSENSITIVE) column resolution, so a view
             # emitting e.g. `DSL_ID` for a config `dsl_id` is not false-rejected. Original casing is kept
             # in the error text. See pipeline_lib.config.column_present (unit-tested there). A missing
             # column fails closed (raises) and is collected by the except below.
-            view_columns = spark.table(fqn).columns
+            if view_columns is None:
+                view_columns = spark.table(fqn).columns
             if not column_present(es_id_field, view_columns):
                 raise ValueError(
-                    f"es_id_field '{es_id_field}' is not an output column of view {fqn}; "
+                    f"es_id_field '{es_id_field}' (from {label}) is not an output column of view {fqn}; "
                     f"available columns: {view_columns}"
                 )
-            id_note = f"es_id_field '{es_id_field}' present"
+            id_notes.append(f"{label}: es_id_field '{es_id_field}' present")
         created.append(filename)
-        print(f"    created {view_name} ({id_note})")
+        print(f"    created {view_name} ({'; '.join(id_notes)})")
     except Exception as exc:  # noqa: BLE001 - deliberately continue to the next view
         failed.append((filename, exc))
         print(f"    FAILED {view_name}: {type(exc).__name__}: {exc}")

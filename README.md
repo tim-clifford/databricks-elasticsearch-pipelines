@@ -18,9 +18,12 @@ framework code you don't normally edit.
 
 The bundle deploys:
 
-- **One `deploy_views` job**: creates or replaces one Databricks view per index. Each view is a
+- **One `deploy_views` job**: creates or replaces one Databricks view per `.sql` file. Each view is a
   `.sql` file in [`_pipelines/pipeline_views/`](_pipelines/pipeline_views/). The job renders the
-  catalog/schema parameters and runs every file with `spark.sql`.
+  catalog/schema parameters and runs every file with `spark.sql`. A view **can be shared** by more than
+  one pipeline (e.g. to send different subsets to different indices or hosts; see
+  [Sharing a view across pipelines](#sharing-a-view-across-pipelines)) - it is created once, and the
+  sharing pipelines must agree on the view definition.
 - **One job per index** (`index_pipeline_<config_name>`): all run the same shared notebook
   [`notebooks/run_index_pipeline.py`](notebooks/run_index_pipeline.py) with that index's config. These
   job resources are **generated** by [`scripts/gen_jobs.py`](scripts/gen_jobs.py) from the config
@@ -79,6 +82,21 @@ LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id
 
 The config owns *where* each table is; the SQL owns the join itself (type, `ON` clause, surfaced
 columns, and any tuning such as a `/*+ BROADCAST(alias) */` hint, written directly in the SQL).
+
+### Sharing a view across pipelines
+
+More than one pipeline may point at the **same** view (same `view:` block, so the same `.sql`). This is
+how you fan one transformed view out to several destinations: give each pipeline its own config with a
+different `es_index_name`, `es_host_config`, and/or `filter_condition` (a subset), all reading the one
+view. `deploy_views` creates the view **once** and prints a `WARNING` naming the sharing pipelines (so an
+*accidental* duplicate view name is still visible).
+
+The sharing configs must agree on the **view definition** - the `view:` target, the `source:`, and every
+`reference_tables` entry (i.e. everything that renders into the `CREATE OR REPLACE VIEW` statement). They
+may differ **only** on the ES-write side: `es_index_name`, `es_host_config`, `es_id_field`,
+`filter_condition`, and `pipeline_mode`. If two sharers would render *different* definitions for one view
+name, `deploy_views` **fails that view closed** (you can't deploy two definitions to one object).
+`es_id_field` is checked per pipeline: the shared view must contain every sharer's `_id` column.
 
 ## Configuration
 

@@ -1077,6 +1077,43 @@ def view_substitutions(cfg: dict, environment: str, source_override: str | None 
     return subs
 
 
+def shared_view_conflict(cfgs: list, environment: str) -> str | None:
+    """Detect a conflicting view DEFINITION among configs that share one view name. Fail-closed helper for
+    deploy_views, which allows N pipelines to share a view.
+
+    `cfgs` is a list of (label, validated_cfg) that all declare the SAME view name. Sharing a view is a
+    supported pattern: multiple pipelines can send different SUBSETS (filter_condition) of one view to
+    different indices or hosts. Those pipelines differ only on the ES-WRITE side (es_index_name,
+    es_host_config, es_id_field, filter_condition, pipeline_mode), NONE of which affects the view's CREATE
+    statement. What they MUST agree on is the view DEFINITION - the target view FQN, the source, and every
+    reference-table join, i.e. their view_substitutions (with ${environment} folded in). Two configs that
+    disagree there would render DIFFERENT `CREATE OR REPLACE VIEW <same-name>` statements against one view
+    object (last writer wins), which is incoherent - so this is a hard error even though sharing itself is
+    allowed.
+
+    Returns None when every config renders an IDENTICAL view definition (including the trivial single-config
+    case); otherwise a human-readable message naming each distinct definition and the configs that produced
+    it. Pure (uses view_substitutions; no Spark), so deploy_views calls it per shared view and collects the
+    message into its per-view failures.
+    """
+    by_subs: dict = {}
+    for label, cfg in cfgs:
+        subs = view_substitutions(cfg, environment)
+        key = tuple(sorted(subs.items()))  # hashable, order-independent identity of the view definition
+        by_subs.setdefault(key, []).append(label)
+    if len(by_subs) <= 1:
+        return None
+    detail = "; ".join(
+        f"{dict(key)} (config(s): {', '.join(sorted(labels))})"
+        for key, labels in sorted(by_subs.items())
+    )
+    return (
+        f"configs sharing this view name render CONFLICTING view definitions: {detail}. Pipelines that "
+        f"share a view must agree on the view target, source, and reference-table joins; they may differ "
+        f"only on es_index_name / es_host_config / es_id_field / filter_condition / pipeline_mode."
+    )
+
+
 # The ${token} pattern a view .sql may reference. Shared by every renderer so the substitution rule
 # (which characters form a token) is defined in exactly one place.
 _VIEW_TOKEN = re.compile(r"\$\{(\w+)\}")

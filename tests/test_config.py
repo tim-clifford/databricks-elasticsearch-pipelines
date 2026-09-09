@@ -26,6 +26,7 @@ from pipeline_lib.config import (
     require_write_repartition,
     resolve_config,
     resolve_name,
+    shared_view_conflict,
     validate_config,
     view_select_body,
     view_substitutions,
@@ -472,6 +473,58 @@ def test_view_substitutions_source_override_none_is_real_source():
     # None (the default, what deploy_views uses) keeps the real source FQN.
     subs = view_substitutions(validate_config(_base()), environment="", source_override=None)
     assert subs["source"] == "cat.ocsf.dns_activity"
+
+
+# --------------------------------------------------------------------------- shared_view_conflict
+
+
+def test_shared_view_conflict_single_config_is_none():
+    # The trivial case (one pipeline owns the view) is never a conflict.
+    assert shared_view_conflict([("a.yml", validate_config(_base()))], "") is None
+
+
+def test_shared_view_conflict_identical_definition_is_none():
+    # Two pipelines sharing a view but differing ONLY on the ES-write side (index, host, id, filter) is
+    # the supported shared-view case: same view definition => no conflict.
+    a = _base()
+    b = _base()
+    b["es_index_name"] = "ecs-dns-activity-secondary"
+    b["es_host_config"] = "es_host_secondary"
+    b["es_id_field"] = "event_id"
+    b["filter_condition"] = "action = 'blocked'"
+    assert shared_view_conflict(
+        [("a.yml", validate_config(a)), ("b.yml", validate_config(b))], ""
+    ) is None
+
+
+def test_shared_view_conflict_different_source_reported():
+    # Same view NAME but a different source => different CREATE statement => conflict (fail closed).
+    a = _base()
+    b = _base()
+    b["source"]["table"] = "dns_activity_backup"
+    msg = shared_view_conflict([("a.yml", validate_config(a)), ("b.yml", validate_config(b))], "")
+    assert msg is not None
+    assert "CONFLICTING" in msg and "a.yml" in msg and "b.yml" in msg
+
+
+def test_shared_view_conflict_different_reference_tables_reported():
+    # A different reference-table join changes the rendered view definition => conflict.
+    a = _base()
+    b = _base()
+    b["reference_tables"] = {"geo": {"catalog": "cat", "schema": "ref", "table": "geoip"}}
+    msg = shared_view_conflict([("a.yml", validate_config(a)), ("b.yml", validate_config(b))], "")
+    assert msg is not None and "CONFLICTING" in msg
+
+
+def test_shared_view_conflict_env_resolves_identically_is_none():
+    # ${environment} templates that resolve to the same FQNs under the given environment are NOT a
+    # conflict (the comparison is on the resolved substitutions, not the raw templates).
+    a = _with_env()
+    b = _with_env()
+    b["es_index_name"] = "ecs-dns-activity-2"
+    assert shared_view_conflict(
+        [("a.yml", validate_config(a)), ("b.yml", validate_config(b))], "prod"
+    ) is None
 
 
 # --------------------------------------------------------------------------- render_view_sql
