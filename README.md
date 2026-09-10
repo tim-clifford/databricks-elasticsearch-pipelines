@@ -154,6 +154,8 @@ chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
 write_concurrency: 4              # OPTIONAL EsWriteConfig tuning (parallel bulk streams per partition; connector >= 0.7.0); omit for connector default 1
+request_timeout: 120              # OPTIONAL EsWriteConfig tuning (per-request ES client timeout, seconds); omit for connector default 60. Raise it (with a smaller chunk_size) when a bulk send times out mid-write
+transport_max_retries: 5          # OPTIONAL EsWriteConfig tuning (whole-request retries on a transport failure: connection reset/timeout, 429/503 on the bulk call); omit for connector default 3. 0 disables them
 bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log; connector >= 0.9.3). Behaves like verify_certs: omit to defer to the global ${var.bulk_stats} default (off), or set true|false here to override it for this pipeline
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
@@ -506,10 +508,10 @@ Two different mechanisms carry values into a job, and they resolve at different 
   redeploying (an invalid value fails the run closed). This is the standalone-job model; a
   [job group](#job-groups) instead bakes these per member at deploy (not `--params`-overridable):
   - `pipeline_mode` (`batch` | `streaming`), `filter_condition` (a Spark SQL predicate), and the
-    connector-write tuning knobs `chunk_size`, `write_concurrency`, `require_existing_index`,
-    `verify_certs` all default to their config values (each is an optional config key; see
-    [Configuration](#configuration)). `pipeline_mode` also accepts a run-time-only maintenance value,
-    `reset_checkpoint` (see [Resetting a checkpoint](#resetting-a-checkpoint)).
+    connector-write tuning knobs `chunk_size`, `write_concurrency`, `request_timeout`,
+    `transport_max_retries`, `require_existing_index`, `verify_certs` all default to their config values
+    (each is an optional config key; see [Configuration](#configuration)). `pipeline_mode` also accepts a
+    run-time-only maintenance value, `reset_checkpoint` (see [Resetting a checkpoint](#resetting-a-checkpoint)).
   - For the tuning knobs, a config that omits a knob (and a run that doesn't override it) leaves the
     connector's own default in force.
   - `write_concurrency` (a positive integer, default the connector's `1`) runs that many bulk request
@@ -517,6 +519,16 @@ Two different mechanisms carry values into a job, and they resolve at different 
     the write is latency-bound on ES round-trips (executors idle, CPU and network both under-used)
     rather than CPU/bandwidth-bound; it multiplies with the partition count, so raise it gradually and
     watch for 429s. Applies to **both** modes.
+  - `request_timeout` (a positive integer, **seconds**; connector default `60`) and
+    `transport_max_retries` (a non-negative integer; connector default `3`, `0` disables) tune a write
+    that fails at the transport layer: the classic symptom is `EsWriteError: ... ConnectionTimeout ...
+    The write operation timed out`, where a whole bulk request exceeded the socket timeout. Because the
+    request never returned per-document statuses, the connector fails those documents closed (counted as
+    rejected, with a single `{_id: None, op_type: bulk, status: None}` sample) rather than listing them
+    individually. Raise `request_timeout` so a large/slow bulk send has longer to complete, and/or lower
+    `chunk_size` so each request is smaller; `transport_max_retries` is how many times the ES client
+    re-sends the *whole* request on such a failure (it is **not** the per-document 429 retry, which is a
+    separate connector knob not surfaced here). Both apply to **both** modes.
   - `bulk_stats` (`true` | `false`; requires connector **>= 0.9.3**) collects
     per-partition ES bulk-send diagnostics and logs them under the `BULK_STATS` tag. It behaves like the
     other bool knobs, with one extra layer: a **global** default. Precedence, highest first: a per-run
