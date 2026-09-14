@@ -13,6 +13,7 @@ raised. It reads values exactly as the runtime emits them - notably the Delta so
 so a metric this runtime does not emit today (e.g. numNewListedFiles) simply appears when it does.
 """
 import json
+import threading
 
 # Log-line prefix. Stable and distinctive so a run's driver log can be grepped for the per-batch trail
 # (e.g. `grep STREAM_PROGRESS`). Do not change it casually: it is the documented handle for the trail.
@@ -243,3 +244,125 @@ def format_progress(progress):
         for i, source in enumerate(sources):
             tokens.extend(_source_tokens(i, source))
     return " ".join(tokens)
+
+
+def _ratio(num, den):
+    """num/den as a float, or None when either isn't a real number or den is falsy (renders n/a).
+    Module-level twin of the nested _pair_ratio in format_bulk_stats, reused by format_tail_summary."""
+    ok = (isinstance(num, (int, float)) and not isinstance(num, bool)
+          and isinstance(den, (int, float)) and not isinstance(den, bool) and den)
+    return (num / den) if ok else None
+
+
+def _median(vals):
+    """Median of the numeric values in `vals` (non-numeric/bool entries ignored), or None if none are
+    numeric. Even counts average the two middle values. Fail-soft: never raises on odd input."""
+    nums = sorted(v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool))
+    if not nums:
+        return None
+    n = len(nums)
+    mid = n // 2
+    return nums[mid] if n % 2 else (nums[mid - 1] + nums[mid]) / 2
+
+
+def format_tail_summary(result):
+    """Render a one-line `BULK_STATS tail:` summary from a bulk_write result dict, calling out the
+    STRAGGLER and SKEW behind a wall-time tail that persists after "all tasks complete".
+
+    `result` is what the connector's bulk_write returns; under EsWriteConfig bulk_stats it carries
+    result['bulk_stats'] (one dict per partition) plus top-level collect_ms / merge_ms. A write's wall
+    time is set by its SLOWEST partition, because Spark's collect returns only once the last task does,
+    so a long tail after the stage view shows every task complete is almost always one partition still
+    draining. This line names that partition by index with its wall clock and the figures that say WHY
+    it lagged: rtt_ms_max vs took_ms_max (a large rtt with a small took is time waiting on the
+    network / ES bulk queue, not ES indexing), its busy/wall concurrency, and its doc count. It then
+    contrasts the slowest partition against the MEDIAN one - wall_max/median >> 1 is a straggler,
+    docs_max/median >> 1 is data skew feeding one fat partition - and echoes collect_ms/merge_ms so a
+    tail that is NOT inside a partition (Spark result finalization, or the driver rollup) is visible
+    too: merge_ms is O(partitions) pure Python and should be milliseconds.
+
+    FAIL-SOFT by contract, like format_bulk_stats / format_progress: this is observability only and is
+    called from the export path, so any missing/renamed/oddly-typed field renders n/a and a non-dict or
+    stat-less input yields a marker line rather than an exception."""
+    try:
+        if not isinstance(result, dict):
+            return f"{BULK_STATS_TAG} tail: <no result: {type(result).__name__}>"
+        counts = (f"collect_ms={_num(result.get('collect_ms'))} "
+                  f"merge_ms={_num(result.get('merge_ms'))}")
+        parts = result.get("bulk_stats")
+        if not isinstance(parts, list) or not parts:
+            return f"{BULK_STATS_TAG} tail: <no bulk stats> {counts}"
+        parts = [p if isinstance(p, dict) else {} for p in parts]
+
+        def _val(p, key):
+            v = p.get(key)
+            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+        # Slowest partition by wall clock: it sets the write's tail. Only partitions carrying a numeric
+        # partition_wall_ms are eligible; if none do, the wall figures render n/a but skew/counts still
+        # report.
+        walls = [(_val(p, "partition_wall_ms"), i) for i, p in enumerate(parts)]
+        walls = [(w, i) for (w, i) in walls if w is not None]
+        if walls:
+            slow_wall, slow_i = max(walls, key=lambda t: t[0])
+            sp = parts[slow_i]
+            conc = _ratio(_val(sp, "send_busy_ms"), _val(sp, "partition_wall_ms"))
+            slow = (f"slowest=part{slow_i} wall_ms={_num(slow_wall)} "
+                    f"rtt_ms_max={_num(_val(sp, 'rtt_ms_max'))} "
+                    f"took_ms_max={_num(_val(sp, 'took_ms_max'))} "
+                    f"conc={_num(conc)} docs={_num(_val(sp, 'docs_sent'))}")
+            wall_med = _median([w for (w, _i) in walls])
+            wall_tokens = (f"median_wall_ms={_num(wall_med)} "
+                           f"wall_max/median={_num(_ratio(slow_wall, wall_med))}")
+        else:
+            slow = "slowest=n/a"
+            wall_tokens = "median_wall_ms=n/a wall_max/median=n/a"
+
+        docs = [d for d in (_val(p, "docs_sent") for p in parts) if d is not None]
+        if docs:
+            docs_tokens = f"docs_max/median={_num(_ratio(max(docs), _median(docs)))}"
+        else:
+            docs_tokens = "docs_max/median=n/a"
+
+        return f"{BULK_STATS_TAG} tail: {slow} | {wall_tokens} {docs_tokens} {counts}"
+    except Exception as _e:  # never let a diagnostic formatter disturb the export
+        return f"{BULK_STATS_TAG} tail: <formatting failed: {type(_e).__name__}: {_e}>"
+
+
+class BatchStatsRelay:
+    """Thread-safe, bounded handoff of a per-micro-batch diagnostic line from the foreachBatch thread to
+    the StreamingQueryListener thread, so the connector's bulk/tail stats surface in the NOTEBOOK CELL.
+
+    The asymmetry this solves: a StreamingQueryListener callback's stdout is surfaced by Databricks in
+    the owning cell (that is where the STREAM_PROGRESS line appears), but a print from inside
+    foreachBatch runs on the micro-batch thread and lands only in the driver log. So foreachBatch, which
+    holds the bulk_write result, cannot print to the cell; the listener, which can, does not have the
+    result. foreachBatch record()s its line keyed by batch_id and onQueryProgress take()s it for the
+    batch it is reporting and prints it - both run on the driver, so this is an in-process handoff, not
+    Spark state.
+
+    Bounded (evict-oldest) so a listener that never consumes a key - e.g. registration failed, or a
+    batch produced no progress event - cannot grow it without limit; in normal operation it holds at
+    most one entry (record then take on the next progress event). Locked because record and take run on
+    different driver threads. Recording/formatting cost is a dict write on the micro-batch thread and a
+    dict read on the listener thread, once per batch: no effect on the write path."""
+
+    def __init__(self, maxsize=64):
+        self._lock = threading.Lock()
+        self._by_id = {}
+        self._maxsize = maxsize
+
+    def record(self, batch_id, text):
+        """Store this batch's diagnostic line for the listener to take() and print in the cell."""
+        with self._lock:
+            self._by_id[batch_id] = text
+            # batch_ids are monotone ints, so the smallest key is the oldest. Evicting it bounds memory
+            # if the listener never consumes (a handful of unconsumed keys is all we ever expect).
+            while len(self._by_id) > self._maxsize:
+                del self._by_id[min(self._by_id)]
+
+    def take(self, batch_id):
+        """Pop and return the line recorded for batch_id, or None if none was recorded (empty batch,
+        bulk_stats off, or a batch whose foreachBatch has not recorded yet)."""
+        with self._lock:
+            return self._by_id.pop(batch_id, None)

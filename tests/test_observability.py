@@ -11,9 +11,11 @@ import pytest
 from pipeline_lib.observability import (
     BULK_STATS_TAG,
     PROGRESS_TAG,
+    BatchStatsRelay,
     batch_job_description,
     format_bulk_stats,
     format_progress,
+    format_tail_summary,
 )
 
 # Captured verbatim from a real micro-batch on the target runtime (Phase-0 probe). Note the Delta
@@ -206,3 +208,119 @@ def test_format_bulk_stats_never_raises_on_bad_input(bad):
     out = format_bulk_stats(bad)
     assert isinstance(out, str)
     assert BULK_STATS_TAG in out
+
+
+# --------------------------------------------------------------------------- format_tail_summary
+
+def test_tail_summary_pins_slowest_partition_and_ratios():
+    # part0 has the larger wall (240 vs 200) so it is the straggler; part1 has more docs (600k vs 400k)
+    # so the doc-skew ratio must reflect part1, NOT the slowest partition - the two signals are distinct.
+    result = {"bulk_stats": _BULK_STATS, "collect_ms": 12345.6, "merge_ms": 7.61}
+    line = format_tail_summary(result)
+    assert line.startswith(f"{BULK_STATS_TAG} tail: ")
+    assert "\n" not in line                                    # one compact line
+    assert "slowest=part0 wall_ms=240.00" in line
+    assert "rtt_ms_max=89.00" in line and "took_ms_max=64.00" in line
+    assert "conc=2.00" in line                                 # 480ms busy / 240ms wall
+    assert "docs=400000" in line                               # the SLOWEST partition's docs
+    assert "median_wall_ms=220.00" in line                     # (240 + 200) / 2
+    assert "wall_max/median=1.09" in line                      # 240 / 220
+    assert "docs_max/median=1.20" in line                      # 600k / 500k (median of 400k, 600k)
+    assert "collect_ms=12345.60" in line and "merge_ms=7.61" in line
+
+
+def test_tail_summary_straggler_without_skew():
+    # One partition takes 50x the median wall on a huge rtt with a tiny took (waiting on the network/ES
+    # queue, not indexing), while every partition ships equal docs: a straggler with NO data skew.
+    stats = [
+        {"docs_sent": 1000, "send_busy_ms": 50.0, "partition_wall_ms": 100.0,
+         "rtt_ms_max": 30.0, "took_ms_max": 5.0},
+        {"docs_sent": 1000, "send_busy_ms": 50.0, "partition_wall_ms": 100.0,
+         "rtt_ms_max": 30.0, "took_ms_max": 5.0},
+        {"docs_sent": 1000, "send_busy_ms": 100.0, "partition_wall_ms": 5000.0,
+         "rtt_ms_max": 4800.0, "took_ms_max": 12.0},
+    ]
+    line = format_tail_summary({"bulk_stats": stats})
+    assert "slowest=part2 wall_ms=5000.00" in line
+    assert "rtt_ms_max=4800.00" in line and "took_ms_max=12.00" in line  # network/ES tail signature
+    assert "wall_max/median=50.00" in line                              # 5000 / 100
+    assert "docs_max/median=1.00" in line                              # equal docs => no skew
+
+
+def test_tail_summary_surfaces_data_skew():
+    # One fat partition holds 10x the median docs (and runs longer for it): the skew ratio must show it.
+    stats = [
+        {"docs_sent": 100, "partition_wall_ms": 100.0},
+        {"docs_sent": 100, "partition_wall_ms": 100.0},
+        {"docs_sent": 1000, "partition_wall_ms": 900.0},
+    ]
+    line = format_tail_summary({"bulk_stats": stats})
+    assert "slowest=part2" in line
+    assert "docs_max/median=10.00" in line                             # 1000 / 100
+
+
+def test_tail_summary_no_bulk_stats_still_reports_counts():
+    # bulk_stats absent (e.g. an empty micro-batch): a marker, but collect_ms/merge_ms still surface so
+    # a driver-side tail (Spark finalization / rollup) is not hidden by the missing per-partition data.
+    line = format_tail_summary({"collect_ms": 500.0, "merge_ms": 3.2})
+    assert line.startswith(f"{BULK_STATS_TAG} tail: <no bulk stats>")
+    assert "collect_ms=500.00" in line and "merge_ms=3.20" in line
+
+
+def test_tail_summary_missing_fields_render_na():
+    # A partition carrying only wall + docs: the absent rtt/took/busy fields render n/a, never fabricated
+    # or crashing; a result without collect_ms/merge_ms shows those as n/a too.
+    line = format_tail_summary({"bulk_stats": [{"docs_sent": 500, "partition_wall_ms": 10.0}]})
+    assert "slowest=part0 wall_ms=10.00" in line
+    assert "rtt_ms_max=n/a" in line and "took_ms_max=n/a" in line and "conc=n/a" in line
+    assert "collect_ms=n/a" in line and "merge_ms=n/a" in line
+
+
+@pytest.mark.parametrize("bad", [
+    None, "garbage", 42, [], {}, {"bulk_stats": "nope"}, {"bulk_stats": []},
+    {"bulk_stats": [None, 7, "x"]}, {"bulk_stats": [{"partition_wall_ms": "bad"}]},
+])
+def test_tail_summary_never_raises_on_bad_input(bad):
+    out = format_tail_summary(bad)
+    assert isinstance(out, str)
+    assert out.startswith(f"{BULK_STATS_TAG} tail:")
+
+
+# --------------------------------------------------------------------------- BatchStatsRelay
+
+def test_relay_record_then_take_returns_line():
+    relay = BatchStatsRelay()
+    relay.record(7, "BULK_STATS ... batch_id=7")
+    assert relay.take(7) == "BULK_STATS ... batch_id=7"
+
+
+def test_relay_take_missing_returns_none():
+    relay = BatchStatsRelay()
+    assert relay.take(0) is None            # nothing recorded (empty batch / bulk_stats off)
+    relay.record(1, "x")
+    assert relay.take(2) is None            # a different batch's id
+
+
+def test_relay_take_consumes_entry():
+    relay = BatchStatsRelay()
+    relay.record(3, "line")
+    assert relay.take(3) == "line"
+    assert relay.take(3) is None            # taken once, then gone
+
+
+def test_relay_rerecord_overwrites():
+    # A retried batch re-records under the same id; the latest line wins.
+    relay = BatchStatsRelay()
+    relay.record(4, "first")
+    relay.record(4, "second")
+    assert relay.take(4) == "second"
+
+
+def test_relay_bounded_evicts_oldest():
+    # If the listener never consumes, the store stays bounded by evicting the smallest (oldest) batch_id.
+    relay = BatchStatsRelay(maxsize=3)
+    for bid in (10, 11, 12, 13):
+        relay.record(bid, f"line{bid}")
+    assert relay.take(10) is None           # 10 was the oldest, evicted when 13 arrived
+    assert relay.take(11) == "line11"
+    assert relay.take(13) == "line13"

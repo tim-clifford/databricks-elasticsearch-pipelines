@@ -187,12 +187,16 @@ from pipeline_lib.config import (  # noqa: E402
 # Ephemeral per-batch streaming observability (pure Python, no Spark): the STREAM_PROGRESS log-line
 # formatter and the Jobs-UI batch label. Kept in pipeline_lib so it is unit-tested off-cluster.
 import json  # noqa: E402
+import time  # noqa: E402
 import uuid  # noqa: E402
 from pipeline_lib.observability import (  # noqa: E402
+    BULK_STATS_TAG,
     PROGRESS_TAG,
+    BatchStatsRelay,
     batch_job_description,
     format_bulk_stats,
     format_progress,
+    format_tail_summary,
 )
 
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
@@ -460,14 +464,26 @@ if PIPELINE_MODE == "batch":
     # Repartition AFTER the filter so the surviving rows spread evenly.
     if WRITE_REPARTITION > 0:
         export_df = export_df.repartition(WRITE_REPARTITION)
+    # Driver wall clock around the write, to LOCATE a tail that persists after the Spark UI shows every
+    # write task complete. bulk_write's own collect_ms (under bulk_stats) is the time INSIDE Spark's
+    # collect (the write job PLUS Spark's result finalization), so if this driver-measured wall is
+    # ~collect_ms the tail is inside the write itself - typically a straggler partition, which the
+    # BULK_STATS tail line below then names - whereas wall well above collect_ms would be work between
+    # the collect and this return. Two time.time() calls on the driver; nothing touches the write path.
+    _bw_t0 = time.time()
     result = bulk_write(export_df, es_write_config)
+    _bw_wall_ms = (time.time() - _bw_t0) * 1000.0
     # Print the core count dict on one line; when bulk_stats is on, result also carries a per-partition
     # 'bulk_stats' list, which we render SEPARATELY (below) as readable BULK_STATS lines rather than
     # dumping the raw list into the result line. reconcile_or_raise reads only the counts, so the extra
     # key is ignored there.
     _core_result = {k: v for k, v in result.items() if k != "bulk_stats"}
     print(f"batch bulk_write result: {_core_result}")
+    print(f"{BULK_STATS_TAG} driver: bulk_write_wall_ms={_bw_wall_ms:.1f}")
     if "bulk_stats" in result:
+        # The tail/straggler summary FIRST (the one-line answer to "where did the wall time go"), then
+        # the full per-partition breakdown. Both fail-soft.
+        print(format_tail_summary(result))
         print(format_bulk_stats(result["bulk_stats"]))
     reconcile_or_raise(result, index=es_write_config.index)
     RUN_SUMMARY = (
@@ -583,11 +599,22 @@ if PIPELINE_MODE == "streaming":
             # When bulk_stats is on, log a COMPACT one-line rollup of this micro-batch's ES bulk-send
             # diagnostics (overall docs/send, rtt, took) so an always-on run has per-batch visibility
             # without the full per-partition breakdown flooding the log. format_bulk_stats is fail-soft,
-            # so a diagnostic-formatting fault can never disturb the write. (On serverless the
-            # foreachBatch body runs server-side, so this lands in executor logs; on classic/continuous
-            # it is on the driver alongside the STREAM_PROGRESS trail.)
+            # so a diagnostic-formatting fault can never disturb the write. This print runs on the
+            # micro-batch thread, so its stdout lands in the driver LOG (surfacing as stderr), not the
+            # notebook cell; to ALSO get it into the cell alongside STREAM_PROGRESS, we hand the same
+            # rollup plus the tail/straggler summary to the progress listener via _bulk_stats_relay
+            # (below), keyed by batch_id. Recording is a single dict write; it adds nothing to the write.
             if "bulk_stats" in result:
-                print(format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}")
+                _overall = format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}"
+                print(_overall)  # driver-log trail (unchanged)
+                # ALSO relay to the listener so it surfaces in the cell. FAIL-SOFT: a relay/format fault
+                # must never disturb the write, and _bulk_stats_relay is defined in the run cell before
+                # the stream starts, so it exists by the time any batch runs.
+                try:
+                    _bulk_stats_relay.record(batch_id, _overall + "\n" + format_tail_summary(result))
+                except Exception as _e:
+                    print(f"WARNING: {BULK_STATS_TAG} could not relay batch {batch_id} to the cell "
+                          f"({type(_e).__name__}: {_e}); continuing")
             # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
             # the summary can dedup a retried batch (write mode append; each batch is its own small file).
             session.createDataFrame(
@@ -673,6 +700,14 @@ if PIPELINE_MODE == "streaming":
     # emit duplicate lines. The CONFIG_NAME prefix keeps the streaming tab legible.
     _QUERY_NAME = f"{CONFIG_NAME}-{uuid.uuid4().hex[:8]}"
 
+    # Per-run handoff of each micro-batch's bulk/tail diagnostics from foreachBatch to the progress
+    # listener, so they surface in the NOTEBOOK CELL next to STREAM_PROGRESS. foreachBatch's own stdout
+    # lands in the driver log (it runs on the micro-batch thread), but a listener callback's stdout is
+    # surfaced by Databricks in the owning cell - so foreachBatch records() its line here (keyed by
+    # batch_id) and onQueryProgress take()s and prints it for the matching batch. Bounded + thread-safe;
+    # a dict write per batch, no effect on the write. Only populated when bulk_stats is on.
+    _bulk_stats_relay = BatchStatsRelay()
+
     # Ephemeral per-batch observability. Register a StreamingQueryListener BEFORE .start() (so it also
     # catches the query-started event) that logs one STREAM_PROGRESS line per micro-batch - backlog
     # (numFilesOutstanding/numBytesOutstanding), the durationMs breakdown, rates, and Delta offset
@@ -705,6 +740,17 @@ if PIPELINE_MODE == "streaming":
                 if progress.get("name") != _QUERY_NAME:
                     return
                 print(format_progress(progress))
+                # Surface this batch's bulk/tail diagnostics in the CELL, if foreachBatch recorded them
+                # (bulk_stats on, non-empty batch). Own try so a relay/format fault cannot suppress the
+                # STREAM_PROGRESS line just printed; only this run's batches reach here (name-filtered
+                # above), and take() removes the entry so it prints once.
+                try:
+                    _relayed = _bulk_stats_relay.take(progress.get("batchId"))
+                    if _relayed:
+                        print(_relayed)
+                except Exception as _re:
+                    print(f"WARNING: {BULK_STATS_TAG} onQueryProgress relay failed "
+                          f"({type(_re).__name__}: {_re})")
             except Exception as _e:
                 print(f"WARNING: {PROGRESS_TAG} onQueryProgress logging failed ({type(_e).__name__}: {_e})")
 

@@ -539,8 +539,13 @@ Two different mechanisms carry values into a job, and they resolve at different 
     a whole environment without editing each config, and set/clear it in one pipeline's config to
     override that. Batch runs emit
     an `overall` rollup (`docs/send`, and send-weighted mean / max round-trip `rtt_ms` and ES-reported
-    `took_ms`) plus one line per write partition with real p50/p95/max; streaming runs emit the compact
-    `overall` line per micro-batch. `rtt_ms - took_ms` is the network/queue overhead and
+    `took_ms`), one line per write partition with real p50/p95/max, and a `tail:` summary that names the
+    slowest partition and the wall-time and doc-count skew behind it (alongside a driver
+    `bulk_write_wall_ms`, so an in-write straggler is distinguishable from time spent after the write
+    returns). Streaming runs emit the compact `overall` line plus that `tail:` summary per micro-batch,
+    routed through the progress listener so they appear wherever the `STREAM_PROGRESS` line does (the
+    notebook cell on classic / continuous runs) rather than only in the driver log. `rtt_ms - took_ms`
+    is the network/queue overhead and
     `docs/send` is the real docs-per-bulk, so this is the tool for diagnosing whether more
     `write_concurrency` or cores would help. On a connector older than 0.9.3 the runner drops it with a
     warning and the export proceeds without the diagnostic (it never fails the run). Applies to **both**
