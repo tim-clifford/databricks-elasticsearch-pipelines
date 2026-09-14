@@ -522,6 +522,72 @@ def test_shipped_databricks_yml_declares_bulk_stats():
     gen_jobs.require_bulk_stats_declared()  # the repo's databricks.yml declares it with a legal default
 
 
+# --- request_timeout / transport_max_retries global-var declaration guards (mirror bulk_stats) ---
+
+
+@pytest.mark.parametrize("default", ["", "60", "120"])
+def test_require_request_timeout_declared_accepts_legal_default(tmp_path, default):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  request_timeout:\n    default: '{default}'\n")
+    gen_jobs.require_request_timeout_declared(str(yml))  # no raise
+
+
+def test_require_request_timeout_declared_missing_fails_closed(tmp_path):
+    # An omitted-request_timeout config bakes ${var.request_timeout}; if the variable is not declared,
+    # fail closed at generation rather than let the reference break confusingly at deploy.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
+    with pytest.raises(ValueError, match="request_timeout is not declared"):
+        gen_jobs.require_request_timeout_declared(str(yml))
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "12.5"])
+def test_require_request_timeout_declared_bad_default_fails_closed(tmp_path, bad):
+    # A mistyped/illegal global default (non-positive-int) is rejected with the SAME validator the runner
+    # applies, so it fails at generation rather than at every run.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  request_timeout:\n    default: '{bad}'\n")
+    with pytest.raises(ValueError, match="request_timeout"):
+        gen_jobs.require_request_timeout_declared(str(yml))
+
+
+@pytest.mark.parametrize("default", ["", "0", "3", "5"])
+def test_require_transport_max_retries_declared_accepts_legal_default(tmp_path, default):
+    # 0 is a LEGAL global default here (disable transport retries), unlike request_timeout's positive-int.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  transport_max_retries:\n    default: '{default}'\n")
+    gen_jobs.require_transport_max_retries_declared(str(yml))  # no raise
+
+
+def test_require_transport_max_retries_declared_missing_fails_closed(tmp_path):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
+    with pytest.raises(ValueError, match="transport_max_retries is not declared"):
+        gen_jobs.require_transport_max_retries_declared(str(yml))
+
+
+@pytest.mark.parametrize("bad", ["abc", "-1", "2.5"])
+def test_require_transport_max_retries_declared_bad_default_fails_closed(tmp_path, bad):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  transport_max_retries:\n    default: '{bad}'\n")
+    with pytest.raises(ValueError, match="transport_max_retries"):
+        gen_jobs.require_transport_max_retries_declared(str(yml))
+
+
+def test_require_reliability_globals_accept_scalar_shorthand(tmp_path):
+    # DAB's scalar shorthand (<name>: <v>, no `default:` key) IS the default; a legal shorthand passes.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  request_timeout: '120'\n  transport_max_retries: '5'\n")
+    gen_jobs.require_request_timeout_declared(str(yml))       # no raise
+    gen_jobs.require_transport_max_retries_declared(str(yml))  # no raise
+
+
+def test_shipped_databricks_yml_declares_reliability_globals():
+    # The repo's databricks.yml declares both with legal defaults.
+    gen_jobs.require_request_timeout_declared()
+    gen_jobs.require_transport_max_retries_declared()
+
+
 def test_render_singleton_omitted_bulk_stats_bakes_global_ref():
     # A singleton config that omits bulk_stats gets ${var.bulk_stats} as the bulk_stats job-parameter
     # default, so it defers to the target-wide global default at deploy.
@@ -609,7 +675,7 @@ def test_group_has_no_job_level_parameters_block():
 
 
 def test_group_run_time_knobs_move_into_task_base_parameters():
-    # The 12 run-time knobs (from job_parameters) become each task's base_parameters, with per-member
+    # The 14 run-time knobs (from job_parameters) become each task's base_parameters, with per-member
     # defaults; the notebook reads the same widget names, so no notebook change.
     cfg = validate_config({
         "es_index_name": "idx-a", "es_id_field": "dsl_id", "es_host_config": "es_host_primary",
@@ -619,12 +685,16 @@ def test_group_run_time_knobs_move_into_task_base_parameters():
     })
     job = _render_group("g1", [("a.yml", "a", cfg, None)])
     bp = job["tasks"][0]["notebook_task"]["base_parameters"]
-    # The grouped task bakes the SAME defaults the generator uses, including the ${var.bulk_stats} ref
-    # for an omitted bulk_stats (so grouped tasks defer to the global default too).
-    for p in job_parameters(cfg, gen_jobs._BULK_STATS_VAR_REF):
+    # The grouped task bakes the SAME defaults the generator uses, including the ${var.*} refs for the
+    # globally-defaulted knobs (bulk_stats, request_timeout, transport_max_retries) when omitted, so
+    # grouped tasks defer to the target-wide defaults too.
+    for p in job_parameters(cfg, gen_jobs._BULK_STATS_VAR_REF,
+                            gen_jobs._REQUEST_TIMEOUT_VAR_REF, gen_jobs._TRANSPORT_MAX_RETRIES_VAR_REF):
         assert bp[p["name"]] == p["default"]
     assert bp["chunk_size"] == "500" and bp["write_concurrency"] == "4"  # per-member defaults carried
     assert bp["bulk_stats"] == "${var.bulk_stats}"  # omitted => defers to the global default
+    assert bp["request_timeout"] == "${var.request_timeout}"  # omitted => defers to the global default
+    assert bp["transport_max_retries"] == "${var.transport_max_retries}"
 
 
 def test_group_shares_one_job_cluster_when_same_config():

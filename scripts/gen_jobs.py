@@ -33,6 +33,8 @@ from pipeline_lib.config import (  # noqa: E402
     job_parameters,
     load_config,
     require_es_flag,
+    require_request_timeout,
+    require_transport_max_retries,
 )
 
 # The bundle-variable reference the generator bakes as the DEFAULT of the bulk_stats job parameter when a
@@ -41,6 +43,15 @@ from pipeline_lib.config import (  # noqa: E402
 # value. Mirrors how ca_certs / checkpoint_base_path are threaded as ${var.*} references (see
 # job_base_parameters). require_bulk_stats_declared fails closed at generation if the variable is missing.
 _BULK_STATS_VAR_REF = "${var.bulk_stats}"
+
+# The bundle-variable references the generator bakes as the DEFAULT of the request_timeout /
+# transport_max_retries job parameters when a config OMITS them: each connection/reliability knob then
+# defers to its target-wide ${var.*} global default (resolved per target at deploy). A config that SETS
+# the knob overrides this with its literal value. Same mechanism as _BULK_STATS_VAR_REF;
+# require_request_timeout_declared / require_transport_max_retries_declared fail closed at generation if
+# the variable is missing.
+_REQUEST_TIMEOUT_VAR_REF = "${var.request_timeout}"
+_TRANSPORT_MAX_RETRIES_VAR_REF = "${var.transport_max_retries}"
 
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "pipeline_configs")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
@@ -242,38 +253,57 @@ def require_job_name_prefix_declared(path: str = _DATABRICKS_YML, doc: dict | No
         )
 
 
-def require_bulk_stats_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
-    """Fail closed at GENERATION if databricks.yml declares no `bulk_stats` variable (or its default is
-    not a legal true/false/empty flag).
+def _require_global_var_declared(name: str, validator, path: str = _DATABRICKS_YML,
+                                 doc: dict | None = None) -> None:
+    """Fail closed at GENERATION if databricks.yml declares no `<name>` variable, or its static default
+    fails `validator` (the SAME require_* helper the runner applies to the effective value).
 
-    A config that OMITS bulk_stats has its job-parameter default baked as ${var.bulk_stats} (the global
-    diagnostics default, per target). If the variable is not declared, that reference would fail only at
-    deploy with a confusing error, so require its declaration here (mirrors require_job_name_prefix_declared).
-    We also validate the variable's static `default:` with the SAME allow-list the runner applies to the
-    effective value (require_es_flag: ""/true/false), so a mistyped global default ('on', 'yes') fails at
-    generation rather than at every run. Per-target/--var overrides are deploy-time and not visible here;
-    the runner re-validates the effective value, so a bad per-target value still fails closed at run.
+    A config that OMITS a globally-defaulted knob (bulk_stats, request_timeout, transport_max_retries)
+    has its job-parameter default baked as ${var.<name>}. If the variable is not declared that reference
+    would fail only at deploy with a confusing error, so require its declaration here (mirrors
+    require_job_name_prefix_declared). Validating the declared default with the runner's own validator
+    means a mistyped global default ('on', 'abc', -1) fails at generation rather than at every run.
+    Per-target/--var overrides are deploy-time and not visible here; the runner re-validates the
+    effective value, so a bad per-target value still fails closed at run.
     """
     variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
-    if "bulk_stats" not in variables:
+    if name not in variables:
         raise ValueError(
-            "bulk_stats is not declared in databricks.yml; add it under `variables:` with an empty default "
-            "(e.g. bulk_stats: {default: \"\"}). The generator bakes ${var.bulk_stats} as the default of the "
-            "bulk_stats job parameter for any pipeline that omits bulk_stats, so the bundle needs the "
-            "variable to resolve it at deploy."
+            f"{name} is not declared in databricks.yml; add it under `variables:` with an empty default "
+            f"(e.g. {name}: {{default: \"\"}}). The generator bakes ${{var.{name}}} as the default of the "
+            f"{name} job parameter for any pipeline that omits {name}, so the bundle needs the "
+            f"variable to resolve it at deploy."
         )
-    # DAB accepts BOTH the full form (bulk_stats: {default: <v>}) and the scalar shorthand
-    # (bulk_stats: <v>, which IS the default). Read the default from whichever shape was used, so a bad
-    # shorthand default (bulk_stats: "on") is validated too rather than silently treated as "".
-    spec = variables["bulk_stats"]
+    # DAB accepts BOTH the full form (<name>: {default: <v>}) and the scalar shorthand (<name>: <v>,
+    # which IS the default). Read the default from whichever shape was used, so a bad shorthand default
+    # is validated too rather than silently treated as "".
+    spec = variables[name]
     default = spec.get("default") if isinstance(spec, dict) else spec
-    # Validate the declared default is a legal flag (""/true/false, YAML bool or string). require_es_flag
-    # raises PipelineConfigError on anything else; re-raise as ValueError to match this module's generation
-    # errors (main treats a bad config/reference uniformly).
+    # Validate the declared default with the runner's own validator. It raises PipelineConfigError on
+    # anything illegal; re-raise as ValueError to match this module's generation errors (main treats a
+    # bad config/reference uniformly).
     try:
-        require_es_flag(default if default is not None else "", "bulk_stats (databricks.yml) default")
+        validator(default if default is not None else "", f"{name} (databricks.yml) default")
     except PipelineConfigError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def require_bulk_stats_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+    """Fail closed at generation if databricks.yml declares no legal `bulk_stats` variable
+    (""/true/false). See _require_global_var_declared."""
+    _require_global_var_declared("bulk_stats", require_es_flag, path, doc)
+
+
+def require_request_timeout_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+    """Fail closed at generation if databricks.yml declares no legal `request_timeout` variable (""/a
+    positive int of seconds). See _require_global_var_declared."""
+    _require_global_var_declared("request_timeout", require_request_timeout, path, doc)
+
+
+def require_transport_max_retries_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+    """Fail closed at generation if databricks.yml declares no legal `transport_max_retries` variable
+    (""/a non-negative int). See _require_global_var_declared."""
+    _require_global_var_declared("transport_max_retries", require_transport_max_retries, path, doc)
 
 
 def _job_display_name(postfix: str) -> str:
@@ -386,7 +416,7 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
         streaming_trigger_interval,
     )
     if include_run_time_knobs:
-        for p in job_parameters(cfg, _BULK_STATS_VAR_REF):
+        for p in job_parameters(cfg, _BULK_STATS_VAR_REF, _REQUEST_TIMEOUT_VAR_REF, _TRANSPORT_MAX_RETRIES_VAR_REF):
             base_parameters[p["name"]] = p["default"]
     task["notebook_task"] = {
         "notebook_path": "../notebooks/run_index_pipeline.py",
@@ -488,7 +518,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     job_def = _assemble_job(
         _job_display_name(postfix),
         description,
-        job_parameters(cfg, _BULK_STATS_VAR_REF),
+        job_parameters(cfg, _BULK_STATS_VAR_REF, _REQUEST_TIMEOUT_VAR_REF, _TRANSPORT_MAX_RETRIES_VAR_REF),
         _trigger_block(cfg["schedule"], cfg["continuous"]),
         _job_clusters_for([(name, cfg, job_cluster_spec)]),
         [task],
@@ -708,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
     bundle_doc = _read_bundle_doc()
     require_job_name_prefix_declared(doc=bundle_doc)
     require_bulk_stats_declared(doc=bundle_doc)
+    require_request_timeout_declared(doc=bundle_doc)
+    require_transport_max_retries_declared(doc=bundle_doc)
     es_host_configs = load_es_host_configs(doc=bundle_doc)
     default_es_host_config = load_default_es_host_config(doc=bundle_doc)
     cluster_configs = load_cluster_configs(doc=bundle_doc)

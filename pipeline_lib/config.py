@@ -18,9 +18,15 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   also a job parameter, overridable per run. Empty => no filter.
     chunk_size: <positive int>           # OPTIONAL EsWriteConfig tuning: docs per bulk request.
     write_concurrency: <positive int>    # OPTIONAL EsWriteConfig tuning: parallel bulk streams per partition.
+    request_timeout: <positive int>      # OPTIONAL EsWriteConfig tuning: per-request ES client timeout,
+                                         #   in seconds (connector default 60). Raise it (with a smaller
+                                         #   chunk_size) when a bulk send times out mid-write.
+    transport_max_retries: <non-neg int> # OPTIONAL EsWriteConfig tuning: whole-request retries on a
+                                         #   transport failure (connection reset/timeout, 429/503 on the
+                                         #   bulk call), connector default 3. 0 disables them.
     require_existing_index: true | false # OPTIONAL EsWriteConfig tuning: require the index to exist.
     verify_certs: true | false           # OPTIONAL EsWriteConfig tuning: verify the ES TLS certificate.
-                                         #   All four: config DEFAULT, also a job parameter overridable
+                                         #   All six: config DEFAULT, also a job parameter overridable
                                          #   per run. Omitted => the connector's own default stands.
     bulk_stats: true | false             # OPTIONAL EsWriteConfig diagnostics: collect per-partition
                                          #   ES bulk-send stats (docs/send, round-trip ms, ES `took` ms)
@@ -359,6 +365,50 @@ def require_write_concurrency(value: object, where: str = "write_concurrency") -
     return require_chunk_size(value, where)
 
 
+def require_request_timeout(value: object, where: str = "request_timeout") -> str:
+    """OPTIONAL EsWriteConfig request_timeout (per-request ES client timeout, in SECONDS): a positive
+    integer, or "" for unset. Same shape and fail-closed rule as require_chunk_size (a positive int;
+    bool refused, being an int subclass), so the config schema and the runner's --params value apply the
+    identical parse. Delegates to require_chunk_size so the one positive-int rule never forks. Raise it
+    above the connector default (60s) when a bulk send times out mid-write ("The write operation timed
+    out") because the payload is large or ES is slow to ack; pairs with a smaller chunk_size."""
+    return require_chunk_size(value, where)
+
+
+def require_transport_max_retries(value: object, where: str = "transport_max_retries") -> str:
+    """OPTIONAL EsWriteConfig transport_max_retries (whole-request retries by the ES client on a
+    transport failure - connection reset/timeout, a 429/503 on the bulk call itself): a NON-NEGATIVE
+    integer, or "" for unset (leave the connector default of 3). 0 is a MEANINGFUL value (disable
+    transport retries), so - unlike require_chunk_size - zero is accepted, and it is distinct from ""
+    (unset). Accepts a YAML int (config default) or a string (run-time override) and returns the
+    canonical string form. A bool (int subclass), a float, a non-numeric string, or a negative value is
+    rejected (fail closed). Not shared with require_write_repartition because that turns "" into a
+    non-empty default; here "" must stay "" so an unset knob defers to the connector's own default.
+
+    This is the transport layer, NOT per-document retries: the _bulk API returns HTTP 200 even when
+    individual documents are rejected, so a raised transport_max_retries re-sends the whole request on a
+    connection-level failure (the timeout case) but never sees a 429'd document (that is
+    max_retries_per_doc, a separate connector knob not exposed here)."""
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        raise PipelineConfigError(f"{where} must be a non-negative integer, got {value!r}")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)  # rejects "2.5"/"1e3"/"abc" (no silent float truncation)
+        except ValueError:
+            raise PipelineConfigError(f"{where} must be a non-negative integer, got {value!r}")
+    else:
+        raise PipelineConfigError(f"{where} must be a non-negative integer, got {value!r}")
+    if parsed < 0:
+        raise PipelineConfigError(f"{where} must be a non-negative integer, got {value!r}")
+    return str(parsed)
+
+
 def require_es_flag(value: object, where: str) -> str:
     """OPTIONAL EsWriteConfig boolean knob (require_existing_index / verify_certs): the canonical
     string "true"/"false", or "" for unset.
@@ -382,7 +432,8 @@ def require_es_flag(value: object, where: str) -> str:
 
 
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
-                           write_concurrency: object = "", bulk_stats: object = "") -> dict:
+                           write_concurrency: object = "", bulk_stats: object = "",
+                           request_timeout: object = "", transport_max_retries: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
     Called by the runner on the effective (config-default or --params override) widget values. Each
@@ -398,7 +449,13 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     all runs), so it is included as bulk_stats=True unless explicitly overridden to false; an empty
     value (widget cleared) falls back to the connector's own default. It requires connector 0.9.3+, so
     the runner drops it from these overrides fail-soft when the installed EsWriteConfig lacks the field
-    (an older wheel) rather than failing the run - this function stays a pure value parser."""
+    (an older wheel) rather than failing the run - this function stays a pure value parser.
+
+    request_timeout (positive int seconds) and transport_max_retries (non-negative int; 0 disables
+    transport retries) are connection/reliability knobs inherited from EsConnection. Both are unset by
+    default (omitted => the connector's own defaults, 60s / 3 retries, stand). Unlike bulk_stats they
+    need no version guard: request_timeout has existed since the connector's first release and
+    transport_max_retries since 0.6.0, so every wheel this framework installs has both fields."""
     overrides: dict = {}
 
     canonical_chunk_size = require_chunk_size(chunk_size)
@@ -408,6 +465,17 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     canonical_write_concurrency = require_write_concurrency(write_concurrency)
     if canonical_write_concurrency:
         overrides["write_concurrency"] = int(canonical_write_concurrency)
+
+    canonical_request_timeout = require_request_timeout(request_timeout)
+    if canonical_request_timeout:
+        overrides["request_timeout"] = int(canonical_request_timeout)
+
+    # transport_max_retries=0 (disable transport retries) is a MEANINGFUL override, so include it: its
+    # canonical form is the non-empty string "0" (truthy), while an unset knob is "" (falsy, omitted so
+    # the connector default of 3 stands).
+    canonical_transport_max_retries = require_transport_max_retries(transport_max_retries)
+    if canonical_transport_max_retries:
+        overrides["transport_max_retries"] = int(canonical_transport_max_retries)
 
     for name, value in (("require_existing_index", require_existing_index),
                         ("verify_certs", verify_certs), ("bulk_stats", bulk_stats)):
@@ -590,7 +658,8 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
 
     allowed_top = {
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
-        "chunk_size", "write_concurrency", "require_existing_index", "verify_certs", "bulk_stats",
+        "chunk_size", "write_concurrency", "request_timeout", "transport_max_retries",
+        "require_existing_index", "verify_certs", "bulk_stats",
         "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
@@ -637,6 +706,12 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # return a string), because it becomes a string-valued job-parameter default in job_parameters.
     chunk_size = require_chunk_size(raw.get("chunk_size", ""), f"{source}: chunk_size")
     write_concurrency = require_write_concurrency(raw.get("write_concurrency", ""), f"{source}: write_concurrency")
+    # request_timeout (positive int seconds) and transport_max_retries (non-negative int; 0 = disable
+    # transport retries) are connection/reliability tuning knobs inherited from EsConnection. Both are
+    # OPTIONAL: absent -> "" (leave the connector default, 60s / 3 retries). Stored canonical string form
+    # (a string job-parameter default), like the other tuning knobs.
+    request_timeout = require_request_timeout(raw.get("request_timeout", ""), f"{source}: request_timeout")
+    transport_max_retries = require_transport_max_retries(raw.get("transport_max_retries", ""), f"{source}: transport_max_retries")
     require_existing_index = require_es_flag(raw.get("require_existing_index", ""), f"{source}: require_existing_index")
     verify_certs = require_es_flag(raw.get("verify_certs", ""), f"{source}: verify_certs")
     # bulk_stats is the diagnostics knob. It now behaves EXACTLY like verify_certs: an absent value is ""
@@ -731,6 +806,8 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "filter_condition": filter_condition,
         "chunk_size": chunk_size,
         "write_concurrency": write_concurrency,
+        "request_timeout": request_timeout,
+        "transport_max_retries": transport_max_retries,
         "require_existing_index": require_existing_index,
         "verify_certs": verify_certs,
         "bulk_stats": bulk_stats,
@@ -998,6 +1075,10 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # verbatim (canonical string form), like filter_condition.
         "chunk_size": cfg["chunk_size"],
         "write_concurrency": cfg["write_concurrency"],
+        # request_timeout / transport_max_retries (connection/reliability tuning) are connector settings,
+        # not object names: passed through verbatim (canonical string form), like the tuning knobs.
+        "request_timeout": cfg["request_timeout"],
+        "transport_max_retries": cfg["transport_max_retries"],
         "require_existing_index": cfg["require_existing_index"],
         "verify_certs": cfg["verify_certs"],
         # bulk_stats (diagnostics toggle) is a connector setting, not an object name: passed through
@@ -1227,7 +1308,9 @@ def job_base_parameters(
     }
 
 
-def job_parameters(cfg: dict, bulk_stats_default_ref: str = "") -> list:
+def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
+                   request_timeout_default_ref: str = "",
+                   transport_max_retries_default_ref: str = "") -> list:
     """The RUN-TIME-overridable job-level parameters for a per-index job, as JobParameterDefinitions.
 
     Unlike base_parameters (fixed at deploy), a job parameter can be overridden per run with
@@ -1238,11 +1321,23 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "") -> list:
       for one run without redeploying.
     - filter_condition: DEFAULT from the config ("" if the config omits it); an optional row filter
       applied before the write, overridable per run.
-    - chunk_size / write_concurrency / require_existing_index / verify_certs: EsWriteConfig tuning knobs. DEFAULT from the
-      config ("" if the config omits it, meaning "use the connector's own default"); overridable per
-      run. The config stores each in canonical string form (see validate_config), which is exactly the
-      string a job-parameter default must be. Parsed + validated by write_config_overrides at run time
-      (an unset one leaves the connector default untouched).
+    - chunk_size / write_concurrency / request_timeout / transport_max_retries / require_existing_index /
+      verify_certs: EsWriteConfig tuning knobs. DEFAULT from the config ("" if the config omits it,
+      meaning "use the connector's own default"); overridable per run. The config stores each in
+      canonical string form (see validate_config), which is exactly the string a job-parameter default
+      must be. Parsed + validated by write_config_overrides at run time (an unset one leaves the
+      connector default untouched). request_timeout (positive int seconds; connector default 60) and
+      transport_max_retries (non-negative int, 0 disables; connector default 3) are the levers for a
+      write that times out mid-send ("The write operation timed out"): raise request_timeout and/or
+      transport_max_retries so a slow/large bulk send has longer to complete and is re-sent on a
+      transport failure. transport_max_retries is the whole-request retry, distinct from per-document
+      429 retries (a separate connector knob not exposed here). Both take a target-wide global default
+      the same way bulk_stats does: when the config OMITS the knob, its job-parameter default falls back
+      to `request_timeout_default_ref` / `transport_max_retries_default_ref` - the caller (the generator)
+      passes the ${var.request_timeout} / ${var.transport_max_retries} bundle variables, so an omitted
+      config defers to the target-wide default, and with NO ref supplied (unit tests) it stays "" (the
+      connector's own default). A config value overrides the global; a per-run --params override wins
+      over both.
     - bulk_stats: EsWriteConfig diagnostics toggle, now behaving like the other bool knobs. DEFAULT from
       the config when set; when the config OMITS it (stored ""), the default falls back to
       `bulk_stats_default_ref` - the caller (the generator) passes the ${var.bulk_stats} bundle variable,
@@ -1271,6 +1366,12 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "") -> list:
         {"name": "filter_condition", "default": cfg["filter_condition"]},
         {"name": "chunk_size", "default": cfg["chunk_size"]},
         {"name": "write_concurrency", "default": cfg["write_concurrency"]},
+        # request_timeout / transport_max_retries: the config value when set, else the caller-supplied
+        # global ref (${var.request_timeout} / ${var.transport_max_retries}, resolved per target at
+        # deploy), else "" (connector default) when no ref is supplied. Same layering as bulk_stats.
+        # transport_max_retries=0 stores canonical "0" (truthy), so a config setting 0 wins over the ref.
+        {"name": "request_timeout", "default": cfg["request_timeout"] or request_timeout_default_ref},
+        {"name": "transport_max_retries", "default": cfg["transport_max_retries"] or transport_max_retries_default_ref},
         {"name": "require_existing_index", "default": cfg["require_existing_index"]},
         {"name": "verify_certs", "default": cfg["verify_certs"]},
         # bulk_stats: the config value when set, else the caller-supplied global ref (${var.bulk_stats},

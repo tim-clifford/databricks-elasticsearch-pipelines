@@ -41,6 +41,8 @@ resources:
             filter_condition: ''
             chunk_size: ''
             write_concurrency: ''
+            request_timeout: ${var.request_timeout}
+            transport_max_retries: ${var.transport_max_retries}
             require_existing_index: ''
             verify_certs: ''
             bulk_stats: ${var.bulk_stats}
@@ -67,6 +69,8 @@ resources:
             filter_condition: ''
             chunk_size: ''
             write_concurrency: ''
+            request_timeout: ${var.request_timeout}
+            transport_max_retries: ${var.transport_max_retries}
             require_existing_index: ''
             verify_certs: ''
             bulk_stats: ${var.bulk_stats}

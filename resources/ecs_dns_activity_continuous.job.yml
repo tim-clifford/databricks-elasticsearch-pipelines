@@ -20,6 +20,10 @@ resources:
         default: ''
       - name: write_concurrency
         default: ''
+      - name: request_timeout
+        default: ${var.request_timeout}
+      - name: transport_max_retries
+        default: ${var.transport_max_retries}
       - name: require_existing_index
         default: ''
       - name: verify_certs

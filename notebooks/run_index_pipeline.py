@@ -35,8 +35,10 @@
 # MAGIC   value `reset_checkpoint`, which clears this pipeline's streaming checkpoint directory and exits
 # MAGIC   without exporting, so the next streaming run starts fresh (as if brand new).
 # MAGIC - `filter_condition`: optional Spark SQL predicate applied before the write (default from config).
-# MAGIC - `chunk_size`, `write_concurrency`, `require_existing_index`, `verify_certs`: EsWriteConfig tuning (default from config;
-# MAGIC   omitted there and unset per run => connector default).
+# MAGIC - `chunk_size`, `write_concurrency`, `request_timeout`, `transport_max_retries`, `require_existing_index`,
+# MAGIC   `verify_certs`: EsWriteConfig tuning (default from config; omitted there and unset per run => connector
+# MAGIC   default). `request_timeout` (seconds) and `transport_max_retries` (0 disables) tune a write that
+# MAGIC   times out mid-send.
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
 # MAGIC   streaming only, honored on the first run before a checkpoint exists.
 # MAGIC - `max_files_per_trigger`, `max_bytes_per_trigger`: streaming read rate-limits that bound each
@@ -112,6 +114,8 @@ dbutils.widgets.text("pipeline_mode", "", "Export mode: batch | streaming | rese
 dbutils.widgets.text("filter_condition", "", "Optional row filter, a Spark SQL predicate (overridable per run)")
 dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty => connector default)")
 dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
+dbutils.widgets.text("request_timeout", "", "EsWriteConfig request_timeout: per-request ES client timeout in seconds (empty => connector default 60)")
+dbutils.widgets.text("transport_max_retries", "", "EsWriteConfig transport_max_retries: whole-request retries on a transport failure; 0 disables (empty => connector default 3)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
 dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default from ${var.bulk_stats}/config; empty => connector default off; needs connector 0.9.3+)")
@@ -138,6 +142,8 @@ PIPELINE_MODE = dbutils.widgets.get("pipeline_mode").strip()
 FILTER_CONDITION = dbutils.widgets.get("filter_condition").strip()
 CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
 WRITE_CONCURRENCY = dbutils.widgets.get("write_concurrency").strip()
+REQUEST_TIMEOUT = dbutils.widgets.get("request_timeout").strip()
+TRANSPORT_MAX_RETRIES = dbutils.widgets.get("transport_max_retries").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
 BULK_STATS = dbutils.widgets.get("bulk_stats").strip()
@@ -235,7 +241,8 @@ if STREAMING_TRIGGER_INTERVAL:
         STREAMING_TRIGGER_INTERVAL, "streaming_trigger_interval base parameter"
     )
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
-write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS)
+write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS,
+                                         request_timeout=REQUEST_TIMEOUT, transport_max_retries=TRANSPORT_MAX_RETRIES)
 # bulk_stats requires connector 0.9.3+ (the release that added the EsWriteConfig field). Its effective
 # value is the global ${var.bulk_stats} default (or a per-pipeline config value / --params override); it
 # is only present in write_overrides when that resolves to a non-empty true/false. On an OLDER wheel, a
