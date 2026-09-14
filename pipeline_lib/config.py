@@ -1308,7 +1308,9 @@ def job_base_parameters(
     }
 
 
-def job_parameters(cfg: dict, bulk_stats_default_ref: str = "") -> list:
+def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
+                   request_timeout_default_ref: str = "",
+                   transport_max_retries_default_ref: str = "") -> list:
     """The RUN-TIME-overridable job-level parameters for a per-index job, as JobParameterDefinitions.
 
     Unlike base_parameters (fixed at deploy), a job parameter can be overridden per run with
@@ -1329,7 +1331,13 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "") -> list:
       write that times out mid-send ("The write operation timed out"): raise request_timeout and/or
       transport_max_retries so a slow/large bulk send has longer to complete and is re-sent on a
       transport failure. transport_max_retries is the whole-request retry, distinct from per-document
-      429 retries (a separate connector knob not exposed here).
+      429 retries (a separate connector knob not exposed here). Both take a target-wide global default
+      the same way bulk_stats does: when the config OMITS the knob, its job-parameter default falls back
+      to `request_timeout_default_ref` / `transport_max_retries_default_ref` - the caller (the generator)
+      passes the ${var.request_timeout} / ${var.transport_max_retries} bundle variables, so an omitted
+      config defers to the target-wide default, and with NO ref supplied (unit tests) it stays "" (the
+      connector's own default). A config value overrides the global; a per-run --params override wins
+      over both.
     - bulk_stats: EsWriteConfig diagnostics toggle, now behaving like the other bool knobs. DEFAULT from
       the config when set; when the config OMITS it (stored ""), the default falls back to
       `bulk_stats_default_ref` - the caller (the generator) passes the ${var.bulk_stats} bundle variable,
@@ -1358,8 +1366,12 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "") -> list:
         {"name": "filter_condition", "default": cfg["filter_condition"]},
         {"name": "chunk_size", "default": cfg["chunk_size"]},
         {"name": "write_concurrency", "default": cfg["write_concurrency"]},
-        {"name": "request_timeout", "default": cfg["request_timeout"]},
-        {"name": "transport_max_retries", "default": cfg["transport_max_retries"]},
+        # request_timeout / transport_max_retries: the config value when set, else the caller-supplied
+        # global ref (${var.request_timeout} / ${var.transport_max_retries}, resolved per target at
+        # deploy), else "" (connector default) when no ref is supplied. Same layering as bulk_stats.
+        # transport_max_retries=0 stores canonical "0" (truthy), so a config setting 0 wins over the ref.
+        {"name": "request_timeout", "default": cfg["request_timeout"] or request_timeout_default_ref},
+        {"name": "transport_max_retries", "default": cfg["transport_max_retries"] or transport_max_retries_default_ref},
         {"name": "require_existing_index", "default": cfg["require_existing_index"]},
         {"name": "verify_certs", "default": cfg["verify_certs"]},
         # bulk_stats: the config value when set, else the caller-supplied global ref (${var.bulk_stats},

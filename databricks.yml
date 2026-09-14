@@ -158,6 +158,27 @@ variables:
     description: "Global default for connector bulk_stats diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off; connector default stands). A pipeline's own bulk_stats and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.9.3."
     default: ""
 
+  # GLOBAL defaults for the connector's connection/reliability tuning, threaded exactly like bulk_stats:
+  # scripts/gen_jobs.py bakes ${var.request_timeout} / ${var.transport_max_retries} as the job-parameter
+  # default for every pipeline that OMITS the knob, so you can raise the per-request ES timeout and the
+  # whole-request retry count for a WHOLE target without editing each pipeline config. These are the
+  # levers for a batch write that fails at the transport layer ("The write operation timed out"): a large
+  # or slow _bulk request that exceeds the socket timeout. Precedence, highest first: a per-run
+  # `--params <knob>=<v>` > a pipeline's own `<knob>:` in its config > this global default > the
+  # connector's own default (request_timeout 60s, transport_max_retries 3). Empty defaults so, out of the
+  # box, the connector defaults stand everywhere; set them per target below (or --var) to raise them
+  # target-wide. A legal request_timeout is "" or a positive integer of seconds; a legal
+  # transport_max_retries is "" or a non-negative integer (0 disables transport retries). Both are
+  # validated at generation and at run. Like the other simple string vars they accept
+  # --var=request_timeout=120 at deploy. request_timeout needs no minimum connector version (0.1.0+);
+  # transport_max_retries requires connector >= 0.6.0.
+  request_timeout:
+    description: "Global default for EsWriteConfig request_timeout (per-request ES client timeout, seconds). Empty default (connector default 60 stands). A pipeline's own request_timeout and a per-run --params override this. Set per target/--var to raise it target-wide."
+    default: ""
+  transport_max_retries:
+    description: "Global default for EsWriteConfig transport_max_retries (whole-request retries on a transport failure; 0 disables). Empty default (connector default 3 stands). A pipeline's own transport_max_retries and a per-run --params override this. Set per target/--var to raise it target-wide. Requires connector >= 0.6.0."
+    default: ""
+
   # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
   # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
   # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds
@@ -253,6 +274,10 @@ targets:
       # bulk_stats: "true"         # turn connector bulk-send diagnostics ON for the whole dev target (a
                                    # pipeline's own bulk_stats or a --params override still wins). Empty
                                    # default (off) inherited when omitted.
+      # request_timeout: "120"     # raise the per-request ES timeout (seconds) for the whole dev target;
+      # transport_max_retries: "5" # and the whole-request retry count. A pipeline's own value or a
+                                   # --params override still wins. Empty defaults inherit the connector
+                                   # defaults (60s / 3) when omitted.
       # DEV Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-dev-es-host:9200

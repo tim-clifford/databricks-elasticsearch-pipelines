@@ -696,6 +696,35 @@ def test_job_parameters_bulk_stats_config_value_overrides_ref(value, expected):
     assert {"name": "bulk_stats", "default": expected} in params
 
 
+def test_job_parameters_reliability_knobs_default_empty_without_ref():
+    # With no refs supplied (the pure/unit-test call), omitted request_timeout / transport_max_retries
+    # stay "" - the connector's own defaults stand.
+    params = job_parameters(validate_config(_base()))
+    assert {"name": "request_timeout", "default": ""} in params
+    assert {"name": "transport_max_retries", "default": ""} in params
+
+
+def test_job_parameters_reliability_knobs_omitted_use_global_ref():
+    # When the config OMITS them, the generator's refs become the job-parameter defaults, so an omitted
+    # pipeline defers to the target-wide ${var.request_timeout} / ${var.transport_max_retries} globals.
+    params = job_parameters(validate_config(_base()), "${var.bulk_stats}",
+                            "${var.request_timeout}", "${var.transport_max_retries}")
+    assert {"name": "request_timeout", "default": "${var.request_timeout}"} in params
+    assert {"name": "transport_max_retries", "default": "${var.transport_max_retries}"} in params
+
+
+def test_job_parameters_reliability_knobs_config_value_overrides_ref():
+    # A config that SETS the knob bakes its literal value, overriding the global ref (per-pipeline wins).
+    # transport_max_retries=0 is meaningful and stored canonical "0" (truthy), so it must beat the ref too.
+    cfg = _base()
+    cfg["request_timeout"] = 120
+    cfg["transport_max_retries"] = 0
+    params = job_parameters(validate_config(cfg), "${var.bulk_stats}",
+                            "${var.request_timeout}", "${var.transport_max_retries}")
+    assert {"name": "request_timeout", "default": "120"} in params
+    assert {"name": "transport_max_retries", "default": "0"} in params
+
+
 def test_job_parameters_streaming_start_defaults_new():
     # streaming_start is a literal default (not a config key), always "new" regardless of the config.
     params = job_parameters(validate_config(_base()))
