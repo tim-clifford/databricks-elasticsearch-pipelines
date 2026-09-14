@@ -155,7 +155,7 @@ require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the i
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
 write_concurrency: 4              # OPTIONAL EsWriteConfig tuning (parallel bulk streams per partition; connector >= 0.7.0); omit for connector default 1
 request_timeout: 120              # OPTIONAL EsWriteConfig tuning (per-request ES client timeout, seconds); omit for connector default 60. Raise it (with a smaller chunk_size) when a bulk send times out mid-write
-transport_max_retries: 5          # OPTIONAL EsWriteConfig tuning (whole-request retries on a transport failure: connection reset/timeout, 429/503 on the bulk call); omit for connector default 3. 0 disables them
+transport_max_retries: 5          # OPTIONAL EsWriteConfig tuning (whole-request retries on a transport failure: connection reset/timeout, 429/503 on the bulk call; connector >= 0.6.0); omit for connector default 3. 0 disables them
 bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log; connector >= 0.9.3). Behaves like verify_certs: omit to defer to the global ${var.bulk_stats} default (off), or set true|false here to override it for this pipeline
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
@@ -520,7 +520,8 @@ Two different mechanisms carry values into a job, and they resolve at different 
     rather than CPU/bandwidth-bound; it multiplies with the partition count, so raise it gradually and
     watch for 429s. Applies to **both** modes.
   - `request_timeout` (a positive integer, **seconds**; connector default `60`) and
-    `transport_max_retries` (a non-negative integer; connector default `3`, `0` disables) tune a write
+    `transport_max_retries` (a non-negative integer; connector default `3`, `0` disables; requires
+    connector **>= 0.6.0**) tune a write
     that fails at the transport layer: the classic symptom is `EsWriteError: ... ConnectionTimeout ...
     The write operation timed out`, where a whole bulk request exceeded the socket timeout. Because the
     request never returned per-document statuses, the connector fails those documents closed (counted as
