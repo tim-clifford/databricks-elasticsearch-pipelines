@@ -42,6 +42,7 @@ resources:
         default: ''
       continuous:
         pause_status: ${var.schedule_pause_status}
+        task_retry_mode: ON_FAILURE
       job_clusters:
       - job_cluster_key: standard_batch
         new_cluster:

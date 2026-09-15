@@ -247,10 +247,38 @@ def test_render_no_continuous_omits_block_and_empties_interval():
 
 def test_render_continuous_emits_trigger_and_no_schedule():
     # A continuous config emits a Databricks Jobs continuous trigger (pause bound to the shared
-    # schedule_pause_status var) INSTEAD of a schedule.
+    # schedule_pause_status var, task_retry_mode ON_FAILURE) INSTEAD of a schedule.
     job = _render_job(_continuous_cfg(), _JC_SPEC)
-    assert job["continuous"] == {"pause_status": "${var.schedule_pause_status}"}
+    assert job["continuous"] == {
+        "pause_status": "${var.schedule_pause_status}",
+        "task_retry_mode": "ON_FAILURE",
+    }
     assert "schedule" not in job
+
+
+def test_render_continuous_sets_task_retry_mode_on_failure():
+    # Continuous jobs MUST set task_retry_mode: ON_FAILURE. This is the recovery knob for a continuous
+    # job (per-task max_retries is not usable in continuous). Its API/bundle default when OMITTED is
+    # NEVER (a failed task is never retried); in a multi-task continuous group a failed task then sits
+    # FAILED forever while the sibling streams never terminate, so the run never restarts either.
+    # ON_FAILURE retries the failed task while a sibling is still running, else cancels and restarts the
+    # whole run. So the value must be present and exactly ON_FAILURE, not merely "not NEVER".
+    singleton = _render_job(_continuous_cfg(), _JC_SPEC)
+    assert singleton["continuous"]["task_retry_mode"] == "ON_FAILURE"
+    group = _render_group("g", [
+        _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="shared"),
+        _member("b.yml", "b", "idx-b", job_cluster_config="shared"),
+    ])
+    assert group["continuous"]["task_retry_mode"] == "ON_FAILURE"
+
+
+def test_render_non_continuous_never_carries_task_retry_mode():
+    # task_retry_mode is a CONTINUOUS-only field (it lives on the continuous trigger). A non-continuous
+    # job has no continuous block at all, so it can never carry the knob - guard against it leaking onto
+    # scheduled/on-demand jobs.
+    job = _render_job(_cfg())
+    assert "continuous" not in job
+    assert "task_retry_mode" not in yaml.safe_dump(job)
 
 
 def test_render_continuous_wires_trigger_interval_base_param():
@@ -273,7 +301,10 @@ def test_render_continuous_existing_cluster():
         "continuous": {"trigger_interval": "30 seconds"},
     }
     job = _render_job(validate_config(raw))  # existing_cluster needs no new_cluster spec
-    assert job["continuous"] == {"pause_status": "${var.schedule_pause_status}"}
+    assert job["continuous"] == {
+        "pause_status": "${var.schedule_pause_status}",
+        "task_retry_mode": "ON_FAILURE",
+    }
     assert "job_clusters" not in job
     assert job["tasks"][0]["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
     assert job["tasks"][0]["notebook_task"]["base_parameters"]["streaming_trigger_interval"] == "30 seconds"
@@ -771,7 +802,10 @@ def test_group_continuous_emits_trigger_and_propagates_interval_to_all():
         _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="shared"),
         _member("b.yml", "b", "idx-b", job_cluster_config="shared"),  # no continuous block: inherits
     ])
-    assert job["continuous"] == {"pause_status": "${var.schedule_pause_status}"}
+    assert job["continuous"] == {
+        "pause_status": "${var.schedule_pause_status}",
+        "task_retry_mode": "ON_FAILURE",
+    }
     for t in job["tasks"]:
         assert t["notebook_task"]["base_parameters"]["streaming_trigger_interval"] == "30 seconds"
 
