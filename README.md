@@ -391,8 +391,8 @@ continuous:
 ```
 
 This emits a Databricks Jobs **continuous** trigger: the orchestrator keeps exactly one run perpetually
-active and auto-restarts it on completion or failure (self-healing), and the runner drives the stream
-with `Trigger.ProcessingTime(interval)` instead of `Trigger.availableNow`, so it never terminates.
+active and restarts it on completion or failure (see **Failure recovery** below), and the runner drives
+the stream with `Trigger.ProcessingTime(interval)` instead of `Trigger.availableNow`, so it never terminates.
 `trigger_interval` is the target gap between the **start** of one micro-batch and the next (batches
 never overlap); a shorter interval trades ES/Delta efficiency (more, smaller bulk writes and index
 refreshes) for lower latency.
@@ -408,6 +408,26 @@ matters only on the very first run.
 `schedule_pause_status` (default `PAUSED`), so `dev`/`stg` deploy the always-on job **dormant** and
 only `prd` (or an explicit `--var=schedule_pause_status=UNPAUSED`) actually runs it. One always-on run
 holds its job cluster for as long as it is unpaused, so treat it as a running-cost commitment.
+
+**Failure recovery.** A continuous job's per-task recovery is governed by the continuous trigger's
+`task_retry_mode`, which the generator pins to **`ON_FAILURE`** for every continuous job. This is
+deliberate and load-bearing: the field's API/bundle default when omitted is **`NEVER`** (a failed task
+is never retried), even though the Jobs UI defaults it to `ON_FAILURE`. Per-task `max_retries` cannot be
+used in a continuous job, so `task_retry_mode` is the only lever. Under `ON_FAILURE`:
+
+- If a task's stream fails, Databricks **retries that task in place** (with exponential backoff) as long
+  as at least one other task in the run is still on its first attempt, so one stream can recover without
+  disturbing the others.
+- When that no longer holds, or the retry limit is reached, the **whole run is cancelled and a fresh one
+  started** (the job-level restart, itself exponential-backoff throttled).
+
+This matters most for a **job group** of continuous streams (multiple tasks in one run): under the
+`NEVER` default a failed task would sit `FAILED` while the sibling streams keep running, so the run never
+reaches a terminal state and the continuous trigger never restarts it either - the failed task would
+never recover. `ON_FAILURE` gives the intended "retry the task, else restart the job" behavior. A
+single-task continuous job recovers under either value (its failure ends the run, which the trigger
+restarts), but it is pinned the same way for consistency. Continuous jobs deployed before this change
+carry the `NEVER` default until redeployed.
 
 **Observability.** An always-on run never reaches the end-of-run summary (it never terminates), so
 health comes from the Databricks Jobs continuous-run state (RUNNING / restart count / failure
@@ -445,7 +465,9 @@ What the group agrees on, all fail-closed at generation (`gen_jobs.py --check`):
   and is **rejected** if members declare different triggers (two different crons, or `schedule` vs
   `continuous`). A **continuous** group propagates its `trigger_interval` to every member (so a member
   that omitted `continuous` still runs always-on rather than draining under `availableNow`) and
-  requires **every** member to be `streaming` on classic compute.
+  requires **every** member to be `streaming` on classic compute. A failed member task recovers per the
+  continuous trigger's `task_retry_mode: ON_FAILURE` (retry that task, else restart the whole run) - see
+  [Continuous (always-on) streaming](#continuous-always-on-streaming) **Failure recovery**.
 - **`job_name_postfix`** (define-once): same rule (omit on most members and set once); conflicting
   values are rejected (see [Job naming](#job-naming)).
 

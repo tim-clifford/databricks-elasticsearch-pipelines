@@ -334,8 +334,20 @@ def _compute_desc(cfg: dict) -> str:
 
 def _continuous_block() -> dict:
     """The job-level `continuous` trigger body (one perpetual, auto-restarting run). pause_status binds
-    schedule_pause_status (default PAUSED) so dev/stg deploy-but-paused and only prd runs the stream."""
-    return {"pause_status": "${var.schedule_pause_status}"}
+    schedule_pause_status (default PAUSED) so dev/stg deploy-but-paused and only prd runs the stream.
+
+    task_retry_mode is PINNED to ON_FAILURE, and this matters most for a multi-task continuous group.
+    A continuous job's per-task recovery is governed ONLY by this field (per-task max_retries is not
+    usable in a continuous job); its API/bundle DEFAULT WHEN OMITTED IS `NEVER` (a failed task is never
+    retried), even though the Jobs UI defaults it to ON_FAILURE. Under NEVER, a task whose stream fails
+    just sits FAILED: in a multi-task group the sibling tasks keep streaming forever, so the run never
+    reaches a terminal state and the continuous trigger never restarts it either - the failed task is
+    stuck with no recovery. ON_FAILURE instead retries the failed task while at least one sibling is
+    still running (recover the one stream without disturbing the others), and when that no longer holds
+    or the retry limit is reached, the whole run is cancelled and a fresh one started. That two-tier
+    behavior - retry the task, else restart the job - is exactly what an always-on pipeline needs, so it
+    is the framework default rather than an opt-in knob."""
+    return {"pause_status": "${var.schedule_pause_status}", "task_retry_mode": "ON_FAILURE"}
 
 
 def _schedule_block(cron: str) -> dict:
