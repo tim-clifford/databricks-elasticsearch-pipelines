@@ -11,8 +11,8 @@ import pytest
 from pipeline_lib.observability import (
     BULK_STATS_TAG,
     PROGRESS_TAG,
-    BatchStatsRelay,
     batch_job_description,
+    bulk_stats_relay_line,
     format_bulk_stats,
     format_progress,
     format_tail_summary,
@@ -220,11 +220,14 @@ def test_tail_summary_pins_slowest_partition_and_ratios():
     assert line.startswith(f"{BULK_STATS_TAG} tail: ")
     assert "\n" not in line                                    # one compact line
     assert "slowest=part0 wall_ms=240.00" in line
+    assert "sends=40" in line                                  # the SLOWEST partition's n_sends
     assert "rtt_ms_max=89.00" in line and "took_ms_max=64.00" in line
     assert "conc=2.00" in line                                 # 480ms busy / 240ms wall
     assert "docs=400000" in line                               # the SLOWEST partition's docs
     assert "median_wall_ms=220.00" in line                     # (240 + 200) / 2
+    assert "wall_p95=240.00" in line                           # nearest-rank p95 of (200, 240)
     assert "wall_max/median=1.09" in line                      # 240 / 220
+    assert "stragglers>2x=0" in line                           # neither wall exceeds 2x median (440)
     assert "docs_max/median=1.20" in line                      # 600k / 500k (median of 400k, 600k)
     assert "collect_ms=12345.60" in line and "merge_ms=7.61" in line
 
@@ -244,6 +247,8 @@ def test_tail_summary_straggler_without_skew():
     assert "slowest=part2 wall_ms=5000.00" in line
     assert "rtt_ms_max=4800.00" in line and "took_ms_max=12.00" in line  # network/ES tail signature
     assert "wall_max/median=50.00" in line                              # 5000 / 100
+    assert "stragglers>2x=1" in line                                   # only part2 exceeds 2x median (200)
+    assert "wall_p95=5000.00" in line                                  # nearest-rank p95 of (100,100,5000)
     assert "docs_max/median=1.00" in line                              # equal docs => no skew
 
 
@@ -286,41 +291,27 @@ def test_tail_summary_never_raises_on_bad_input(bad):
     assert out.startswith(f"{BULK_STATS_TAG} tail:")
 
 
-# --------------------------------------------------------------------------- BatchStatsRelay
+# --------------------------------------------------------------------------- bulk_stats relay (file channel)
 
-def test_relay_record_then_take_returns_line():
-    relay = BatchStatsRelay()
-    relay.record(7, "BULK_STATS ... batch_id=7")
-    assert relay.take(7) == "BULK_STATS ... batch_id=7"
-
-
-def test_relay_take_missing_returns_none():
-    relay = BatchStatsRelay()
-    assert relay.take(0) is None            # nothing recorded (empty batch / bulk_stats off)
-    relay.record(1, "x")
-    assert relay.take(2) is None            # a different batch's id
+def test_relay_line_composes_overall_and_tail_with_batch_id():
+    result = {"bulk_stats": _BULK_STATS, "collect_ms": 100.0, "merge_ms": 2.0}
+    line = bulk_stats_relay_line(result, 5)
+    assert line is not None
+    over, tail = line.split("\n", 1)
+    assert over.startswith(f"{BULK_STATS_TAG} overall:") and "batch_id=5" in over
+    assert tail.startswith(f"{BULK_STATS_TAG} tail:")
 
 
-def test_relay_take_consumes_entry():
-    relay = BatchStatsRelay()
-    relay.record(3, "line")
-    assert relay.take(3) == "line"
-    assert relay.take(3) is None            # taken once, then gone
+def test_relay_line_none_when_no_bulk_stats():
+    # An empty micro-batch (or bulk_stats off) carries no per-partition stats: nothing to relay, so the
+    # listener writes/reads nothing for that batch rather than a misleading empty rollup.
+    assert bulk_stats_relay_line({"collect_ms": 1.0}, 3) is None
+    assert bulk_stats_relay_line({}, 3) is None
+    assert bulk_stats_relay_line("not a dict", 3) is None
 
 
-def test_relay_rerecord_overwrites():
-    # A retried batch re-records under the same id; the latest line wins.
-    relay = BatchStatsRelay()
-    relay.record(4, "first")
-    relay.record(4, "second")
-    assert relay.take(4) == "second"
-
-
-def test_relay_bounded_evicts_oldest():
-    # If the listener never consumes, the store stays bounded by evicting the smallest (oldest) batch_id.
-    relay = BatchStatsRelay(maxsize=3)
-    for bid in (10, 11, 12, 13):
-        relay.record(bid, f"line{bid}")
-    assert relay.take(10) is None           # 10 was the oldest, evicted when 13 arrived
-    assert relay.take(11) == "line11"
-    assert relay.take(13) == "line13"
+def test_relay_line_never_raises():
+    # Fail-soft: a malformed result yields None (skip the relay), never an exception into the write path.
+    for bad in ({"bulk_stats": "nope"}, {"bulk_stats": [None, 7]}, {"bulk_stats": [{"x": "y"}]}):
+        out = bulk_stats_relay_line(bad, 1)
+        assert out is None or isinstance(out, str)

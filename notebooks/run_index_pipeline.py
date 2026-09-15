@@ -192,8 +192,8 @@ import uuid  # noqa: E402
 from pipeline_lib.observability import (  # noqa: E402
     BULK_STATS_TAG,
     PROGRESS_TAG,
-    BatchStatsRelay,
     batch_job_description,
+    bulk_stats_relay_line,
     format_bulk_stats,
     format_progress,
     format_tail_summary,
@@ -554,6 +554,33 @@ if PIPELINE_MODE == "streaming":
     metrics_dir = f"{checkpoint_location}/_run_metrics"
     dbutils.fs.rm(metrics_dir, recurse=True)
 
+    # Per-batch bulk-stats RELAY directory, a SIBLING of _run_metrics (kept out of it so the summary's
+    # spark.read.json(metrics_dir) never sees these files). Under Spark Connect foreachBatch runs
+    # server-side and its BULK_STATS print reaches only the driver log, while the StreamingQueryListener
+    # runs client-side and its print reaches the notebook cell (that is why STREAM_PROGRESS shows there).
+    # An in-memory handoff can't cross that process split, so foreachBatch writes each batch's
+    # overall+tail line to `{relay_dir}/{batch_id}` (via the SAME Spark write it uses for the row count -
+    # the one file mechanism proven to work server-side here), and onQueryProgress reads it for the batch
+    # it is reporting and prints it into the cell. Cleared at run start so it only holds this run.
+    relay_dir = f"{checkpoint_location}/_bulk_stats_relay"
+    dbutils.fs.rm(relay_dir, recurse=True)
+
+    def read_relay_line(batch_id):
+        """Client-side read of the per-batch relay file foreachBatch wrote to `{relay_dir}/{batch_id}`
+        (a Spark `.text()` output directory containing one `part-*.txt`). Called from the progress
+        listener, which runs on the DRIVER where the UC Volume is FUSE-mounted, so a plain os/open read
+        works with no Spark job on the listener thread. FAIL-SOFT: a missing directory (empty batch, or
+        not yet written) or any read error yields None, so nothing extra is printed for that batch."""
+        try:
+            d = f"{relay_dir}/{int(batch_id)}"
+            for name in sorted(os.listdir(d)):
+                if name.startswith("part-"):
+                    with open(os.path.join(d, name)) as fh:
+                        return fh.read().rstrip("\n")
+        except Exception:
+            return None
+        return None
+
     def foreach_batch(batch_df, batch_id: int):
         # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so
         # the deployed view's projection/joins/hints apply to exactly this batch. Both the register and
@@ -599,19 +626,21 @@ if PIPELINE_MODE == "streaming":
             # When bulk_stats is on, log a COMPACT one-line rollup of this micro-batch's ES bulk-send
             # diagnostics (overall docs/send, rtt, took) so an always-on run has per-batch visibility
             # without the full per-partition breakdown flooding the log. format_bulk_stats is fail-soft,
-            # so a diagnostic-formatting fault can never disturb the write. This print runs on the
-            # micro-batch thread, so its stdout lands in the driver LOG (surfacing as stderr), not the
-            # notebook cell; to ALSO get it into the cell alongside STREAM_PROGRESS, we hand the same
-            # rollup plus the tail/straggler summary to the progress listener via _bulk_stats_relay
-            # (below), keyed by batch_id. Recording is a single dict write; it adds nothing to the write.
+            # so a diagnostic-formatting fault can never disturb the write. This print runs server-side
+            # (micro-batch), so its stdout lands in the driver LOG (surfacing as stderr), not the cell.
             if "bulk_stats" in result:
-                _overall = format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}"
-                print(_overall)  # driver-log trail (unchanged)
-                # ALSO relay to the listener so it surfaces in the cell. FAIL-SOFT: a relay/format fault
-                # must never disturb the write, and _bulk_stats_relay is defined in the run cell before
-                # the stream starts, so it exists by the time any batch runs.
+                print(format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}")
+                # ALSO relay the overall+tail line to the cell, via a small per-batch FILE the
+                # client-side listener reads (foreachBatch's own stdout can't reach the cell under Spark
+                # Connect - see relay_dir above). Written with the SAME nested Spark write used for the
+                # row count below, so it uses only a mechanism proven to work server-side here. FAIL-SOFT:
+                # a relay/format fault must never disturb the write. Only data-carrying batches produce a
+                # line (bulk_stats_relay_line returns None otherwise), so empty batches write nothing.
                 try:
-                    _bulk_stats_relay.record(batch_id, _overall + "\n" + format_tail_summary(result))
+                    _relay_line = bulk_stats_relay_line(result, batch_id)
+                    if _relay_line is not None:
+                        session.createDataFrame([(_relay_line,)], "line string") \
+                            .coalesce(1).write.mode("overwrite").text(f"{relay_dir}/{int(batch_id)}")
                 except Exception as _e:
                     print(f"WARNING: {BULK_STATS_TAG} could not relay batch {batch_id} to the cell "
                           f"({type(_e).__name__}: {_e}); continuing")
@@ -700,14 +729,6 @@ if PIPELINE_MODE == "streaming":
     # emit duplicate lines. The CONFIG_NAME prefix keeps the streaming tab legible.
     _QUERY_NAME = f"{CONFIG_NAME}-{uuid.uuid4().hex[:8]}"
 
-    # Per-run handoff of each micro-batch's bulk/tail diagnostics from foreachBatch to the progress
-    # listener, so they surface in the NOTEBOOK CELL next to STREAM_PROGRESS. foreachBatch's own stdout
-    # lands in the driver log (it runs on the micro-batch thread), but a listener callback's stdout is
-    # surfaced by Databricks in the owning cell - so foreachBatch records() its line here (keyed by
-    # batch_id) and onQueryProgress take()s and prints it for the matching batch. Bounded + thread-safe;
-    # a dict write per batch, no effect on the write. Only populated when bulk_stats is on.
-    _bulk_stats_relay = BatchStatsRelay()
-
     # Ephemeral per-batch observability. Register a StreamingQueryListener BEFORE .start() (so it also
     # catches the query-started event) that logs one STREAM_PROGRESS line per micro-batch - backlog
     # (numFilesOutstanding/numBytesOutstanding), the durationMs breakdown, rates, and Delta offset
@@ -740,12 +761,13 @@ if PIPELINE_MODE == "streaming":
                 if progress.get("name") != _QUERY_NAME:
                     return
                 print(format_progress(progress))
-                # Surface this batch's bulk/tail diagnostics in the CELL, if foreachBatch recorded them
-                # (bulk_stats on, non-empty batch). Own try so a relay/format fault cannot suppress the
-                # STREAM_PROGRESS line just printed; only this run's batches reach here (name-filtered
-                # above), and take() removes the entry so it prints once.
+                # Surface this batch's bulk/tail diagnostics in the CELL, if foreachBatch wrote them for
+                # this batch (bulk_stats on, non-empty batch). Read the per-batch relay file written
+                # server-side; this runs on the driver so a plain file read reaches it. Own try so a
+                # relay/read fault cannot suppress the STREAM_PROGRESS line just printed; only this run's
+                # batches reach here (name-filtered above).
                 try:
-                    _relayed = _bulk_stats_relay.take(progress.get("batchId"))
+                    _relayed = read_relay_line(progress.get("batchId"))
                     if _relayed:
                         print(_relayed)
                 except Exception as _re:
