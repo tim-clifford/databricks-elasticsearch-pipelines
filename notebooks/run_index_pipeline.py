@@ -693,7 +693,7 @@ if PIPELINE_MODE == "streaming":
 #
 # streaming_start controls where a FIRST run (no checkpoint yet) begins; once a checkpoint exists it is
 # the position of record and startingVersion is ignored (Spark resumes from the checkpoint). Because the
-# seed is a no-op on a resume, we DETECT an existing persisted offset and skip the DESCRIBE HISTORY +
+# seed is a no-op on a resume, we DETECT an existing persisted offset and skip the current-version lookup +
 # startingVersion seed entirely on those runs - it avoids a needless metadata scan and, more importantly,
 # stops the "seeding at current source version" line from printing on runs where the seed is ignored,
 # which misrepresented the real state (a resume, not a seed) after the first run.
@@ -742,10 +742,22 @@ if PIPELINE_MODE == "streaming":
     if STREAMING_START == "new":
         if _checkpoint_has_committed_offset(checkpoint_location):
             # A prior run already persisted an offset: Spark resumes from the checkpoint and
-            # startingVersion is ignored. Skip the DESCRIBE HISTORY scan and the seed entirely.
+            # startingVersion is ignored. Skip the current-version lookup and the seed entirely.
             print("streaming_start=new: resuming from existing checkpoint (startingVersion ignored)")
         else:
-            current_version = spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN}").agg({"version": "max"}).collect()[0][0]
+            # Resolve the source's current Delta version to seed startingVersion. Read ONLY the latest
+            # commit via DeltaTable.history(1), NOT DESCRIBE HISTORY: the SQL command materializes the
+            # ENTIRE commit history as a driver-side relation, and aggregating over it (.agg max) serializes
+            # that whole relation into the aggregation job's task - on a source with a long transaction log
+            # that task exceeds spark.rpc.message.maxSize (default 256MB) and the run aborts with a
+            # "Serialized task ... exceeds max allowed" SparkException. history(1) pushes the limit into
+            # Delta's history manager (listStart = snapshot.version - 1 + 1), reading a single commit file
+            # and yielding a one-row relation, so cost is O(1) in history length. Its single row is the
+            # current snapshot version - exactly the max we need. Supported on both compute paths: the JVM
+            # DeltaTable on dedicated/single-user classic, and delta-connect on serverless and
+            # Standard-access classic (both run Spark Connect).
+            from delta.tables import DeltaTable  # noqa: E402
+            current_version = DeltaTable.forName(spark, SOURCE_FQN).history(1).select("version").collect()[0][0]
             print(f"streaming_start=new: first run, seeding at current source version {current_version} (history skipped)")
             reader = reader.option("startingVersion", str(current_version))
     stream_df = reader.table(SOURCE_FQN)
