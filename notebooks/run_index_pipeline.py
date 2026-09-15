@@ -659,11 +659,14 @@ if PIPELINE_MODE == "streaming":
                 # ALSO relay the overall+tail line to the cell, via a small per-batch FILE the
                 # client-side listener reads (foreachBatch's own stdout can't reach the cell under Spark
                 # Connect - see relay_dir above). Written with the SAME nested Spark write used for the
-                # row count below, so it uses only a mechanism proven to work server-side here. FAIL-SOFT:
-                # a relay/format fault must never disturb the write. Only data-carrying batches produce a
+                # row count below, so it uses only a mechanism proven to work server-side here. Gated on
+                # _relay_readable: when the checkpoint path isn't FUSE-readable the listener can neither
+                # read NOR prune these files, so skip the write entirely (no leak; the operator was warned
+                # once at run start, and the oneline above still reaches the driver log). FAIL-SOFT: a
+                # relay/format fault must never disturb the write. Only data-carrying batches produce a
                 # line (bulk_stats_relay_line returns None otherwise), so empty batches write nothing.
                 try:
-                    _relay_line = bulk_stats_relay_line(result, batch_id)
+                    _relay_line = bulk_stats_relay_line(result, batch_id) if _relay_readable else None
                     if _relay_line is not None:
                         session.createDataFrame([(_relay_line,)], "line string") \
                             .coalesce(1).write.mode("overwrite").text(f"{relay_dir}/{int(batch_id)}")
