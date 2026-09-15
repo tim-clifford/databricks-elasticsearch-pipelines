@@ -252,6 +252,20 @@ def test_tail_summary_straggler_without_skew():
     assert "docs_max/median=1.00" in line                              # equal docs => no skew
 
 
+def test_tail_summary_zero_median_does_not_inflate_straggler_count():
+    # With a zero median wall (empty/near-empty partitions), `w > 2*median` would collapse to `w > 0`
+    # and flag every non-empty partition. The count must stay 0 rather than fabricate stragglers.
+    stats = [
+        {"partition_wall_ms": 0.0, "docs_sent": 0},
+        {"partition_wall_ms": 0.0, "docs_sent": 0},
+        {"partition_wall_ms": 100.0, "docs_sent": 10},
+    ]
+    line = format_tail_summary({"bulk_stats": stats})
+    assert "stragglers>2x=0" in line          # not 1, despite 100 > 2*0
+    assert "median_wall_ms=0.00" in line
+    assert "wall_max/median=n/a" in line       # ratio with a zero denominator renders n/a, not inf
+
+
 def test_tail_summary_surfaces_data_skew():
     # One fat partition holds 10x the median docs (and runs longer for it): the skew ratio must show it.
     stats = [

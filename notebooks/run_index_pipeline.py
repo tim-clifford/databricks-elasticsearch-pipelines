@@ -565,21 +565,47 @@ if PIPELINE_MODE == "streaming":
     relay_dir = f"{checkpoint_location}/_bulk_stats_relay"
     dbutils.fs.rm(relay_dir, recurse=True)
 
+    # The relay READ below is a driver-side os/open read, which needs relay_dir on a FUSE-mounted path
+    # (/Volumes or /dbfs). Streaming checkpoints are UC Volumes in practice, but if a deployment points
+    # checkpoint_base_path at a dbfs:/ or cloud URI the read would fail-soft to None and the per-batch
+    # relay-to-cell would vanish with no signal. So when diagnostics are on AND the path is not
+    # FUSE-readable, warn ONCE here (the BULK_STATS oneline still reaches the driver log from
+    # foreachBatch). Non-fatal: diagnostics never affect the export.
+    _relay_readable = relay_dir.startswith("/Volumes/") or relay_dir.startswith("/dbfs/")
+    if BULK_STATS.strip().lower() == "true" and not _relay_readable:
+        print(f"WARNING: {BULK_STATS_TAG} per-batch relay-to-cell disabled: checkpoint path "
+              f"{checkpoint_location!r} is not a FUSE-mounted /Volumes or /dbfs path; the per-batch "
+              f"BULK_STATS/tail line still appears in the driver log.")
+
     def read_relay_line(batch_id):
         """Client-side read of the per-batch relay file foreachBatch wrote to `{relay_dir}/{batch_id}`
         (a Spark `.text()` output directory containing one `part-*.txt`). Called from the progress
         listener, which runs on the DRIVER where the UC Volume is FUSE-mounted, so a plain os/open read
-        works with no Spark job on the listener thread. FAIL-SOFT: a missing directory (empty batch, or
-        not yet written) or any read error yields None, so nothing extra is printed for that batch."""
+        works with no Spark job on the listener thread. After reading, PRUNE this and any earlier batch's
+        relay directory (the listener only ever reads the batch it is reporting, so anything <= batch_id
+        is spent) - otherwise an always-on stream would accumulate one directory per batch. FAIL-SOFT: a
+        missing directory (empty batch, or not yet written) or any read/prune error yields None / is
+        ignored, so nothing extra is printed and the export is never affected."""
+        content = None
         try:
             d = f"{relay_dir}/{int(batch_id)}"
             for name in sorted(os.listdir(d)):
                 if name.startswith("part-"):
                     with open(os.path.join(d, name)) as fh:
-                        return fh.read().rstrip("\n")
+                        content = fh.read().rstrip("\n")
+                    break
         except Exception:
-            return None
-        return None
+            content = None
+        # Prune spent relay dirs (<= this batch). Best-effort; bounds growth even if a batch's progress
+        # event was missed (its dir is reclaimed when a later batch is read).
+        try:
+            _n = int(batch_id)
+            for name in os.listdir(relay_dir):
+                if name.isdigit() and int(name) <= _n:
+                    dbutils.fs.rm(f"{relay_dir}/{name}", recurse=True)
+        except Exception:
+            pass
+        return content
 
     def foreach_batch(batch_df, batch_id: int):
         # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so

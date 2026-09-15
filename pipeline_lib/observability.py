@@ -331,7 +331,10 @@ def format_tail_summary(result):
             # How the slow tail is shaped across partitions: p95 vs median vs max says whether it is one
             # outlier (max >> p95 ~ median) or a broad slow tail (p95 >> median), and stragglers>2x counts
             # how many partitions ran past 2x the median wall (1 == a lone straggler; many == systemic).
-            straggler_ct = sum(1 for w in wall_vals if wall_med is not None and w > 2 * wall_med)
+            # Require a POSITIVE median: with a zero median (e.g. empty/near-empty partitions) `w > 2*0`
+            # collapses to `w > 0` and would flag every non-empty partition, a meaningless count.
+            straggler_ct = (sum(1 for w in wall_vals if w > 2 * wall_med)
+                            if isinstance(wall_med, (int, float)) and wall_med > 0 else 0)
             wall_tokens = (f"median_wall_ms={_num(wall_med)} "
                            f"wall_p95={_num(_percentile(wall_vals, 0.95))} "
                            f"wall_max/median={_num(_ratio(slow_wall, wall_med))} "
