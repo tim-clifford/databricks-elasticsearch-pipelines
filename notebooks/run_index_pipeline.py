@@ -187,12 +187,16 @@ from pipeline_lib.config import (  # noqa: E402
 # Ephemeral per-batch streaming observability (pure Python, no Spark): the STREAM_PROGRESS log-line
 # formatter and the Jobs-UI batch label. Kept in pipeline_lib so it is unit-tested off-cluster.
 import json  # noqa: E402
+import time  # noqa: E402
 import uuid  # noqa: E402
 from pipeline_lib.observability import (  # noqa: E402
+    BULK_STATS_TAG,
     PROGRESS_TAG,
     batch_job_description,
+    bulk_stats_relay_line,
     format_bulk_stats,
     format_progress,
+    format_tail_summary,
 )
 
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
@@ -460,14 +464,26 @@ if PIPELINE_MODE == "batch":
     # Repartition AFTER the filter so the surviving rows spread evenly.
     if WRITE_REPARTITION > 0:
         export_df = export_df.repartition(WRITE_REPARTITION)
+    # Driver wall clock around the write, to LOCATE a tail that persists after the Spark UI shows every
+    # write task complete. bulk_write's own collect_ms (under bulk_stats) is the time INSIDE Spark's
+    # collect (the write job PLUS Spark's result finalization), so if this driver-measured wall is
+    # ~collect_ms the tail is inside the write itself - typically a straggler partition, which the
+    # BULK_STATS tail line below then names - whereas wall well above collect_ms would be work between
+    # the collect and this return. Two time.time() calls on the driver; nothing touches the write path.
+    _bw_t0 = time.time()
     result = bulk_write(export_df, es_write_config)
+    _bw_wall_ms = (time.time() - _bw_t0) * 1000.0
     # Print the core count dict on one line; when bulk_stats is on, result also carries a per-partition
     # 'bulk_stats' list, which we render SEPARATELY (below) as readable BULK_STATS lines rather than
     # dumping the raw list into the result line. reconcile_or_raise reads only the counts, so the extra
     # key is ignored there.
     _core_result = {k: v for k, v in result.items() if k != "bulk_stats"}
     print(f"batch bulk_write result: {_core_result}")
+    print(f"{BULK_STATS_TAG} driver: bulk_write_wall_ms={_bw_wall_ms:.1f}")
     if "bulk_stats" in result:
+        # The tail/straggler summary FIRST (the one-line answer to "where did the wall time go"), then
+        # the full per-partition breakdown. Both fail-soft.
+        print(format_tail_summary(result))
         print(format_bulk_stats(result["bulk_stats"]))
     reconcile_or_raise(result, index=es_write_config.index)
     RUN_SUMMARY = (
@@ -538,6 +554,59 @@ if PIPELINE_MODE == "streaming":
     metrics_dir = f"{checkpoint_location}/_run_metrics"
     dbutils.fs.rm(metrics_dir, recurse=True)
 
+    # Per-batch bulk-stats RELAY directory, a SIBLING of _run_metrics (kept out of it so the summary's
+    # spark.read.json(metrics_dir) never sees these files). Under Spark Connect foreachBatch runs
+    # server-side and its BULK_STATS print reaches only the driver log, while the StreamingQueryListener
+    # runs client-side and its print reaches the notebook cell (that is why STREAM_PROGRESS shows there).
+    # An in-memory handoff can't cross that process split, so foreachBatch writes each batch's
+    # overall+tail line to `{relay_dir}/{batch_id}` (via the SAME Spark write it uses for the row count -
+    # the one file mechanism proven to work server-side here), and onQueryProgress reads it for the batch
+    # it is reporting and prints it into the cell. Cleared at run start so it only holds this run.
+    relay_dir = f"{checkpoint_location}/_bulk_stats_relay"
+    dbutils.fs.rm(relay_dir, recurse=True)
+
+    # The relay READ below is a driver-side os/open read, which needs relay_dir on a FUSE-mounted path
+    # (/Volumes or /dbfs). Streaming checkpoints are UC Volumes in practice, but if a deployment points
+    # checkpoint_base_path at a dbfs:/ or cloud URI the read would fail-soft to None and the per-batch
+    # relay-to-cell would vanish with no signal. So when diagnostics are on AND the path is not
+    # FUSE-readable, warn ONCE here (the BULK_STATS oneline still reaches the driver log from
+    # foreachBatch). Non-fatal: diagnostics never affect the export.
+    _relay_readable = relay_dir.startswith("/Volumes/") or relay_dir.startswith("/dbfs/")
+    if BULK_STATS.strip().lower() == "true" and not _relay_readable:
+        print(f"WARNING: {BULK_STATS_TAG} per-batch relay-to-cell disabled: checkpoint path "
+              f"{checkpoint_location!r} is not a FUSE-mounted /Volumes or /dbfs path; the per-batch "
+              f"BULK_STATS/tail line still appears in the driver log.")
+
+    def read_relay_line(batch_id):
+        """Client-side read of the per-batch relay file foreachBatch wrote to `{relay_dir}/{batch_id}`
+        (a Spark `.text()` output directory containing one `part-*.txt`). Called from the progress
+        listener, which runs on the DRIVER where the UC Volume is FUSE-mounted, so a plain os/open read
+        works with no Spark job on the listener thread. After reading, PRUNE this and any earlier batch's
+        relay directory (the listener only ever reads the batch it is reporting, so anything <= batch_id
+        is spent) - otherwise an always-on stream would accumulate one directory per batch. FAIL-SOFT: a
+        missing directory (empty batch, or not yet written) or any read/prune error yields None / is
+        ignored, so nothing extra is printed and the export is never affected."""
+        content = None
+        try:
+            d = f"{relay_dir}/{int(batch_id)}"
+            for name in sorted(os.listdir(d)):
+                if name.startswith("part-"):
+                    with open(os.path.join(d, name)) as fh:
+                        content = fh.read().rstrip("\n")
+                    break
+        except Exception:
+            content = None
+        # Prune spent relay dirs (<= this batch). Best-effort; bounds growth even if a batch's progress
+        # event was missed (its dir is reclaimed when a later batch is read).
+        try:
+            _n = int(batch_id)
+            for name in os.listdir(relay_dir):
+                if name.isdigit() and int(name) <= _n:
+                    dbutils.fs.rm(f"{relay_dir}/{name}", recurse=True)
+        except Exception:
+            pass
+        return content
+
     def foreach_batch(batch_df, batch_id: int):
         # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so
         # the deployed view's projection/joins/hints apply to exactly this batch. Both the register and
@@ -583,11 +652,27 @@ if PIPELINE_MODE == "streaming":
             # When bulk_stats is on, log a COMPACT one-line rollup of this micro-batch's ES bulk-send
             # diagnostics (overall docs/send, rtt, took) so an always-on run has per-batch visibility
             # without the full per-partition breakdown flooding the log. format_bulk_stats is fail-soft,
-            # so a diagnostic-formatting fault can never disturb the write. (On serverless the
-            # foreachBatch body runs server-side, so this lands in executor logs; on classic/continuous
-            # it is on the driver alongside the STREAM_PROGRESS trail.)
+            # so a diagnostic-formatting fault can never disturb the write. This print runs server-side
+            # (micro-batch), so its stdout lands in the driver LOG (surfacing as stderr), not the cell.
             if "bulk_stats" in result:
                 print(format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}")
+                # ALSO relay the overall+tail line to the cell, via a small per-batch FILE the
+                # client-side listener reads (foreachBatch's own stdout can't reach the cell under Spark
+                # Connect - see relay_dir above). Written with the SAME nested Spark write used for the
+                # row count below, so it uses only a mechanism proven to work server-side here. Gated on
+                # _relay_readable: when the checkpoint path isn't FUSE-readable the listener can neither
+                # read NOR prune these files, so skip the write entirely (no leak; the operator was warned
+                # once at run start, and the oneline above still reaches the driver log). FAIL-SOFT: a
+                # relay/format fault must never disturb the write. Only data-carrying batches produce a
+                # line (bulk_stats_relay_line returns None otherwise), so empty batches write nothing.
+                try:
+                    _relay_line = bulk_stats_relay_line(result, batch_id) if _relay_readable else None
+                    if _relay_line is not None:
+                        session.createDataFrame([(_relay_line,)], "line string") \
+                            .coalesce(1).write.mode("overwrite").text(f"{relay_dir}/{int(batch_id)}")
+                except Exception as _e:
+                    print(f"WARNING: {BULK_STATS_TAG} could not relay batch {batch_id} to the cell "
+                          f"({type(_e).__name__}: {_e}); continuing")
             # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
             # the summary can dedup a retried batch (write mode append; each batch is its own small file).
             session.createDataFrame(
@@ -705,6 +790,18 @@ if PIPELINE_MODE == "streaming":
                 if progress.get("name") != _QUERY_NAME:
                     return
                 print(format_progress(progress))
+                # Surface this batch's bulk/tail diagnostics in the CELL, if foreachBatch wrote them for
+                # this batch (bulk_stats on, non-empty batch). Read the per-batch relay file written
+                # server-side; this runs on the driver so a plain file read reaches it. Own try so a
+                # relay/read fault cannot suppress the STREAM_PROGRESS line just printed; only this run's
+                # batches reach here (name-filtered above).
+                try:
+                    _relayed = read_relay_line(progress.get("batchId"))
+                    if _relayed:
+                        print(_relayed)
+                except Exception as _re:
+                    print(f"WARNING: {BULK_STATS_TAG} onQueryProgress relay failed "
+                          f"({type(_re).__name__}: {_re})")
             except Exception as _e:
                 print(f"WARNING: {PROGRESS_TAG} onQueryProgress logging failed ({type(_e).__name__}: {_e})")
 

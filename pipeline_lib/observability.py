@@ -243,3 +243,136 @@ def format_progress(progress):
         for i, source in enumerate(sources):
             tokens.extend(_source_tokens(i, source))
     return " ".join(tokens)
+
+
+def _ratio(num, den):
+    """num/den as a float, or None when either isn't a real number or den is falsy (renders n/a).
+    Module-level twin of the nested _pair_ratio in format_bulk_stats, reused by format_tail_summary."""
+    ok = (isinstance(num, (int, float)) and not isinstance(num, bool)
+          and isinstance(den, (int, float)) and not isinstance(den, bool) and den)
+    return (num / den) if ok else None
+
+
+def _median(vals):
+    """Median of the numeric values in `vals` (non-numeric/bool entries ignored), or None if none are
+    numeric. Even counts average the two middle values. Fail-soft: never raises on odd input."""
+    nums = sorted(v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool))
+    if not nums:
+        return None
+    n = len(nums)
+    mid = n // 2
+    return nums[mid] if n % 2 else (nums[mid - 1] + nums[mid]) / 2
+
+
+def _percentile(vals, q):
+    """Nearest-rank percentile (q in [0, 1]) of the numeric values in `vals`, or None if none are
+    numeric. Nearest-rank (not interpolated) is fine for the small partition counts here and never
+    fabricates a value between observed ones. Fail-soft."""
+    import math
+    nums = sorted(v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool))
+    if not nums:
+        return None
+    idx = max(0, min(len(nums) - 1, math.ceil(q * len(nums)) - 1))
+    return nums[idx]
+
+
+def format_tail_summary(result):
+    """Render a one-line `BULK_STATS tail:` summary from a bulk_write result dict, calling out the
+    STRAGGLER and SKEW behind a wall-time tail that persists after "all tasks complete".
+
+    `result` is what the connector's bulk_write returns; under EsWriteConfig bulk_stats it carries
+    result['bulk_stats'] (one dict per partition) plus top-level collect_ms / merge_ms. A write's wall
+    time is set by its SLOWEST partition, because Spark's collect returns only once the last task does,
+    so a long tail after the stage view shows every task complete is almost always one partition still
+    draining. This line names that partition by index with its wall clock and the figures that say WHY
+    it lagged: rtt_ms_max vs took_ms_max (a large rtt with a small took is time waiting on the
+    network / ES bulk queue, not ES indexing), its busy/wall concurrency, and its doc count. It then
+    contrasts the slowest partition against the MEDIAN one - wall_max/median >> 1 is a straggler,
+    docs_max/median >> 1 is data skew feeding one fat partition - and echoes collect_ms/merge_ms so a
+    tail that is NOT inside a partition (Spark result finalization, or the driver rollup) is visible
+    too: merge_ms is O(partitions) pure Python and should be milliseconds.
+
+    FAIL-SOFT by contract, like format_bulk_stats / format_progress: this is observability only and is
+    called from the export path, so any missing/renamed/oddly-typed field renders n/a and a non-dict or
+    stat-less input yields a marker line rather than an exception."""
+    try:
+        if not isinstance(result, dict):
+            return f"{BULK_STATS_TAG} tail: <no result: {type(result).__name__}>"
+        counts = (f"collect_ms={_num(result.get('collect_ms'))} "
+                  f"merge_ms={_num(result.get('merge_ms'))}")
+        parts = result.get("bulk_stats")
+        if not isinstance(parts, list) or not parts:
+            return f"{BULK_STATS_TAG} tail: <no bulk stats> {counts}"
+        parts = [p if isinstance(p, dict) else {} for p in parts]
+
+        def _val(p, key):
+            v = p.get(key)
+            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+        # Slowest partition by wall clock: it sets the write's tail. Only partitions carrying a numeric
+        # partition_wall_ms are eligible; if none do, the wall figures render n/a but skew/counts still
+        # report.
+        walls = [(_val(p, "partition_wall_ms"), i) for i, p in enumerate(parts)]
+        walls = [(w, i) for (w, i) in walls if w is not None]
+        if walls:
+            slow_wall, slow_i = max(walls, key=lambda t: t[0])
+            sp = parts[slow_i]
+            conc = _ratio(_val(sp, "send_busy_ms"), _val(sp, "partition_wall_ms"))
+            # The slowest partition's shape: n_sends (few big sends vs many small), rtt_ms_max vs
+            # took_ms_max (a big rtt with a small took = time waiting on the network / ES bulk queue,
+            # not indexing), busy/wall concurrency, and docs.
+            slow = (f"slowest=part{slow_i} wall_ms={_num(slow_wall)} "
+                    f"sends={_num(_val(sp, 'n_sends'))} "
+                    f"rtt_ms_max={_num(_val(sp, 'rtt_ms_max'))} "
+                    f"took_ms_max={_num(_val(sp, 'took_ms_max'))} "
+                    f"conc={_num(conc)} docs={_num(_val(sp, 'docs_sent'))}")
+            wall_vals = [w for (w, _i) in walls]
+            wall_med = _median(wall_vals)
+            # How the slow tail is shaped across partitions: p95 vs median vs max says whether it is one
+            # outlier (max >> p95 ~ median) or a broad slow tail (p95 >> median), and stragglers>2x counts
+            # how many partitions ran past 2x the median wall (1 == a lone straggler; many == systemic).
+            # Require a POSITIVE median: with a zero median (e.g. empty/near-empty partitions) `w > 2*0`
+            # collapses to `w > 0` and would flag every non-empty partition, a meaningless count.
+            straggler_ct = (sum(1 for w in wall_vals if w > 2 * wall_med)
+                            if isinstance(wall_med, (int, float)) and wall_med > 0 else 0)
+            wall_tokens = (f"median_wall_ms={_num(wall_med)} "
+                           f"wall_p95={_num(_percentile(wall_vals, 0.95))} "
+                           f"wall_max/median={_num(_ratio(slow_wall, wall_med))} "
+                           f"stragglers>2x={straggler_ct}")
+        else:
+            slow = "slowest=n/a"
+            wall_tokens = "median_wall_ms=n/a wall_p95=n/a wall_max/median=n/a stragglers>2x=0"
+
+        docs = [d for d in (_val(p, "docs_sent") for p in parts) if d is not None]
+        if docs:
+            docs_tokens = f"docs_max/median={_num(_ratio(max(docs), _median(docs)))}"
+        else:
+            docs_tokens = "docs_max/median=n/a"
+
+        return f"{BULK_STATS_TAG} tail: {slow} | {wall_tokens} {docs_tokens} {counts}"
+    except Exception as _e:  # never let a diagnostic formatter disturb the export
+        return f"{BULK_STATS_TAG} tail: <formatting failed: {type(_e).__name__}: {_e}>"
+
+
+def bulk_stats_relay_line(result, batch_id):
+    """The text to relay for one micro-batch: the compact `BULK_STATS overall` rollup (with batch_id)
+    plus the `BULK_STATS tail:` summary, or None when the result carries no bulk_stats (diagnostics off,
+    or an empty batch that shipped nothing).
+
+    The streaming path cannot print the connector's bulk_stats into the notebook cell directly: under
+    Spark Connect `foreachBatch` runs SERVER-side (its stdout goes to the driver log, and its Python
+    memory is a different process), while the StreamingQueryListener callback runs CLIENT-side (its
+    stdout reaches the cell - that is why STREAM_PROGRESS shows there). An in-memory handoff cannot
+    bridge the two. So `foreachBatch` writes this text to a small per-batch file (via the same Spark
+    write it already uses for the per-batch row count) and the listener reads it for the batch it is
+    reporting - a file is the one channel both sides share. This function is the PURE part (the content);
+    the notebook owns the file I/O so this module stays Spark/Databricks-free and unit-testable.
+
+    FAIL-SOFT: never raises (format_* are fail-soft), so a diagnostic fault cannot disturb the write."""
+    try:
+        if not isinstance(result, dict) or "bulk_stats" not in result:
+            return None
+        overall = format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}"
+        return overall + "\n" + format_tail_summary(result)
+    except Exception:  # never let a diagnostic helper disturb the export
+        return None
