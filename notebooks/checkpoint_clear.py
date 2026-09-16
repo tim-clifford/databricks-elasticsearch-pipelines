@@ -186,7 +186,17 @@ except Exception as exc:  # noqa: BLE001 - captured and re-raised in the final c
 # (or, if the base path is empty/absent, that nothing remains). Also probe the exact target so the final
 # cell can state definitively whether it is gone.
 print(f"checkpoints under {CHECKPOINT_BASE_PATH!r} (after):")
-_print_checkpoint_listing(CHECKPOINT_BASE_PATH)
+# Best-effort: this after-listing is DIAGNOSTIC only. The authoritative success signal is the guarded
+# GONE_AFTER re-check below, which fails closed on a real error against the target itself. So a failure to
+# re-list the base here (a transient IO / permission blip on the base dir) must neither bypass the RESULTS
+# cell with a bare traceback nor turn a verified-successful clear into a false failure: warn and continue,
+# and let GONE_AFTER decide the outcome. (Cell 2's before-listing is deliberately NOT wrapped: it runs
+# before any delete, so a hard failure there is a clean fail-closed with nothing done.)
+try:
+    _print_checkpoint_listing(CHECKPOINT_BASE_PATH)
+except Exception as exc:  # noqa: BLE001 - diagnostic listing only; outcome is decided by GONE_AFTER
+    print(f"  WARNING: could not list base path after delete ({type(exc).__name__}: {exc}); "
+          f"the clear result is decided by the target re-check below")
 
 # Ground-truth re-check of the exact target. Only meaningful when the delete did not itself error.
 # Guarded like the delete: a non-not-found error here (permission/403, transient IO) is captured into
