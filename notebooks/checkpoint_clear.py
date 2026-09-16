@@ -12,9 +12,11 @@
 # MAGIC Elasticsearch connection setting.
 # MAGIC
 # MAGIC Parameters:
-# MAGIC - `config_name` (job parameter, REQUIRED): the pipeline definition whose checkpoint to clear
-# MAGIC   (`_pipelines/pipeline_configs/<config_name>.yml`). Default is blank; a blank, malformed, or
-# MAGIC   unknown value fails closed.
+# MAGIC - `config_name` (job parameter, REQUIRED): the pipeline whose checkpoint to clear. Default is
+# MAGIC   blank; a blank or malformed value (outside the `[A-Za-z0-9_-]+` config-stem charset) fails
+# MAGIC   closed. A name with no matching `_pipelines/pipeline_configs/<config_name>.yml` is only WARNED,
+# MAGIC   not rejected: a checkpoint can outlive a removed pipeline, and a typo simply finds nothing to
+# MAGIC   delete (reported as a warning).
 # MAGIC - `checkpoint_base_path` (deploy-time base_parameter, from the `${var.checkpoint_base_path}` bundle
 # MAGIC   variable): the UC Volume base under which every stream keeps its checkpoint. The target folder is
 # MAGIC   `{checkpoint_base_path}/{config_name}`, composed the IDENTICAL way the runner composes
@@ -67,22 +69,30 @@ if not CHECKPOINT_BASE_PATH:
         "a checkpoint clear needs a UC Volume checkpoint base"
     )
 
-# Resolve the synced bundle root so we can confirm the pipeline definition exists. This notebook is synced
-# to <bundle files>/notebooks/checkpoint_clear.py; the _pipelines/ tree is a sibling of notebooks/. Same
-# resolution deploy_views.py and run_index_pipeline.py use.
+# Resolve the synced bundle root so we can look up the matching pipeline definition. This notebook is
+# synced to <bundle files>/notebooks/checkpoint_clear.py; the _pipelines/ tree is a sibling of notebooks/.
+# Same resolution deploy_views.py and run_index_pipeline.py use.
 _nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
 FILES_ROOT = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # .../files
 CONFIG_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_configs")
 
-# Accept either extension (gen_jobs.py and deploy_views.py both discover .yml AND .yaml), matching
-# run_index_pipeline.py's config resolution. Fail closed if neither exists: a clear must name a real
-# pipeline, so a typo raises here rather than silently "succeeding" against a path no pipeline owns.
+# Look up the matching pipeline definition, accepting either extension (gen_jobs.py and deploy_views.py
+# both discover .yml AND .yaml), the same lookup run_index_pipeline.py uses. This is ADVISORY, NOT a gate:
+# a checkpoint can legitimately OUTLIVE its config - a pipeline removed from _pipelines/pipeline_configs may
+# leave a lingering checkpoint we still want to clear - so a missing definition WARNS and proceeds rather
+# than failing closed. This deliberately does NOT reject a config_name absent from pipeline_configs. The
+# genuine typo case is still caught, without being restrictive: a mistyped name resolves to a checkpoint
+# path that does not exist, which Cell 3 reports as a NOT_PRESENT warning (nothing deleted). The charset
+# gate above independently fends off path traversal whether or not a definition exists.
 CONFIG_PATH = next(
     (p for ext in (".yml", ".yaml") if os.path.exists(p := os.path.join(CONFIG_DIR, f"{CONFIG_NAME}{ext}"))),
     None,
 )
 if CONFIG_PATH is None:
-    raise ValueError(f"no pipeline definition found for {CONFIG_NAME!r} (.yml/.yaml) in {CONFIG_DIR}")
+    print(f"WARNING: no current pipeline definition for {CONFIG_NAME!r} (.yml/.yaml) in {CONFIG_DIR}. "
+          f"Proceeding anyway to clear any lingering checkpoint - a pipeline removed from pipeline_configs "
+          f"can leave one behind. If instead this name is a typo, its checkpoint will simply not exist and "
+          f"nothing will be deleted (reported below).")
 
 # SINGLE SOURCE OF TRUTH for the target path: composed the IDENTICAL way the runner builds
 # checkpoint_location (run_index_pipeline.py streaming branch and reset_checkpoint mode), so this job
@@ -91,7 +101,7 @@ CHECKPOINT_LOCATION = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
 
 print("checkpoint clear - parameters:")
 print(f"  config_name          = {CONFIG_NAME!r}")
-print(f"  pipeline definition   = {CONFIG_PATH!r}")
+print(f"  pipeline definition   = {CONFIG_PATH!r}" + ("" if CONFIG_PATH else "  (none - see warning above)"))
 print(f"  checkpoint_base_path  = {CHECKPOINT_BASE_PATH!r}")
 print(f"  target checkpoint dir = {CHECKPOINT_LOCATION!r}")
 
