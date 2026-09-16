@@ -13,6 +13,7 @@ raised. It reads values exactly as the runtime emits them - notably the Delta so
 so a metric this runtime does not emit today (e.g. numNewListedFiles) simply appears when it does.
 """
 import json
+from datetime import datetime, timezone
 
 # Log-line prefix. Stable and distinctive so a run's driver log can be grepped for the per-batch trail
 # (e.g. `grep STREAM_PROGRESS`). Do not change it casually: it is the documented handle for the trail.
@@ -28,6 +29,31 @@ BULK_STATS_TAG = "BULK_STATS"
 # renders as n/a rather than raising (fail-soft).
 _RTT_KEYS = ("rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max")
 _TOOK_KEYS = ("took_ms_p50", "took_ms_p95", "took_ms_max")
+# The GIL-wait probe keys the connector emits (total stall over the partition plus its distribution).
+# A high gil_wait beside a high rtt means the round trip is inflated by GIL starvation (client-side,
+# under a high write_concurrency), not a real socket/ES wait. Absent on pre-gil-probe connectors -> n/a.
+_GIL_KEYS = ("gil_wait_ms_total", "gil_wait_ms_p95", "gil_wait_ms_max")
+
+
+def _ts_token(now=None):
+    """Wall-clock `ts=<ISO-8601 UTC, ms>Z` token appended to each emitted line so the trail can be
+    placed in real time and correlated with ES/cluster metrics. It matters most for the streaming
+    BULK_STATS relay: `foreachBatch` BUILDS the line server-side, but the listener PRINTS it client-side
+    later, so the driver log's own line timestamp is the relay time, not the batch time -- this token
+    captures the batch time at the moment the line is built. `now=None` reads the current UTC time; tests
+    pass a fixed datetime. Fail-soft: returns '' if the clock read fails, so a formatter never raises."""
+    try:
+        dt = now if now is not None else datetime.now(timezone.utc)
+        return f"ts={dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond // 1000:03d}Z"
+    except Exception:
+        return ""
+
+
+def _with_ts(line, now=None):
+    """Append the `ts=` token to a finished line (at the END, so every existing tag/keyword prefix and
+    its `startswith` contract is preserved). Drops the token silently if the clock read failed."""
+    ts = _ts_token(now)
+    return f"{line} {ts}" if ts else line
 
 # The backlog metrics we call out by name (the "am I caught up or behind" signal). Any OTHER metric key
 # the runtime emits is still surfaced generically after these, so this is a highlight list, not a filter.
@@ -107,7 +133,7 @@ def _num(value):
     return str(value)
 
 
-def format_bulk_stats(bulk_stats, oneline=False):
+def format_bulk_stats(bulk_stats, oneline=False, now=None):
     """Render the connector's per-partition `bulk_stats` as greppable BULK_STATS log line(s).
 
     `bulk_stats` is the list the connector returns under result['bulk_stats'] when EsWriteConfig
@@ -119,7 +145,13 @@ def format_bulk_stats(bulk_stats, oneline=False):
     bytes_sent/docs_sent is the real per-document size (no ES query) and bytes_sent/n_sends the
     per-request size - comparing rtt against these tells a fixed per-request latency apart from a
     transfer-bound write. send_busy_ms/partition_wall_ms is the effective in-flight concurrency the
-    partition reached (~1 == sends ran serially, ~write_concurrency == fully overlapped).
+    partition reached (~1 == sends ran serially, ~write_concurrency == fully overlapped). send_cpu_ms is
+    the worker CPU burned inside es.bulk (so send_busy_ms - send_cpu_ms is off-CPU send time) and the
+    gil_wait_ms_* come from the connector's GIL-acquisition probe: a large gil_wait beside a high rtt
+    means the round trip is inflated by GIL starvation (client-side, under a high write_concurrency),
+    not a genuine socket/ES wait. Both are n/a on connectors that predate those fields. A `ts=<UTC>`
+    wall-clock token is appended to the overall line (see _ts_token: it is the batch time even when the
+    relay prints the line later); `now` is injectable for tests.
 
     Returns a multi-line string: an `overall` line (cluster-wide rollup) followed by one line per
     partition, OR just the overall line when oneline=True (used by the streaming per-batch log to avoid
@@ -146,11 +178,20 @@ def format_bulk_stats(bulk_stats, oneline=False):
                     total += v
             return total
 
+        def _sum_opt(key):
+            """Sum like _sum, but return None (renders n/a) when NO partition carried a numeric value,
+            so a field the connector never emitted reads as 'not measured' rather than a false 0."""
+            present = [p.get(key) for p in parts
+                       if isinstance(p.get(key), (int, float)) and not isinstance(p.get(key), bool)]
+            return sum(present) if present else None
+
         total_sends = _sum("n_sends")
         total_docs = _sum("docs_sent")
         total_bytes = _sum("bytes_sent")
         total_busy = _sum("send_busy_ms")
         total_wall = _sum("partition_wall_ms")
+        total_cpu = _sum_opt("send_cpu_ms")            # off-CPU send time = busy - cpu (n/a on old wheels)
+        total_gil = _sum_opt("gil_wait_ms_total")      # summed GIL stall across partitions (n/a if unset)
         docs_per_send = (total_docs / total_sends) if total_sends else 0.0
 
         def _pair_ratio(num, den):
@@ -190,33 +231,38 @@ def format_bulk_stats(bulk_stats, oneline=False):
             f"bytes/send={_num(_rounded(_pair_ratio(total_bytes, total_sends), 1))} "
             f"conc(busy/wall)={_num(_rounded(_pair_ratio(total_busy, total_wall), 2))} "
             f"rtt_ms(mean={_num(_weighted_mean('rtt_ms_mean'))} max={_num(_max('rtt_ms_max'))}) "
-            f"took_ms(mean={_num(_weighted_mean('took_ms_mean'))} max={_num(_max('took_ms_max'))})"
+            f"took_ms(mean={_num(_weighted_mean('took_ms_mean'))} max={_num(_max('took_ms_max'))}) "
+            f"cpu_ms(total={_num(_rounded(total_cpu, 1))}) "
+            f"gil_wait_ms(total={_num(_rounded(total_gil, 1))} max={_num(_max('gil_wait_ms_max'))})"
         )
         if oneline:
-            return overall
+            return _with_ts(overall, now)
 
-        lines = [overall]
+        lines = [_with_ts(overall, now)]
         for i, p in enumerate(parts):
             rtt = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _RTT_KEYS)
             took = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _TOOK_KEYS)
+            gil = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _GIL_KEYS)
             bytes_per_doc = _pair_ratio(p.get("bytes_sent"), p.get("docs_sent"))
             conc = _pair_ratio(p.get("send_busy_ms"), p.get("partition_wall_ms"))
             lines.append(
                 f"{BULK_STATS_TAG}   part{i}: sends={_num(p.get('n_sends'))} "
                 f"docs={_num(p.get('docs_sent'))} bytes/doc={_num(_rounded(bytes_per_doc, 1))} "
-                f"conc={_num(_rounded(conc, 2))} rtt_ms({rtt}) took_ms({took})"
+                f"conc={_num(_rounded(conc, 2))} cpu_ms={_num(p.get('send_cpu_ms'))} "
+                f"rtt_ms({rtt}) took_ms({took}) gil_wait_ms({gil})"
             )
         return "\n".join(lines)
     except Exception as _e:  # never let a diagnostic formatter disturb the export
         return f"{BULK_STATS_TAG} <formatting failed: {type(_e).__name__}: {_e}>"
 
 
-def format_progress(progress):
+def format_progress(progress, now=None):
     """Render one StreamingQueryProgress (parsed to a dict) as a single greppable STREAM_PROGRESS line.
 
-    FAIL-SOFT by contract (see module docstring): returns a best-effort string for any input and never
-    raises, so a listener callback built on it cannot destabilize the stream. A non-dict input yields a
-    marker line rather than an exception.
+    A `ts=<UTC>` wall-clock token is appended so the batch can be placed in real time. FAIL-SOFT by
+    contract (see module docstring): returns a best-effort string for any input and never raises, so a
+    listener callback built on it cannot destabilize the stream. A non-dict input yields a marker line
+    rather than an exception. `now` is injectable for tests; None uses the current time.
     """
     if not isinstance(progress, dict):
         return f"{PROGRESS_TAG} <unparseable progress: {type(progress).__name__}>"
@@ -242,7 +288,7 @@ def format_progress(progress):
     if isinstance(sources, list):
         for i, source in enumerate(sources):
             tokens.extend(_source_tokens(i, source))
-    return " ".join(tokens)
+    return _with_ts(" ".join(tokens), now)
 
 
 def _ratio(num, den):
@@ -276,7 +322,7 @@ def _percentile(vals, q):
     return nums[idx]
 
 
-def format_tail_summary(result):
+def format_tail_summary(result, now=None):
     """Render a one-line `BULK_STATS tail:` summary from a bulk_write result dict, calling out the
     STRAGGLER and SKEW behind a wall-time tail that persists after "all tasks complete".
 
@@ -292,9 +338,10 @@ def format_tail_summary(result):
     tail that is NOT inside a partition (Spark result finalization, or the driver rollup) is visible
     too: merge_ms is O(partitions) pure Python and should be milliseconds.
 
-    FAIL-SOFT by contract, like format_bulk_stats / format_progress: this is observability only and is
-    called from the export path, so any missing/renamed/oddly-typed field renders n/a and a non-dict or
-    stat-less input yields a marker line rather than an exception."""
+    A `ts=<UTC>` wall-clock token is appended (the batch time even when the relay prints it later);
+    `now` is injectable for tests. FAIL-SOFT by contract, like format_bulk_stats / format_progress: this
+    is observability only and is called from the export path, so any missing/renamed/oddly-typed field
+    renders n/a and a non-dict or stat-less input yields a marker line rather than an exception."""
     try:
         if not isinstance(result, dict):
             return f"{BULK_STATS_TAG} tail: <no result: {type(result).__name__}>"
@@ -302,7 +349,7 @@ def format_tail_summary(result):
                   f"merge_ms={_num(result.get('merge_ms'))}")
         parts = result.get("bulk_stats")
         if not isinstance(parts, list) or not parts:
-            return f"{BULK_STATS_TAG} tail: <no bulk stats> {counts}"
+            return _with_ts(f"{BULK_STATS_TAG} tail: <no bulk stats> {counts}", now)
         parts = [p if isinstance(p, dict) else {} for p in parts]
 
         def _val(p, key):
@@ -321,10 +368,14 @@ def format_tail_summary(result):
             # The slowest partition's shape: n_sends (few big sends vs many small), rtt_ms_max vs
             # took_ms_max (a big rtt with a small took = time waiting on the network / ES bulk queue,
             # not indexing), busy/wall concurrency, and docs.
+            # gil_wait_ms_total on the slowest partition is a first-class "why it lagged" signal: a large
+            # value beside a large rtt_ms_max says the tail is GIL starvation (the worker could not read
+            # the ES response), not the network / ES queue. n/a on connectors without the probe.
             slow = (f"slowest=part{slow_i} wall_ms={_num(slow_wall)} "
                     f"sends={_num(_val(sp, 'n_sends'))} "
                     f"rtt_ms_max={_num(_val(sp, 'rtt_ms_max'))} "
                     f"took_ms_max={_num(_val(sp, 'took_ms_max'))} "
+                    f"gil_wait_ms_total={_num(_val(sp, 'gil_wait_ms_total'))} "
                     f"conc={_num(conc)} docs={_num(_val(sp, 'docs_sent'))}")
             wall_vals = [w for (w, _i) in walls]
             wall_med = _median(wall_vals)
@@ -349,15 +400,16 @@ def format_tail_summary(result):
         else:
             docs_tokens = "docs_max/median=n/a"
 
-        return f"{BULK_STATS_TAG} tail: {slow} | {wall_tokens} {docs_tokens} {counts}"
+        return _with_ts(f"{BULK_STATS_TAG} tail: {slow} | {wall_tokens} {docs_tokens} {counts}", now)
     except Exception as _e:  # never let a diagnostic formatter disturb the export
         return f"{BULK_STATS_TAG} tail: <formatting failed: {type(_e).__name__}: {_e}>"
 
 
-def bulk_stats_relay_line(result, batch_id):
+def bulk_stats_relay_line(result, batch_id, now=None):
     """The text to relay for one micro-batch: the compact `BULK_STATS overall` rollup (with batch_id)
     plus the `BULK_STATS tail:` summary, or None when the result carries no bulk_stats (diagnostics off,
-    or an empty batch that shipped nothing).
+    or an empty batch that shipped nothing). Both lines carry the SAME `ts=` batch timestamp, captured
+    here when the line is built (server-side in foreachBatch) so it survives the later client-side print.
 
     The streaming path cannot print the connector's bulk_stats into the notebook cell directly: under
     Spark Connect `foreachBatch` runs SERVER-side (its stdout goes to the driver log, and its Python
@@ -372,7 +424,10 @@ def bulk_stats_relay_line(result, batch_id):
     try:
         if not isinstance(result, dict) or "bulk_stats" not in result:
             return None
-        overall = format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}"
-        return overall + "\n" + format_tail_summary(result)
+        # One timestamp for the whole batch: capture it once so the overall and tail lines agree.
+        if now is None:
+            now = datetime.now(timezone.utc)
+        overall = format_bulk_stats(result["bulk_stats"], oneline=True, now=now) + f" batch_id={batch_id}"
+        return overall + "\n" + format_tail_summary(result, now=now)
     except Exception:  # never let a diagnostic helper disturb the export
         return None
