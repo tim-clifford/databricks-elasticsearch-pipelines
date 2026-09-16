@@ -13,7 +13,8 @@
 # MAGIC
 # MAGIC Parameters:
 # MAGIC - `config_name` (job parameter, REQUIRED): the pipeline definition whose checkpoint to clear
-# MAGIC   (`_pipelines/pipeline_configs/<config_name>.yml`). Default is blank; a blank value fails closed.
+# MAGIC   (`_pipelines/pipeline_configs/<config_name>.yml`). Default is blank; a blank, malformed, or
+# MAGIC   unknown value fails closed.
 # MAGIC - `checkpoint_base_path` (deploy-time base_parameter, from the `${var.checkpoint_base_path}` bundle
 # MAGIC   variable): the UC Volume base under which every stream keeps its checkpoint. The target folder is
 # MAGIC   `{checkpoint_base_path}/{config_name}`, composed the IDENTICAL way the runner composes
@@ -21,14 +22,26 @@
 # MAGIC   from - never the shared base, never another pipeline's checkpoint.
 
 # COMMAND ----------
-# Cell 1 - DEBUG INFO. Read the two parameters, fail closed on anything missing, compose the target
-# checkpoint path, and print everything relevant before we touch the filesystem.
+# Cell 1 - DEBUG INFO. Read the two parameters, fail closed on anything missing or unsafe, tie config_name
+# to a real pipeline definition, compose the target checkpoint path, and print everything relevant before
+# we touch the filesystem.
 #
 # config_name is a per-run JOB PARAMETER (default "" in the job resource, overridable with
 # `--params config_name=<name>`); checkpoint_base_path is a DEPLOY-TIME base_parameter (the bundle
-# variable). Both arrive as notebook widgets. We read the effective value, strip it, and validate: a
-# blank config_name or an empty checkpoint_base_path fails closed here (never a silent no-target delete),
-# mirroring the runner's own required-parameter checks.
+# variable). Both arrive as notebook widgets. We read the effective value, strip it, and validate:
+#   1. config_name non-empty (never a no-target run),
+#   2. config_name is a bare config stem - an allow-list of [A-Za-z0-9_-] (the config-stem charset used
+#      throughout pipeline_lib, e.g. the job-group/cluster-key validators). This rejects path separators
+#      and `..` BEFORE the name is ever interpolated into a path we recursively delete, so a value like
+#      '../other' can't escape the base and delete another pipeline's checkpoint (or a parent dir),
+#   3. checkpoint_base_path non-empty,
+#   4. a matching _pipelines/pipeline_configs/<config_name>.yml (or .yaml) EXISTS - resolved the same way
+#      run_index_pipeline.py does before its reset_checkpoint delete. This ties the clear to a real
+#      pipeline: a typo'd/unknown config_name fails closed here instead of composing a nonexistent path
+#      and reporting a benign "nothing to delete" success.
+import os
+import re
+
 dbutils.widgets.text("config_name", "", "Pipeline definition whose checkpoint to clear (_pipelines/pipeline_configs/<config_name>.yml)")
 dbutils.widgets.text("checkpoint_base_path", "", "UC Volume base for streaming checkpoints (this job appends /<config_name>)")
 CONFIG_NAME = dbutils.widgets.get("config_name").strip()
@@ -36,6 +49,14 @@ CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
 
 if not CONFIG_NAME:
     raise ValueError("missing required parameter: config_name")
+# Allow-list the config-stem charset (letters, digits, underscore, hyphen), the same charset pipeline_lib
+# holds a config stem to. Fails closed on anything else - crucially any '/' or '.' - so the name cannot
+# carry a path separator or `..` into the composed, recursively-deleted path.
+if not re.fullmatch(r"[A-Za-z0-9_-]+", CONFIG_NAME):
+    raise ValueError(
+        f"invalid config_name {CONFIG_NAME!r}: must match [A-Za-z0-9_-]+ (a bare pipeline config stem, "
+        f"no path separators)"
+    )
 if not CHECKPOINT_BASE_PATH:
     # checkpoint_base_path is empty on main and set per target; a clear with no base path has no
     # location to act on, so fail closed rather than compose a meaningless path.
@@ -44,6 +65,23 @@ if not CHECKPOINT_BASE_PATH:
         "a checkpoint clear needs a UC Volume checkpoint base"
     )
 
+# Resolve the synced bundle root so we can confirm the pipeline definition exists. This notebook is synced
+# to <bundle files>/notebooks/checkpoint_clear.py; the _pipelines/ tree is a sibling of notebooks/. Same
+# resolution deploy_views.py and run_index_pipeline.py use.
+_nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+FILES_ROOT = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # .../files
+CONFIG_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_configs")
+
+# Accept either extension (gen_jobs.py and deploy_views.py both discover .yml AND .yaml), matching
+# run_index_pipeline.py's config resolution. Fail closed if neither exists: a clear must name a real
+# pipeline, so a typo raises here rather than silently "succeeding" against a path no pipeline owns.
+CONFIG_PATH = next(
+    (p for ext in (".yml", ".yaml") if os.path.exists(p := os.path.join(CONFIG_DIR, f"{CONFIG_NAME}{ext}"))),
+    None,
+)
+if CONFIG_PATH is None:
+    raise ValueError(f"no pipeline definition found for {CONFIG_NAME!r} (.yml/.yaml) in {CONFIG_DIR}")
+
 # SINGLE SOURCE OF TRUTH for the target path: composed the IDENTICAL way the runner builds
 # checkpoint_location (run_index_pipeline.py streaming branch and reset_checkpoint mode), so this job
 # clears exactly the checkpoint the stream would resume from - and only that one, never the shared base.
@@ -51,6 +89,7 @@ CHECKPOINT_LOCATION = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
 
 print("checkpoint clear - parameters:")
 print(f"  config_name          = {CONFIG_NAME!r}")
+print(f"  pipeline definition   = {CONFIG_PATH!r}")
 print(f"  checkpoint_base_path  = {CHECKPOINT_BASE_PATH!r}")
 print(f"  target checkpoint dir = {CHECKPOINT_LOCATION!r}")
 
@@ -88,7 +127,7 @@ if _path_exists(CHECKPOINT_BASE_PATH):
     else:
         print("  (base path exists but is empty - no checkpoints)")
 else:
-    print(f"  (base path does not exist yet - nothing to list)")
+    print("  (base path does not exist yet - nothing to list)")
 
 # COMMAND ----------
 # Cell 3 - DELETE. Remove the target checkpoint folder if it exists; if it does not, WARN (a no-op, not
@@ -96,7 +135,7 @@ else:
 # reported by the final cell, which then fails the run - a maintenance job that could not do its one job
 # must not report green.
 EXISTED_BEFORE = None   # True/False once probed; None means the probe itself errored
-DELETED = False         # True only if rm actually removed the folder
+RM_RESULT = None        # bool dbutils.fs.rm returned (True removed, False path already absent)
 CLEAR_ERROR = None      # str of any real (non-not-found) failure
 
 try:
@@ -104,9 +143,12 @@ try:
     if EXISTED_BEFORE:
         print(f"deleting checkpoint directory {CHECKPOINT_LOCATION!r}")
         # dbutils.fs.rm(recurse=True) removes the directory and everything under it (offsets, commits,
-        # sources, metrics). It returns True when it removed a path. We report that boolean verbatim.
-        DELETED = bool(dbutils.fs.rm(CHECKPOINT_LOCATION, recurse=True))
-        print(f"deleted (rm returned {DELETED})")
+        # sources, metrics). It returns True when it removed a path and False when the path was already
+        # absent. We report that boolean verbatim, but base success on the verified end state (cell 5),
+        # not on this boolean: if another actor removes the folder between the probe and this rm, rm
+        # returns False yet the goal (folder gone) is still met.
+        RM_RESULT = bool(dbutils.fs.rm(CHECKPOINT_LOCATION, recurse=True))
+        print(f"delete issued (rm returned {RM_RESULT})")
     else:
         print(f"WARNING: checkpoint directory {CHECKPOINT_LOCATION!r} does not exist - nothing to delete "
               f"(config_name={CONFIG_NAME!r}). No action taken.")
@@ -127,7 +169,7 @@ if _path_exists(CHECKPOINT_BASE_PATH):
     else:
         print("  (base path exists but is empty - no checkpoints)")
 else:
-    print(f"  (base path does not exist - nothing remains)")
+    print("  (base path does not exist - nothing remains)")
 
 # Ground-truth re-check of the exact target. Only meaningful when the delete did not itself error.
 GONE_AFTER = None
@@ -136,19 +178,23 @@ if CLEAR_ERROR is None:
     print(f"target {CHECKPOINT_LOCATION!r} present after: {not GONE_AFTER}")
 
 # COMMAND ----------
-# Cell 5 - RESULTS. Summarize what happened: whether the folder existed, whether it was deleted, whether
-# it is verified gone, and any error. If a real error occurred, RAISE after reporting so the job run
-# fails closed (a missing folder is a benign warning and succeeds; a failed delete does not).
+# Cell 5 - RESULTS. Summarize what happened: whether the folder existed, whether it is verified gone, and
+# any error. Success is defined by the VERIFIED END STATE, not by rm's boolean: if the folder existed and
+# is now gone (whether this job's rm removed it or a concurrent actor did), that is DELETED. If a real
+# error occurred, or the folder existed and is still present, RAISE after reporting so the job run fails
+# closed (a missing folder is a benign warning and succeeds).
 if CLEAR_ERROR is not None:
     outcome = "ERROR"
 elif EXISTED_BEFORE:
-    outcome = "DELETED" if (DELETED and GONE_AFTER) else "DELETE_INCOMPLETE"
+    # GONE_AFTER, not RM_RESULT, decides success - so a probe/rm race that reaches the goal is not a
+    # false failure.
+    outcome = "DELETED" if GONE_AFTER else "DELETE_INCOMPLETE"
 else:
     outcome = "NOT_PRESENT"
 
 SUMMARY = (
     f"checkpoint_clear outcome={outcome} config_name={CONFIG_NAME!r} "
-    f"checkpoint={CHECKPOINT_LOCATION!r} existed_before={EXISTED_BEFORE} deleted={DELETED} "
+    f"checkpoint={CHECKPOINT_LOCATION!r} existed_before={EXISTED_BEFORE} rm_result={RM_RESULT} "
     f"gone_after={GONE_AFTER} error={CLEAR_ERROR!r}"
 )
 print(f"CHECKPOINT CLEAR COMPLETE: {SUMMARY}")
