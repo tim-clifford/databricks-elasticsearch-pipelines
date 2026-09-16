@@ -1,0 +1,41 @@
+resources:
+  jobs:
+    checkpoint_clear:
+      name: "[${bundle.target}] ${var.job_name_prefix}: _checkpoint clear"
+      description: >-
+        A serverless maintenance job that DELETES the Structured Streaming checkpoint directory for a
+        single pipeline config, so that pipeline's next streaming run starts fresh. Takes one required
+        job parameter, config_name; the target is {checkpoint_base_path}/{config_name}, composed the same
+        way notebooks/run_index_pipeline.py composes checkpoint_location, so it can only clear the
+        checkpoint that pipeline would resume from. Standalone counterpart to the runner's in-line
+        pipeline_mode=reset_checkpoint. No cluster block => serverless notebook task.
+
+      # config_name is REQUIRED: the run-time parameter naming the pipeline whose checkpoint to clear.
+      # Default is blank; the notebook fails closed on a blank value (never a no-target delete). Override
+      # per run with `--params config_name=<name>` (or set it in the Run dialog).
+      parameters:
+        - name: config_name
+          default: ""
+
+      # Never run two copies at once, consistent with every index job and deploy_views. Fixed at 1.
+      max_concurrent_runs: 1
+
+      # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
+      # rather than queued, matching every generated job and deploy_views (see scripts/gen_jobs.py).
+      queue:
+        enabled: false
+
+      tasks:
+        - task_key: checkpoint_clear
+          notebook_task:
+            notebook_path: ../notebooks/checkpoint_clear.py
+            # checkpoint_base_path is the deploy-time bundle variable (the UC Volume streaming base); the
+            # notebook appends /<config_name>. config_name arrives as a job parameter (above), not here.
+            base_parameters:
+              checkpoint_base_path: ${var.checkpoint_base_path}
+
+      # On-demand: invoke via `databricks bundle run checkpoint_clear --params config_name=<name>`.
+      # CAN_MANAGE_RUN so any teammate in `users` can trigger it, matching deploy_views.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          group_name: users
