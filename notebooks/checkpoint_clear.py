@@ -49,9 +49,11 @@ CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
 
 if not CONFIG_NAME:
     raise ValueError("missing required parameter: config_name")
-# Allow-list the config-stem charset (letters, digits, underscore, hyphen), the same charset pipeline_lib
-# holds a config stem to. Fails closed on anything else - crucially any '/' or '.' - so the name cannot
-# carry a path separator or `..` into the composed, recursively-deleted path.
+# Allow-list the config-stem charset (letters, digits, underscore, hyphen). This is the SAME charset the
+# generator holds every config stem to (scripts/gen_jobs.py _VALID_STEM = ^[A-Za-z0-9_-]+$; mirrored by
+# pipeline_lib.config._VALID_JOB_GROUP / _VALID_JOB_CLUSTER_KEY), so a name valid here is exactly a name
+# that could have produced a deployed pipeline. Fails closed on anything else - crucially any '/' or '.' -
+# so the name cannot carry a path separator or `..` into the composed, recursively-deleted path.
 if not re.fullmatch(r"[A-Za-z0-9_-]+", CONFIG_NAME):
     raise ValueError(
         f"invalid config_name {CONFIG_NAME!r}: must match [A-Za-z0-9_-]+ (a bare pipeline config stem, "
@@ -113,21 +115,44 @@ def _path_exists(path: str) -> bool:
             return False
         raise
 
+
+def _list_checkpoints(base: str):
+    """List the entries directly under `base`, returning (exists, entries).
+
+    Collapses the existence probe and the listing into ONE dbutils.fs.ls call so there is no
+    time-of-check/time-of-use window: a concurrent removal of the base path between a separate probe
+    and ls would otherwise raise uncaught. Not-found (any of the runtime's signals) degrades to
+    (False, []) - the benign "base path does not exist" branch; ANY other error re-raises (fail
+    closed), matching _path_exists.
+    """
+    try:
+        return True, dbutils.fs.ls(base)
+    except Exception as exc:  # noqa: BLE001 - narrowed below; non-not-found is re-raised
+        msg = str(exc)
+        if "FileNotFoundException" in msg or "No such file or directory" in msg or "does not exist" in msg:
+            return False, []
+        raise
+
+
+def _print_checkpoint_listing(base: str) -> None:
+    """Print every checkpoint directly under `base`, or a benign notice if it is absent/empty."""
+    exists, entries = _list_checkpoints(base)
+    if not exists:
+        print("  (base path does not exist - nothing to list)")
+    elif entries:
+        for entry in sorted(entries, key=lambda e: e.name):
+            print(f"  {entry.name}")
+    else:
+        print("  (base path exists but is empty - no checkpoints)")
+
 # COMMAND ----------
 # Cell 2 - BEFORE listing. Show every checkpoint that currently exists under the base path, so it is
 # visible in the run log which checkpoints are present (and that the target is among them) before we
 # delete anything. If the base path itself does not exist yet (no stream has ever checkpointed here),
-# that is not an error: report it and carry on - the target folder cannot exist either, handled next.
+# that is not an error: the helper reports it and we carry on - the target folder cannot exist either,
+# handled next.
 print(f"checkpoints under {CHECKPOINT_BASE_PATH!r} (before):")
-if _path_exists(CHECKPOINT_BASE_PATH):
-    _before = dbutils.fs.ls(CHECKPOINT_BASE_PATH)
-    if _before:
-        for _entry in sorted(_before, key=lambda e: e.name):
-            print(f"  {_entry.name}")
-    else:
-        print("  (base path exists but is empty - no checkpoints)")
-else:
-    print("  (base path does not exist yet - nothing to list)")
+_print_checkpoint_listing(CHECKPOINT_BASE_PATH)
 
 # COMMAND ----------
 # Cell 3 - DELETE. Remove the target checkpoint folder if it exists; if it does not, WARN (a no-op, not
@@ -161,21 +186,20 @@ except Exception as exc:  # noqa: BLE001 - captured and re-raised in the final c
 # (or, if the base path is empty/absent, that nothing remains). Also probe the exact target so the final
 # cell can state definitively whether it is gone.
 print(f"checkpoints under {CHECKPOINT_BASE_PATH!r} (after):")
-if _path_exists(CHECKPOINT_BASE_PATH):
-    _after = dbutils.fs.ls(CHECKPOINT_BASE_PATH)
-    if _after:
-        for _entry in sorted(_after, key=lambda e: e.name):
-            print(f"  {_entry.name}")
-    else:
-        print("  (base path exists but is empty - no checkpoints)")
-else:
-    print("  (base path does not exist - nothing remains)")
+_print_checkpoint_listing(CHECKPOINT_BASE_PATH)
 
 # Ground-truth re-check of the exact target. Only meaningful when the delete did not itself error.
+# Guarded like the delete: a non-not-found error here (permission/403, transient IO) is captured into
+# CLEAR_ERROR rather than propagating, so the RESULTS cell still runs, reports a SUMMARY, and raises -
+# the structured fail-closed reporting is never bypassed by a bare traceback.
 GONE_AFTER = None
 if CLEAR_ERROR is None:
-    GONE_AFTER = not _path_exists(CHECKPOINT_LOCATION)
-    print(f"target {CHECKPOINT_LOCATION!r} present after: {not GONE_AFTER}")
+    try:
+        GONE_AFTER = not _path_exists(CHECKPOINT_LOCATION)
+        print(f"target {CHECKPOINT_LOCATION!r} present after: {not GONE_AFTER}")
+    except Exception as exc:  # noqa: BLE001 - captured so Cell 5 still reports and raises
+        CLEAR_ERROR = f"{type(exc).__name__}: {exc}"
+        print(f"ERROR while re-checking target after delete: {CLEAR_ERROR}")
 
 # COMMAND ----------
 # Cell 5 - RESULTS. Summarize what happened: whether the folder existed, whether it is verified gone, and
