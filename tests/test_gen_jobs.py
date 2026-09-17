@@ -117,16 +117,17 @@ def test_render_scheduled_job_disables_queue():
 
 
 def test_render_all_jobs_notify_support_email_on_failure():
-    # Every generated job emails ${var.support_email} on a run failure. The variable is empty in dev/stg
-    # (the Jobs API drops the empty on_failure entry, so no emails) and set only in prd, so the same
-    # emitted block gives per-target control. Holds for every compute; independent of schedule/continuous.
+    # Every generated job emails the ${var.support_email} recipients on a run failure. on_failure
+    # references the whole complex LIST variable (NOT [${var.support_email}]) so an empty-list target
+    # resolves to [] (no recipients = off), never [""]. The variable is empty in dev/stg and set only in
+    # prd, so the same emitted block gives per-target control. Holds for every compute.
     for compute, spec in (
         (None, None),
         ({"type": "existing_cluster", "cluster_config": "interactive_primary"}, None),
         ({"type": "job_cluster", "job_cluster_config": "std"}, {"spark_version": "15.4.x-scala2.12", "num_workers": 1}),
     ):
         assert _render_job(_cfg(compute), spec)["email_notifications"] == {
-            "on_failure": ["${var.support_email}"]
+            "on_failure": "${var.support_email}"
         }
 
 
@@ -147,7 +148,7 @@ def test_render_group_job_notifies_support_email_on_failure():
         _member("a.yml", "a", "idx-a", mode="batch"),
         _member("b.yml", "b", "idx-b", mode="batch"),
     ])
-    assert job["email_notifications"] == {"on_failure": ["${var.support_email}"]}
+    assert job["email_notifications"] == {"on_failure": "${var.support_email}"}
     assert job["notification_settings"] == {
         "no_alert_for_skipped_runs": True,
         "no_alert_for_canceled_runs": True,
@@ -539,7 +540,7 @@ def test_shipped_databricks_yml_declares_job_name_prefix():
 
 def test_require_support_email_declared_present_passes(tmp_path):
     yml = tmp_path / "databricks.yml"
-    yml.write_text("variables:\n  support_email:\n    default: ''\n")
+    yml.write_text("variables:\n  support_email:\n    type: complex\n    default: []\n")
     gen_jobs.require_support_email_declared(str(yml))  # no raise
 
 
@@ -717,7 +718,7 @@ def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
     path = os.path.join(_REPO_ROOT, "resources", filename)
     with open(path) as fh:
         job = yaml.safe_load(fh)["resources"]["jobs"][job_key]
-    assert job["email_notifications"] == {"on_failure": ["${var.support_email}"]}
+    assert job["email_notifications"] == {"on_failure": "${var.support_email}"}
     assert job["notification_settings"] == {
         "no_alert_for_skipped_runs": True,
         "no_alert_for_canceled_runs": True,

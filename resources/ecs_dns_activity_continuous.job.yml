@@ -12,8 +12,7 @@ resources:
       queue:
         enabled: false
       email_notifications:
-        on_failure:
-        - ${var.support_email}
+        on_failure: ${var.support_email}
       notification_settings:
         no_alert_for_skipped_runs: true
         no_alert_for_canceled_runs: true
