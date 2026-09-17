@@ -745,19 +745,29 @@ if PIPELINE_MODE == "streaming":
             # startingVersion is ignored. Skip the current-version lookup and the seed entirely.
             print("streaming_start=new: resuming from existing checkpoint (startingVersion ignored)")
         else:
-            # Resolve the source's current Delta version to seed startingVersion. Read ONLY the latest
-            # commit via DeltaTable.history(1), NOT DESCRIBE HISTORY: the SQL command materializes the
-            # ENTIRE commit history as a driver-side relation, and aggregating over it (.agg max) serializes
-            # that whole relation into the aggregation job's task - on a source with a long transaction log
-            # that task exceeds spark.rpc.message.maxSize (default 256MB) and the run aborts with a
-            # "Serialized task ... exceeds max allowed" SparkException. history(1) pushes the limit into
-            # Delta's history manager (listStart = snapshot.version - 1 + 1), reading a single commit file
-            # and yielding a one-row relation, so cost is O(1) in history length. Its single row is the
-            # current snapshot version - exactly the max we need. Supported on both compute paths: the JVM
-            # DeltaTable on dedicated/single-user classic, and delta-connect on serverless and
-            # Standard-access classic (both run Spark Connect).
-            from delta.tables import DeltaTable  # noqa: E402
-            current_version = DeltaTable.forName(spark, SOURCE_FQN).history(1).select("version").collect()[0][0]
+            # Resolve the source's current Delta version to seed startingVersion, via
+            # `DESCRIBE HISTORY <table> LIMIT 1`. DESCRIBE HISTORY returns commits newest-first, so the one
+            # LIMIT 1 row is the latest commit and its `version` is the current snapshot version - exactly
+            # the seed we need (startingVersion is INCLUSIVE and must be an existing version).
+            #
+            # We deliberately do NOT use delta.tables.DeltaTable.forName(SOURCE_FQN).history(1) here. That
+            # Python API errors on some managed source types - notably Lakeflow/SDP-managed streaming tables
+            # and materialized views - which the client hit in production; the DESCRIBE HISTORY SQL command
+            # works across those table types. (An earlier version of this line used the DeltaTable.history
+            # API precisely to bound the read; it was correct for RPC size but too narrow on table type.)
+            #
+            # Two things keep this from re-introducing the spark.rpc.message.maxSize task abort that the
+            # ORIGINAL full-history form hit (that one was `DESCRIBE HISTORY <table>` with NO limit, chained
+            # to `.agg(max("version"))`): (1) LIMIT 1 pulls a single row, and (2) there is NO .agg() - the
+            # abort came from the aggregation, which submitted a Spark JOB whose serialized task embedded the
+            # whole history relation and, on a long transaction log, exceeded the 256MB RPC task-size limit.
+            # A plain `.select("version").collect()` over a LIMIT is a driver-local collect (CollectLimit),
+            # not an executor aggregation, so it serializes no oversized task. RESIDUAL CAVEAT: DESCRIBE
+            # HISTORY still assembles its result on the driver, so on a source with an extremely long
+            # transaction log this driver-side build is heavier than the O(1) history(1) API was; it is
+            # bounded by LIMIT 1 + a driver collect, not by the RPC task-size limit. Client-proven on their
+            # SDP streaming tables.
+            current_version = spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1").select("version").collect()[0][0]
             print(f"streaming_start=new: first run, seeding at current source version {current_version} (history skipped)")
             reader = reader.option("startingVersion", str(current_version))
     stream_df = reader.table(SOURCE_FQN)
