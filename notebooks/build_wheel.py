@@ -110,9 +110,18 @@ if not WHEEL_PATH:
         "a UC Volume wheel path to derive its destination directory from"
     )
 
-# Upload destination = the PARENT directory of wheel_path (drop the filename). rstrip a trailing slash
-# first so a path that (wrongly) ends in '/' still yields its containing dir, not itself.
-VOLUME_DEST_DIR = os.path.dirname(WHEEL_PATH.rstrip("/"))
+# wheel_path must be a full .whl FILE path: index jobs %pip install it directly, and we derive the upload
+# dir as its PARENT. Reject a directory-valued wheel_path (e.g. '.../wheels' or a trailing-slash dir) - its
+# os.path.dirname would strip a real path component and silently publish one level too high (the /Volumes
+# check below would still pass). Requiring a .whl basename makes the parent-dir derivation correct by
+# construction (and, since it can't end in '/', no rstrip is needed).
+if not WHEEL_PATH.endswith(".whl"):
+    raise ValueError(
+        f"wheel_path {WHEEL_PATH!r} must be a full .whl file path (this job uploads to its parent directory)"
+    )
+
+# Upload destination = the PARENT directory of the wheel_path file (drop the filename).
+VOLUME_DEST_DIR = os.path.dirname(WHEEL_PATH)
 if not VOLUME_DEST_DIR.startswith("/Volumes/"):
     raise ValueError(
         f"derived upload directory {VOLUME_DEST_DIR!r} (parent of wheel_path {WHEEL_PATH!r}) is not under "
@@ -162,6 +171,19 @@ else:
     if not os.path.isdir(VOLUME_DEST_DIR):
         raise RuntimeError(f"failed to create volume destination directory {VOLUME_DEST_DIR}")
     print(f"created and verified: {VOLUME_DEST_DIR}")
+
+# IMMUTABLE PUBLISH: refuse to overwrite an already-published wheel of this version. The file at
+# DEST_WHEEL_PATH may be the one index jobs currently install (whichever version wheel_path names), and
+# silently swapping its bytes under an unchanged version string breaks the "published alongside; adoption is
+# a separate step" contract. Fail closed BEFORE the build so republishing a version is a deliberate act:
+# bump wheel_version, or remove the existing file first. Single-flight (max_concurrent_runs=1, queue
+# disabled) means no concurrent run can create it between here and the copy in cell 7.
+if os.path.exists(DEST_WHEEL_PATH):
+    raise FileExistsError(
+        f"target wheel already exists: {DEST_WHEEL_PATH}. Refusing to overwrite it (it may be in use by "
+        f"index jobs). Build a different wheel_version, or remove the existing file first to republish."
+    )
+print(f"target wheel not yet present (safe to publish): {DEST_WHEEL_PATH}")
 
 # COMMAND ----------
 # Cell 5 - BUILD the wheel into a fresh temp directory. We build only the wheel (--wheel) with
