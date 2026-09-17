@@ -21,18 +21,17 @@
 # MAGIC   the upload destination; the filename is rebuilt from `wheel_version`. Empty fails closed.
 
 # COMMAND ----------
-# Cell 1 - INSTALL the build frontend and restart Python. `build` is the PyPA build frontend
-# (`python -m build`). This cell handles ONLY the install, because restartPython() discards all Python
-# interpreter state, so any work done before it would just have to be redone; every parameter is read
-# AFTER the restart (cell 2). `build` is a static package name (no widget to expand), but we invoke the
-# pip magic programmatically - the same mechanism run_index_pipeline.py uses - to keep this a normal
-# Python cell whose last statement is restartPython() (which ends the cell).
-#
-# NOTE on isolation: the build in cell 5 uses `--no-isolation` (required per client-system testing), which
-# means `build` does NOT create a fresh venv and instead expects the repo's build backend (hatchling) to
-# already be importable in this environment. If a live run fails there with a "backend not available"
-# error, the fix is to also install the backend here (e.g. `pip install build hatchling`).
-get_ipython().run_line_magic("pip", "install build")
+# Cell 1 - INSTALL the build frontend + backend, and restart Python. `build` is the PyPA build frontend
+# (`python -m build`); `hatchling` is the connector's build backend (pyproject [build-system] requires it).
+# We install BOTH because cell 5 builds with `--no-isolation` (required per client-system testing): build
+# does NOT provision a fresh isolated env, so the backend must already be importable here - installing only
+# `build` fails the build with "Backend 'hatchling.build' is not available" (confirmed on a serverless run).
+# This cell handles ONLY the install, because restartPython() discards all Python interpreter state, so any
+# work done before it would just have to be redone; every parameter is read AFTER the restart (cell 2).
+# `build`/`hatchling` are static package names (no widget to expand), but we invoke the pip magic
+# programmatically - the same mechanism run_index_pipeline.py uses - to keep this a normal Python cell whose
+# last statement is restartPython() (which ends the cell).
+get_ipython().run_line_magic("pip", "install build hatchling")
 dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -44,13 +43,18 @@ dbutils.library.restartPython()
 # overridable with --params); wheel_path is a DEPLOY-TIME base_parameter (the ${var.wheel_path} bundle
 # variable). All arrive as notebook widgets. We validate:
 #   1. repo_workspace_path non-empty and absolute (existence is checked in cell 3),
-#   2. wheel_version non-empty and a bare PEP 440 version (an allow-list that admits only already-normalized
-#      forms - x.x.x with an optional .devN/.postN or aN/bN/rcN suffix - so the value drops verbatim into
-#      both a wheel filename and an fs path with no separators or `..` to escape the volume dir),
+#   2. wheel_version a valid PEP 440 version, which we NORMALIZE (via packaging, the library build itself
+#      uses) and use in normalized form everywhere below. build writes the normalized version into the
+#      wheel filename, so normalizing here is what keeps cell 6's exact-name check aligned with what build
+#      emits (a non-canonical but valid input like '01.2.3', or a combined '1.0.0rc1.dev1', is accepted and
+#      normalized rather than passing here only to fail the name match later). A non-local PEP 440 version's
+#      normalized string is only digits, dots and lowercase tokens, so it drops into the filename/fs path
+#      with no separators or `..` to escape the volume dir,
 #   3. wheel_path non-empty (empty on main; set per target at deploy),
 #   4. the derived upload directory is under /Volumes/ (a UC Volume, where index jobs read the wheel from).
 import os
-import re
+
+from packaging.version import InvalidVersion, Version
 
 dbutils.widgets.text("repo_workspace_path", "", "Workspace path of the connector repo to build (contains pyproject.toml)")
 dbutils.widgets.text("wheel_version", "", "Connector version to build, x.x.x (must match the repo's pyproject.toml)")
@@ -69,16 +73,22 @@ if not REPO_WORKSPACE_PATH.startswith("/"):
 
 if not WHEEL_VERSION:
     raise ValueError("missing required parameter: wheel_version (the x.x.x connector version to build)")
-# Allow-list the version: a bare, already-normalized PEP 440 version. This is what appears VERBATIM in a
-# wheel filename, so accepting only these forms keeps the expected filename (cell 6) an exact match, and -
-# crucially - rejects anything with a '/' or '.' sequence that could carry a path separator or `..` into
-# the composed upload path. Fails closed on anything else.
-_WHEEL_VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:\.(?:dev|post)\d+|(?:a|b|rc)\d+)?")
-if not _WHEEL_VERSION_RE.fullmatch(WHEEL_VERSION):
-    raise ValueError(
-        f"invalid wheel_version {WHEEL_VERSION!r}: expected a version like 'x.x.x' (optionally with a "
-        f".devN/.postN or aN/bN/rcN suffix), no path separators"
-    )
+# Parse and NORMALIZE the version with packaging (the same library build uses). `python -m build` writes the
+# PEP 440-normalized version into the wheel filename, so we build the expected filename (cell 6) from the
+# NORMALIZED form rather than matching the raw input: a valid-but-non-canonical input like '01.2.3', or a
+# combined suffix like '1.0.0rc1.dev1', is accepted and normalized to exactly what build emits, instead of
+# passing here only to fail cell 6's name match. An unparseable value fails closed (InvalidVersion).
+try:
+    _parsed_version = Version(WHEEL_VERSION)
+except InvalidVersion as exc:
+    raise ValueError(f"invalid wheel_version {WHEEL_VERSION!r}: not a PEP 440 version ({exc})")
+# Reject a local-version segment ('1.2.3+abc'): we never publish those, and the wheel filename escapes the
+# '+' (to '_'), which would break cell 6's exact-name match. A NON-LOCAL PEP 440 version's normalized string
+# is only digits, dots and lowercase tokens (a/b/rc/dev/post) - no '/' or '..' - so it drops safely into the
+# composed filename and fs path with nothing that could escape the volume dir.
+if _parsed_version.local is not None:
+    raise ValueError(f"invalid wheel_version {WHEEL_VERSION!r}: local version segments (+...) are not supported")
+NORMALIZED_VERSION = str(_parsed_version)
 
 if not WHEEL_PATH:
     # wheel_path is empty on main and set per target; without it there is no volume directory to derive.
@@ -98,13 +108,13 @@ if not VOLUME_DEST_DIR.startswith("/Volumes/"):
 
 # HARDCODED wheel filename FORMAT, matching what the connector build produces on main (src-layout, dist
 # name 'databricks-es-connector' -> normalized 'databricks_es_connector', pure-Python 'py3-none-any').
-# Only the version varies, from wheel_version.
-WHEEL_FILENAME = f"databricks_es_connector-{WHEEL_VERSION}-py3-none-any.whl"
+# Only the version varies, from the NORMALIZED wheel_version (so this equals what build writes).
+WHEEL_FILENAME = f"databricks_es_connector-{NORMALIZED_VERSION}-py3-none-any.whl"
 DEST_WHEEL_PATH = f"{VOLUME_DEST_DIR}/{WHEEL_FILENAME}"
 
 print("build wheel - parameters:")
 print(f"  repo_workspace_path = {REPO_WORKSPACE_PATH!r}")
-print(f"  wheel_version       = {WHEEL_VERSION!r}")
+print(f"  wheel_version       = {WHEEL_VERSION!r}  (normalized: {NORMALIZED_VERSION!r})")
 print(f"  wheel_path (var)    = {WHEEL_PATH!r}")
 print(f"  volume dest dir     = {VOLUME_DEST_DIR!r}  (parent of wheel_path)")
 print(f"  wheel filename      = {WHEEL_FILENAME!r}  (hardcoded format, version from wheel_version)")
@@ -124,28 +134,19 @@ if not os.path.isfile(_PYPROJECT):
 print(f"repo path OK: {REPO_WORKSPACE_PATH} (found {_PYPROJECT})")
 
 # COMMAND ----------
-# Cell 4 - ENSURE the upload directory exists, creating it if not. dbutils.fs understands /Volumes paths.
-# The existence probe fails closed on ambiguity: a positively-reported not-found returns False; ANY other
-# error (permission/403, transient IO) re-raises rather than being misread as "not there" (the same
-# not-found matching checkpoint_clear.py / run_index_pipeline.py use). After a create we re-probe to
-# confirm, so a silently-failed mkdirs cannot pass as success.
-def _fs_exists(path: str) -> bool:
-    try:
-        dbutils.fs.ls(path)
-        return True
-    except Exception as exc:  # noqa: BLE001 - narrowed below; non-not-found is re-raised
-        msg = str(exc)
-        if "FileNotFoundException" in msg or "No such file or directory" in msg or "does not exist" in msg:
-            return False
-        raise
-
-
-if _fs_exists(VOLUME_DEST_DIR):
+# Cell 4 - ENSURE the upload directory exists, creating it if not. We use the LOCAL FILE API (os) against
+# the FUSE-mounted UC Volume, NOT dbutils.fs. This whole build/upload path deliberately avoids dbutils.fs:
+# on serverless shared UC, dbutils.fs.cp refuses to read a driver-local file: source (it raises
+# LocalFilesystemAccessDeniedException for anything outside /Workspace), which is exactly the copy we need in
+# cell 7. os/shutil against /Volumes is the supported way to read/write Volume files on serverless, so we use
+# it uniformly here too. After a create we re-probe to confirm, so a silently-failed mkdir cannot pass as
+# success.
+if os.path.isdir(VOLUME_DEST_DIR):
     print(f"volume destination directory already exists: {VOLUME_DEST_DIR}")
 else:
     print(f"volume destination directory does not exist - creating: {VOLUME_DEST_DIR}")
-    dbutils.fs.mkdirs(VOLUME_DEST_DIR)
-    if not _fs_exists(VOLUME_DEST_DIR):
+    os.makedirs(VOLUME_DEST_DIR, exist_ok=True)
+    if not os.path.isdir(VOLUME_DEST_DIR):
         raise RuntimeError(f"failed to create volume destination directory {VOLUME_DEST_DIR}")
     print(f"created and verified: {VOLUME_DEST_DIR}")
 
@@ -170,7 +171,12 @@ print(_proc.stdout)
 print("--- build stderr ---")
 print(_proc.stderr)
 if _proc.returncode != 0:
-    raise RuntimeError(f"wheel build failed (exit code {_proc.returncode}); see the build output above")
+    # Embed the tail of stderr (falling back to stdout) in the exception itself, not just "see above": when
+    # this notebook runs as a job, the cell's printed output is not returned by the run-output API, so a
+    # bare "see above" would leave the failure undiagnosable without opening the run UI. Capped so a verbose
+    # build log can't blow the notebook's output/error size limits.
+    _tail = (_proc.stderr or _proc.stdout or "").strip()[-3000:]
+    raise RuntimeError(f"wheel build failed (exit code {_proc.returncode}); build output tail:\n{_tail}")
 _built = sorted(f for f in os.listdir(BUILD_OUTDIR) if f.endswith(".whl"))
 if not _built:
     raise RuntimeError(f"build reported success (exit 0) but produced no .whl file in {BUILD_OUTDIR}")
@@ -212,18 +218,19 @@ if f"{_LIB_PKG}/__init__.py" not in _names:
 print(f"content check OK: library package present ({len(_lib_modules)} {_LIB_PKG}/ module file(s))")
 
 # COMMAND ----------
-# Cell 7 - UPLOAD the verified wheel to the UC Volume and confirm it landed. dbutils.fs.cp copies from the
-# driver-local build outdir (file: scheme) to the volume path. We then re-list the destination directory
-# and assert the file is present AND its size matches the local wheel, so a truncated or failed copy cannot
-# report green.
+# Cell 7 - UPLOAD the verified wheel to the UC Volume and confirm it landed. shutil.copyfile reads the
+# driver-local build outdir and writes the FUSE-mounted /Volumes path (the local file API; see cell 4 for why
+# not dbutils.fs.cp). We then stat the destination and assert the file is present AND its size matches the
+# local wheel, so a truncated or failed copy cannot report green.
+import shutil
+
 print(f"uploading {LOCAL_WHEEL_PATH} -> {DEST_WHEEL_PATH}")
-dbutils.fs.cp(f"file:{LOCAL_WHEEL_PATH}", DEST_WHEEL_PATH)
+shutil.copyfile(LOCAL_WHEEL_PATH, DEST_WHEEL_PATH)
 
 _local_size = os.path.getsize(LOCAL_WHEEL_PATH)
-_dest_entries = [e for e in dbutils.fs.ls(VOLUME_DEST_DIR) if e.name == WHEEL_FILENAME]
-if not _dest_entries:
-    raise RuntimeError(f"upload verify failed: {WHEEL_FILENAME!r} not found under {VOLUME_DEST_DIR} after copy")
-_dest_size = _dest_entries[0].size
+if not os.path.isfile(DEST_WHEEL_PATH):
+    raise RuntimeError(f"upload verify failed: {DEST_WHEEL_PATH} not present after copy")
+_dest_size = os.path.getsize(DEST_WHEEL_PATH)
 print(f"upload complete: dest={DEST_WHEEL_PATH} local_size={_local_size} dest_size={_dest_size}")
 if _dest_size != _local_size:
     raise RuntimeError(
@@ -233,8 +240,12 @@ print(f"upload verified: {DEST_WHEEL_PATH} ({_dest_size} bytes)")
 
 # COMMAND ----------
 # Cell 8 - LIST the volume directory so the run log shows every file now in the upload destination
-# (including the wheel just uploaded, and any prior versions still present).
+# (including the wheel just uploaded, and any prior versions still present). Local file API against the
+# FUSE-mounted volume, consistent with cells 4 and 7.
 print(f"contents of {VOLUME_DEST_DIR}:")
-for _e in sorted(dbutils.fs.ls(VOLUME_DEST_DIR), key=lambda e: e.name):
-    _kind = "dir " if _e.isDir() else "file"
-    print(f"  [{_kind}] {_e.name}\t{_e.size} bytes")
+for _name in sorted(os.listdir(VOLUME_DEST_DIR)):
+    _full = os.path.join(VOLUME_DEST_DIR, _name)
+    if os.path.isdir(_full):
+        print(f"  [dir ] {_name}")
+    else:
+        print(f"  [file] {_name}\t{os.path.getsize(_full)} bytes")
