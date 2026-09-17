@@ -647,6 +647,25 @@ def test_shipped_deploy_views_job_disables_queue():
     assert job["queue"] == {"enabled": False}
 
 
+def test_shipped_build_wheel_job_shape():
+    # build_wheel is hand-authored (not generated), so guard its shape against drift: single-flight +
+    # skip-not-queue like every other job, its two required run parameters (blank defaults, so a bare run
+    # fails closed in the notebook), and the wheel_path base_parameter the notebook derives the upload dir
+    # from. The notebook's build/upload behavior is proven by a live run, not here.
+    path = os.path.join(_REPO_ROOT, "resources", "build_wheel.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["build_wheel"]
+    assert job["max_concurrent_runs"] == 1
+    assert job["queue"] == {"enabled": False}
+    # Both parameters are declared with blank defaults (the notebook fails closed on blank).
+    assert {"name": "repo_workspace_path", "default": ""} in job["parameters"]
+    assert {"name": "wheel_version", "default": ""} in job["parameters"]
+    (task,) = job["tasks"]
+    assert task["notebook_task"]["notebook_path"] == "../notebooks/build_wheel.py"
+    # wheel_path is wired from the bundle variable; the notebook takes its parent dir as the upload target.
+    assert task["notebook_task"]["base_parameters"] == {"wheel_path": "${var.wheel_path}"}
+
+
 # --------------------------------------------------------------------------- job groups
 
 
