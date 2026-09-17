@@ -257,21 +257,34 @@ print(f"content check OK: library package present ({len(_lib_modules)} {_LIB_PKG
 
 # COMMAND ----------
 # Cell 7 - UPLOAD the verified wheel to the UC Volume and confirm it landed. We use the local file API
-# against the FUSE-mounted /Volumes (see cell 4 for why not dbutils.fs.cp), with a stage-then-atomic-rename
-# publish so neither failure mode leaves a bad file at DEST_WHEEL_PATH:
-#   - Copy into a TEMP file in the SAME directory (so the publish is a rename within one filesystem), then
-#     size-verify the staged copy. A copy that raises or truncates only ever affects the temp file, which the
-#     finally-block removes - never a partial/corrupt wheel at the destination that index jobs might install.
-#   - Publish with os.rename, which is atomic (readers see either no file or the whole file, never a partial).
-#     Guard no-overwrite: cell 4 already failed fast on a pre-existing target; we re-assert absence here right
-#     before the rename. Single-flight (max_concurrent_runs=1, queue disabled) rules out a concurrent run of
-#     THIS job creating it in between; an external writer to the same volume path in that sub-second window is
-#     the only residual race and is out of scope.
+# against the FUSE-mounted /Volumes (see cell 4 for why not dbutils.fs.cp), staging into a temp file in the
+# SAME directory, size-verifying it, then renaming it onto DEST_WHEEL_PATH:
+#   - A copy that raises or truncates only ever affects the temp file (removed in the finally block), so
+#     DEST_WHEEL_PATH never holds a partial/corrupt wheel.
+#   - The publish is os.rename. On a POSIX fs it is atomic; the volume FUSE mount MAY instead implement it as
+#     copy+delete, which is acceptable HERE: at publish time DEST_WHEEL_PATH does not exist (the immutable-
+#     publish pre-check in cell 4, re-asserted below) and is NOT yet adopted by any index job (adoption is a
+#     separate wheel_path change), so nothing reads it concurrently - the publish does not need to be atomic
+#     against a concurrent reader. Single-flight (max_concurrent_runs=1, queue disabled) rules out a
+#     concurrent run of THIS job; os.rename would replace an existing DEST, so the exists() re-check right
+#     before it is what upholds no-overwrite (its sub-second TOCTOU against an external writer is out of scope
+#     for an on-demand maintenance job).
+import glob
 import shutil
 import tempfile
 
 print(f"uploading {LOCAL_WHEEL_PATH} -> {DEST_WHEEL_PATH}")
 _local_size = os.path.getsize(LOCAL_WHEEL_PATH)
+# Sweep any staging files orphaned by a previously killed run so they can't accumulate. They are harmless
+# hidden dotfiles under our own prefix (a crash between mkstemp and rename can leave one; the finally block
+# only runs on normal control flow) and never block a re-run - the guard checks DEST_WHEEL_PATH, not these -
+# but we clean them proactively rather than let the volume dir collect them.
+for _stale in glob.glob(os.path.join(VOLUME_DEST_DIR, ".build_wheel.*.whl.partial")):
+    try:
+        os.remove(_stale)
+        print(f"  removed stale staging file: {_stale}")
+    except OSError:
+        pass
 _fd, _staged = tempfile.mkstemp(dir=VOLUME_DEST_DIR, prefix=".build_wheel.", suffix=".whl.partial")
 os.close(_fd)
 try:
