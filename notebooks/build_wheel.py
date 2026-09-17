@@ -300,8 +300,13 @@ try:
     os.rename(_staged, DEST_WHEEL_PATH)
     _staged = None  # published: the temp path no longer exists, nothing to clean up
 finally:
-    if _staged is not None and os.path.exists(_staged):
-        os.remove(_staged)
+    # Best-effort cleanup: guard the remove so a cleanup failure (e.g. a FUSE IO error) can never REPLACE the
+    # real exception propagating from the try block (an unguarded raise in finally would mask it).
+    if _staged is not None:
+        try:
+            os.remove(_staged)
+        except OSError:
+            pass
 
 if not os.path.isfile(DEST_WHEEL_PATH):
     raise RuntimeError(f"upload verify failed: {DEST_WHEEL_PATH} not present after publish")
