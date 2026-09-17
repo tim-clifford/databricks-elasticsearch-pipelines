@@ -178,12 +178,20 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
                     total += v
             return total
 
+        def _numeric(p, key):
+            v = p.get(key)
+            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+        def _all_present(*keys):
+            """True only when EVERY partition carries a numeric value for EVERY key. Used to gate the
+            optional cpu/gil rollups: a field only SOME partitions emit (a connector-version mix) must
+            NOT be summed into a total that looks cluster-wide but understates contention, and a pair
+            like gil (total, max) must be sourced together so it never renders total=n/a max=<value>."""
+            return all(_numeric(p, k) is not None for p in parts for k in keys)
+
         def _sum_opt(key):
-            """Sum like _sum, but return None (renders n/a) when NO partition carried a numeric value,
-            so a field the connector never emitted reads as 'not measured' rather than a false 0."""
-            present = [p.get(key) for p in parts
-                       if isinstance(p.get(key), (int, float)) and not isinstance(p.get(key), bool)]
-            return sum(present) if present else None
+            """Sum `key` across partitions, or None (renders n/a) unless every partition carries it."""
+            return _sum(key) if _all_present(key) else None
 
         total_sends = _sum("n_sends")
         total_docs = _sum("docs_sent")
@@ -191,7 +199,10 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
         total_busy = _sum("send_busy_ms")
         total_wall = _sum("partition_wall_ms")
         total_cpu = _sum_opt("send_cpu_ms")            # off-CPU send time = busy - cpu (n/a on old wheels)
-        total_gil = _sum_opt("gil_wait_ms_total")      # summed GIL stall across partitions (n/a if unset)
+        # gil total and max are sourced together (both n/a unless every partition has both), so the
+        # rollup never shows an inconsistent total/max pair. (max is read below, where _max is defined.)
+        gil_ok = _all_present("gil_wait_ms_total", "gil_wait_ms_max")
+        total_gil = _sum("gil_wait_ms_total") if gil_ok else None
         docs_per_send = (total_docs / total_sends) if total_sends else 0.0
 
         def _pair_ratio(num, den):
@@ -233,7 +244,8 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
             f"rtt_ms(mean={_num(_weighted_mean('rtt_ms_mean'))} max={_num(_max('rtt_ms_max'))}) "
             f"took_ms(mean={_num(_weighted_mean('took_ms_mean'))} max={_num(_max('took_ms_max'))}) "
             f"cpu_ms(total={_num(_rounded(total_cpu, 1))}) "
-            f"gil_wait_ms(total={_num(_rounded(total_gil, 1))} max={_num(_max('gil_wait_ms_max'))})"
+            f"gil_wait_ms(total={_num(_rounded(total_gil, 1))} "
+            f"max={_num(_max('gil_wait_ms_max') if gil_ok else None)})"
         )
         if oneline:
             return _with_ts(overall, now)

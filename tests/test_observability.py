@@ -405,3 +405,17 @@ def test_bulk_stats_cpu_and_gil_render_na_when_absent():
     assert "gil_wait_ms(total=n/a max=n/a)" in line
     tail = format_tail_summary({"bulk_stats": _BULK_STATS})
     assert "gil_wait_ms_total=n/a" in tail
+
+
+def test_bulk_stats_partial_cpu_gil_presence_renders_na_not_partial_total():
+    # A field present on SOME partitions but not all (a connector-version mix) must NOT be summed into
+    # a total that looks cluster-wide -- that would understate contention. It reads n/a until uniform.
+    # part0 carries cpu+gil, part1 does not.
+    mixed = [
+        {"n_sends": 5, "docs_sent": 100, "send_busy_ms": 50.0, "partition_wall_ms": 50.0,
+         "send_cpu_ms": 12.0, "gil_wait_ms_total": 8.0, "gil_wait_ms_max": 3.0},
+        {"n_sends": 5, "docs_sent": 100, "send_busy_ms": 50.0, "partition_wall_ms": 50.0},
+    ]
+    line = format_bulk_stats(mixed, oneline=True)
+    assert "cpu_ms(total=n/a)" in line                       # not "12.0": only one partition had it
+    assert "gil_wait_ms(total=n/a max=n/a)" in line          # total and max sourced together, both n/a
