@@ -4,12 +4,16 @@ resources:
       name: "[${bundle.target}] ${var.job_name_prefix}: _build wheel"
       description: >-
         A serverless maintenance job that BUILDS the databricks-es-connector wheel from a copy of the
-        connector repo synced into the workspace, and UPLOADS it to the UC Volume directory this bundle's
-        wheel_path points at (so index jobs install exactly what was built). Takes two required run
-        parameters: repo_workspace_path (the /Workspace path of the checked-out connector repo to build)
-        and wheel_version (the x.x.x version, used to name the built wheel and to verify it was produced).
-        The upload directory is the PARENT of ${var.wheel_path} (the filename is rebuilt from
-        wheel_version, not taken from wheel_path). No cluster block => serverless notebook task.
+        connector repo synced into the workspace, and PUBLISHES it into the UC Volume directory this
+        bundle's wheel_path lives in. Takes two required run parameters: repo_workspace_path (the /Workspace
+        path of the checked-out connector repo to build) and wheel_version (the x.x.x version, used to name
+        the built wheel and to verify it was produced). The upload directory is the PARENT of
+        ${var.wheel_path}; the FILENAME is rebuilt from wheel_version, NOT taken from wheel_path - so this
+        job publishes whatever version you build alongside the existing wheels, and does NOT overwrite or
+        repoint wheel_path. It does not put the new wheel into use: index jobs keep installing the exact
+        ${var.wheel_path}, so adopting the freshly built version is a separate, deliberate step (update
+        wheel_path in databricks.yml to the new filename and redeploy, when ready). No cluster block =>
+        serverless notebook task.
 
       # Both are REQUIRED per-run job parameters. Defaults are blank; the notebook fails closed on a blank
       # or malformed value (never a no-target build/upload). Override per run with

@@ -3,8 +3,15 @@
 # MAGIC # databricks-elasticsearch-pipelines: build wheel
 # MAGIC
 # MAGIC A maintenance notebook that BUILDS the `databricks-es-connector` wheel from a copy of the connector
-# MAGIC repo synced into the workspace and UPLOADS it to the UC Volume directory this bundle's `wheel_path`
-# MAGIC points at, so the per-index jobs install exactly the wheel this job just built.
+# MAGIC repo synced into the workspace and PUBLISHES it into the UC Volume directory this bundle's
+# MAGIC `wheel_path` lives in (the parent dir), under a filename built from `wheel_version`.
+# MAGIC
+# MAGIC This job does NOT put the new wheel into use. Index jobs install the exact `${var.wheel_path}`
+# MAGIC string (`run_index_pipeline.py` runs `%pip install <wheel_path>`), so the freshly built wheel is only
+# MAGIC ADDED alongside the existing ones - `wheel_path` is not overwritten or repointed. Adopting the new
+# MAGIC version is a separate, deliberate step: update `wheel_path` in `databricks.yml` to the new filename
+# MAGIC and redeploy, when ready. So `wheel_version` and the version baked into `wheel_path` may legitimately
+# MAGIC differ (that is the point of building a new version).
 # MAGIC
 # MAGIC Parameters:
 # MAGIC - `repo_workspace_path` (job parameter, REQUIRED): the `/Workspace/...` path of the checked-out
@@ -18,7 +25,8 @@
 # MAGIC   expected filename will not be present) and fails the run.
 # MAGIC - `wheel_path` (deploy-time base_parameter, from the `${var.wheel_path}` bundle variable): the UC
 # MAGIC   Volume path an index job installs the connector from. This job uses only its PARENT DIRECTORY as
-# MAGIC   the upload destination; the filename is rebuilt from `wheel_version`. Empty fails closed.
+# MAGIC   the upload destination (the filename is rebuilt from `wheel_version`); it does not read or overwrite
+# MAGIC   the file at `wheel_path` itself. Empty fails closed.
 
 # COMMAND ----------
 # Cell 1 - INSTALL the build frontend + backend, and restart Python. `build` is the PyPA build frontend
@@ -242,6 +250,18 @@ if _dest_size != _local_size:
         f"upload verify failed: size mismatch (local={_local_size}, dest={_dest_size}) for {DEST_WHEEL_PATH}"
     )
 print(f"upload verified: {DEST_WHEEL_PATH} ({_dest_size} bytes)")
+# The wheel is now PUBLISHED, not yet in use. Index jobs install the exact ${var.wheel_path}; this job only
+# added a file to that path's directory. Adopting the new build is a separate, deliberate step. State that
+# here so the run log is unambiguous (and note whether this build already matches the current wheel_path).
+_matches_current = os.path.basename(WHEEL_PATH.rstrip("/")) == WHEEL_FILENAME
+print(
+    f"NOTE: published only - index jobs install the exact wheel_path ({WHEEL_PATH!r}). "
+    + (
+        "This build's filename matches the current wheel_path, so a redeploy will pick it up."
+        if _matches_current
+        else f"To adopt this build, point wheel_path at {WHEEL_FILENAME!r} in databricks.yml and redeploy."
+    )
+)
 
 # COMMAND ----------
 # Cell 8 - LIST the volume directory so the run log shows every file now in the upload destination
