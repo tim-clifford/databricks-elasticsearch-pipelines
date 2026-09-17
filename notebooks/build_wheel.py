@@ -251,16 +251,13 @@ if _dest_size != _local_size:
     )
 print(f"upload verified: {DEST_WHEEL_PATH} ({_dest_size} bytes)")
 # The wheel is now PUBLISHED, not yet in use. Index jobs install the exact ${var.wheel_path}; this job only
-# added a file to that path's directory. Adopting the new build is a separate, deliberate step. State that
-# here so the run log is unambiguous (and note whether this build already matches the current wheel_path).
-_matches_current = os.path.basename(WHEEL_PATH.rstrip("/")) == WHEEL_FILENAME
+# added a file to that path's directory. Adopting the new build is a separate, deliberate step, so state
+# that here to keep the run log unambiguous. We phrase it as "ensure wheel_path references this filename"
+# (a no-op if it already does) rather than trying to detect a match: wheel_path's basename may encode the
+# same version in a non-canonical form, so a raw string compare against our normalized name could mislead.
 print(
-    f"NOTE: published only - index jobs install the exact wheel_path ({WHEEL_PATH!r}). "
-    + (
-        "This build's filename matches the current wheel_path, so a redeploy will pick it up."
-        if _matches_current
-        else f"To adopt this build, point wheel_path at {WHEEL_FILENAME!r} in databricks.yml and redeploy."
-    )
+    f"NOTE: published only - index jobs install the exact wheel_path ({WHEEL_PATH!r}). To put THIS build "
+    f"into use, ensure wheel_path references {WHEEL_FILENAME!r} in databricks.yml and redeploy."
 )
 
 # COMMAND ----------
