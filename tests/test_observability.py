@@ -329,3 +329,102 @@ def test_relay_line_never_raises():
     for bad in ({"bulk_stats": "nope"}, {"bulk_stats": [None, 7]}, {"bulk_stats": [{"x": "y"}]}):
         out = bulk_stats_relay_line(bad, 1)
         assert out is None or isinstance(out, str)
+
+
+# --------------------------------------------------------------------------- wall-clock timestamps
+
+from datetime import datetime, timezone  # noqa: E402  (kept beside the tests that use it)
+
+# A fixed instant so the injected `ts=` token is deterministic. microsecond 123000 -> ".123Z".
+_FIXED_NOW = datetime(2026, 9, 16, 19, 30, 0, 123000, tzinfo=timezone.utc)
+_EXPECT_TS = "ts=2026-09-16T19:30:00.123Z"
+
+
+def test_progress_line_carries_injected_timestamp():
+    line = format_progress(REAL_PROGRESS, now=_FIXED_NOW)
+    assert line.startswith(PROGRESS_TAG + " ")   # the tag prefix contract is preserved
+    assert line.endswith(" " + _EXPECT_TS)        # ts appended at the end so nothing else shifts
+
+
+def test_bulk_stats_and_tail_carry_injected_timestamp():
+    overall = format_bulk_stats(_BULK_STATS, oneline=True, now=_FIXED_NOW)
+    assert overall.startswith(f"{BULK_STATS_TAG} overall:") and overall.endswith(" " + _EXPECT_TS)
+    tail = format_tail_summary({"bulk_stats": _BULK_STATS}, now=_FIXED_NOW)
+    assert tail.startswith(f"{BULK_STATS_TAG} tail: ") and tail.endswith(" " + _EXPECT_TS)
+    # The no-bulk-stats marker line still gets a ts (and keeps its startswith contract).
+    marker = format_tail_summary({"collect_ms": 1.0, "merge_ms": 2.0}, now=_FIXED_NOW)
+    assert marker.startswith(f"{BULK_STATS_TAG} tail: <no bulk stats>") and marker.endswith(_EXPECT_TS)
+
+
+def test_relay_shares_one_timestamp_across_overall_and_tail():
+    # foreachBatch builds the relay server-side; the listener prints it later. Both relayed lines must
+    # carry the SAME batch timestamp, captured once when the line is built.
+    line = bulk_stats_relay_line({"bulk_stats": _BULK_STATS, "collect_ms": 1.0, "merge_ms": 2.0},
+                                 7, now=_FIXED_NOW)
+    over, tail = line.split("\n", 1)
+    assert _EXPECT_TS in over and _EXPECT_TS in tail
+    assert over.count("ts=") == 1 and tail.count("ts=") == 1   # exactly one timestamp per line
+    assert "batch_id=7" in over
+
+
+def test_timestamp_converts_non_utc_now_to_utc():
+    # The token is labeled Z, so a tz-aware `now` in another zone must be CONVERTED to UTC, not stamped
+    # with its raw wall-clock components. 19:30+05:00 is 14:30Z.
+    from datetime import timedelta
+    plus5 = datetime(2026, 9, 16, 19, 30, 0, 123000, tzinfo=timezone(timedelta(hours=5)))
+    line = format_bulk_stats(_BULK_STATS, oneline=True, now=plus5)
+    assert line.endswith(" ts=2026-09-16T14:30:00.123Z"), line
+
+
+def test_default_timestamp_is_present_and_well_formed():
+    # With no injected now, a real current-time token is still appended in the expected shape.
+    import re
+    line = format_bulk_stats(_BULK_STATS, oneline=True)
+    assert re.search(r" ts=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$", line)
+
+
+# ----------------------------------------------------------------- send_cpu_ms / gil_wait_ms surfacing
+
+# One partition carrying the connector's socket-vs-GIL diagnostic fields (send_cpu_ms, gil_wait_ms_*).
+_GIL_STATS = [
+    {"n_sends": 10, "docs_sent": 1000, "bytes_sent": 100000,
+     "send_busy_ms": 200.0, "send_cpu_ms": 40.0, "partition_wall_ms": 100.0,
+     "rtt_ms_mean": 20.0, "rtt_ms_p50": 18.0, "rtt_ms_p95": 30.0, "rtt_ms_max": 55.0,
+     "took_ms_mean": 5.0, "took_ms_p50": 4.0, "took_ms_p95": 8.0, "took_ms_max": 12.0,
+     "gil_wait_ms_total": 70.0, "gil_wait_ms_p50": 3.0, "gil_wait_ms_p95": 15.0,
+     "gil_wait_ms_max": 22.0, "gil_wait_samples": 800},
+]
+
+
+def test_bulk_stats_surfaces_cpu_and_gil_when_present():
+    lines = format_bulk_stats(_GIL_STATS).splitlines()
+    assert "cpu_ms(total=40.00)" in lines[0]
+    assert "gil_wait_ms(total=70.00 max=22.00)" in lines[0]          # summed total, max of per-part max
+    assert "cpu_ms=40.00" in lines[1]                                # per-partition worker CPU
+    assert "gil_wait_ms(total=70.00 p95=15.00 max=22.00)" in lines[1]
+    tail = format_tail_summary({"bulk_stats": _GIL_STATS})
+    assert "gil_wait_ms_total=70.00" in tail                         # the slowest partition's GIL stall
+
+
+def test_bulk_stats_cpu_and_gil_render_na_when_absent():
+    # A pre-gil-probe connector result (the _BULK_STATS fixture carries no cpu/gil keys): the new tokens
+    # must read n/a, not a fabricated 0, so "not measured" is never mistaken for "no contention".
+    line = format_bulk_stats(_BULK_STATS, oneline=True)
+    assert "cpu_ms(total=n/a)" in line
+    assert "gil_wait_ms(total=n/a max=n/a)" in line
+    tail = format_tail_summary({"bulk_stats": _BULK_STATS})
+    assert "gil_wait_ms_total=n/a" in tail
+
+
+def test_bulk_stats_partial_cpu_gil_presence_renders_na_not_partial_total():
+    # A field present on SOME partitions but not all (a connector-version mix) must NOT be summed into
+    # a total that looks cluster-wide -- that would understate contention. It reads n/a until uniform.
+    # part0 carries cpu+gil, part1 does not.
+    mixed = [
+        {"n_sends": 5, "docs_sent": 100, "send_busy_ms": 50.0, "partition_wall_ms": 50.0,
+         "send_cpu_ms": 12.0, "gil_wait_ms_total": 8.0, "gil_wait_ms_max": 3.0},
+        {"n_sends": 5, "docs_sent": 100, "send_busy_ms": 50.0, "partition_wall_ms": 50.0},
+    ]
+    line = format_bulk_stats(mixed, oneline=True)
+    assert "cpu_ms(total=n/a)" in line                       # not "12.0": only one partition had it
+    assert "gil_wait_ms(total=n/a max=n/a)" in line          # total and max sourced together, both n/a
