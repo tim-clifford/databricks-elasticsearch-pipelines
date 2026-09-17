@@ -367,6 +367,15 @@ def test_relay_shares_one_timestamp_across_overall_and_tail():
     assert "batch_id=7" in over
 
 
+def test_timestamp_converts_non_utc_now_to_utc():
+    # The token is labeled Z, so a tz-aware `now` in another zone must be CONVERTED to UTC, not stamped
+    # with its raw wall-clock components. 19:30+05:00 is 14:30Z.
+    from datetime import timedelta
+    plus5 = datetime(2026, 9, 16, 19, 30, 0, 123000, tzinfo=timezone(timedelta(hours=5)))
+    line = format_bulk_stats(_BULK_STATS, oneline=True, now=plus5)
+    assert line.endswith(" ts=2026-09-16T14:30:00.123Z"), line
+
+
 def test_default_timestamp_is_present_and_well_formed():
     # With no injected now, a real current-time token is still appended in the expected shape.
     import re

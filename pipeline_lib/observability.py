@@ -44,6 +44,10 @@ def _ts_token(now=None):
     pass a fixed datetime. Fail-soft: returns '' if the clock read fails, so a formatter never raises."""
     try:
         dt = now if now is not None else datetime.now(timezone.utc)
+        # The token is labeled Z, so it MUST be UTC. strftime uses the raw wall-clock components, so a
+        # tz-aware `now` is converted to UTC first; a naive datetime is assumed already-UTC (the contract).
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
         return f"ts={dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond // 1000:03d}Z"
     except Exception:
         return ""
