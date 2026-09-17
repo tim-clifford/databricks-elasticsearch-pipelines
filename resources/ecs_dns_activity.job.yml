@@ -10,6 +10,12 @@ resources:
       max_concurrent_runs: 1
       queue:
         enabled: false
+      email_notifications:
+        on_failure:
+        - ${var.support_email}
+      notification_settings:
+        no_alert_for_skipped_runs: true
+        no_alert_for_canceled_runs: true
       parameters:
       - name: pipeline_mode
         default: batch

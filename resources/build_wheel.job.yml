@@ -35,6 +35,17 @@ resources:
       queue:
         enabled: false
 
+      # Notify the target's support address on a run failure. ${var.support_email} is empty in dev/stg
+      # (no emails) and set only in prd. notification_settings suppress SKIPPED (queue disabled => an
+      # overlapping trigger is skipped, not failed) and CANCELED runs, so the address is paged only on a
+      # genuine failure. Matches every other job (see scripts/gen_jobs.py _assemble_job).
+      email_notifications:
+        on_failure:
+          - ${var.support_email}
+      notification_settings:
+        no_alert_for_skipped_runs: true
+        no_alert_for_canceled_runs: true
+
       tasks:
         - task_key: build_wheel
           notebook_task:

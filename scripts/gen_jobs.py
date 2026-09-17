@@ -306,6 +306,24 @@ def require_transport_max_retries_declared(path: str = _DATABRICKS_YML, doc: dic
     _require_global_var_declared("transport_max_retries", require_transport_max_retries, path, doc)
 
 
+def require_support_email_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION if databricks.yml declares no `support_email` variable.
+
+    Every generated job emits email_notifications.on_failure: [${var.support_email}], so the bundle needs
+    the variable to resolve it per target at deploy; if it is not declared that reference fails only at
+    deploy with a confusing error. Mirrors require_job_name_prefix_declared: we check DECLARATION, not
+    value (the address is a per-target/--var deploy-time choice, and an EMPTY value is valid = failure
+    emails off for that target, so there is nothing to validate about the string here)."""
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
+    if "support_email" not in variables:
+        raise ValueError(
+            "support_email is not declared in databricks.yml; add it under `variables:` with an empty "
+            "default (e.g. support_email: {default: \"\"}). The generator emits "
+            "email_notifications.on_failure: [${var.support_email}] into every job, so the bundle needs "
+            "the variable to resolve it at deploy (empty = failure emails off for that target)."
+        )
+
+
 def _job_display_name(postfix: str) -> str:
     """The job display name: `[<target>] <prefix>: <postfix>`.
 
@@ -469,7 +487,8 @@ def _job_clusters_for(members: list) -> list | None:
 def _assemble_job(display_name: str, description: str, job_params: list | None,
                   trigger: dict | None, job_clusters: list | None, tasks: list) -> dict:
     """Assemble one job dict with deterministic key order: name, description, max_concurrent_runs,
-    queue, [parameters], [schedule|continuous], [job_clusters], tasks, permissions.
+    queue, email_notifications, notification_settings, [parameters], [schedule|continuous],
+    [job_clusters], tasks, permissions.
 
     job_params: the job-level `parameters:` list (singleton) or None to omit it (a grouped job carries
     the run-time knobs in each task's base_parameters instead - job parameters can't hold per-member
@@ -489,6 +508,17 @@ def _assemble_job(display_name: str, description: str, job_params: list | None,
         "description": description,
         "max_concurrent_runs": 1,
         "queue": {"enabled": False},
+        # Notify the target's support address on a run failure. ${var.support_email} is empty in dev/stg
+        # (the Jobs API drops an empty on_failure entry, so no emails), set only in prd. The paired
+        # notification_settings suppress SKIPPED runs (queue disabled above => an overlapping trigger is
+        # skipped, not failed) and CANCELED runs (a continuous job's ON_FAILURE retry cancels-and-restarts),
+        # so the address is paged only on a genuine failure. Emitted on every generated job; the
+        # hand-authored resources/*.job.yml carry the same block.
+        "email_notifications": {"on_failure": ["${var.support_email}"]},
+        "notification_settings": {
+            "no_alert_for_skipped_runs": True,
+            "no_alert_for_canceled_runs": True,
+        },
     }
     if job_params is not None:
         job_def["parameters"] = job_params
@@ -749,6 +779,7 @@ def main(argv: list[str] | None = None) -> int:
     # job_name_prefix variable is missing (every generated name references ${var.job_name_prefix}).
     bundle_doc = _read_bundle_doc()
     require_job_name_prefix_declared(doc=bundle_doc)
+    require_support_email_declared(doc=bundle_doc)
     require_bulk_stats_declared(doc=bundle_doc)
     require_request_timeout_declared(doc=bundle_doc)
     require_transport_max_retries_declared(doc=bundle_doc)
