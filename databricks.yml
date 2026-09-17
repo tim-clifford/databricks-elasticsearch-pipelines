@@ -204,6 +204,27 @@ variables:
     description: "Workspace-specific cluster policy id injected into every job cluster. Empty default; set per target below or override with --var=cluster_policy_id=<id> whenever a pipeline uses job_cluster compute. Workspace-specific: dev deploys go to each engineer's own workspace."
     default: ""
 
+  # Support email RECIPIENTS that EVERY job (generated index/group jobs, deploy_views, checkpoint_clear,
+  # build_wheel) notifies when a run fails in that target. Each job emits
+  # email_notifications.on_failure: ${var.support_email} plus notification_settings that suppress SKIPPED
+  # runs (this bundle disables queueing, so an overlapping trigger is skipped, not a failure) and CANCELED
+  # runs (a continuous job's ON_FAILURE retry cancels-and-restarts), so the address is paged only on a
+  # genuine run failure. Controlled PER TARGET below: it ships EMPTY on main and stays empty ([]) for dev
+  # and stg (no failure emails there), and only prd sets a real address.
+  #
+  # This is a `type: complex` variable holding a LIST, and the empty list [] is what turns notifications
+  # OFF for a target: an empty on_failure list is an unambiguous "no recipients" (unlike a single empty
+  # STRING, "", which would emit on_failure: [""] and rely on the platform silently dropping an invalid
+  # empty-recipient entry - engine/version-dependent). Usually a single address, e.g.
+  # ["es-oncall@yourco.com"]; add more entries to page several people. Because it is complex, it CANNOT be
+  # set via --var (the CLI rejects complex-type --var, like the es_host_* configs); override dev through
+  # the git-ignored .databricks/bundle/<target>/variable-overrides.json instead. See the on_failure emit
+  # in scripts/gen_jobs.py _assemble_job and the hand-authored resources/*.job.yml.
+  support_email:
+    type: complex
+    description: "Email recipients (a LIST) notified on any job/task run FAILURE in this target. Empty list [] = notifications OFF; set an address (usually one, e.g. [\"es-oncall@yourco.com\"]) only in prd below. dev/stg stay []. type: complex, so NOT settable via --var; override dev via .databricks/bundle/<target>/variable-overrides.json."
+    default: []
+
   # OPTIONAL cluster config for existing_cluster compute. Like an ES host config, it is a `type: complex`
   # variable (a single cluster_id field) so the generator can tell cluster configs apart from other
   # variables. A pipeline that runs on an existing (interactive/all-purpose) cluster names one via
@@ -268,6 +289,7 @@ targets:
       #   checkpoint_base_path: /Volumes/<catalog>/<schema>/<volume>/checkpoints/${workspace.current_user.short_name}
       checkpoint_base_path: ""
       cluster_policy_id: ""        # e.g. 00156D2098BE864B - workspace-specific; in dev each engineer uses their own
+      support_email: []            # empty list = failure emails OFF in dev
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""           # e.g. 0123-456789-abcde
       ca_certs: ""                 # e.g. /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
@@ -296,6 +318,7 @@ targets:
       wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
       checkpoint_base_path: ""     # e.g. /Volumes/<catalog>/<schema>/<volume>/checkpoints (UC Volume; required only for streaming)
       cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
+      support_email: []            # empty list = failure emails OFF in stg
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""
       ca_certs: ""                 # /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
@@ -320,6 +343,7 @@ targets:
       wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
       checkpoint_base_path: ""     # e.g. /Volumes/<catalog>/<schema>/<volume>/checkpoints (UC Volume; required only for streaming)
       cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
+      support_email: []            # e.g. ["es-oncall@yourco.com"] to page prd failures; empty list ships on main (off)
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""
       ca_certs: ""                 # /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs

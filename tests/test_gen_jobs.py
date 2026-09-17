@@ -116,6 +116,45 @@ def test_render_scheduled_job_disables_queue():
     assert "schedule" in job and job["queue"] == {"enabled": False}
 
 
+def test_render_all_jobs_notify_support_email_on_failure():
+    # Every generated job emails the ${var.support_email} recipients on a run failure. on_failure
+    # references the whole complex LIST variable (NOT [${var.support_email}]) so an empty-list target
+    # resolves to [] (no recipients = off), never [""]. The variable is empty in dev/stg and set only in
+    # prd, so the same emitted block gives per-target control. Holds for every compute.
+    for compute, spec in (
+        (None, None),
+        ({"type": "existing_cluster", "cluster_config": "interactive_primary"}, None),
+        ({"type": "job_cluster", "job_cluster_config": "std"}, {"spark_version": "15.4.x-scala2.12", "num_workers": 1}),
+    ):
+        assert _render_job(_cfg(compute), spec)["email_notifications"] == {
+            "on_failure": "${var.support_email}"
+        }
+
+
+def test_render_all_jobs_suppress_skipped_and_canceled_alerts():
+    # Paired with email_notifications: suppress SKIPPED runs (queue disabled => an overlapping trigger is
+    # skipped, not failed) and CANCELED runs (a continuous job's ON_FAILURE retry cancels-and-restarts),
+    # so the support address is paged only on a genuine failure, not on the framework's own churn.
+    assert _render_job(_cfg())["notification_settings"] == {
+        "no_alert_for_skipped_runs": True,
+        "no_alert_for_canceled_runs": True,
+    }
+
+
+def test_render_group_job_notifies_support_email_on_failure():
+    # A grouped (multi-task) job carries the same failure-email block at the JOB level, so one failed
+    # member fails the run and pages the address, exactly like a singleton.
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch"),
+        _member("b.yml", "b", "idx-b", mode="batch"),
+    ])
+    assert job["email_notifications"] == {"on_failure": "${var.support_email}"}
+    assert job["notification_settings"] == {
+        "no_alert_for_skipped_runs": True,
+        "no_alert_for_canceled_runs": True,
+    }
+
+
 # --------------------------------------------------------------------------- render: existing_cluster
 
 
@@ -499,6 +538,25 @@ def test_shipped_databricks_yml_declares_job_name_prefix():
     gen_jobs.require_job_name_prefix_declared()  # the repo's databricks.yml declares it
 
 
+def test_require_support_email_declared_present_passes(tmp_path):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  support_email:\n    type: complex\n    default: []\n")
+    gen_jobs.require_support_email_declared(str(yml))  # no raise
+
+
+def test_require_support_email_declared_missing_fails_closed(tmp_path):
+    # Every job emits email_notifications.on_failure: [${var.support_email}]; if the variable is not
+    # declared, fail closed at generation rather than let the reference break confusingly at deploy.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
+    with pytest.raises(ValueError, match="support_email is not declared"):
+        gen_jobs.require_support_email_declared(str(yml))
+
+
+def test_shipped_databricks_yml_declares_support_email():
+    gen_jobs.require_support_email_declared()  # the repo's databricks.yml declares it
+
+
 def test_require_bulk_stats_declared_present_passes(tmp_path):
     yml = tmp_path / "databricks.yml"
     yml.write_text("variables:\n  bulk_stats:\n    default: ''\n")
@@ -645,6 +703,26 @@ def test_shipped_deploy_views_job_disables_queue():
         job = yaml.safe_load(fh)["resources"]["jobs"]["deploy_views"]
     assert job["max_concurrent_runs"] == 1
     assert job["queue"] == {"enabled": False}
+
+
+@pytest.mark.parametrize("filename,job_key", [
+    ("deploy_views.job.yml", "deploy_views"),
+    ("checkpoint_clear.job.yml", "checkpoint_clear"),
+    ("build_wheel.job.yml", "build_wheel"),
+])
+def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
+    # The hand-authored jobs are NOT emitted by gen_jobs, so guard their failure-email block against drift:
+    # each must carry the same email_notifications.on_failure: [${var.support_email}] and the skipped/
+    # canceled suppression that every generated job gets. Without this a hand-authored job could silently
+    # go un-monitored while the generated ones page prd on failure.
+    path = os.path.join(_REPO_ROOT, "resources", filename)
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"][job_key]
+    assert job["email_notifications"] == {"on_failure": "${var.support_email}"}
+    assert job["notification_settings"] == {
+        "no_alert_for_skipped_runs": True,
+        "no_alert_for_canceled_runs": True,
+    }
 
 
 def test_shipped_build_wheel_job_shape():
