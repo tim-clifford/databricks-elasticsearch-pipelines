@@ -256,22 +256,42 @@ if f"{_LIB_PKG}/__init__.py" not in _names:
 print(f"content check OK: library package present ({len(_lib_modules)} {_LIB_PKG}/ module file(s))")
 
 # COMMAND ----------
-# Cell 7 - UPLOAD the verified wheel to the UC Volume and confirm it landed. We read the driver-local build
-# outdir and write the FUSE-mounted /Volumes path (the local file API; see cell 4 for why not dbutils.fs.cp).
-# The write uses EXCLUSIVE create ('xb'), so the no-overwrite guarantee is ATOMIC at the write itself, not a
-# check-then-act split from cell 4's pre-check: if the target appeared in between (an external actor - a
-# concurrent run is ruled out by single-flight), the open raises FileExistsError instead of truncating a
-# possibly in-use wheel. We then stat the destination and assert the file is present AND its size matches the
-# local wheel, so a truncated or failed copy cannot report green.
+# Cell 7 - UPLOAD the verified wheel to the UC Volume and confirm it landed. We use the local file API
+# against the FUSE-mounted /Volumes (see cell 4 for why not dbutils.fs.cp), with a stage-then-atomic-rename
+# publish so neither failure mode leaves a bad file at DEST_WHEEL_PATH:
+#   - Copy into a TEMP file in the SAME directory (so the publish is a rename within one filesystem), then
+#     size-verify the staged copy. A copy that raises or truncates only ever affects the temp file, which the
+#     finally-block removes - never a partial/corrupt wheel at the destination that index jobs might install.
+#   - Publish with os.rename, which is atomic (readers see either no file or the whole file, never a partial).
+#     Guard no-overwrite: cell 4 already failed fast on a pre-existing target; we re-assert absence here right
+#     before the rename. Single-flight (max_concurrent_runs=1, queue disabled) rules out a concurrent run of
+#     THIS job creating it in between; an external writer to the same volume path in that sub-second window is
+#     the only residual race and is out of scope.
 import shutil
+import tempfile
 
 print(f"uploading {LOCAL_WHEEL_PATH} -> {DEST_WHEEL_PATH}")
-with open(LOCAL_WHEEL_PATH, "rb") as _src, open(DEST_WHEEL_PATH, "xb") as _dst:
-    shutil.copyfileobj(_src, _dst)
-
 _local_size = os.path.getsize(LOCAL_WHEEL_PATH)
+_fd, _staged = tempfile.mkstemp(dir=VOLUME_DEST_DIR, prefix=".build_wheel.", suffix=".whl.partial")
+os.close(_fd)
+try:
+    shutil.copyfile(LOCAL_WHEEL_PATH, _staged)
+    _staged_size = os.path.getsize(_staged)
+    if _staged_size != _local_size:
+        raise RuntimeError(f"staged copy size mismatch (local={_local_size}, staged={_staged_size})")
+    if os.path.exists(DEST_WHEEL_PATH):
+        raise FileExistsError(
+            f"target wheel already exists: {DEST_WHEEL_PATH}. Refusing to overwrite it (it may be in use by "
+            f"index jobs). Build a different wheel_version, or remove the existing file first to republish."
+        )
+    os.rename(_staged, DEST_WHEEL_PATH)
+    _staged = None  # published: the temp path no longer exists, nothing to clean up
+finally:
+    if _staged is not None and os.path.exists(_staged):
+        os.remove(_staged)
+
 if not os.path.isfile(DEST_WHEEL_PATH):
-    raise RuntimeError(f"upload verify failed: {DEST_WHEEL_PATH} not present after copy")
+    raise RuntimeError(f"upload verify failed: {DEST_WHEEL_PATH} not present after publish")
 _dest_size = os.path.getsize(DEST_WHEEL_PATH)
 print(f"upload complete: dest={DEST_WHEEL_PATH} local_size={_local_size} dest_size={_dest_size}")
 if _dest_size != _local_size:
