@@ -47,9 +47,10 @@ dbutils.library.restartPython()
 #      uses) and use in normalized form everywhere below. build writes the normalized version into the
 #      wheel filename, so normalizing here is what keeps cell 6's exact-name check aligned with what build
 #      emits (a non-canonical but valid input like '01.2.3', or a combined '1.0.0rc1.dev1', is accepted and
-#      normalized rather than passing here only to fail the name match later). A non-local PEP 440 version's
-#      normalized string is only digits, dots and lowercase tokens, so it drops into the filename/fs path
-#      with no separators or `..` to escape the volume dir,
+#      normalized rather than passing here only to fail the name match later). Local-version and epoch
+#      segments are rejected below, after which a normalized PEP 440 version is only digits, dots and
+#      lowercase tokens, so it drops into the filename/fs path with no separators or `..` to escape the
+#      volume dir,
 #   3. wheel_path non-empty (empty on main; set per target at deploy),
 #   4. the derived upload directory is under /Volumes/ (a UC Volume, where index jobs read the wheel from).
 import os
@@ -82,12 +83,16 @@ try:
     _parsed_version = Version(WHEEL_VERSION)
 except InvalidVersion as exc:
     raise ValueError(f"invalid wheel_version {WHEEL_VERSION!r}: not a PEP 440 version ({exc})")
-# Reject a local-version segment ('1.2.3+abc'): we never publish those, and the wheel filename escapes the
-# '+' (to '_'), which would break cell 6's exact-name match. A NON-LOCAL PEP 440 version's normalized string
-# is only digits, dots and lowercase tokens (a/b/rc/dev/post) - no '/' or '..' - so it drops safely into the
-# composed filename and fs path with nothing that could escape the volume dir.
+# Reject local-version ('1.2.3+abc') and epoch ('2!1.0.0') segments: we never publish either, and each keeps
+# a character ('+', '!') that str(Version) preserves but the wheel filename escapes to '_' per PEP 427 - so
+# the composed name would never match what build emits, failing cell 6 late on an otherwise-good build. Once
+# both are excluded, a normalized PEP 440 version is only digits, dots and lowercase tokens (a/b/rc/dev/post):
+# no '/' or '..', and nothing build would escape, so it drops into the composed filename and fs path safely
+# AND equals exactly what build writes.
 if _parsed_version.local is not None:
     raise ValueError(f"invalid wheel_version {WHEEL_VERSION!r}: local version segments (+...) are not supported")
+if _parsed_version.epoch != 0:
+    raise ValueError(f"invalid wheel_version {WHEEL_VERSION!r}: epoch version segments (N!...) are not supported")
 NORMALIZED_VERSION = str(_parsed_version)
 
 if not WHEEL_PATH:
