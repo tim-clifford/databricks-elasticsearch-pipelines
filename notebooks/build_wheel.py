@@ -115,7 +115,10 @@ if not WHEEL_PATH:
 # os.path.dirname would strip a real path component and silently publish one level too high (the /Volumes
 # check below would still pass). Requiring a .whl basename makes the parent-dir derivation correct by
 # construction (and, since it can't end in '/', no rstrip is needed).
-if not WHEEL_PATH.endswith(".whl"):
+if not WHEEL_PATH.endswith(".whl") or os.path.isdir(WHEEL_PATH):
+    # endswith() rejects a trailing-slash or non-wheel path; the isdir() check additionally rejects an
+    # existing directory whose name happens to end in '.whl', which the suffix test alone would accept and
+    # then dirname one level too high. (A not-yet-existing dest is isdir()==False and allowed.)
     raise ValueError(
         f"wheel_path {WHEEL_PATH!r} must be a full .whl file path (this job uploads to its parent directory)"
     )
@@ -253,14 +256,18 @@ if f"{_LIB_PKG}/__init__.py" not in _names:
 print(f"content check OK: library package present ({len(_lib_modules)} {_LIB_PKG}/ module file(s))")
 
 # COMMAND ----------
-# Cell 7 - UPLOAD the verified wheel to the UC Volume and confirm it landed. shutil.copyfile reads the
-# driver-local build outdir and writes the FUSE-mounted /Volumes path (the local file API; see cell 4 for why
-# not dbutils.fs.cp). We then stat the destination and assert the file is present AND its size matches the
+# Cell 7 - UPLOAD the verified wheel to the UC Volume and confirm it landed. We read the driver-local build
+# outdir and write the FUSE-mounted /Volumes path (the local file API; see cell 4 for why not dbutils.fs.cp).
+# The write uses EXCLUSIVE create ('xb'), so the no-overwrite guarantee is ATOMIC at the write itself, not a
+# check-then-act split from cell 4's pre-check: if the target appeared in between (an external actor - a
+# concurrent run is ruled out by single-flight), the open raises FileExistsError instead of truncating a
+# possibly in-use wheel. We then stat the destination and assert the file is present AND its size matches the
 # local wheel, so a truncated or failed copy cannot report green.
 import shutil
 
 print(f"uploading {LOCAL_WHEEL_PATH} -> {DEST_WHEEL_PATH}")
-shutil.copyfile(LOCAL_WHEEL_PATH, DEST_WHEEL_PATH)
+with open(LOCAL_WHEEL_PATH, "rb") as _src, open(DEST_WHEEL_PATH, "xb") as _dst:
+    shutil.copyfileobj(_src, _dst)
 
 _local_size = os.path.getsize(LOCAL_WHEEL_PATH)
 if not os.path.isfile(DEST_WHEEL_PATH):
