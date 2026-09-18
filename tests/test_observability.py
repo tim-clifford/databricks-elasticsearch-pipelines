@@ -153,13 +153,15 @@ _BULK_STATS = [
      "rtt_ms_mean": 12.5, "rtt_ms_p50": 11.0, "rtt_ms_p95": 22.0, "rtt_ms_max": 89.0,
      "http_ms_mean": 11.0, "http_ms_p50": 10.0, "http_ms_p95": 20.0, "http_ms_max": 80.0,
      "took_ms_mean": 8.0, "took_ms_p50": 7.0, "took_ms_p95": 15.0, "took_ms_max": 64.0,
-     "timeout_sends": 0, "timeout_wait_ms": 0.0, "error_sends": 0, "error_wait_ms": 0.0},
+     "timeout_sends": 0, "timeout_wait_ms": 0.0, "error_sends": 0, "error_wait_ms": 0.0,
+     "docs_retried": 5, "rejected_429": 5, "rejected_409": 1, "rejected_4xx_other": 2, "rejected_5xx": 0},
     {"n_sends": 60, "docs_sent": 600000, "bytes_sent": 1_200_000_000,
      "send_busy_ms": 600.0, "partition_wall_ms": 200.0,   # conc = 3.0
      "rtt_ms_mean": 10.0, "rtt_ms_p50": 9.0, "rtt_ms_p95": 18.0, "rtt_ms_max": 50.0,
      "http_ms_mean": 9.0, "http_ms_p50": 8.0, "http_ms_p95": 16.0, "http_ms_max": 45.0,
      "took_ms_mean": 6.0, "took_ms_p50": 5.0, "took_ms_p95": 12.0, "took_ms_max": 40.0,
-     "timeout_sends": 0, "timeout_wait_ms": 0.0, "error_sends": 0, "error_wait_ms": 0.0},
+     "timeout_sends": 0, "timeout_wait_ms": 0.0, "error_sends": 0, "error_wait_ms": 0.0,
+     "docs_retried": 3, "rejected_429": 3, "rejected_409": 0, "rejected_4xx_other": 0, "rejected_5xx": 1},
 ]
 
 
@@ -179,6 +181,8 @@ def test_format_bulk_stats_overall_rollup_is_exact():
     assert "took_ms(mean=6.80 max=64.00)" in line
     assert "timeouts(sends=0 wait_ms=0.00)" in line         # healthy fixture: no failed sends
     assert "errors(sends=0 wait_ms=0.00)" in line
+    assert "retried=8" in line                              # 5 + 3 docs re-sent for a 429
+    assert "rejected(429=8 409=1 4xx=2 5xx=1)" in line      # summed per-status across partitions
 
 
 def test_format_bulk_stats_per_partition_lines_carry_real_percentiles():
@@ -190,7 +194,9 @@ def test_format_bulk_stats_per_partition_lines_carry_real_percentiles():
     assert "http_ms(p50=10.00 p95=20.00 max=80.00)" in lines[1]
     assert "took_ms(p50=7.00 p95=15.00 max=64.00)" in lines[1]
     assert "timeouts(sends=0 wait_ms=0.00)" in lines[1] and "errors(sends=0 wait_ms=0.00)" in lines[1]
+    assert "retried=5" in lines[1] and "rejected(429=5 409=1 4xx=2 5xx=0)" in lines[1]
     assert "part1:" in lines[2] and "rtt_ms(p50=9.00 p95=18.00 max=50.00)" in lines[2]
+    assert "retried=3" in lines[2] and "rejected(429=3 409=0 4xx=0 5xx=1)" in lines[2]
     assert "conc=3.00" in lines[2]                                       # 600/200
 
 
@@ -242,6 +248,7 @@ def test_tail_summary_surfaces_http_ms_and_timeout_wait():
     line = format_tail_summary(result)
     assert "http_ms_max=80.00" in line          # slowest is part0 (larger wall); its http_ms_max
     assert "timeout_wait_ms=0.00" in line        # healthy fixture: no timeout retries on the slowest
+    assert "rejected_429=5" in line and "docs_retried=5" in line   # part0's item-level 429 backpressure
 
 
 # --------------------------------------------------------------------------- format_tail_summary

@@ -213,6 +213,13 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
         total_timeout_wait = _sum_opt("timeout_wait_ms")
         total_error_sends = _sum_opt("error_sends")
         total_error_wait = _sum_opt("error_wait_ms")
+        # Retry/reject accounting (connector 0.9.7+): docs re-sent for a retryable 429, and non-2xx item
+        # responses bucketed by status (transient 429/503 vs permanent 400/409). n/a on older wheels.
+        total_docs_retried = _sum_opt("docs_retried")
+        total_rej_429 = _sum_opt("rejected_429")
+        total_rej_409 = _sum_opt("rejected_409")
+        total_rej_4xx = _sum_opt("rejected_4xx_other")
+        total_rej_5xx = _sum_opt("rejected_5xx")
         # gil total and max are sourced together (both n/a unless every partition has both), so the
         # rollup never shows an inconsistent total/max pair. (max is read below, where _max is defined.)
         gil_ok = _all_present("gil_wait_ms_total", "gil_wait_ms_max")
@@ -260,6 +267,9 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
             f"took_ms(mean={_num(_weighted_mean('took_ms_mean'))} max={_num(_max('took_ms_max'))}) "
             f"timeouts(sends={_num(total_timeout_sends)} wait_ms={_num(_rounded(total_timeout_wait, 1))}) "
             f"errors(sends={_num(total_error_sends)} wait_ms={_num(_rounded(total_error_wait, 1))}) "
+            f"retried={_num(total_docs_retried)} "
+            f"rejected(429={_num(total_rej_429)} 409={_num(total_rej_409)} "
+            f"4xx={_num(total_rej_4xx)} 5xx={_num(total_rej_5xx)}) "
             f"cpu_ms(total={_num(_rounded(total_cpu, 1))}) "
             f"gil_wait_ms(total={_num(_rounded(total_gil, 1))} "
             f"max={_num(_max('gil_wait_ms_max') if gil_ok else None)})"
@@ -281,6 +291,9 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
                 f"conc={_num(_rounded(conc, 2))} cpu_ms={_num(p.get('send_cpu_ms'))} "
                 f"timeouts(sends={_num(p.get('timeout_sends'))} wait_ms={_num(p.get('timeout_wait_ms'))}) "
                 f"errors(sends={_num(p.get('error_sends'))} wait_ms={_num(p.get('error_wait_ms'))}) "
+                f"retried={_num(p.get('docs_retried'))} "
+                f"rejected(429={_num(p.get('rejected_429'))} 409={_num(p.get('rejected_409'))} "
+                f"4xx={_num(p.get('rejected_4xx_other'))} 5xx={_num(p.get('rejected_5xx'))}) "
                 f"rtt_ms({rtt}) http_ms({http}) took_ms({took}) gil_wait_ms({gil})"
             )
         return "\n".join(lines)
@@ -406,13 +419,16 @@ def format_tail_summary(result, now=None):
             # timeout_wait_ms on the slowest partition is a first-class "why it lagged" signal too: a large
             # value says the tail is time spent on connector-owned timeout re-sends (retry_transport_timeout),
             # distinct from GIL starvation or a slow-but-succeeding round trip. http_ms_max sits between
-            # rtt and took (network vs ES). Both n/a on connectors without them (pre-0.9.7).
+            # rtt and took (network vs ES). rejected_429 + docs_retried say the tail is item-level 429
+            # backpressure (ES write queue full). All n/a on connectors without them (pre-0.9.7).
             slow = (f"slowest=part{slow_i} wall_ms={_num(slow_wall)} "
                     f"sends={_num(_val(sp, 'n_sends'))} "
                     f"rtt_ms_max={_num(_val(sp, 'rtt_ms_max'))} "
                     f"http_ms_max={_num(_val(sp, 'http_ms_max'))} "
                     f"took_ms_max={_num(_val(sp, 'took_ms_max'))} "
                     f"timeout_wait_ms={_num(_val(sp, 'timeout_wait_ms'))} "
+                    f"rejected_429={_num(_val(sp, 'rejected_429'))} "
+                    f"docs_retried={_num(_val(sp, 'docs_retried'))} "
                     f"gil_wait_ms_total={_num(_val(sp, 'gil_wait_ms_total'))} "
                     f"conc={_num(conc)} docs={_num(_val(sp, 'docs_sent'))}")
             wall_vals = [w for (w, _i) in walls]
