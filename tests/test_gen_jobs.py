@@ -611,6 +611,52 @@ def test_shipped_databricks_yml_declares_bulk_stats():
     gen_jobs.require_bulk_stats_declared()  # the repo's databricks.yml declares it with a legal default
 
 
+# --- retry_transport_timeout global-var declaration + render guards (mirror bulk_stats) ---
+
+
+@pytest.mark.parametrize("default", ["true", "false", ""])
+def test_require_retry_transport_timeout_declared_accepts_legal_default(tmp_path, default):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  retry_transport_timeout:\n    default: '{default}'\n")
+    gen_jobs.require_retry_transport_timeout_declared(str(yml))  # no raise
+
+
+def test_require_retry_transport_timeout_declared_missing_fails_closed(tmp_path):
+    # An omitted-knob config bakes ${var.retry_transport_timeout}; if the variable is not declared, fail
+    # closed at generation rather than let the reference break confusingly at deploy.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
+    with pytest.raises(ValueError, match="retry_transport_timeout is not declared"):
+        gen_jobs.require_retry_transport_timeout_declared(str(yml))
+
+
+@pytest.mark.parametrize("bad", ["yes", "on", "1"])
+def test_require_retry_transport_timeout_declared_bad_default_fails_closed(tmp_path, bad):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  retry_transport_timeout:\n    default: '{bad}'\n")
+    with pytest.raises(ValueError, match="retry_transport_timeout"):
+        gen_jobs.require_retry_transport_timeout_declared(str(yml))
+
+
+def test_shipped_databricks_yml_declares_retry_transport_timeout():
+    gen_jobs.require_retry_transport_timeout_declared()  # the repo's databricks.yml declares it
+
+
+def test_render_singleton_omitted_retry_transport_timeout_bakes_global_ref():
+    cfg = _cfg()
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
+    assert {"name": "retry_transport_timeout", "default": "${var.retry_transport_timeout}"} in job["parameters"]
+
+
+def test_render_singleton_set_retry_transport_timeout_bakes_literal():
+    cfg = _cfg()
+    cfg["retry_transport_timeout"] = "true"
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
+    assert {"name": "retry_transport_timeout", "default": "true"} in job["parameters"]
+
+
 # --- request_timeout / transport_max_retries global-var declaration guards (mirror bulk_stats) ---
 
 
@@ -817,7 +863,8 @@ def test_group_run_time_knobs_move_into_task_base_parameters():
     # globally-defaulted knobs (bulk_stats, request_timeout, transport_max_retries) when omitted, so
     # grouped tasks defer to the target-wide defaults too.
     for p in job_parameters(cfg, gen_jobs._BULK_STATS_VAR_REF,
-                            gen_jobs._REQUEST_TIMEOUT_VAR_REF, gen_jobs._TRANSPORT_MAX_RETRIES_VAR_REF):
+                            gen_jobs._REQUEST_TIMEOUT_VAR_REF, gen_jobs._TRANSPORT_MAX_RETRIES_VAR_REF,
+                            gen_jobs._RETRY_TRANSPORT_TIMEOUT_VAR_REF):
         assert bp[p["name"]] == p["default"]
     assert bp["chunk_size"] == "500" and bp["write_concurrency"] == "4"  # per-member defaults carried
     assert bp["bulk_stats"] == "${var.bulk_stats}"  # omitted => defers to the global default

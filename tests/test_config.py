@@ -664,6 +664,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
         {"name": "bulk_stats", "default": ""},
+        {"name": "retry_transport_timeout", "default": ""},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": "0"},
         {"name": "max_partition_bytes", "default": "2m"},
@@ -702,6 +703,50 @@ def test_job_parameters_reliability_knobs_default_empty_without_ref():
     params = job_parameters(validate_config(_base()))
     assert {"name": "request_timeout", "default": ""} in params
     assert {"name": "transport_max_retries", "default": ""} in params
+
+
+def test_job_parameters_retry_transport_timeout_defaults_empty_without_ref():
+    # With no ref supplied (the pure/unit-test call), an omitted retry_transport_timeout stays "" - the
+    # connector's own default (off) stands.
+    params = job_parameters(validate_config(_base()))
+    assert {"name": "retry_transport_timeout", "default": ""} in params
+
+
+def test_job_parameters_retry_transport_timeout_omitted_uses_global_ref():
+    # When the config OMITS retry_transport_timeout, the generator's ref (4th positional) becomes the
+    # job-parameter default, so an omitted pipeline defers to ${var.retry_transport_timeout}.
+    params = job_parameters(validate_config(_base()), "${var.bulk_stats}",
+                            "${var.request_timeout}", "${var.transport_max_retries}",
+                            "${var.retry_transport_timeout}")
+    assert {"name": "retry_transport_timeout", "default": "${var.retry_transport_timeout}"} in params
+
+
+@pytest.mark.parametrize("value,expected", [(True, "true"), (False, "false")])
+def test_job_parameters_retry_transport_timeout_config_value_overrides_ref(value, expected):
+    # A config that SETS retry_transport_timeout bakes its literal value, overriding the global ref.
+    cfg = _base()
+    cfg["retry_transport_timeout"] = value
+    params = job_parameters(validate_config(cfg), "${var.bulk_stats}",
+                            "${var.request_timeout}", "${var.transport_max_retries}",
+                            "${var.retry_transport_timeout}")
+    assert {"name": "retry_transport_timeout", "default": expected} in params
+
+
+def test_validate_config_retry_transport_timeout_canonicalized_and_rejected():
+    # Stored canonical ("true"/"false"/"") like the other bool flags; a bad value fails closed.
+    assert validate_config({**_base(), "retry_transport_timeout": True})["retry_transport_timeout"] == "true"
+    assert validate_config({**_base(), "retry_transport_timeout": False})["retry_transport_timeout"] == "false"
+    assert validate_config(_base())["retry_transport_timeout"] == ""    # omitted => unset
+    with pytest.raises(PipelineConfigError, match="retry_transport_timeout"):
+        validate_config({**_base(), "retry_transport_timeout": "maybe"})
+
+
+def test_write_config_overrides_includes_retry_transport_timeout():
+    # The runner's override parser converts the effective flag to a typed bool kwarg, and omits it when
+    # unset (so the connector default stands).
+    assert write_config_overrides("", "", "", retry_transport_timeout="true")["retry_transport_timeout"] is True
+    assert write_config_overrides("", "", "", retry_transport_timeout="false")["retry_transport_timeout"] is False
+    assert "retry_transport_timeout" not in write_config_overrides("", "", "", retry_transport_timeout="")
 
 
 def test_job_parameters_reliability_knobs_omitted_use_global_ref():
