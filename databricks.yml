@@ -179,6 +179,22 @@ variables:
     description: "Global default for EsWriteConfig transport_max_retries (whole-request retries on a transport failure; 0 disables). Empty default (connector default 3 stands). A pipeline's own transport_max_retries and a per-run --params override this. Set per target/--var to raise it target-wide. Requires connector >= 0.6.0."
     default: ""
 
+  # GLOBAL default for the connector's retry_transport_timeout, threaded exactly like bulk_stats (a bool
+  # flag). When ON, the connector OWNS whole-request timeout retries: a bulk send that exceeds
+  # request_timeout is re-sent (whole chunk) up to transport_max_retries times with backoff, in connector
+  # code, instead of elasticsearch-py silently re-sending it and then a surfaced timeout failing the write
+  # (which makes Spark re-run the whole batch, so a latency-bound pipeline falls behind). It builds the
+  # write client with retry_on_timeout=False so the two layers do not stack; request_timeout is NOT
+  # shortened. A timed-out re-send re-applies the chunk: idempotent with es_id_field, an accepted at-least-
+  # once duplicate with auto-generated ids. Precedence, highest first: a per-run `--params
+  # retry_transport_timeout=<v>` > a pipeline's own `retry_transport_timeout:` in its config > this global
+  # default > the connector's own default (OFF). Empty default so it is off everywhere out of the box; set
+  # it "true" per target below (or --var) to turn it on target-wide. A legal value is "" / true / false
+  # (validated at generation and at run). Requires connector >= 0.9.7 (older wheels drop it fail-soft).
+  retry_transport_timeout:
+    description: "Global default for EsWriteConfig retry_transport_timeout (connector-owned whole-request timeout retry with backoff). Empty default (off; connector default stands). A pipeline's own retry_transport_timeout and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.9.7."
+    default: ""
+
   # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
   # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
   # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds
@@ -300,6 +316,10 @@ targets:
       # transport_max_retries: "5" # and the whole-request retry count. A pipeline's own value or a
                                    # --params override still wins. Empty defaults inherit the connector
                                    # defaults (60s / 3) when omitted.
+      # retry_transport_timeout: "true"  # let the connector OWN whole-request timeout retries (re-send with
+                                   # backoff instead of failing the batch) for the whole dev target. A
+                                   # pipeline's own value or a --params override still wins. Empty default
+                                   # (off) inherited when omitted. Requires connector >= 0.9.7.
       # DEV Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-dev-es-host:9200

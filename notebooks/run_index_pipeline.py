@@ -119,6 +119,7 @@ dbutils.widgets.text("transport_max_retries", "", "EsWriteConfig transport_max_r
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
 dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default from ${var.bulk_stats}/config; empty => connector default off; needs connector 0.9.3+)")
+dbutils.widgets.text("retry_transport_timeout", "", "EsWriteConfig retry_transport_timeout: true|false; connector OWNS whole-request timeout retry (re-send with backoff instead of failing the batch) (default from ${var.retry_transport_timeout}/config; empty => connector default off; needs connector 0.9.7+)")
 dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
 dbutils.widgets.text("max_partition_bytes", "", "spark.sql.files.maxPartitionBytes for the source read, e.g. 32m (0 leaves it unset; empty => default)")
 # Streaming-only widgets. checkpoint_base_path is a deploy-time base_parameter (bundle variable);
@@ -147,6 +148,7 @@ TRANSPORT_MAX_RETRIES = dbutils.widgets.get("transport_max_retries").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
 BULK_STATS = dbutils.widgets.get("bulk_stats").strip()
+RETRY_TRANSPORT_TIMEOUT = dbutils.widgets.get("retry_transport_timeout").strip()
 WRITE_REPARTITION = dbutils.widgets.get("write_repartition").strip()
 MAX_PARTITION_BYTES = dbutils.widgets.get("max_partition_bytes").strip()
 CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
@@ -246,24 +248,27 @@ if STREAMING_TRIGGER_INTERVAL:
     )
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS,
-                                         request_timeout=REQUEST_TIMEOUT, transport_max_retries=TRANSPORT_MAX_RETRIES)
-# bulk_stats requires connector 0.9.3+ (the release that added the EsWriteConfig field). Its effective
-# value is the global ${var.bulk_stats} default (or a per-pipeline config value / --params override); it
-# is only present in write_overrides when that resolves to a non-empty true/false. On an OLDER wheel, a
-# present bulk_stats would make EsWriteConfig(**write_overrides) raise TypeError on an unexpected kwarg
-# and fail EVERY such run. bulk_stats is DIAGNOSTICS ONLY, so it must never break the
-# export: if the installed EsWriteConfig has no such field, drop it from the overrides and warn, rather
-# than failing. Detected against the live dataclass's own field set (the installed wheel is the source
-# of truth), so this is correct whatever version is deployed. The other tuning knobs have existed since
-# well before this framework, so only bulk_stats is guarded.
-if "bulk_stats" in write_overrides:
+                                         request_timeout=REQUEST_TIMEOUT, transport_max_retries=TRANSPORT_MAX_RETRIES,
+                                         retry_transport_timeout=RETRY_TRANSPORT_TIMEOUT)
+# Two knobs were added to EsWriteConfig in specific connector releases: bulk_stats (0.9.3+) and
+# retry_transport_timeout (0.9.7+). Each is only present in write_overrides when its effective value (the
+# global ${var.*} default, a per-pipeline config value, or a --params override) resolves to a non-empty
+# true/false. On an OLDER wheel, a present-but-unknown kwarg would make EsWriteConfig(**write_overrides)
+# raise TypeError and fail EVERY such run. Both knobs are OPTIONAL enhancements (diagnostics; a reliability
+# retry), so they must never break the export: if the installed EsWriteConfig lacks a field, drop it from
+# the overrides and warn rather than failing. Detected against the live dataclass's own field set (the
+# installed wheel is the source of truth), so this is correct whatever version is deployed. The other
+# tuning knobs have existed since well before this framework, so only these version-gated ones are guarded.
+_VERSION_GATED_KNOBS = {"bulk_stats": "0.9.3+", "retry_transport_timeout": "0.9.7+"}
+if any(k in write_overrides for k in _VERSION_GATED_KNOBS):
     import dataclasses  # noqa: E402
     _es_fields = {f.name for f in dataclasses.fields(EsWriteConfig)}
-    if "bulk_stats" not in _es_fields:
-        _dropped = write_overrides.pop("bulk_stats")
-        print(f"WARNING: installed connector (databricks_es_connector {_connector_version}) has no "
-              f"EsWriteConfig.bulk_stats field; dropping bulk_stats={_dropped} (requires 0.9.3+). "
-              f"The export proceeds WITHOUT per-partition bulk-send diagnostics.")
+    for _knob, _min_ver in _VERSION_GATED_KNOBS.items():
+        if _knob in write_overrides and _knob not in _es_fields:
+            _dropped = write_overrides.pop(_knob)
+            print(f"WARNING: installed connector (databricks_es_connector {_connector_version}) has no "
+                  f"EsWriteConfig.{_knob} field; dropping {_knob}={_dropped} (requires {_min_ver}). "
+                  f"The export proceeds WITHOUT it.")
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
 WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repartition job parameter"))
 # - max_partition_bytes: Spark byte-size (or "0" = leave unset). Validated unconditionally; applied to

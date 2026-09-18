@@ -38,6 +38,12 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   pipeline; the job parameter (--params bulk_stats=...) then
                                          #   overrides per run. Requires connector 0.9.3+ (older wheels
                                          #   ignore it, fail-soft).
+    retry_transport_timeout: true | false  # OPTIONAL EsWriteConfig reliability toggle: let the connector
+                                         #   OWN whole-request timeout retries (re-send with backoff
+                                         #   instead of failing the batch). Same layering as bulk_stats
+                                         #   (config value > ${var.retry_transport_timeout} global >
+                                         #   connector default OFF). Requires connector 0.9.7+ (older
+                                         #   wheels ignore it, fail-soft).
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -433,7 +439,8 @@ def require_es_flag(value: object, where: str) -> str:
 
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
                            write_concurrency: object = "", bulk_stats: object = "",
-                           request_timeout: object = "", transport_max_retries: object = "") -> dict:
+                           request_timeout: object = "", transport_max_retries: object = "",
+                           retry_transport_timeout: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
     Called by the runner on the effective (config-default or --params override) widget values. Each
@@ -450,6 +457,10 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     value (widget cleared) falls back to the connector's own default. It requires connector 0.9.3+, so
     the runner drops it from these overrides fail-soft when the installed EsWriteConfig lacks the field
     (an older wheel) rather than failing the run - this function stays a pure value parser.
+
+    retry_transport_timeout is the same shape of bool knob (canonical "true"/"false"/"" via
+    require_es_flag): when true the connector owns whole-request timeout retries. It requires connector
+    0.9.7+, so the runner drops it fail-soft on an older wheel the same way it does bulk_stats.
 
     request_timeout (positive int seconds) and transport_max_retries (non-negative int; 0 disables
     transport retries) are connection/reliability knobs inherited from EsConnection. Both are unset by
@@ -478,7 +489,8 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
         overrides["transport_max_retries"] = int(canonical_transport_max_retries)
 
     for name, value in (("require_existing_index", require_existing_index),
-                        ("verify_certs", verify_certs), ("bulk_stats", bulk_stats)):
+                        ("verify_certs", verify_certs), ("bulk_stats", bulk_stats),
+                        ("retry_transport_timeout", retry_transport_timeout)):
         flag = require_es_flag(value, name)
         if flag:
             overrides[name] = flag == "true"
@@ -659,7 +671,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     allowed_top = {
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
         "chunk_size", "write_concurrency", "request_timeout", "transport_max_retries",
-        "require_existing_index", "verify_certs", "bulk_stats",
+        "require_existing_index", "verify_certs", "bulk_stats", "retry_transport_timeout",
         "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
@@ -722,6 +734,15 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # Stored canonical ("true"/"false"/"") like the other bool knobs, so it becomes a string job-parameter
     # default. Requires connector 0.9.3+; on an older wheel the runner drops it fail-soft (see runner).
     bulk_stats = require_es_flag(raw.get("bulk_stats", ""), f"{source}: bulk_stats")
+    # retry_transport_timeout is the connector-owned-timeout-retry toggle. Behaves EXACTLY like bulk_stats:
+    # an absent value is "" (unset at the config level), deferring to the GLOBAL default (the generator
+    # bakes the omitted job-parameter default as the ${var.retry_transport_timeout} databricks.yml variable
+    # per target), and when that is empty too the connector's own default (OFF) stands. A config value here
+    # (`retry_transport_timeout: true|false`) OVERRIDES the global for this pipeline; the run-time job
+    # parameter overrides it per run. Stored canonical ("true"/"false"/""). Requires connector 0.9.7+; on
+    # an older wheel the runner drops it fail-soft (see runner).
+    retry_transport_timeout = require_es_flag(raw.get("retry_transport_timeout", ""),
+                                              f"{source}: retry_transport_timeout")
     # write_repartition is OPTIONAL but, unlike the tuning knobs above, an absent value does NOT mean
     # "unset": it falls back to the built-in default (require_write_repartition turns "" into
     # _DEFAULT_WRITE_REPARTITION), so a config that omits it still parallelizes the write instead of
@@ -811,6 +832,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "require_existing_index": require_existing_index,
         "verify_certs": verify_certs,
         "bulk_stats": bulk_stats,
+        "retry_transport_timeout": retry_transport_timeout,
         "write_repartition": write_repartition,
         "max_partition_bytes": max_partition_bytes,
         "max_files_per_trigger": max_files_per_trigger,
@@ -1084,6 +1106,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # bulk_stats (diagnostics toggle) is a connector setting, not an object name: passed through
         # verbatim (canonical string form), like the tuning knobs.
         "bulk_stats": cfg["bulk_stats"],
+        # retry_transport_timeout (connector-owned timeout retry toggle): a connector setting, passed
+        # through verbatim (canonical string form), like bulk_stats.
+        "retry_transport_timeout": cfg["retry_transport_timeout"],
         # write_repartition (partitions for the pre-write repartition) and max_partition_bytes (read
         # scan parallelism) are run behaviors, not object names: passed through verbatim (canonical
         # string form), like the tuning knobs.
@@ -1310,7 +1335,8 @@ def job_base_parameters(
 
 def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
                    request_timeout_default_ref: str = "",
-                   transport_max_retries_default_ref: str = "") -> list:
+                   transport_max_retries_default_ref: str = "",
+                   retry_transport_timeout_default_ref: str = "") -> list:
     """The RUN-TIME-overridable job-level parameters for a per-index job, as JobParameterDefinitions.
 
     Unlike base_parameters (fixed at deploy), a job parameter can be overridden per run with
@@ -1345,6 +1371,9 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
       tests) it stays "" (the connector's own default, off). A config value overrides the global; the
       job parameter (--params bulk_stats=...) overrides per run. Canonical string form, parsed by
       write_config_overrides. Requires connector 0.9.3+ (older wheels drop it fail-soft in the runner).
+    - retry_transport_timeout: EsWriteConfig connector-owned-timeout-retry toggle, same layering as
+      bulk_stats (config value, else `retry_transport_timeout_default_ref` = ${var.retry_transport_timeout},
+      else "" for the connector default off). Requires connector 0.9.7+ (older wheels drop it fail-soft).
     - streaming_start: new|full, DEFAULT "new" (start the stream at the source's current version, so
       only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
       run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
@@ -1377,6 +1406,10 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
         # bulk_stats: the config value when set, else the caller-supplied global ref (${var.bulk_stats},
         # resolved per target at deploy), else "" (connector default off) when no ref is supplied.
         {"name": "bulk_stats", "default": cfg["bulk_stats"] or bulk_stats_default_ref},
+        # retry_transport_timeout: same layering as bulk_stats (config value, else the
+        # ${var.retry_transport_timeout} global ref, else "" for the connector default off).
+        {"name": "retry_transport_timeout",
+         "default": cfg["retry_transport_timeout"] or retry_transport_timeout_default_ref},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": cfg["write_repartition"]},
         {"name": "max_partition_bytes", "default": cfg["max_partition_bytes"]},
