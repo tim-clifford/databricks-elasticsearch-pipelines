@@ -28,6 +28,10 @@ BULK_STATS_TAG = "BULK_STATS"
 # re-typed inline) so the formatter and its tests read the same set; a key the connector renames simply
 # renders as n/a rather than raising (fail-soft).
 _RTT_KEYS = ("rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max")
+# http_ms is the connector's node-level HTTP wall (elastic_transport resp.meta.duration), nested between
+# rtt and took: rtt_ms >= http_ms >= took_ms. rtt-http is the client layer above the node (response
+# decode + GIL), http-took is compression + network. Absent on pre-0.9.7 connectors -> n/a.
+_HTTP_KEYS = ("http_ms_p50", "http_ms_p95", "http_ms_max")
 _TOOK_KEYS = ("took_ms_p50", "took_ms_p95", "took_ms_max")
 # The GIL-wait probe keys the connector emits (total stall over the partition plus its distribution).
 # A high gil_wait beside a high rtt means the round trip is inflated by GIL starvation (client-side,
@@ -203,6 +207,12 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
         total_busy = _sum("send_busy_ms")
         total_wall = _sum("partition_wall_ms")
         total_cpu = _sum_opt("send_cpu_ms")            # off-CPU send time = busy - cpu (n/a on old wheels)
+        # Failed-send accounting (connector 0.9.7+): count and wall time of sends that RAISED, split by
+        # timeout vs other transport error. n/a on older wheels (gated by _sum_opt / _all_present).
+        total_timeout_sends = _sum_opt("timeout_sends")
+        total_timeout_wait = _sum_opt("timeout_wait_ms")
+        total_error_sends = _sum_opt("error_sends")
+        total_error_wait = _sum_opt("error_wait_ms")
         # gil total and max are sourced together (both n/a unless every partition has both), so the
         # rollup never shows an inconsistent total/max pair. (max is read below, where _max is defined.)
         gil_ok = _all_present("gil_wait_ms_total", "gil_wait_ms_max")
@@ -246,7 +256,10 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
             f"bytes/send={_num(_rounded(_pair_ratio(total_bytes, total_sends), 1))} "
             f"conc(busy/wall)={_num(_rounded(_pair_ratio(total_busy, total_wall), 2))} "
             f"rtt_ms(mean={_num(_weighted_mean('rtt_ms_mean'))} max={_num(_max('rtt_ms_max'))}) "
+            f"http_ms(mean={_num(_weighted_mean('http_ms_mean'))} max={_num(_max('http_ms_max'))}) "
             f"took_ms(mean={_num(_weighted_mean('took_ms_mean'))} max={_num(_max('took_ms_max'))}) "
+            f"timeouts(sends={_num(total_timeout_sends)} wait_ms={_num(_rounded(total_timeout_wait, 1))}) "
+            f"errors(sends={_num(total_error_sends)} wait_ms={_num(_rounded(total_error_wait, 1))}) "
             f"cpu_ms(total={_num(_rounded(total_cpu, 1))}) "
             f"gil_wait_ms(total={_num(_rounded(total_gil, 1))} "
             f"max={_num(_max('gil_wait_ms_max') if gil_ok else None)})"
@@ -257,6 +270,7 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
         lines = [_with_ts(overall, now)]
         for i, p in enumerate(parts):
             rtt = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _RTT_KEYS)
+            http = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _HTTP_KEYS)
             took = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _TOOK_KEYS)
             gil = " ".join(f"{k.rsplit('_', 1)[1]}={_num(p.get(k))}" for k in _GIL_KEYS)
             bytes_per_doc = _pair_ratio(p.get("bytes_sent"), p.get("docs_sent"))
@@ -265,7 +279,9 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
                 f"{BULK_STATS_TAG}   part{i}: sends={_num(p.get('n_sends'))} "
                 f"docs={_num(p.get('docs_sent'))} bytes/doc={_num(_rounded(bytes_per_doc, 1))} "
                 f"conc={_num(_rounded(conc, 2))} cpu_ms={_num(p.get('send_cpu_ms'))} "
-                f"rtt_ms({rtt}) took_ms({took}) gil_wait_ms({gil})"
+                f"timeouts(sends={_num(p.get('timeout_sends'))} wait_ms={_num(p.get('timeout_wait_ms'))}) "
+                f"errors(sends={_num(p.get('error_sends'))} wait_ms={_num(p.get('error_wait_ms'))}) "
+                f"rtt_ms({rtt}) http_ms({http}) took_ms({took}) gil_wait_ms({gil})"
             )
         return "\n".join(lines)
     except Exception as _e:  # never let a diagnostic formatter disturb the export
@@ -387,10 +403,16 @@ def format_tail_summary(result, now=None):
             # gil_wait_ms_total on the slowest partition is a first-class "why it lagged" signal: a large
             # value beside a large rtt_ms_max says the tail is GIL starvation (the worker could not read
             # the ES response), not the network / ES queue. n/a on connectors without the probe.
+            # timeout_wait_ms on the slowest partition is a first-class "why it lagged" signal too: a large
+            # value says the tail is time spent on connector-owned timeout re-sends (retry_transport_timeout),
+            # distinct from GIL starvation or a slow-but-succeeding round trip. http_ms_max sits between
+            # rtt and took (network vs ES). Both n/a on connectors without them (pre-0.9.7).
             slow = (f"slowest=part{slow_i} wall_ms={_num(slow_wall)} "
                     f"sends={_num(_val(sp, 'n_sends'))} "
                     f"rtt_ms_max={_num(_val(sp, 'rtt_ms_max'))} "
+                    f"http_ms_max={_num(_val(sp, 'http_ms_max'))} "
                     f"took_ms_max={_num(_val(sp, 'took_ms_max'))} "
+                    f"timeout_wait_ms={_num(_val(sp, 'timeout_wait_ms'))} "
                     f"gil_wait_ms_total={_num(_val(sp, 'gil_wait_ms_total'))} "
                     f"conc={_num(conc)} docs={_num(_val(sp, 'docs_sent'))}")
             wall_vals = [w for (w, _i) in walls]

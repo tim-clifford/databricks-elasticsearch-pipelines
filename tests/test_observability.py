@@ -151,11 +151,15 @@ _BULK_STATS = [
     {"n_sends": 40, "docs_sent": 400000, "bytes_sent": 800_000_000,
      "send_busy_ms": 480.0, "partition_wall_ms": 240.0,   # conc = 2.0
      "rtt_ms_mean": 12.5, "rtt_ms_p50": 11.0, "rtt_ms_p95": 22.0, "rtt_ms_max": 89.0,
-     "took_ms_mean": 8.0, "took_ms_p50": 7.0, "took_ms_p95": 15.0, "took_ms_max": 64.0},
+     "http_ms_mean": 11.0, "http_ms_p50": 10.0, "http_ms_p95": 20.0, "http_ms_max": 80.0,
+     "took_ms_mean": 8.0, "took_ms_p50": 7.0, "took_ms_p95": 15.0, "took_ms_max": 64.0,
+     "timeout_sends": 0, "timeout_wait_ms": 0.0, "error_sends": 0, "error_wait_ms": 0.0},
     {"n_sends": 60, "docs_sent": 600000, "bytes_sent": 1_200_000_000,
      "send_busy_ms": 600.0, "partition_wall_ms": 200.0,   # conc = 3.0
      "rtt_ms_mean": 10.0, "rtt_ms_p50": 9.0, "rtt_ms_p95": 18.0, "rtt_ms_max": 50.0,
-     "took_ms_mean": 6.0, "took_ms_p50": 5.0, "took_ms_p95": 12.0, "took_ms_max": 40.0},
+     "http_ms_mean": 9.0, "http_ms_p50": 8.0, "http_ms_p95": 16.0, "http_ms_max": 45.0,
+     "took_ms_mean": 6.0, "took_ms_p50": 5.0, "took_ms_p95": 12.0, "took_ms_max": 40.0,
+     "timeout_sends": 0, "timeout_wait_ms": 0.0, "error_sends": 0, "error_wait_ms": 0.0},
 ]
 
 
@@ -171,7 +175,10 @@ def test_format_bulk_stats_overall_rollup_is_exact():
     assert "bytes/doc=2000.0" in line                       # 2e9 bytes / 1e6 docs
     assert "conc(busy/wall)=2.45" in line                   # 1080ms busy / 440ms wall
     assert "rtt_ms(mean=11.00 max=89.00)" in line
+    assert "http_ms(mean=9.80 max=80.00)" in line           # (11*40 + 9*60)/100 = 9.8; max 80
     assert "took_ms(mean=6.80 max=64.00)" in line
+    assert "timeouts(sends=0 wait_ms=0.00)" in line         # healthy fixture: no failed sends
+    assert "errors(sends=0 wait_ms=0.00)" in line
 
 
 def test_format_bulk_stats_per_partition_lines_carry_real_percentiles():
@@ -180,7 +187,9 @@ def test_format_bulk_stats_per_partition_lines_carry_real_percentiles():
     assert "part0:" in lines[1] and "sends=40" in lines[1] and "docs=400000" in lines[1]
     assert "bytes/doc=2000.0" in lines[1] and "conc=2.00" in lines[1]   # 8e8/4e5; 480/240
     assert "rtt_ms(p50=11.00 p95=22.00 max=89.00)" in lines[1]
+    assert "http_ms(p50=10.00 p95=20.00 max=80.00)" in lines[1]
     assert "took_ms(p50=7.00 p95=15.00 max=64.00)" in lines[1]
+    assert "timeouts(sends=0 wait_ms=0.00)" in lines[1] and "errors(sends=0 wait_ms=0.00)" in lines[1]
     assert "part1:" in lines[2] and "rtt_ms(p50=9.00 p95=18.00 max=50.00)" in lines[2]
     assert "conc=3.00" in lines[2]                                       # 600/200
 
@@ -208,6 +217,31 @@ def test_format_bulk_stats_never_raises_on_bad_input(bad):
     out = format_bulk_stats(bad)
     assert isinstance(out, str)
     assert BULK_STATS_TAG in out
+
+
+def test_format_bulk_stats_all_sends_timed_out_partition():
+    # With retry_transport_timeout, a partition whose EVERY send timed out yields n_sends=0 AND
+    # docs_sent=0 while timeout_sends>0. The per-send ratios (docs/send, bytes/send, conc) must guard the
+    # zero divisor (n/a or 0, never a crash), and the timeout counters must still render. Previously
+    # n_sends=0 only meant an empty partition; now it can mean "all sends failed".
+    stats = [{"n_sends": 0, "docs_sent": 0, "bytes_sent": 0,
+              "send_busy_ms": 0.0, "partition_wall_ms": 900000.0,
+              "rtt_ms_mean": None, "rtt_ms_p50": None, "rtt_ms_p95": None, "rtt_ms_max": None,
+              "http_ms_mean": None, "http_ms_p50": None, "http_ms_p95": None, "http_ms_max": None,
+              "took_ms_mean": None, "took_ms_p50": None, "took_ms_p95": None, "took_ms_max": None,
+              "timeout_sends": 3, "timeout_wait_ms": 900000.0, "error_sends": 0, "error_wait_ms": 0.0}]
+    out = format_bulk_stats(stats)          # must not raise (no divide-by-zero on n_sends)
+    overall = out.splitlines()[0]
+    assert "sends=0" in overall and "docs/send=0.00" in overall     # guarded zero divisor
+    assert "timeouts(sends=3 wait_ms=900000.00)" in overall         # the failed-send cost still renders
+    assert "part0:" in out.splitlines()[1] and "timeouts(sends=3 wait_ms=900000.00)" in out.splitlines()[1]
+
+
+def test_tail_summary_surfaces_http_ms_and_timeout_wait():
+    result = {"bulk_stats": _BULK_STATS, "collect_ms": 1.0, "merge_ms": 1.0}
+    line = format_tail_summary(result)
+    assert "http_ms_max=80.00" in line          # slowest is part0 (larger wall); its http_ms_max
+    assert "timeout_wait_ms=0.00" in line        # healthy fixture: no timeout retries on the slowest
 
 
 # --------------------------------------------------------------------------- format_tail_summary
