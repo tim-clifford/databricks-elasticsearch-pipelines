@@ -437,10 +437,37 @@ def require_es_flag(value: object, where: str) -> str:
     raise PipelineConfigError(f"{where} must be 'true' or 'false', got {value!r}")
 
 
+def require_op_type(value: object, where: str = "op_type") -> str:
+    """OPTIONAL EsWriteConfig op_type: the _bulk action used for index writes, canonical string.
+
+    Absent/empty -> "" (unset), which defers to the connector's own default op_type ("index", today's
+    behavior). A PRESENT value is passed THROUGH to EsWriteConfig unchanged: the connector is the single
+    source of truth for which op_types are legal (currently index | create, plus the create-409 no-op
+    that lets an append-only feed dedup a resend) and rejects an unknown one in
+    EsWriteConfig.__post_init__, so this validator deliberately does NOT re-enumerate the allowed set (a
+    copy here would drift from the connector's). It only enforces that a present value is a bare,
+    single-token string (lowercase letters/underscore) safe to carry as a job-parameter default; a
+    non-string or a token with spaces/punctuation fails closed. Same config-default-plus-run-time-override
+    shape as the other tuning knobs. Requires connector 0.10.0+; on an older wheel the runner drops it
+    fail-soft (a warning; the feed then runs as the connector's default op_type)."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise PipelineConfigError(
+            f"{where} must be a string (e.g. 'index' or 'create'), got {type(value).__name__}"
+        )
+    v = value.strip()
+    if v and not re.fullmatch(r"[a-z_]+", v):
+        raise PipelineConfigError(
+            f"{where} must be a bare lowercase op_type token (e.g. 'index' or 'create'), got {value!r}"
+        )
+    return v
+
+
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
                            write_concurrency: object = "", bulk_stats: object = "",
                            request_timeout: object = "", transport_max_retries: object = "",
-                           retry_transport_timeout: object = "") -> dict:
+                           retry_transport_timeout: object = "", op_type: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
     Called by the runner on the effective (config-default or --params override) widget values. Each
@@ -461,6 +488,12 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     retry_transport_timeout is the same shape of bool knob (canonical "true"/"false"/"" via
     require_es_flag): when true the connector owns whole-request timeout retries. It requires connector
     0.9.7+, so the runner drops it fail-soft on an older wheel the same way it does bulk_stats.
+
+    op_type is a STRING knob (index | create) parsed by require_op_type: a set value is passed through
+    unchanged (the connector validates the allowed set, not this layer), an unset "" is omitted so the
+    connector's default op_type ("index") stands. Requires connector 0.10.0+, dropped fail-soft on an
+    older wheel like bulk_stats. It is per-config (no global ${var.*}), so unlike bulk_stats it has no
+    target-wide default: a feed opts into create explicitly.
 
     request_timeout (positive int seconds) and transport_max_retries (non-negative int; 0 disables
     transport retries) are connection/reliability knobs inherited from EsConnection. Both are unset by
@@ -494,6 +527,13 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
         flag = require_es_flag(value, name)
         if flag:
             overrides[name] = flag == "true"
+
+    # op_type is a STRING knob (not a bool/int): a set value is passed through as-is (the connector
+    # validates index|create), an unset value ("") is omitted so the connector's default op_type stands.
+    # Requires connector 0.10.0+; the runner drops it fail-soft on an older wheel (see _VERSION_GATED_KNOBS).
+    canonical_op_type = require_op_type(op_type)
+    if canonical_op_type:
+        overrides["op_type"] = canonical_op_type
 
     return overrides
 
@@ -672,6 +712,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
         "chunk_size", "write_concurrency", "request_timeout", "transport_max_retries",
         "require_existing_index", "verify_certs", "bulk_stats", "retry_transport_timeout",
+        "op_type",
         "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
@@ -743,6 +784,16 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # an older wheel the runner drops it fail-soft (see runner).
     retry_transport_timeout = require_es_flag(raw.get("retry_transport_timeout", ""),
                                               f"{source}: retry_transport_timeout")
+    # op_type selects the _bulk action for index writes: "index" (default, an upsert-over-_id) or
+    # "create" (append-only, plus the connector's create-409-is-a-no-op dedup so a resend of an
+    # already-indexed doc is skipped instead of overwriting or failing the batch). OPTIONAL: absent -> ""
+    # (unset), which defers to the connector default ("index"). It is PER-CONFIG with NO global ${var.*}
+    # (a feed opts into create explicitly, unlike bulk_stats/retry_transport_timeout which take a
+    # target-wide default). Stored canonical string form (a job-parameter default). A present value is
+    # passed THROUGH to the connector, which is the single source of truth for the allowed set (so it is
+    # NOT re-enumerated here); a non-string/malformed token fails closed. Requires connector 0.10.0+; on
+    # an older wheel the runner drops it fail-soft.
+    op_type = require_op_type(raw.get("op_type", ""), f"{source}: op_type")
     # write_repartition is OPTIONAL but, unlike the tuning knobs above, an absent value does NOT mean
     # "unset": it falls back to the built-in default (require_write_repartition turns "" into
     # _DEFAULT_WRITE_REPARTITION), so a config that omits it still parallelizes the write instead of
@@ -833,6 +884,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "verify_certs": verify_certs,
         "bulk_stats": bulk_stats,
         "retry_transport_timeout": retry_transport_timeout,
+        "op_type": op_type,
         "write_repartition": write_repartition,
         "max_partition_bytes": max_partition_bytes,
         "max_files_per_trigger": max_files_per_trigger,
@@ -1374,6 +1426,11 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
     - retry_transport_timeout: EsWriteConfig connector-owned-timeout-retry toggle, same layering as
       bulk_stats (config value, else `retry_transport_timeout_default_ref` = ${var.retry_transport_timeout},
       else "" for the connector default off). Requires connector 0.9.7+ (older wheels drop it fail-soft).
+    - op_type: EsWriteConfig bulk-action selector, index (default) | create. DEFAULT from the config when
+      set, else "" (the connector default op_type, "index"). PER-CONFIG with NO global ${var.*} ref (a
+      feed opts into create explicitly), so unlike bulk_stats it takes no *_default_ref. Canonical string
+      form, parsed/passed-through by write_config_overrides. Requires connector 0.10.0+ (older wheels
+      drop it fail-soft in the runner).
     - streaming_start: new|full, DEFAULT "new" (start the stream at the source's current version, so
       only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
       run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
@@ -1395,6 +1452,9 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
         {"name": "filter_condition", "default": cfg["filter_condition"]},
         {"name": "chunk_size", "default": cfg["chunk_size"]},
         {"name": "write_concurrency", "default": cfg["write_concurrency"]},
+        # op_type: the config value when set, else "" (the connector default op_type, "index"). PER-CONFIG
+        # with NO global ref (a feed opts into create explicitly), so it takes no *_default_ref layering.
+        {"name": "op_type", "default": cfg["op_type"]},
         # request_timeout / transport_max_retries: the config value when set, else the caller-supplied
         # global ref (${var.request_timeout} / ${var.transport_max_retries}, resolved per target at
         # deploy), else "" (connector default) when no ref is supplied. Same layering as bulk_stats.
