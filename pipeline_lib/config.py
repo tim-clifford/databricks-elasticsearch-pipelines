@@ -44,6 +44,13 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   (config value > ${var.retry_transport_timeout} global >
                                          #   connector default OFF). Requires connector 0.9.7+ (older
                                          #   wheels ignore it, fail-soft).
+    op_type: index | create             # OPTIONAL EsWriteConfig bulk-action selector. "index" (default)
+                                         #   upserts over the _id; "create" is append-only (a resend of an
+                                         #   already-indexed doc returns 409 and is a no-op, deduped not
+                                         #   overwritten). Unlike bulk_stats it is PER-CONFIG with NO
+                                         #   global default (a feed opts into create explicitly); omitted
+                                         #   => the connector default ("index"). Requires connector
+                                         #   0.10.0+ (older wheels ignore it, fail-soft).
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
