@@ -164,6 +164,14 @@ _BULK_STATS = [
      "docs_retried": 3, "rejected_429": 3, "rejected_409": 0, "rejected_4xx_other": 0, "rejected_5xx": 1},
 ]
 
+# Same shape as _BULK_STATS but carrying docs_deduped (connector 0.10.0+, op_type=create): create-ops
+# that returned 409 and were counted as an already-exists no-op (a successful dedup on a resend), which
+# is distinct from rejected_409 (a genuine index-mode version conflict). part0 = 4, part1 = 2.
+_DEDUPED_BULK_STATS = [
+    {**_BULK_STATS[0], "docs_deduped": 4},
+    {**_BULK_STATS[1], "docs_deduped": 2},
+]
+
 
 def test_format_bulk_stats_overall_rollup_is_exact():
     # The overall line reports figures that recombine EXACTLY across partitions: total sends/docs,
@@ -205,6 +213,30 @@ def test_format_bulk_stats_oneline_is_overall_only():
     assert "\n" not in line
     assert line.startswith(f"{BULK_STATS_TAG} overall:")
     assert "part0" not in line
+
+
+def test_bulk_stats_docs_deduped_rendered_overall_and_per_partition():
+    # docs_deduped (connector 0.10.0+, op_type=create): create-ops that 409'd and were treated as an
+    # already-exists no-op (a successful dedup on a resend). Summed in the overall line, shown per
+    # partition, and surfaced on the slowest partition in the tail summary (part0 is slowest: wall 240 >
+    # 200). It reads independently of rejected_409, which stays for genuine index-mode conflicts.
+    lines = format_bulk_stats(_DEDUPED_BULK_STATS).splitlines()
+    assert "deduped=6" in lines[0]        # 4 + 2 across partitions
+    assert "deduped=4" in lines[1]
+    assert "deduped=2" in lines[2]
+    tail = format_tail_summary({"bulk_stats": _DEDUPED_BULK_STATS})
+    assert "docs_deduped=4" in tail       # slowest partition's dedup count
+
+
+def test_bulk_stats_docs_deduped_na_when_absent():
+    # A pre-0.10.0 connector result (the _BULK_STATS fixture carries no docs_deduped): the token renders
+    # n/a, never a bogus 0, and never raises - the fail-soft rule for every newer bulk_stats field.
+    overall = format_bulk_stats(_BULK_STATS, oneline=True)
+    assert "deduped=n/a" in overall
+    per_part = format_bulk_stats(_BULK_STATS).splitlines()[1]
+    assert "deduped=n/a" in per_part
+    tail = format_tail_summary({"bulk_stats": _BULK_STATS})
+    assert "docs_deduped=n/a" in tail
 
 
 def test_format_bulk_stats_none_took_renders_na_not_raises():

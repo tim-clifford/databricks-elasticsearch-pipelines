@@ -46,6 +46,7 @@ resources:
             filter_condition: ''
             chunk_size: ''
             write_concurrency: ''
+            op_type: ''
             request_timeout: ${var.request_timeout}
             transport_max_retries: ${var.transport_max_retries}
             require_existing_index: ''
@@ -75,6 +76,7 @@ resources:
             filter_condition: ''
             chunk_size: ''
             write_concurrency: ''
+            op_type: ''
             request_timeout: ${var.request_timeout}
             transport_max_retries: ${var.transport_max_retries}
             require_existing_index: ''
