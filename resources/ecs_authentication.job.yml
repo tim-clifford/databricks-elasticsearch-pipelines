@@ -24,6 +24,8 @@ resources:
         default: ''
       - name: write_concurrency
         default: ''
+      - name: op_type
+        default: ''
       - name: request_timeout
         default: ${var.request_timeout}
       - name: transport_max_retries
