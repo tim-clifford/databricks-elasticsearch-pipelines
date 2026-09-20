@@ -776,7 +776,15 @@ if PIPELINE_MODE == "streaming":
         _cp_state = _checkpoint_offsets_state(checkpoint_location)
         if _cp_state == "has_offset":
             # A prior run persisted an offset: Spark resumes from the checkpoint (startingVersion is
-            # ignored). No seed needed.
+            # ignored), so no seed is needed. A committed offset ALWAYS means "resume" - we never re-run
+            # the no-op drain when offsets exist. Consequences:
+            #   - A pipeline whose checkpoint predates this seed logic resumes normally: it is never
+            #     no-op-drained, so no un-sent backlog is skipped (re-draining an existing checkpoint is
+            #     exactly what would lose data, which is why has_offset never triggers a drain).
+            #   - If a previous run's no-op seed FAILED partway, it left a partial offset; this run's main
+            #     stream resumes from there and SENDS the un-drained tail of the initial snapshot to ES
+            #     (slower, and partial history reaches ES). That is the SAFE direction - it over-sends,
+            #     never drops - and is self-limiting to the tail; a clean seed avoids it entirely.
             print("streaming_start=new: resuming from existing checkpoint (no seed needed)")
         elif _cp_state == "empty":
             # GENUINE first run (offsets dir positively absent): establish the checkpoint at the source's
