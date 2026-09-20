@@ -659,6 +659,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "filter_condition", "default": "action = 'allowed'"},
         {"name": "chunk_size", "default": ""},
         {"name": "write_concurrency", "default": ""},
+        {"name": "op_type", "default": ""},
         {"name": "request_timeout", "default": ""},
         {"name": "transport_max_retries", "default": ""},
         {"name": "require_existing_index", "default": ""},
@@ -747,6 +748,67 @@ def test_write_config_overrides_includes_retry_transport_timeout():
     assert write_config_overrides("", "", "", retry_transport_timeout="true")["retry_transport_timeout"] is True
     assert write_config_overrides("", "", "", retry_transport_timeout="false")["retry_transport_timeout"] is False
     assert "retry_transport_timeout" not in write_config_overrides("", "", "", retry_transport_timeout="")
+
+
+# --- op_type (connector 0.10.0+): per-config bulk action, "index" (default) | "create" -------------
+# Unlike bulk_stats/retry_transport_timeout, op_type has NO global ${var.*} default: it is a per-feed
+# choice (like es_id_field), so its job-parameter default is the config value alone (no ref fallback).
+# The allowed set (index|create) is NOT re-enumerated here - the connector's EsWriteConfig is the single
+# source of truth and validates the value; this layer only passes a bare token through / fails closed on
+# a non-string or a malformed one.
+
+
+def test_job_parameters_op_type_defaults_empty():
+    # Omitted config => "" job-parameter default; the connector's own default op_type ("index") stands.
+    # op_type takes no *_default_ref (it is not globally-var'd), so the pure call already reflects it.
+    params = job_parameters(validate_config(_base()))
+    assert {"name": "op_type", "default": ""} in params
+
+
+@pytest.mark.parametrize("value", ["index", "create"])
+def test_job_parameters_op_type_config_value_baked(value):
+    # A config that SETS op_type bakes its literal value as the job-parameter default (per-config, no ref
+    # fallback even when the globally-var'd refs are supplied).
+    cfg = _base()
+    cfg["op_type"] = value
+    params = job_parameters(validate_config(cfg), "${var.bulk_stats}",
+                            "${var.request_timeout}", "${var.transport_max_retries}",
+                            "${var.retry_transport_timeout}")
+    assert {"name": "op_type", "default": value} in params
+
+
+def test_validate_config_op_type_passthrough_and_type_checked():
+    # A present op_type is passed THROUGH unchanged (the connector validates index|create); omitted => ""
+    # (unset). A non-string or a non-bare-token value fails closed here, but the value SET itself
+    # (e.g. an unknown op) is deliberately NOT enumerated at this layer.
+    assert validate_config({**_base(), "op_type": "create"})["op_type"] == "create"
+    assert validate_config({**_base(), "op_type": "index"})["op_type"] == "index"
+    assert validate_config({**_base(), "op_type": " create "})["op_type"] == "create"  # stripped
+    assert validate_config(_base())["op_type"] == ""            # omitted => unset
+    with pytest.raises(PipelineConfigError, match="op_type"):
+        validate_config({**_base(), "op_type": 7})              # non-string
+    with pytest.raises(PipelineConfigError, match="op_type"):
+        validate_config({**_base(), "op_type": "has space"})    # not a bare token
+
+
+def test_validate_config_op_type_create_requires_es_id_field():
+    # Cross-field consistency (like continuous-requires-streaming): op_type: create is append-only and
+    # needs an explicit _id to dedup a resend, so create WITHOUT es_id_field is rejected fail-closed at
+    # config time rather than left to fail at the connector (0.10.0+) or silently duplicate on an older
+    # wheel. create WITH es_id_field, and index without it, are both fine.
+    no_id = {k: v for k, v in _base().items() if k != "es_id_field"}
+    with pytest.raises(PipelineConfigError, match="op_type: create requires es_id_field"):
+        validate_config({**no_id, "op_type": "create"})
+    assert validate_config({**no_id, "op_type": "index"})["op_type"] == "index"   # index needs no id
+    assert validate_config({**_base(), "op_type": "create"})["op_type"] == "create"  # create + id ok
+
+
+def test_write_config_overrides_includes_op_type():
+    # The runner's override parser passes a set op_type through as a string kwarg, and OMITS it when unset
+    # (so the connector's own default op_type stands). The value is not enumerated here.
+    assert write_config_overrides("", "", "", op_type="create")["op_type"] == "create"
+    assert write_config_overrides("", "", "", op_type="index")["op_type"] == "index"
+    assert "op_type" not in write_config_overrides("", "", "", op_type="")
 
 
 def test_job_parameters_reliability_knobs_omitted_use_global_ref():

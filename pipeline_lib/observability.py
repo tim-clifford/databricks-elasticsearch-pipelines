@@ -220,6 +220,10 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
         total_rej_409 = _sum_opt("rejected_409")
         total_rej_4xx = _sum_opt("rejected_4xx_other")
         total_rej_5xx = _sum_opt("rejected_5xx")
+        # Dedup accounting (connector 0.10.0+, op_type=create): create-ops that returned 409 and were
+        # counted as an already-exists no-op (a successful dedup on a resend), distinct from rejected_409
+        # (a genuine index-mode version conflict). n/a on older wheels.
+        total_docs_deduped = _sum_opt("docs_deduped")
         # gil total and max are sourced together (both n/a unless every partition has both), so the
         # rollup never shows an inconsistent total/max pair. (max is read below, where _max is defined.)
         gil_ok = _all_present("gil_wait_ms_total", "gil_wait_ms_max")
@@ -270,6 +274,7 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
             f"retried={_num(total_docs_retried)} "
             f"rejected(429={_num(total_rej_429)} 409={_num(total_rej_409)} "
             f"4xx={_num(total_rej_4xx)} 5xx={_num(total_rej_5xx)}) "
+            f"deduped={_num(total_docs_deduped)} "
             f"cpu_ms(total={_num(_rounded(total_cpu, 1))}) "
             f"gil_wait_ms(total={_num(_rounded(total_gil, 1))} "
             f"max={_num(_max('gil_wait_ms_max') if gil_ok else None)})"
@@ -294,6 +299,7 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
                 f"retried={_num(p.get('docs_retried'))} "
                 f"rejected(429={_num(p.get('rejected_429'))} 409={_num(p.get('rejected_409'))} "
                 f"4xx={_num(p.get('rejected_4xx_other'))} 5xx={_num(p.get('rejected_5xx'))}) "
+                f"deduped={_num(p.get('docs_deduped'))} "
                 f"rtt_ms({rtt}) http_ms({http}) took_ms({took}) gil_wait_ms({gil})"
             )
         return "\n".join(lines)
@@ -420,7 +426,8 @@ def format_tail_summary(result, now=None):
             # value says the tail is time spent on connector-owned timeout re-sends (retry_transport_timeout),
             # distinct from GIL starvation or a slow-but-succeeding round trip. http_ms_max sits between
             # rtt and took (network vs ES). rejected_429 + docs_retried say the tail is item-level 429
-            # backpressure (ES write queue full). All n/a on connectors without them (pre-0.9.7).
+            # backpressure (ES write queue full); docs_deduped says it is create-mode dedup of a resend
+            # (op_type=create, 0.10.0+). All n/a on connectors without them (pre-0.9.7 / pre-0.10.0).
             slow = (f"slowest=part{slow_i} wall_ms={_num(slow_wall)} "
                     f"sends={_num(_val(sp, 'n_sends'))} "
                     f"rtt_ms_max={_num(_val(sp, 'rtt_ms_max'))} "
@@ -429,6 +436,7 @@ def format_tail_summary(result, now=None):
                     f"timeout_wait_ms={_num(_val(sp, 'timeout_wait_ms'))} "
                     f"rejected_429={_num(_val(sp, 'rejected_429'))} "
                     f"docs_retried={_num(_val(sp, 'docs_retried'))} "
+                    f"docs_deduped={_num(_val(sp, 'docs_deduped'))} "
                     f"gil_wait_ms_total={_num(_val(sp, 'gil_wait_ms_total'))} "
                     f"conc={_num(conc)} docs={_num(_val(sp, 'docs_sent'))}")
             wall_vals = [w for (w, _i) in walls]
