@@ -877,6 +877,22 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
                 f"always-on continuous trigger or a schedule, not both); remove one"
             )
 
+    # op_type: create is APPEND-ONLY and needs an explicit _id to dedup a resend against. Without
+    # es_id_field the connector passes no _id, ES auto-assigns a random one, so a create can never
+    # 409-conflict: the resend-dedup the mode promises never fires and a replay accumulates duplicates.
+    # Enforce the documented requirement fail-closed HERE (same shape as the continuous cross-field
+    # checks above), so a misconfigured feed is rejected at generation/deploy rather than failing at the
+    # connector on a 0.10.0+ wheel, or silently degrading to auto-id duplication if op_type is dropped on
+    # an older wheel. A run-time --params op_type=create override bypasses this and is backstopped by the
+    # connector's own id_field guard. (This is a cross-field consistency check, not op_type value
+    # validation, which stays the connector's single source of truth.)
+    if op_type == "create" and es_id_field is None:
+        raise PipelineConfigError(
+            f"{source}: op_type: create requires es_id_field (append-only dedup needs an explicit _id; "
+            f"a create without one never conflicts, so ES auto-assigns ids and replays duplicate). "
+            f"Set es_id_field, or use op_type: index."
+        )
+
     return {
         "es_index_name": es_index_name,
         "es_id_field": es_id_field,

@@ -791,6 +791,18 @@ def test_validate_config_op_type_passthrough_and_type_checked():
         validate_config({**_base(), "op_type": "has space"})    # not a bare token
 
 
+def test_validate_config_op_type_create_requires_es_id_field():
+    # Cross-field consistency (like continuous-requires-streaming): op_type: create is append-only and
+    # needs an explicit _id to dedup a resend, so create WITHOUT es_id_field is rejected fail-closed at
+    # config time rather than left to fail at the connector (0.10.0+) or silently duplicate on an older
+    # wheel. create WITH es_id_field, and index without it, are both fine.
+    no_id = {k: v for k, v in _base().items() if k != "es_id_field"}
+    with pytest.raises(PipelineConfigError, match="op_type: create requires es_id_field"):
+        validate_config({**no_id, "op_type": "create"})
+    assert validate_config({**no_id, "op_type": "index"})["op_type"] == "index"   # index needs no id
+    assert validate_config({**_base(), "op_type": "create"})["op_type"] == "create"  # create + id ok
+
+
 def test_write_config_overrides_includes_op_type():
     # The runner's override parser passes a set op_type through as a string kwarg, and OMITS it when unset
     # (so the connector's own default op_type stands). The value is not enumerated here.
