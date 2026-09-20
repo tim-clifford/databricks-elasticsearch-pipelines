@@ -40,7 +40,9 @@
 # MAGIC   default). `request_timeout` (seconds) and `transport_max_retries` (0 disables) tune a write that
 # MAGIC   times out mid-send.
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
-# MAGIC   streaming only, honored on the first run before a checkpoint exists.
+# MAGIC   streaming only, honored on the first run before a checkpoint exists. `new` establishes the
+# MAGIC   checkpoint at the current source position via a no-op availableNow seed (drains the initial
+# MAGIC   snapshot without exporting to ES), so history is skipped without stalling on a large source.
 # MAGIC - `max_files_per_trigger`, `max_bytes_per_trigger`: streaming read rate-limits that bound each
 # MAGIC   micro-batch (default from config; empty => Spark defaults). Streaming only; useful for a backfill.
 
@@ -702,42 +704,61 @@ if PIPELINE_MODE == "streaming":
 # them rather than failing the stream; corrections are handled out-of-band via a batch backfill.
 #
 # streaming_start controls where a FIRST run (no checkpoint yet) begins; once a checkpoint exists it is
-# the position of record and startingVersion is ignored (Spark resumes from the checkpoint). Because the
-# seed is a no-op on a resume, we DETECT an existing persisted offset and skip the current-version lookup +
-# startingVersion seed entirely on those runs - it avoids a needless metadata scan and, more importantly,
-# stops the "seeding at current source version" line from printing on runs where the seed is ignored,
-# which misrepresented the real state (a resume, not a seed) after the first run.
-# - "new": start at the source's CURRENT Delta version, so existing history is NOT re-exported and
-#   subsequent runs pick up only new commits. We resolve the concrete current version NUMBER rather
-#   than startingVersion="latest" because of a Trigger.availableNow interaction proven live: a "latest"
-#   first run finds no new rows, runs zero micro-batches, and persists NO checkpoint offset, so it never
-#   establishes a resume point and later runs keep skipping new data. A numeric startingVersion seeds a
-#   real, persisted offset even on a zero-row first batch, so the next run resumes correctly.
-#   startingVersion is INCLUSIVE and must be an EXISTING version, so we use the current version
-#   (current+1 is rejected when it does not exist yet). One consequence: if the current commit is an
-#   append, the first "new" run re-exports that single commit's rows. That is a harmless idempotent
-#   upsert (bounded to one commit) ONLY when es_id_field is set; with es_id_field OMITTED those rows get
-#   fresh random _ids and are re-inserted as NEW documents (duplicates).
-# - "full": omit startingVersion, so the first micro-batches backfill the whole existing table.
+# the position of record (Spark resumes from the checkpoint), so we POSITIVELY classify the checkpoint's
+# offsets and skip all first-run seeding on a resume (see _checkpoint_offsets_state).
+# - "new": establish the checkpoint at the source's CURRENT position WITHOUT exporting existing data,
+#   then subsequent runs pick up only new commits. On a genuine first run we do this with a dedicated
+#   NO-OP SEED: a Trigger.availableNow stream (startingVersion = current version, a bounded
+#   maxFilesPerTrigger, skipChangeCommits matching the main reader) whose foreachBatch does NOTHING,
+#   writing the REAL checkpoint. It drains the source's initial snapshot as empty-effect micro-batches -
+#   committing offsets but sending nothing to ES - then stops, and the MAIN stream below resumes from
+#   that checkpoint incrementally. Why a separate no-op drain rather than seeding startingVersion on the
+#   main reader: on a large-history source, first-run positioning enumerates a task per active file and
+#   can run for many hours before the main stream makes progress; doing it as a no-op (no transform, no
+#   ES write) bounded by maxFilesPerTrigger lets it complete and commit a resume point cheaply. We use a
+#   numeric startingVersion (not "latest") so the seed persists a real offset even with no new data;
+#   "latest" runs zero batches and persists none, so the next run would re-seed and could skip real data.
+#   If the checkpoint state cannot be positively classified (a listing error, neither clearly resume nor
+#   clearly first-run), we fall back to seeding startingVersion on the main reader instead of the no-op
+#   drain - safe on both a resume and a true first run, and it never skips a backlog.
+# - "full": omit startingVersion and use the REAL foreachBatch, so the first micro-batches backfill the
+#   whole existing table to ES (intentional history export).
 if PIPELINE_MODE == "streaming":
-    def _checkpoint_has_committed_offset(cp_location: str) -> bool:
-        # True ONLY when the streaming checkpoint positively holds at least one persisted offset - the
-        # signal that Spark will resume from the checkpoint and IGNORE startingVersion. Fails CLOSED:
-        # any ambiguity (offsets dir absent because this is a first run, or an ls error) returns False so
-        # we still seed startingVersion. Seeding is harmless when a checkpoint does exist (Spark ignores
-        # the option on resume) but ESSENTIAL on a genuine first run, where omitting it would backfill
-        # the whole table. So a false negative costs nothing; a false positive would re-export history -
-        # hence we only skip on positive proof of a real batch-offset file.
+    def _checkpoint_offsets_state(cp_location: str) -> str:
+        # POSITIVELY classify the checkpoint's offsets directory, so the "new" first-run seeding path is
+        # chosen without ever silently dropping data (allow-list, fail closed):
+        #   "has_offset" - at least one integer-named batch offset file exists => Spark will RESUME from
+        #                  the checkpoint (startingVersion ignored); no first-run seeding.
+        #   "empty"      - the offsets dir POSITIVELY does not exist (clean not-found) or holds no batch
+        #                  offset => a genuine first run => safe to run the no-op seed drain.
+        #   "unknown"    - the listing FAILED for any OTHER reason (transient IO, permissions): we cannot
+        #                  distinguish resume from first run, so the caller must fall back to the
+        #                  startingVersion-on-the-main-reader path (a no-op on resume, a correct seed on a
+        #                  true first run) rather than the no-op drain, which on a MISCLASSIFIED resume
+        #                  would advance the offset past an un-sent backlog and lose those records.
         offsets_dir = f"{cp_location.rstrip('/')}/offsets"
         try:
             entries = dbutils.fs.ls(offsets_dir)
-        except Exception:
-            # offsets/ does not exist yet (first run) or is unreadable: seed, do not skip.
-            return False
-        # Structured Streaming names each committed batch offset file by its integer batch id ("0",
-        # "1", ...). Require at least one such file: an integer-named entry is a persisted resume point.
-        # Filtering to digit names ignores transient temp/hidden files and any non-batch marker.
-        return any(e.name.rstrip("/").isdigit() for e in entries)
+        except Exception as _e:
+            # Only a clean not-found is a genuine first run. Match the not-found signals this runtime
+            # raises (verified elsewhere in this notebook: a missing UC-Volume path raises with "No such
+            # file or directory" / FileNotFoundException); ANY other error is ambiguous, not "empty".
+            _msg = str(_e)
+            if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
+                return "empty"
+            return "unknown"
+        # Structured Streaming names each committed batch offset file by its integer batch id ("0", "1",
+        # ...). An integer-named entry is a persisted resume point; digit-filtering ignores transient
+        # temp/hidden files and non-batch markers. No such entry (empty dir) is still a first run.
+        return "has_offset" if any(e.name.rstrip("/").isdigit() for e in entries) else "empty"
+
+    # The seed drain's batch bound (used by the "new" first-run path below). maxFilesPerTrigger MUST be
+    # set on the no-op seed so the source's initial snapshot is consumed as bounded, resumable
+    # micro-batches instead of one unbounded batch that can stall on a large-history source. Reuse the
+    # operator's max_files_per_trigger when set; otherwise this default. TUNABLE: since the seed's batches
+    # are no-ops (no read/transform/write), a larger value means fewer passes to drain; the right value is
+    # confirmed against the real source during rollout.
+    _SEED_MAX_FILES_PER_TRIGGER_DEFAULT = "10000"
 
     reader = spark.readStream.option("skipChangeCommits", "true")
     # Optional read rate-limits: bound how much each micro-batch pulls from the source. Applied to BOTH
@@ -750,35 +771,72 @@ if PIPELINE_MODE == "streaming":
     if MAX_BYTES_PER_TRIGGER:
         reader = reader.option("maxBytesPerTrigger", MAX_BYTES_PER_TRIGGER)
     if STREAMING_START == "new":
-        if _checkpoint_has_committed_offset(checkpoint_location):
-            # A prior run already persisted an offset: Spark resumes from the checkpoint and
-            # startingVersion is ignored. Skip the current-version lookup and the seed entirely.
-            print("streaming_start=new: resuming from existing checkpoint (startingVersion ignored)")
-        else:
-            # Resolve the source's current Delta version to seed startingVersion, via
-            # `DESCRIBE HISTORY <table> LIMIT 1`. DESCRIBE HISTORY returns commits newest-first, so the one
-            # LIMIT 1 row is the latest commit and its `version` is the current snapshot version - exactly
-            # the seed we need (startingVersion is INCLUSIVE and must be an existing version).
+        # Choose the first-run seeding strategy from the checkpoint's POSITIVELY classified state, so a
+        # misread never silently drops data (see _checkpoint_offsets_state).
+        _cp_state = _checkpoint_offsets_state(checkpoint_location)
+        if _cp_state == "has_offset":
+            # A prior run persisted an offset: Spark resumes from the checkpoint (startingVersion is
+            # ignored). No seed needed.
+            print("streaming_start=new: resuming from existing checkpoint (no seed needed)")
+        elif _cp_state == "empty":
+            # GENUINE first run (offsets dir positively absent): establish the checkpoint at the source's
+            # current position WITHOUT exporting existing data, via a no-op Trigger.availableNow seed
+            # drain, then let the main stream below resume from it incrementally. On a large-history
+            # source, seeding startingVersion directly on the main reader enumerates a task per active
+            # file and can take many hours before the main stream progresses; running that as a no-op (no
+            # transform, no ES write), bounded by maxFilesPerTrigger, lets it complete and commit a resume
+            # point cheaply.
             #
-            # We deliberately do NOT use delta.tables.DeltaTable.forName(SOURCE_FQN).history(1) here. That
-            # Python API errors on some managed source types - notably Lakeflow/SDP-managed streaming tables
-            # and materialized views - which the client hit in production; the DESCRIBE HISTORY SQL command
-            # works across those table types. (An earlier version of this line used the DeltaTable.history
-            # API precisely to bound the read; it was correct for RPC size but too narrow on table type.)
-            #
-            # Two things keep this from re-introducing the spark.rpc.message.maxSize task abort that the
-            # ORIGINAL full-history form hit (that one was `DESCRIBE HISTORY <table>` with NO limit, chained
-            # to `.agg(max("version"))`): (1) LIMIT 1 pulls a single row, and (2) there is NO .agg() - the
-            # abort came from the aggregation, which submitted a Spark JOB whose serialized task embedded the
-            # whole history relation and, on a long transaction log, exceeded the 256MB RPC task-size limit.
-            # A plain `.select("version").collect()` over a LIMIT is a driver-local collect (CollectLimit),
-            # not an executor aggregation, so it serializes no oversized task. RESIDUAL CAVEAT: DESCRIBE
-            # HISTORY still assembles its result on the driver, so on a source with an extremely long
-            # transaction log this driver-side build is heavier than the O(1) history(1) API was; it is
-            # bounded by LIMIT 1 + a driver collect, not by the RPC task-size limit. Client-proven on their
-            # SDP streaming tables.
+            # Resolve the current Delta version to pin the seed's startingVersion via
+            # `DESCRIBE HISTORY <table> LIMIT 1` (commits are newest-first, so the LIMIT 1 row's `version`
+            # is the current snapshot version). We do NOT use DeltaTable.forName(...).history(1): that
+            # Python API errors on some managed source types (Lakeflow/SDP streaming tables and
+            # materialized views) the client hit in production, while the SQL command works across them.
+            # LIMIT 1 + a plain `.select("version").collect()` is a driver-local CollectLimit (no .agg, no
+            # executor aggregation), so it avoids the spark.rpc.message.maxSize task abort the original
+            # full-history `.agg(max("version"))` form hit on a long transaction log.
             current_version = spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1").select("version").collect()[0][0]
-            print(f"streaming_start=new: first run, seeding at current source version {current_version} (history skipped)")
+            seed_max_files = MAX_FILES_PER_TRIGGER or _SEED_MAX_FILES_PER_TRIGGER_DEFAULT
+            print(f"streaming_start=new: first run, draining initial snapshot as a NO-OP seed "
+                  f"(startingVersion={current_version}, maxFilesPerTrigger={seed_max_files}); existing data "
+                  f"is NOT sent to ES, only a resume point is established at {checkpoint_location}")
+            # skipChangeCommits matches the main reader (a source-identity option, must agree on resume);
+            # startingVersion is numeric so the seed persists an offset even with no new data ("latest"
+            # would run zero batches and persist none, so the next run would re-seed and could skip data).
+            seed_reader = (
+                spark.readStream
+                .option("skipChangeCommits", "true")
+                .option("startingVersion", str(current_version))
+                .option("maxFilesPerTrigger", seed_max_files)
+            )
+            if MAX_BYTES_PER_TRIGGER:
+                seed_reader = seed_reader.option("maxBytesPerTrigger", MAX_BYTES_PER_TRIGGER)
+            # foreachBatch does NOTHING: the batch DataFrame is never acted on, so no source data is read,
+            # transformed, or written - the engine merely advances and commits the streaming offset for
+            # each (empty-effect) micro-batch, which is precisely the resume point we want. availableNow
+            # drains all currently-available data this way, then stops. A UNIQUE seed query name avoids
+            # colliding with the main query on a reused SparkSession.
+            seed_query = (
+                seed_reader.table(SOURCE_FQN).writeStream
+                .queryName(f"{CONFIG_NAME}-seed-{uuid.uuid4().hex[:8]}")
+                .option("checkpointLocation", checkpoint_location)
+                .foreachBatch(lambda _batch_df, _batch_id: None)
+                .trigger(availableNow=True)
+                .start()
+            )
+            seed_query.awaitTermination()
+            print(f"streaming_start=new: seed drain complete; the main stream resumes incrementally from "
+                  f"{checkpoint_location}")
+        else:  # "unknown"
+            # The offsets listing FAILED for a reason other than a clean not-found, so we cannot tell a
+            # resume from a first run. Fall back to the PROVEN-SAFE original behavior: seed startingVersion
+            # on the MAIN reader. It is a no-op on a real resume (Spark ignores it once an offset exists)
+            # and a correct first-run seed otherwise - and, unlike the no-op drain, it NEVER skips a
+            # backlog on a misclassified resume. (Slower on a true first run against a huge table, but this
+            # path is rare and correctness comes first.)
+            current_version = spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1").select("version").collect()[0][0]
+            print(f"streaming_start=new: checkpoint offsets state UNKNOWN (listing error); falling back to "
+                  f"startingVersion={current_version} on the main reader (safe on resume and first run)")
             reader = reader.option("startingVersion", str(current_version))
     stream_df = reader.table(SOURCE_FQN)
 
