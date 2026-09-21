@@ -849,7 +849,7 @@ def test_group_has_no_job_level_parameters_block():
 
 
 def test_group_run_time_knobs_move_into_task_base_parameters():
-    # The 14 run-time knobs (from job_parameters) become each task's base_parameters, with per-member
+    # The 16 run-time knobs (from job_parameters) become each task's base_parameters, with per-member
     # defaults; the notebook reads the same widget names, so no notebook change.
     cfg = validate_config({
         "es_index_name": "idx-a", "es_id_field": "dsl_id", "es_host_config": "es_host_primary",
