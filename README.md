@@ -538,8 +538,8 @@ Two different mechanisms carry values into a job, and they resolve at different 
   - `pipeline_mode` (`batch` | `streaming`), `filter_condition` (a Spark SQL predicate), and the
     connector-write tuning knobs `chunk_size`, `write_concurrency`, `request_timeout`,
     `transport_max_retries`, `require_existing_index`, `verify_certs` all default to their config values
-    (each is an optional config key; see [Configuration](#configuration)). `pipeline_mode` also accepts a
-    run-time-only maintenance value, `reset_checkpoint` (see [Resetting a checkpoint](#resetting-a-checkpoint)).
+    (each is an optional config key; see [Configuration](#configuration)). Clearing a stale streaming
+    checkpoint is a separate operation, not a `pipeline_mode` (see [Resetting a checkpoint](#resetting-a-checkpoint)).
   - For the tuning knobs, a config that omits a knob (and a run that doesn't override it) leaves the
     connector's own default in force.
   - `write_concurrency` (a positive integer, default the connector's `1`) runs that many bulk request
@@ -718,7 +718,7 @@ Key behaviors:
   index is reset and you want to resend its records from the Delta table, clear that stream's
   checkpoint first, otherwise the stream considers those records already exported and writes nothing.
   Deterministic document `_id`s make a re-send an idempotent upsert, not a duplicate. Clear it with the
-  `reset_checkpoint` mode below rather than by hand.
+  dedicated `_checkpoint clear` job below rather than by hand.
   - **Per-developer checkpoints in `dev`.** `mode: development` isolates workspace files and resource
     names per user but **not** UC Volume data paths, so two developers streaming the same pipeline would
     share one checkpoint. The `dev` target in `databricks.yml` documents appending
@@ -728,22 +728,24 @@ Key behaviors:
 ### Resetting a checkpoint
 
 When a stream's checkpoint is stale (say the index was wiped, or you want to re-stream from a fresh
-`streaming_start`), reset it by running the pipeline's own job once in `reset_checkpoint` mode:
+`streaming_start`), clear it with the dedicated `_checkpoint clear` job (a serverless maintenance job,
+`resources/checkpoint_clear.job.yml`):
 
 ```bash
-databricks bundle run <config_name> -t <target> -p <profile> --params pipeline_mode=reset_checkpoint
+databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>
 ```
 
-This deletes the whole checkpoint directory `<checkpoint_base_path>/<config_name>` and **exits without
-exporting to Elasticsearch** (it never reads the ES secret or writes a document). The next `streaming`
-run then behaves like a first run: `streaming_start=new` reseeds at the source's current version,
-`streaming_start=full` backfills the whole table. It is a run-time-only override, so it needs no
-redeploy and changes no other parameter; clearing an already-absent checkpoint is a harmless no-op.
+This deletes the whole checkpoint directory `<checkpoint_base_path>/<config_name>` and does nothing else
+(it never reads the ES secret or writes a document). The next `streaming` run of that pipeline then
+behaves like a first run: `streaming_start=new` reseeds at the source's current version,
+`streaming_start=full` backfills the whole table. Clearing an already-absent checkpoint is a harmless
+no-op. `config_name` is required and validated closed (a blank or path-bearing value fails), so the job
+can only ever clear the one checkpoint that pipeline would resume from, never the shared base or another
+pipeline's checkpoint.
 
 For a **continuous** (always-on) pipeline, pause the continuous trigger first (or cancel the running
-job), run the reset, then resume, so the always-on stream is not re-establishing a checkpoint while you
-clear it. `reset_checkpoint` is exempt from the rule that a continuous job must run `pipeline_mode:
-streaming`, precisely so a continuous pipeline can be reset this way.
+job), run the clear, then resume, so the always-on stream is not re-establishing a checkpoint while you
+clear it.
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.

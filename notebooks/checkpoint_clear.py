@@ -6,10 +6,10 @@
 # MAGIC pipeline config, so the next streaming run of that pipeline starts fresh (its `streaming_start`
 # MAGIC then governs where it begins), exactly as if the pipeline were brand new.
 # MAGIC
-# MAGIC This is the standalone counterpart to the runner's in-line `pipeline_mode=reset_checkpoint`
-# MAGIC (`notebooks/run_index_pipeline.py`): same target path, but a dedicated `_checkpoint clear` job you
-# MAGIC invoke on demand with just the `config_name`, without a full pipeline run and without touching any
-# MAGIC Elasticsearch connection setting.
+# MAGIC This is the sole way to clear a checkpoint: a dedicated `_checkpoint clear` job you invoke on
+# MAGIC demand with just the `config_name`, targeting the same path the runner
+# MAGIC (`notebooks/run_index_pipeline.py`) composes for `checkpoint_location`, without a full pipeline run
+# MAGIC and without touching any Elasticsearch connection setting.
 # MAGIC
 # MAGIC Parameters:
 # MAGIC - `config_name` (job parameter, REQUIRED): the pipeline whose checkpoint to clear. Default is
@@ -38,7 +38,7 @@
 #      '../other' can't escape the base and delete another pipeline's checkpoint (or a parent dir),
 #   3. checkpoint_base_path non-empty,
 #   4. a matching _pipelines/pipeline_configs/<config_name>.yml (or .yaml) EXISTS - resolved the same way
-#      run_index_pipeline.py does before its reset_checkpoint delete. This ties the clear to a real
+#      run_index_pipeline.py resolves its config. This ties the clear to a real
 #      pipeline: a typo'd/unknown config_name fails closed here instead of composing a nonexistent path
 #      and reporting a benign "nothing to delete" success.
 import os
@@ -95,8 +95,8 @@ if CONFIG_PATH is None:
           f"nothing will be deleted (reported below).")
 
 # SINGLE SOURCE OF TRUTH for the target path: composed the IDENTICAL way the runner builds
-# checkpoint_location (run_index_pipeline.py streaming branch and reset_checkpoint mode), so this job
-# clears exactly the checkpoint the stream would resume from - and only that one, never the shared base.
+# checkpoint_location (run_index_pipeline.py streaming branch), so this job clears exactly the checkpoint
+# the stream would resume from - and only that one, never the shared base.
 CHECKPOINT_LOCATION = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
 
 print("checkpoint clear - parameters:")
