@@ -31,16 +31,17 @@
 # MAGIC   config's `continuous` block, or empty for availableNow (drain-and-stop). Deploy-time, not per-run.
 # MAGIC
 # MAGIC Run-time parameters (job parameters; overridable per run with `--params <name>=<value>`):
-# MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config), or the run-time-only maintenance
-# MAGIC   value `reset_checkpoint`, which clears this pipeline's streaming checkpoint directory and exits
-# MAGIC   without exporting, so the next streaming run starts fresh (as if brand new).
+# MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config). Clearing a stale streaming
+# MAGIC   checkpoint is handled by the dedicated `_checkpoint clear` job, not a pipeline_mode.
 # MAGIC - `filter_condition`: optional Spark SQL predicate applied before the write (default from config).
 # MAGIC - `chunk_size`, `write_concurrency`, `request_timeout`, `transport_max_retries`, `require_existing_index`,
 # MAGIC   `verify_certs`: EsWriteConfig tuning (default from config; omitted there and unset per run => connector
 # MAGIC   default). `request_timeout` (seconds) and `transport_max_retries` (0 disables) tune a write that
 # MAGIC   times out mid-send.
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
-# MAGIC   streaming only, honored on the first run before a checkpoint exists.
+# MAGIC   streaming only, honored on the first run before a checkpoint exists. `new` establishes the
+# MAGIC   checkpoint at the current source position via a no-op availableNow seed (drains the initial
+# MAGIC   snapshot without exporting to ES), so history is skipped without stalling on a large source.
 # MAGIC - `max_files_per_trigger`, `max_bytes_per_trigger`: streaming read rate-limits that bound each
 # MAGIC   micro-batch (default from config; empty => Spark defaults). Streaming only; useful for a backfill.
 
@@ -110,7 +111,7 @@ dbutils.widgets.text("es_host_url", "", "Elasticsearch endpoint, e.g. https://<h
 dbutils.widgets.text("secret_scope_name", "", "Databricks secret scope holding the ES api_key")
 dbutils.widgets.text("secret_key_name", "", "Key in the scope whose value is the ES api_key")
 dbutils.widgets.text("ca_certs", "", "UC Volume path to a CA bundle (PEM) verifying the ES TLS cert (empty => system CAs)")
-dbutils.widgets.text("pipeline_mode", "", "Export mode: batch | streaming | reset_checkpoint (job parameter; overridable per run)")
+dbutils.widgets.text("pipeline_mode", "", "Export mode: batch | streaming (job parameter; overridable per run)")
 dbutils.widgets.text("filter_condition", "", "Optional row filter, a Spark SQL predicate (overridable per run)")
 dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty => connector default)")
 dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
@@ -204,6 +205,10 @@ from pipeline_lib.observability import (  # noqa: E402
     format_progress,
     format_tail_summary,
 )
+# Streaming checkpoint offsets-state classifier (pure Python, dependency-injected ls; unit-tested
+# off-cluster). Decides seed-vs-resume for streaming_start=new; fail-closed so an existing checkpoint is
+# never misread as a first run (which would drain over an un-exported backlog).
+from pipeline_lib.checkpoint import EMPTY, HAS_OFFSET, checkpoint_offsets_state  # noqa: E402
 
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
 # override fails closed immediately without wasting the config load/resolve on a run that can't
@@ -219,9 +224,7 @@ from pipeline_lib.observability import (  # noqa: E402
 #   (the batch export and each streaming micro-batch). Empty widget -> the built-in default (the
 #   validator turns "" into _DEFAULT_WRITE_REPARTITION), so a standalone run still parallelizes. Parsed
 #   to int here since it feeds df.repartition(N).
-# allow_reset_checkpoint=True: this is the RUN-TIME override path, where reset_checkpoint is a valid
-# one-off maintenance mode (config defaults reject it, so it can only ever arrive as a --params override).
-PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter", allow_reset_checkpoint=True)
+PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job parameter")
 # A continuous (always-on) job carries a Databricks Jobs continuous trigger and hands the notebook a
 # non-empty streaming_trigger_interval (a deploy-time base_parameter). pipeline_mode stays run-time
 # overridable, so guard the one override that would misbehave: a batch (or any non-streaming) run under
@@ -229,17 +232,12 @@ PIPELINE_MODE = require_pipeline_mode(PIPELINE_MODE, "pipeline_mode job paramete
 # endless loop of full re-exports to ES. Fail closed so the mismatch surfaces as one clear run failure.
 # (validate_config already forbids continuous + non-streaming at DEPLOY; this closes the RUN-TIME
 # override gap that a deploy-time config check cannot see.)
-# reset_checkpoint is exempt: it clears the checkpoint and exits WITHOUT exporting to ES, so the
-# "endless loop of full re-exports" harm this guard prevents does not apply. Resetting a continuous
-# pipeline is a legitimate maintenance action (pause the continuous trigger, run once in
-# reset_checkpoint mode, then resume), so allow it here.
-if STREAMING_TRIGGER_INTERVAL and PIPELINE_MODE not in ("streaming", "reset_checkpoint"):
+if STREAMING_TRIGGER_INTERVAL and PIPELINE_MODE != "streaming":
     raise ValueError(
         f"continuous job (streaming_trigger_interval={STREAMING_TRIGGER_INTERVAL!r}) requires "
-        f"pipeline_mode=streaming (or reset_checkpoint to clear it), got {PIPELINE_MODE!r}: a "
-        f"terminating {PIPELINE_MODE} run under a continuous trigger would auto-restart in an endless "
-        f"loop. Remove the pipeline_mode override, or run this config's batch export as a separate, "
-        f"non-continuous job."
+        f"pipeline_mode=streaming, got {PIPELINE_MODE!r}: a terminating {PIPELINE_MODE} run under a "
+        f"continuous trigger would auto-restart in an endless loop. Remove the pipeline_mode override, "
+        f"or run this config's batch export as a separate, non-continuous job."
     )
 # Re-validate the continuous ProcessingTime cadence against the SAME grammar the config schema uses,
 # BEFORE it reaches Trigger.ProcessingTime. streaming_trigger_interval is a deploy-time base_parameter
@@ -292,25 +290,22 @@ MAX_BYTES_PER_TRIGGER = require_max_bytes_per_trigger(MAX_BYTES_PER_TRIGGER, "ma
 # rather than constructing a broken EsWriteConfig. These come from this pipeline's es_host_config (a
 # complex bundle variable in databricks.yml, resolved per target); an empty value means that host
 # config's fields were never filled in for the target being deployed - the common cause on a fresh
-# checkout. Skipped for reset_checkpoint, which only clears a checkpoint directory and never touches ES,
-# so it must not demand ES connection settings it never uses (e.g. a reset on a partly-configured target).
-if PIPELINE_MODE != "reset_checkpoint":
-    for _param, _value in (
-        ("es_host_url", ES_HOST_URL),
-        ("secret_scope_name", SECRET_SCOPE_NAME),
-        ("secret_key_name", SECRET_KEY_NAME),
-    ):
-        if not _value:
-            raise ValueError(
-                f"missing required parameter: {_param} (fill in this pipeline's es_host_config values "
-                f"for this target in databricks.yml)"
-            )
+# checkout. Both export modes (batch, streaming) write to ES, so this always applies.
+for _param, _value in (
+    ("es_host_url", ES_HOST_URL),
+    ("secret_scope_name", SECRET_SCOPE_NAME),
+    ("secret_key_name", SECRET_KEY_NAME),
+):
+    if not _value:
+        raise ValueError(
+            f"missing required parameter: {_param} (fill in this pipeline's es_host_config values "
+            f"for this target in databricks.yml)"
+        )
 
-# checkpoint_base_path is required for a STREAMING run and a RESET_CHECKPOINT run (batch and
-# deploy_views never touch a checkpoint, so their runs leave it empty). Validated here so a run that
-# needs a checkpoint location but has none fails closed immediately rather than after the config load;
-# for reset it also guards against composing (and rm-ing) a root path from an empty base.
-if PIPELINE_MODE in ("streaming", "reset_checkpoint") and not CHECKPOINT_BASE_PATH:
+# checkpoint_base_path is required for a STREAMING run (batch and deploy_views never touch a checkpoint,
+# so their runs leave it empty). Validated here so a run that needs a checkpoint location but has none
+# fails closed immediately rather than after the config load.
+if PIPELINE_MODE == "streaming" and not CHECKPOINT_BASE_PATH:
     raise ValueError(
         f"missing required parameter: checkpoint_base_path (set the bundle variable at deploy); "
         f"a {PIPELINE_MODE} run needs a UC Volume checkpoint location"
@@ -330,38 +325,6 @@ if config_path is None:
 # load_config validates the schema; resolve_config folds ${environment} in and validates the result
 # (both fail closed). After this, every catalog/schema/name is a concrete identifier.
 cfg = resolve_config(load_config(config_path), ENVIRONMENT)
-
-# COMMAND ----------
-# RESET_CHECKPOINT maintenance mode. Clear THIS pipeline's streaming checkpoint directory, then EXIT
-# without any ES export. Purpose: discard a stale/old checkpoint so the NEXT streaming run starts fresh
-# (that run's streaming_start then governs where it begins), exactly as if the pipeline were brand new.
-#
-# It is a run-time-only override (--params pipeline_mode=reset_checkpoint) on an otherwise-normal
-# streaming job; every other job parameter is irrelevant here. The ES-param check above is skipped for
-# this mode, and this branch runs BEFORE the es_write_config setup below and exits inline, so a reset
-# never requires, reads, or uses any ES connection setting - it does one thing and stops. (Exiting
-# mid-notebook is deliberate: it is how the reset bypasses all the export cells.)
-#
-# Blast radius: the delete is scoped to the ONE composed path {checkpoint_base_path}/{config_name} -
-# built the IDENTICAL way the streaming branch builds checkpoint_location (single source of truth), so a
-# reset can only ever clear the checkpoint the stream would resume from - never the shared base, so
-# resetting one pipeline cannot touch another's checkpoint. checkpoint_base_path was validated non-empty
-# above for this mode.
-if PIPELINE_MODE == "reset_checkpoint":
-    checkpoint_location = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
-    # Log the exact target before deleting (so the run log shows what is being removed), then delete.
-    print(f"reset_checkpoint: deleting checkpoint directory {checkpoint_location}")
-    # dbutils.fs.rm(recurse=True) removes the directory and everything under it (offsets, commits,
-    # sources, and the _run_metrics subdir). It returns True if it removed a path and False if the path
-    # did not exist, so clearing an absent checkpoint is a harmless no-op, not a failure. We report that
-    # boolean verbatim (removed=...) rather than interpreting it, so the log states exactly what rm did.
-    _removed = dbutils.fs.rm(checkpoint_location, recurse=True)
-    RESET_SUMMARY = f"reset_checkpoint checkpoint={checkpoint_location} removed={_removed}"
-    print(f"RESET CHECKPOINT COMPLETE: {RESET_SUMMARY}")
-    dbutils.notebook.exit(
-        f"config_name={CONFIG_NAME}; es_index_name={cfg['es_index_name']}; "
-        f"pipeline_mode={PIPELINE_MODE}; {RESET_SUMMARY}"
-    )
 
 # COMMAND ----------
 # Echo the resolved configuration + effective run-time settings before the export, so a run's log
@@ -700,47 +663,42 @@ if PIPELINE_MODE == "streaming":
                 pass
 
 # COMMAND ----------
-# STREAMING run (streaming mode only). Read the RAW source as a Delta stream and drain it once.
-# skipChangeCommits=true: tolerate non-append commits (a manual UPDATE/DELETE upstream) by skipping
-# them rather than failing the stream; corrections are handled out-of-band via a batch backfill.
+# STREAMING run - STEP 1 of 2: PREPARE the checkpoint (streaming mode only). Build the Delta stream
+# reader and, on a first run, position the checkpoint; the NEXT cell runs the stream from it. Nothing
+# here writes to ES. skipChangeCommits=true: tolerate non-append commits (a manual UPDATE/DELETE
+# upstream) by skipping them rather than failing the stream; corrections are handled out-of-band via a
+# batch backfill.
 #
 # streaming_start controls where a FIRST run (no checkpoint yet) begins; once a checkpoint exists it is
-# the position of record and startingVersion is ignored (Spark resumes from the checkpoint). Because the
-# seed is a no-op on a resume, we DETECT an existing persisted offset and skip the current-version lookup +
-# startingVersion seed entirely on those runs - it avoids a needless metadata scan and, more importantly,
-# stops the "seeding at current source version" line from printing on runs where the seed is ignored,
-# which misrepresented the real state (a resume, not a seed) after the first run.
-# - "new": start at the source's CURRENT Delta version, so existing history is NOT re-exported and
-#   subsequent runs pick up only new commits. We resolve the concrete current version NUMBER rather
-#   than startingVersion="latest" because of a Trigger.availableNow interaction proven live: a "latest"
-#   first run finds no new rows, runs zero micro-batches, and persists NO checkpoint offset, so it never
-#   establishes a resume point and later runs keep skipping new data. A numeric startingVersion seeds a
-#   real, persisted offset even on a zero-row first batch, so the next run resumes correctly.
-#   startingVersion is INCLUSIVE and must be an EXISTING version, so we use the current version
-#   (current+1 is rejected when it does not exist yet). One consequence: if the current commit is an
-#   append, the first "new" run re-exports that single commit's rows. That is a harmless idempotent
-#   upsert (bounded to one commit) ONLY when es_id_field is set; with es_id_field OMITTED those rows get
-#   fresh random _ids and are re-inserted as NEW documents (duplicates).
-# - "full": omit startingVersion, so the first micro-batches backfill the whole existing table.
+# the position of record (Spark resumes from the checkpoint), so we POSITIVELY classify the checkpoint's
+# offsets and skip all first-run seeding on a resume (see checkpoint_offsets_state in pipeline_lib).
+# - "new": establish the checkpoint at the source's CURRENT position WITHOUT exporting existing data,
+#   then subsequent runs pick up only new commits. On a genuine first run we do this with a dedicated
+#   NO-OP SEED: a Trigger.availableNow stream (startingVersion = current version, a bounded
+#   maxFilesPerTrigger, skipChangeCommits matching the main reader) whose foreachBatch does NOTHING,
+#   writing the REAL checkpoint. It drains the source's initial snapshot as empty-effect micro-batches -
+#   committing offsets but sending nothing to ES - then stops, and the MAIN stream below resumes from
+#   that checkpoint incrementally. Why a separate no-op drain rather than seeding startingVersion on the
+#   main reader: on a large-history source, first-run positioning enumerates a task per active file and
+#   can run for many hours before the main stream makes progress; doing it as a no-op (no transform, no
+#   ES write) bounded by maxFilesPerTrigger lets it complete and commit a resume point cheaply. We use a
+#   numeric startingVersion (not "latest") to pin a deterministic boundary, and after the seed we VERIFY
+#   an offset was actually committed: if it was not (nothing to drain at that version, so availableNow
+#   ran zero batches), we pin startingVersion on the main reader instead, so existing history is never
+#   re-exported. If the checkpoint state cannot be positively classified (a listing error, neither
+#   clearly resume nor clearly first-run), we likewise fall back to seeding startingVersion on the main
+#   reader instead of the no-op drain - safe on both a resume and a true first run, and it never skips a
+#   backlog.
+# - "full": omit startingVersion and use the REAL foreachBatch, so the first micro-batches backfill the
+#   whole existing table to ES (intentional history export).
 if PIPELINE_MODE == "streaming":
-    def _checkpoint_has_committed_offset(cp_location: str) -> bool:
-        # True ONLY when the streaming checkpoint positively holds at least one persisted offset - the
-        # signal that Spark will resume from the checkpoint and IGNORE startingVersion. Fails CLOSED:
-        # any ambiguity (offsets dir absent because this is a first run, or an ls error) returns False so
-        # we still seed startingVersion. Seeding is harmless when a checkpoint does exist (Spark ignores
-        # the option on resume) but ESSENTIAL on a genuine first run, where omitting it would backfill
-        # the whole table. So a false negative costs nothing; a false positive would re-export history -
-        # hence we only skip on positive proof of a real batch-offset file.
-        offsets_dir = f"{cp_location.rstrip('/')}/offsets"
-        try:
-            entries = dbutils.fs.ls(offsets_dir)
-        except Exception:
-            # offsets/ does not exist yet (first run) or is unreadable: seed, do not skip.
-            return False
-        # Structured Streaming names each committed batch offset file by its integer batch id ("0",
-        # "1", ...). Require at least one such file: an integer-named entry is a persisted resume point.
-        # Filtering to digit names ignores transient temp/hidden files and any non-batch marker.
-        return any(e.name.rstrip("/").isdigit() for e in entries)
+    # The seed drain's batch bound (used by the "new" first-run path below). maxFilesPerTrigger MUST be
+    # set on the no-op seed so the source's initial snapshot is consumed as bounded, resumable
+    # micro-batches instead of one unbounded batch that can stall on a large-history source. Reuse the
+    # operator's max_files_per_trigger when set; otherwise this default. TUNABLE: since the seed's batches
+    # are no-ops (no read/transform/write), a larger value means fewer passes to drain; the right value is
+    # confirmed against the real source during rollout.
+    _SEED_MAX_FILES_PER_TRIGGER_DEFAULT = "10000"
 
     reader = spark.readStream.option("skipChangeCommits", "true")
     # Optional read rate-limits: bound how much each micro-batch pulls from the source. Applied to BOTH
@@ -753,36 +711,120 @@ if PIPELINE_MODE == "streaming":
     if MAX_BYTES_PER_TRIGGER:
         reader = reader.option("maxBytesPerTrigger", MAX_BYTES_PER_TRIGGER)
     if STREAMING_START == "new":
-        if _checkpoint_has_committed_offset(checkpoint_location):
-            # A prior run already persisted an offset: Spark resumes from the checkpoint and
-            # startingVersion is ignored. Skip the current-version lookup and the seed entirely.
-            print("streaming_start=new: resuming from existing checkpoint (startingVersion ignored)")
-        else:
-            # Resolve the source's current Delta version to seed startingVersion, via
-            # `DESCRIBE HISTORY <table> LIMIT 1`. DESCRIBE HISTORY returns commits newest-first, so the one
-            # LIMIT 1 row is the latest commit and its `version` is the current snapshot version - exactly
-            # the seed we need (startingVersion is INCLUSIVE and must be an existing version).
+        # Choose the first-run seeding strategy from the checkpoint's POSITIVELY classified state, so a
+        # misread never silently drops data (see checkpoint_offsets_state).
+        _cp_state = checkpoint_offsets_state(checkpoint_location, dbutils.fs.ls)
+        if _cp_state == HAS_OFFSET:
+            # A prior run persisted an offset: Spark resumes from the checkpoint (startingVersion is
+            # ignored), so no seed is needed. A committed offset ALWAYS means "resume" - we never re-run
+            # the no-op drain when offsets exist. Consequences:
+            #   - A pipeline whose checkpoint predates this seed logic resumes normally: it is never
+            #     no-op-drained, so no un-sent backlog is skipped (re-draining an existing checkpoint is
+            #     exactly what would lose data, which is why has_offset never triggers a drain).
+            #   - If a previous run's no-op seed FAILED partway, it left a partial offset; this run's main
+            #     stream resumes from there and SENDS the un-drained tail of the initial snapshot to ES
+            #     (slower, and partial history reaches ES). That is the SAFE direction - it over-sends,
+            #     never drops - and is self-limiting to the tail; a clean seed avoids it entirely.
+            print("streaming_start=new: resuming from existing checkpoint (no seed needed)")
+        elif _cp_state == EMPTY:
+            # GENUINE first run (offsets dir positively absent): establish the checkpoint at the source's
+            # current position WITHOUT exporting existing data, via a no-op Trigger.availableNow seed
+            # drain, then let the main stream below resume from it incrementally. On a large-history
+            # source, seeding startingVersion directly on the main reader enumerates a task per active
+            # file and can take many hours before the main stream progresses; running that as a no-op (no
+            # transform, no ES write), bounded by maxFilesPerTrigger, lets it complete and commit a resume
+            # point cheaply.
             #
-            # We deliberately do NOT use delta.tables.DeltaTable.forName(SOURCE_FQN).history(1) here. That
-            # Python API errors on some managed source types - notably Lakeflow/SDP-managed streaming tables
-            # and materialized views - which the client hit in production; the DESCRIBE HISTORY SQL command
-            # works across those table types. (An earlier version of this line used the DeltaTable.history
-            # API precisely to bound the read; it was correct for RPC size but too narrow on table type.)
-            #
-            # Two things keep this from re-introducing the spark.rpc.message.maxSize task abort that the
-            # ORIGINAL full-history form hit (that one was `DESCRIBE HISTORY <table>` with NO limit, chained
-            # to `.agg(max("version"))`): (1) LIMIT 1 pulls a single row, and (2) there is NO .agg() - the
-            # abort came from the aggregation, which submitted a Spark JOB whose serialized task embedded the
-            # whole history relation and, on a long transaction log, exceeded the 256MB RPC task-size limit.
-            # A plain `.select("version").collect()` over a LIMIT is a driver-local collect (CollectLimit),
-            # not an executor aggregation, so it serializes no oversized task. RESIDUAL CAVEAT: DESCRIBE
-            # HISTORY still assembles its result on the driver, so on a source with an extremely long
-            # transaction log this driver-side build is heavier than the O(1) history(1) API was; it is
-            # bounded by LIMIT 1 + a driver collect, not by the RPC task-size limit. Client-proven on their
-            # SDP streaming tables.
+            # Resolve the current Delta version to pin the seed's startingVersion via
+            # `DESCRIBE HISTORY <table> LIMIT 1` (commits are newest-first, so the LIMIT 1 row's `version`
+            # is the current snapshot version). We do NOT use DeltaTable.forName(...).history(1): that
+            # Python API errors on some managed source types (Lakeflow/SDP streaming tables and
+            # materialized views) the client hit in production, while the SQL command works across them.
+            # LIMIT 1 + a plain `.select("version").collect()` is a driver-local CollectLimit (no .agg, no
+            # executor aggregation), so it avoids the spark.rpc.message.maxSize task abort the original
+            # full-history `.agg(max("version"))` form hit on a long transaction log.
             current_version = spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1").select("version").collect()[0][0]
-            print(f"streaming_start=new: first run, seeding at current source version {current_version} (history skipped)")
+            seed_max_files = MAX_FILES_PER_TRIGGER or _SEED_MAX_FILES_PER_TRIGGER_DEFAULT
+            print(f"streaming_start=new: first run, draining initial snapshot as a NO-OP seed "
+                  f"(startingVersion={current_version}, maxFilesPerTrigger={seed_max_files}); existing data "
+                  f"is NOT sent to ES, only a resume point is established at {checkpoint_location}")
+            # skipChangeCommits matches the main reader (a source-identity option, must agree on resume);
+            # startingVersion is numeric so the seed persists an offset even with no new data ("latest"
+            # would run zero batches and persist none, so the next run would re-seed and could skip data).
+            seed_reader = (
+                spark.readStream
+                .option("skipChangeCommits", "true")
+                .option("startingVersion", str(current_version))
+                .option("maxFilesPerTrigger", seed_max_files)
+            )
+            if MAX_BYTES_PER_TRIGGER:
+                seed_reader = seed_reader.option("maxBytesPerTrigger", MAX_BYTES_PER_TRIGGER)
+            # foreachBatch does NOTHING: the batch DataFrame is never acted on, so no source data is read,
+            # transformed, or written - the engine merely advances and commits the streaming offset for
+            # each (empty-effect) micro-batch, which is precisely the resume point we want. availableNow
+            # drains all currently-available data this way, then stops. A UNIQUE seed query name avoids
+            # colliding with the main query on a reused SparkSession.
+            #
+            # START BOUNDARY (intentional): availableNow snapshots its END offset at query LAUNCH (Delta's
+            # lastOffsetForTriggerAvailableNow) and drains only up to that snapshot, so the resume point is
+            # the source's latest version AT SEED LAUNCH. Two consequences, both intended for
+            # streaming_start=new ("start from ~now", never backfill history):
+            #   - Commits that land WHILE the drain runs (which can be many hours on a large-history
+            #     source) are NOT lost: they are past the seed's snapshot, so the main stream below resumes
+            #     from the committed offset and exports everything after it.
+            #   - The only commits the seed skips are any that land in the sub-second window between the
+            #     `DESCRIBE HISTORY` version resolution above and this .start() (i.e. strictly-after the
+            #     pinned startingVersion but at/under the launch snapshot). That near-instant startup
+            #     boundary is deliberately treated as part of "now" and not exported - consistent with the
+            #     feature's contract of starting fresh rather than replaying recent history.
+            seed_query = (
+                seed_reader.table(SOURCE_FQN).writeStream
+                .queryName(f"{CONFIG_NAME}-seed-{uuid.uuid4().hex[:8]}")
+                .option("checkpointLocation", checkpoint_location)
+                .foreachBatch(lambda _batch_df, _batch_id: None)
+                .trigger(availableNow=True)
+                .start()
+            )
+            seed_query.awaitTermination()
+            # The seed exists to persist a resume offset. A numeric startingVersion under availableNow
+            # normally commits at least one offset even with no new data, but we do NOT rely on that: if
+            # there is nothing to drain at/after the pinned version (e.g. the current version is a
+            # metadata-only commit with no data files and no later commits), availableNow can run ZERO
+            # micro-batches and persist NO offset. The main reader below carries no startingVersion, so
+            # against an empty checkpoint it would backfill the ENTIRE table to ES - exactly what this
+            # feature prevents. So VERIFY an offset was actually committed; if not, pin startingVersion on
+            # the main reader as a fallback (it reads only from the current version forward, never
+            # re-exporting history, and is a no-op in the normal case where the seed did commit).
+            if checkpoint_offsets_state(checkpoint_location, dbutils.fs.ls) == HAS_OFFSET:
+                print(f"streaming_start=new: seed drain complete; the main stream resumes incrementally "
+                      f"from {checkpoint_location}")
+            else:
+                print(f"streaming_start=new: seed committed no offset (nothing to drain at "
+                      f"startingVersion={current_version}); pinning startingVersion={current_version} on "
+                      f"the main reader so existing history is NOT re-exported")
+                reader = reader.option("startingVersion", str(current_version))
+        else:  # "unknown"
+            # The offsets listing FAILED for a reason other than a clean not-found, so we cannot tell a
+            # resume from a first run. Fall back to the PROVEN-SAFE original behavior: seed startingVersion
+            # on the MAIN reader. It is a no-op on a real resume (Spark ignores it once an offset exists)
+            # and a correct first-run seed otherwise - and, unlike the no-op drain, it NEVER skips a
+            # backlog on a misclassified resume. (Slower on a true first run against a huge table, but this
+            # path is rare and correctness comes first.)
+            current_version = spark.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1").select("version").collect()[0][0]
+            print(f"streaming_start=new: checkpoint offsets state UNKNOWN (listing error); falling back to "
+                  f"startingVersion={current_version} on the main reader (safe on resume and first run)")
             reader = reader.option("startingVersion", str(current_version))
+    # `reader` is now fully prepared: skipChangeCommits, any rate limits, and - for a first-run new-mode
+    # seed - either a persisted checkpoint offset (from the no-op drain) or a pinned startingVersion. The
+    # next cell runs the actual stream from it.
+
+# COMMAND ----------
+# STREAMING run - STEP 2 of 2: RUN the stream (streaming mode only). Read the RAW source as a Delta
+# stream using the `reader` prepared in the previous cell, and export each micro-batch via foreach_batch.
+# The trigger is chosen below: availableNow (drain-and-stop, the scheduled/serverless default) or
+# ProcessingTime (an always-on continuous job). `reader` carries over from the previous cell via the
+# shared notebook session; this cell re-opens the same `if PIPELINE_MODE == "streaming":` guard.
+if PIPELINE_MODE == "streaming":
     stream_df = reader.table(SOURCE_FQN)
 
     # The Spark-UI query name: CONFIG_NAME (readable identifier of THIS pipeline) plus a short unique

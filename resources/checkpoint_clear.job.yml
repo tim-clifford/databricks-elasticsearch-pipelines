@@ -7,8 +7,8 @@ resources:
         single pipeline config, so that pipeline's next streaming run starts fresh. Takes one required
         job parameter, config_name; the target is {checkpoint_base_path}/{config_name}, composed the same
         way notebooks/run_index_pipeline.py composes checkpoint_location, so it can only clear the
-        checkpoint that pipeline would resume from. Standalone counterpart to the runner's in-line
-        pipeline_mode=reset_checkpoint. No cluster block => serverless notebook task.
+        checkpoint that pipeline would resume from. This is the sole way to clear a checkpoint. No
+        cluster block => serverless notebook task.
 
       # config_name is REQUIRED: the run-time parameter naming the pipeline whose checkpoint to clear.
       # Default is blank; the notebook fails closed on a blank value (never a no-target delete). Override
