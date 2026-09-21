@@ -19,21 +19,21 @@ resources:
       - name: pipeline_mode
         default: streaming
       - name: filter_condition
-        default: ''
+        default: ${var.filter_condition}
       - name: chunk_size
-        default: ''
+        default: ${var.chunk_size}
       - name: write_concurrency
-        default: ''
+        default: ${var.write_concurrency}
       - name: op_type
-        default: ''
+        default: ${var.op_type}
       - name: request_timeout
         default: ${var.request_timeout}
       - name: transport_max_retries
         default: ${var.transport_max_retries}
       - name: require_existing_index
-        default: ''
+        default: ${var.require_existing_index}
       - name: verify_certs
-        default: ''
+        default: ${var.verify_certs}
       - name: bulk_stats
         default: ${var.bulk_stats}
       - name: retry_transport_timeout
@@ -41,15 +41,15 @@ resources:
       - name: bypass_fast_path
         default: ${var.bypass_fast_path}
       - name: streaming_start
-        default: new
+        default: ${var.streaming_start}
       - name: write_repartition
-        default: '0'
+        default: ${var.write_repartition}
       - name: max_partition_bytes
-        default: 2m
+        default: ${var.max_partition_bytes}
       - name: max_files_per_trigger
-        default: ''
+        default: ${var.max_files_per_trigger}
       - name: max_bytes_per_trigger
-        default: ''
+        default: ${var.max_bytes_per_trigger}
       tasks:
       - task_key: index_pipeline_ecs_authentication
         notebook_task:

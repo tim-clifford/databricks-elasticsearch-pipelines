@@ -11,7 +11,35 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 
 import gen_jobs  # noqa: E402
-from pipeline_lib.config import job_parameters, validate_config  # noqa: E402
+from pipeline_lib.config import (  # noqa: E402
+    RUNTIME_KNOB_NAMES,
+    job_parameters,
+    runtime_knob_global_refs,
+    validate_config,
+)
+
+
+# Legal global defaults for building a databricks.yml the run-time-knob gate accepts: pipeline_mode and
+# streaming_start need a concrete value (their validators reject ""), every other knob (op_type included)
+# accepts "".
+_LEGAL_KNOB_DEFAULTS = {"pipeline_mode": "batch", "streaming_start": "new"}
+
+
+def _write_runtime_knob_yml(tmp_path, overrides=None, drop=()):
+    """Write a databricks.yml declaring EVERY run-time knob with a legal default, applying `overrides`
+    (name -> default) and dropping `drop` names, so a test can break or remove exactly one knob and assert
+    require_runtime_knobs_declared fails closed on it."""
+    overrides = overrides or {}
+    lines = ["variables:"]
+    for name in RUNTIME_KNOB_NAMES:
+        if name in drop:
+            continue
+        default = overrides.get(name, _LEGAL_KNOB_DEFAULTS.get(name, ""))
+        lines.append(f"  {name}:")
+        lines.append(f"    default: '{default}'")
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("\n".join(lines) + "\n")
+    return yml
 
 
 def _cfg(compute=None, schedule=None):
@@ -557,89 +585,72 @@ def test_shipped_databricks_yml_declares_support_email():
     gen_jobs.require_support_email_declared()  # the repo's databricks.yml declares it
 
 
-def test_require_bulk_stats_declared_present_passes(tmp_path):
+def test_require_runtime_knobs_declared_shipped_passes():
+    # The repo's databricks.yml declares EVERY run-time knob with a legal default.
+    gen_jobs.require_runtime_knobs_declared()  # no raise
+
+
+def test_require_runtime_knobs_declared_full_legal_passes(tmp_path):
+    gen_jobs.require_runtime_knobs_declared(str(_write_runtime_knob_yml(tmp_path)))  # no raise
+
+
+@pytest.mark.parametrize("missing", ["pipeline_mode", "bulk_stats", "streaming_start", "max_bytes_per_trigger"])
+def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
+    # An omitted-knob config bakes ${var.<name>}; if the variable is not declared, fail closed at
+    # generation rather than let the reference break confusingly at deploy. Checked for every knob (the
+    # gate loops the registry), so dropping ANY one is caught, naming that knob.
+    yml = _write_runtime_knob_yml(tmp_path, drop=(missing,))
+    with pytest.raises(ValueError, match=f"{missing} is not declared"):
+        gen_jobs.require_runtime_knobs_declared(str(yml))
+
+
+@pytest.mark.parametrize("name,bad", [
+    ("bulk_stats", "on"), ("retry_transport_timeout", "yes"), ("bypass_fast_path", "1"),
+    ("verify_certs", "maybe"), ("require_existing_index", "nope"),
+    ("request_timeout", "abc"), ("transport_max_retries", "-1"),
+    ("pipeline_mode", "turbo"), ("op_type", "has space"), ("streaming_start", "sideways"),
+    ("write_repartition", "-5"), ("max_partition_bytes", "32x"), ("chunk_size", "0"),
+])
+def test_require_runtime_knobs_declared_bad_default_fails_closed(tmp_path, name, bad):
+    # The registry wires each knob's OWN validator (the same require_* helper the runner applies to the
+    # effective value), so an illegal global default for ANY knob fails closed at generation, not at run.
+    yml = _write_runtime_knob_yml(tmp_path, overrides={name: bad})
+    with pytest.raises(ValueError, match=name):
+        gen_jobs.require_runtime_knobs_declared(str(yml))
+
+
+def test_version_gated_knob_globals_ship_empty():
+    # Regression: a VERSION-GATED connector knob (see _VERSION_GATED_KNOBS in
+    # notebooks/run_index_pipeline.py: bulk_stats, retry_transport_timeout, op_type, bypass_fast_path) MUST
+    # ship an EMPTY global default in databricks.yml. A concrete non-empty global would make a config that
+    # OMITS the knob bake that value, so on a connector older than the knob's min version the runner's
+    # version-gate drops it with a spurious "dropping <knob>=<v>" warning every run (export unchanged, but
+    # misleading). An empty global bakes "" => the knob is omitted from write_overrides => the gate never
+    # fires unless a target/config explicitly set it. op_type's empty also defers to the connector default
+    # (index), so nothing is lost. (op_type shipped a literal 'index' once; this guards against regressing.)
+    doc = yaml.safe_load(open(os.path.join(_REPO_ROOT, "databricks.yml")))
+    variables = doc["variables"]
+    for knob in ("bulk_stats", "retry_transport_timeout", "op_type", "bypass_fast_path"):
+        spec = variables[knob]
+        default = spec.get("default") if isinstance(spec, dict) else spec
+        assert (default or "") == "", (
+            f"version-gated knob {knob!r} must ship an EMPTY global default (got {default!r}); a non-empty "
+            f"global spuriously trips the runner version-gate on a pre-min-version wheel"
+        )
+
+
+def test_require_runtime_knobs_declared_accepts_scalar_shorthand(tmp_path):
+    # DAB's scalar shorthand (<name>: <v>, no `default:` key) IS the default; a legal shorthand for every
+    # knob passes (the gate reads the default from whichever shape was used).
+    lines = ["variables:"]
+    for name in RUNTIME_KNOB_NAMES:
+        lines.append(f"  {name}: '{_LEGAL_KNOB_DEFAULTS.get(name, '')}'")
     yml = tmp_path / "databricks.yml"
-    yml.write_text("variables:\n  bulk_stats:\n    default: ''\n")
-    gen_jobs.require_bulk_stats_declared(str(yml))  # no raise
+    yml.write_text("\n".join(lines) + "\n")
+    gen_jobs.require_runtime_knobs_declared(str(yml))  # no raise
 
 
-@pytest.mark.parametrize("default", ["true", "false", ""])
-def test_require_bulk_stats_declared_accepts_legal_default(tmp_path, default):
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  bulk_stats:\n    default: '{default}'\n")
-    gen_jobs.require_bulk_stats_declared(str(yml))  # no raise
-
-
-def test_require_bulk_stats_declared_missing_fails_closed(tmp_path):
-    # An omitted-bulk_stats config bakes ${var.bulk_stats}; if the variable is not declared, fail closed
-    # at generation rather than let the reference break confusingly at deploy.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
-    with pytest.raises(ValueError, match="bulk_stats is not declared"):
-        gen_jobs.require_bulk_stats_declared(str(yml))
-
-
-@pytest.mark.parametrize("bad", ["yes", "on", "1"])
-def test_require_bulk_stats_declared_bad_default_fails_closed(tmp_path, bad):
-    # A mistyped global default is rejected with the same allow-list the runner applies to the effective
-    # value, so it fails at generation rather than at every run.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  bulk_stats:\n    default: '{bad}'\n")
-    with pytest.raises(ValueError, match="bulk_stats"):
-        gen_jobs.require_bulk_stats_declared(str(yml))
-
-
-@pytest.mark.parametrize("shorthand", ["true", "false", ""])
-def test_require_bulk_stats_declared_accepts_scalar_shorthand(tmp_path, shorthand):
-    # DAB's scalar shorthand (bulk_stats: <v>, no `default:` key) IS the default; a legal shorthand passes.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  bulk_stats: '{shorthand}'\n")
-    gen_jobs.require_bulk_stats_declared(str(yml))  # no raise
-
-
-@pytest.mark.parametrize("bad", ["on", "yes", "1"])
-def test_require_bulk_stats_declared_bad_scalar_shorthand_fails_closed(tmp_path, bad):
-    # A bad shorthand default (bulk_stats: "on") must ALSO fail closed at generation - it would otherwise
-    # bake as ${var.bulk_stats} and fail require_es_flag at every run.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  bulk_stats: '{bad}'\n")
-    with pytest.raises(ValueError, match="bulk_stats"):
-        gen_jobs.require_bulk_stats_declared(str(yml))
-
-
-def test_shipped_databricks_yml_declares_bulk_stats():
-    gen_jobs.require_bulk_stats_declared()  # the repo's databricks.yml declares it with a legal default
-
-
-# --- retry_transport_timeout global-var declaration + render guards (mirror bulk_stats) ---
-
-
-@pytest.mark.parametrize("default", ["true", "false", ""])
-def test_require_retry_transport_timeout_declared_accepts_legal_default(tmp_path, default):
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  retry_transport_timeout:\n    default: '{default}'\n")
-    gen_jobs.require_retry_transport_timeout_declared(str(yml))  # no raise
-
-
-def test_require_retry_transport_timeout_declared_missing_fails_closed(tmp_path):
-    # An omitted-knob config bakes ${var.retry_transport_timeout}; if the variable is not declared, fail
-    # closed at generation rather than let the reference break confusingly at deploy.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
-    with pytest.raises(ValueError, match="retry_transport_timeout is not declared"):
-        gen_jobs.require_retry_transport_timeout_declared(str(yml))
-
-
-@pytest.mark.parametrize("bad", ["yes", "on", "1"])
-def test_require_retry_transport_timeout_declared_bad_default_fails_closed(tmp_path, bad):
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  retry_transport_timeout:\n    default: '{bad}'\n")
-    with pytest.raises(ValueError, match="retry_transport_timeout"):
-        gen_jobs.require_retry_transport_timeout_declared(str(yml))
-
-
-def test_shipped_databricks_yml_declares_retry_transport_timeout():
-    gen_jobs.require_retry_transport_timeout_declared()  # the repo's databricks.yml declares it
+# --- render guards: an omitted knob bakes its ${var.<name>} global ref, a set knob bakes its literal ---
 
 
 def test_render_singleton_omitted_retry_transport_timeout_bakes_global_ref():
@@ -657,37 +668,6 @@ def test_render_singleton_set_retry_transport_timeout_bakes_literal():
     assert {"name": "retry_transport_timeout", "default": "true"} in job["parameters"]
 
 
-# --- bypass_fast_path global-var declaration + render guards (mirror retry_transport_timeout) ---
-
-
-@pytest.mark.parametrize("default", ["true", "false", ""])
-def test_require_bypass_fast_path_declared_accepts_legal_default(tmp_path, default):
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  bypass_fast_path:\n    default: '{default}'\n")
-    gen_jobs.require_bypass_fast_path_declared(str(yml))  # no raise
-
-
-def test_require_bypass_fast_path_declared_missing_fails_closed(tmp_path):
-    # An omitted-knob config bakes ${var.bypass_fast_path}; if the variable is not declared, fail closed
-    # at generation rather than let the reference break confusingly at deploy.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
-    with pytest.raises(ValueError, match="bypass_fast_path is not declared"):
-        gen_jobs.require_bypass_fast_path_declared(str(yml))
-
-
-@pytest.mark.parametrize("bad", ["yes", "on", "1"])
-def test_require_bypass_fast_path_declared_bad_default_fails_closed(tmp_path, bad):
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  bypass_fast_path:\n    default: '{bad}'\n")
-    with pytest.raises(ValueError, match="bypass_fast_path"):
-        gen_jobs.require_bypass_fast_path_declared(str(yml))
-
-
-def test_shipped_databricks_yml_declares_bypass_fast_path():
-    gen_jobs.require_bypass_fast_path_declared()  # the repo's databricks.yml declares it
-
-
 def test_render_singleton_omitted_bypass_fast_path_bakes_global_ref():
     cfg = _cfg()
     text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
@@ -701,72 +681,6 @@ def test_render_singleton_set_bypass_fast_path_bakes_literal():
     text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
     job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
     assert {"name": "bypass_fast_path", "default": "true"} in job["parameters"]
-
-
-# --- request_timeout / transport_max_retries global-var declaration guards (mirror bulk_stats) ---
-
-
-@pytest.mark.parametrize("default", ["", "60", "120"])
-def test_require_request_timeout_declared_accepts_legal_default(tmp_path, default):
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  request_timeout:\n    default: '{default}'\n")
-    gen_jobs.require_request_timeout_declared(str(yml))  # no raise
-
-
-def test_require_request_timeout_declared_missing_fails_closed(tmp_path):
-    # An omitted-request_timeout config bakes ${var.request_timeout}; if the variable is not declared,
-    # fail closed at generation rather than let the reference break confusingly at deploy.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
-    with pytest.raises(ValueError, match="request_timeout is not declared"):
-        gen_jobs.require_request_timeout_declared(str(yml))
-
-
-@pytest.mark.parametrize("bad", ["abc", "0", "-5", "12.5"])
-def test_require_request_timeout_declared_bad_default_fails_closed(tmp_path, bad):
-    # A mistyped/illegal global default (non-positive-int) is rejected with the SAME validator the runner
-    # applies, so it fails at generation rather than at every run.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  request_timeout:\n    default: '{bad}'\n")
-    with pytest.raises(ValueError, match="request_timeout"):
-        gen_jobs.require_request_timeout_declared(str(yml))
-
-
-@pytest.mark.parametrize("default", ["", "0", "3", "5"])
-def test_require_transport_max_retries_declared_accepts_legal_default(tmp_path, default):
-    # 0 is a LEGAL global default here (disable transport retries), unlike request_timeout's positive-int.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  transport_max_retries:\n    default: '{default}'\n")
-    gen_jobs.require_transport_max_retries_declared(str(yml))  # no raise
-
-
-def test_require_transport_max_retries_declared_missing_fails_closed(tmp_path):
-    yml = tmp_path / "databricks.yml"
-    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
-    with pytest.raises(ValueError, match="transport_max_retries is not declared"):
-        gen_jobs.require_transport_max_retries_declared(str(yml))
-
-
-@pytest.mark.parametrize("bad", ["abc", "-1", "2.5"])
-def test_require_transport_max_retries_declared_bad_default_fails_closed(tmp_path, bad):
-    yml = tmp_path / "databricks.yml"
-    yml.write_text(f"variables:\n  transport_max_retries:\n    default: '{bad}'\n")
-    with pytest.raises(ValueError, match="transport_max_retries"):
-        gen_jobs.require_transport_max_retries_declared(str(yml))
-
-
-def test_require_reliability_globals_accept_scalar_shorthand(tmp_path):
-    # DAB's scalar shorthand (<name>: <v>, no `default:` key) IS the default; a legal shorthand passes.
-    yml = tmp_path / "databricks.yml"
-    yml.write_text("variables:\n  request_timeout: '120'\n  transport_max_retries: '5'\n")
-    gen_jobs.require_request_timeout_declared(str(yml))       # no raise
-    gen_jobs.require_transport_max_retries_declared(str(yml))  # no raise
-
-
-def test_shipped_databricks_yml_declares_reliability_globals():
-    # The repo's databricks.yml declares both with legal defaults.
-    gen_jobs.require_request_timeout_declared()
-    gen_jobs.require_transport_max_retries_declared()
 
 
 def test_render_singleton_omitted_bulk_stats_bakes_global_ref():
@@ -905,17 +819,16 @@ def test_group_run_time_knobs_move_into_task_base_parameters():
     })
     job = _render_group("g1", [("a.yml", "a", cfg, None)])
     bp = job["tasks"][0]["notebook_task"]["base_parameters"]
-    # The grouped task bakes the SAME defaults the generator uses, including the ${var.*} refs for the
-    # globally-defaulted knobs (bulk_stats, request_timeout, transport_max_retries) when omitted, so
-    # grouped tasks defer to the target-wide defaults too.
-    for p in job_parameters(cfg, gen_jobs._BULK_STATS_VAR_REF,
-                            gen_jobs._REQUEST_TIMEOUT_VAR_REF, gen_jobs._TRANSPORT_MAX_RETRIES_VAR_REF,
-                            gen_jobs._RETRY_TRANSPORT_TIMEOUT_VAR_REF, gen_jobs._BYPASS_FAST_PATH_VAR_REF):
+    # The grouped task bakes the SAME defaults the generator uses (job_parameters with the full
+    # runtime_knob_global_refs()), so every knob the member OMITS carries its ${var.<name>} global ref and
+    # grouped tasks defer to the target-wide defaults too; a knob the member SETS carries its literal.
+    for p in job_parameters(cfg, runtime_knob_global_refs()):
         assert bp[p["name"]] == p["default"]
     assert bp["chunk_size"] == "500" and bp["write_concurrency"] == "4"  # per-member defaults carried
-    assert bp["bulk_stats"] == "${var.bulk_stats}"  # omitted => defers to the global default
-    assert bp["request_timeout"] == "${var.request_timeout}"  # omitted => defers to the global default
-    assert bp["transport_max_retries"] == "${var.transport_max_retries}"
+    assert bp["bulk_stats"] == "${var.bulk_stats}"        # omitted => defers to the global default
+    assert bp["request_timeout"] == "${var.request_timeout}"      # omitted => global default
+    assert bp["streaming_start"] == "${var.streaming_start}"      # now globally-defaulted too
+    assert bp["pipeline_mode"] == "batch"                 # set on the member => literal
 
 
 def test_group_shares_one_job_cluster_when_same_config():

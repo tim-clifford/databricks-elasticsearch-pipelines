@@ -210,6 +210,65 @@ variables:
     description: "Global default for EsWriteConfig bypass_fast_path (skip the errors-probe fast path; classify every chunk per-item for exact op_type=create counts, at the cost of fast-path throughput). Empty default (off; connector fast path used). A pipeline's own bypass_fast_path and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.10.0."
     default: ""
 
+  # GLOBAL defaults for the REMAINING run-time knobs, so EVERY run-time job parameter follows ONE uniform
+  # pattern: this target-wide ${var.<name>} default < a per-pipeline config value (the config key) < a
+  # per-run --params override. scripts/gen_jobs.py bakes ${var.<name>} as the job-parameter default for any
+  # pipeline that OMITS the knob (driven by the pipeline_lib.config._RUNTIME_KNOBS registry), so a knob can
+  # be set target-wide here WITHOUT editing each pipeline config; a config that sets the knob overrides
+  # this, and --params wins per run. An empty "" default means "no target-wide default" - the pipeline's
+  # own config value, else the connector/Spark/built-in default, stands - EXCEPT pipeline_mode and
+  # streaming_start, which have no meaningful empty value (their validators reject "") and so carry a
+  # concrete default (batch / new). op_type stays EMPTY even though it is concrete-valued: its empty form
+  # defers to the connector's own default (index) AND, being version-gated (connector >= 0.10.0), a
+  # non-empty global would make an omitting config bake a value the runner's version-gate then drops with
+  # a spurious warning on an older wheel. All are validated at generation (require_runtime_knobs_declared)
+  # and at run, and like the other simple string vars accept a --var=<name>=<value> override at deploy.
+  # (bulk_stats, request_timeout, transport_max_retries, retry_transport_timeout, and bypass_fast_path
+  # above are the same pattern.)
+  #
+  # CAVEAT (empty-sentinel knobs): setting a NON-empty global for a knob whose unset form is "" (every knob
+  # here except pipeline_mode / streaming_start) applies to EVERY pipeline that omits that knob, with no
+  # per-config way to opt back out to the connector/Spark default. Most pointed for filter_condition: a
+  # target-wide value is applied as a Spark predicate to every omitting pipeline's write, so leave it ""
+  # unless every such pipeline's view really should carry that filter. The shipped "" defaults mean there
+  # is no such inheritance out of the box.
+  pipeline_mode:
+    description: "Global default export mode (batch|streaming) for pipelines that omit pipeline_mode. Default batch. A pipeline's own pipeline_mode and a per-run --params override this. A continuous pipeline must set streaming EXPLICITLY (it cannot inherit this global)."
+    default: batch
+  filter_condition:
+    description: "Global default row filter (a Spark SQL predicate) for pipelines that omit filter_condition. Empty default (no filter). A pipeline's own filter_condition and a per-run --params override this."
+    default: ""
+  chunk_size:
+    description: "Global default EsWriteConfig chunk_size (docs per bulk request) for pipelines that omit it. Empty default (connector default stands). A pipeline's own value and a per-run --params override this."
+    default: ""
+  write_concurrency:
+    description: "Global default EsWriteConfig write_concurrency (parallel bulk streams per partition) for pipelines that omit it. Empty default (connector default 1). A pipeline's own value and a per-run --params override this."
+    default: ""
+  op_type:
+    description: "Global default EsWriteConfig op_type (index|create) for pipelines that omit it. Empty default (the connector default, index, stands). A pipeline's own op_type and a per-run --params override this. create is append-only and needs a deterministic es_id_field to dedup a resend (without one, replays duplicate); requires connector >= 0.10.0. Empty (not a literal 'index') so an omitting config bakes '' and a pre-0.10.0 wheel's version-gate never spuriously drops it."
+    default: ""
+  require_existing_index:
+    description: "Global default EsWriteConfig require_existing_index (true|false) for pipelines that omit it. Empty default (connector default stands). A pipeline's own value and a per-run --params override this."
+    default: ""
+  verify_certs:
+    description: "Global default EsWriteConfig verify_certs (true|false) for pipelines that omit it. Empty default (connector default stands). A pipeline's own value and a per-run --params override this. Incompatible with a set ca_certs when false (the connector rejects that combination)."
+    default: ""
+  streaming_start:
+    description: "Global default first-run stream position (new|full) for pipelines that omit streaming_start. Default new (only new commits; full backfills the whole table). A pipeline's own value and a per-run --params override this. Streaming only; honored on a first run before a checkpoint exists."
+    default: new
+  write_repartition:
+    description: "Global default write_repartition (partitions to repartition the write input into before bulk_write; 0 disables) for pipelines that omit it. Empty default (built-in default 0, off). A pipeline's own value and a per-run --params override this."
+    default: ""
+  max_partition_bytes:
+    description: "Global default spark.sql.files.maxPartitionBytes for the source read (e.g. 32m; 0 leaves it unset) for pipelines that omit it. Empty default (built-in default 2m). A pipeline's own value and a per-run --params override this."
+    default: ""
+  max_files_per_trigger:
+    description: "Global default streaming read rate-limit: max Delta files per micro-batch, for pipelines that omit it. Empty default (Spark default 1000). A pipeline's own value and a per-run --params override this. Streaming only."
+    default: ""
+  max_bytes_per_trigger:
+    description: "Global default streaming read rate-limit: max bytes per micro-batch (e.g. 128m), for pipelines that omit it. Empty default (no cap). A pipeline's own value and a per-run --params override this. Streaming only."
+    default: ""
+
   # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
   # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
   # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds

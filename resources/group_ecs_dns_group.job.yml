@@ -43,22 +43,22 @@ resources:
             ca_certs: ${var.ca_certs}
             streaming_trigger_interval: ''
             pipeline_mode: batch
-            filter_condition: ''
-            chunk_size: ''
-            write_concurrency: ''
-            op_type: ''
+            filter_condition: ${var.filter_condition}
+            chunk_size: ${var.chunk_size}
+            write_concurrency: ${var.write_concurrency}
+            op_type: ${var.op_type}
             request_timeout: ${var.request_timeout}
             transport_max_retries: ${var.transport_max_retries}
-            require_existing_index: ''
-            verify_certs: ''
+            require_existing_index: ${var.require_existing_index}
+            verify_certs: ${var.verify_certs}
             bulk_stats: ${var.bulk_stats}
             retry_transport_timeout: ${var.retry_transport_timeout}
             bypass_fast_path: ${var.bypass_fast_path}
-            streaming_start: new
-            write_repartition: '0'
-            max_partition_bytes: 2m
-            max_files_per_trigger: ''
-            max_bytes_per_trigger: ''
+            streaming_start: ${var.streaming_start}
+            write_repartition: ${var.write_repartition}
+            max_partition_bytes: ${var.max_partition_bytes}
+            max_files_per_trigger: ${var.max_files_per_trigger}
+            max_bytes_per_trigger: ${var.max_bytes_per_trigger}
       - task_key: index_pipeline_ecs_dns_group_b
         job_cluster_key: standard_batch
         notebook_task:
@@ -74,22 +74,22 @@ resources:
             ca_certs: ${var.ca_certs}
             streaming_trigger_interval: ''
             pipeline_mode: batch
-            filter_condition: ''
-            chunk_size: ''
-            write_concurrency: ''
-            op_type: ''
+            filter_condition: ${var.filter_condition}
+            chunk_size: ${var.chunk_size}
+            write_concurrency: ${var.write_concurrency}
+            op_type: ${var.op_type}
             request_timeout: ${var.request_timeout}
             transport_max_retries: ${var.transport_max_retries}
-            require_existing_index: ''
-            verify_certs: ''
+            require_existing_index: ${var.require_existing_index}
+            verify_certs: ${var.verify_certs}
             bulk_stats: ${var.bulk_stats}
             retry_transport_timeout: ${var.retry_transport_timeout}
             bypass_fast_path: ${var.bypass_fast_path}
-            streaming_start: new
-            write_repartition: '0'
-            max_partition_bytes: 2m
-            max_files_per_trigger: ''
-            max_bytes_per_trigger: ''
+            streaming_start: ${var.streaming_start}
+            write_repartition: ${var.write_repartition}
+            max_partition_bytes: ${var.max_partition_bytes}
+            max_files_per_trigger: ${var.max_files_per_trigger}
+            max_bytes_per_trigger: ${var.max_bytes_per_trigger}
       permissions:
       - level: CAN_MANAGE_RUN
         group_name: users

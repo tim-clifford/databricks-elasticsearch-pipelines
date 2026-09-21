@@ -365,6 +365,21 @@ if cfg["es_id_field"] is None:
     print(f"WARNING: {PIPELINE_MODE} pipeline with no es_id_field - ES auto-generates _ids, so a replay "
           f"(a retry or restart) re-inserts rows as NEW documents and accumulates DUPLICATES.{_stream_note} "
           f"Set es_id_field for idempotent upserts; leave it unset only if duplicates are acceptable.")
+    # op_type=create escalates the above: create needs a DETERMINISTIC _id to dedup a resend (the
+    # connector's create-409-is-a-no-op). With no es_id_field, ES assigns a random _id per doc, so a
+    # create can NEVER 409-conflict and the append-only dedup the mode promises silently never fires - a
+    # replay just accumulates duplicates, exactly as op_type=index would. That is a footgun (the intended
+    # effect is lost), not a data-integrity failure, so WARN rather than fail; the run still writes. The
+    # config-load guard (validate_config) already fails a config that STATICALLY sets op_type: create with
+    # no es_id_field; this covers the path that guard cannot see - op_type=create arriving via the
+    # ${var.op_type} global default or a --params override, known only here at run time. Keyed on the
+    # EFFECTIVE op_type in write_overrides (post version-gate), so on an older wheel where op_type was
+    # dropped fail-soft there is no create in effect and nothing to warn about.
+    if write_overrides.get("op_type") == "create":
+        print("WARNING: op_type=create with no es_id_field - creates get ES-assigned random _ids, so they "
+              "never 409-conflict and the append-only dedup op_type=create promises NEVER fires; the run "
+              "behaves like op_type=index (replays DUPLICATE). Set es_id_field so create dedups resends, "
+              "or drop op_type=create.")
 
 # Tune read/scan parallelism for BOTH modes by setting spark.sql.files.maxPartitionBytes before any
 # read below (smaller => more, smaller source-file splits => the scan+view-transform fans out across
