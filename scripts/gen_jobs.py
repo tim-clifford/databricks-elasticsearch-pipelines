@@ -27,45 +27,23 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Import the shared config schema from the repo root, so validation is not re-implemented here.
 sys.path.insert(0, _REPO_ROOT)
 from pipeline_lib.config import (  # noqa: E402
+    _RUNTIME_KNOBS,
     PipelineConfigError,
     _require_identifier,
     job_base_parameters,
     job_parameters,
     load_config,
-    require_es_flag,
-    require_request_timeout,
-    require_transport_max_retries,
+    runtime_knob_global_refs,
 )
 
-# The bundle-variable reference the generator bakes as the DEFAULT of the bulk_stats job parameter when a
-# config OMITS bulk_stats: the diagnostics toggle then defers to the target-wide ${var.bulk_stats} global
-# default (resolved per target at deploy). A config that SETS bulk_stats overrides this with its literal
-# value. Mirrors how ca_certs / checkpoint_base_path are threaded as ${var.*} references (see
-# job_base_parameters). require_bulk_stats_declared fails closed at generation if the variable is missing.
-_BULK_STATS_VAR_REF = "${var.bulk_stats}"
-
-# The bundle-variable references the generator bakes as the DEFAULT of the request_timeout /
-# transport_max_retries job parameters when a config OMITS them: each connection/reliability knob then
-# defers to its target-wide ${var.*} global default (resolved per target at deploy). A config that SETS
-# the knob overrides this with its literal value. Same mechanism as _BULK_STATS_VAR_REF;
-# require_request_timeout_declared / require_transport_max_retries_declared fail closed at generation if
-# the variable is missing.
-_REQUEST_TIMEOUT_VAR_REF = "${var.request_timeout}"
-_TRANSPORT_MAX_RETRIES_VAR_REF = "${var.transport_max_retries}"
-
-# The bundle-variable reference the generator bakes as the DEFAULT of the retry_transport_timeout job
-# parameter when a config OMITS it: the toggle then defers to the target-wide ${var.retry_transport_timeout}
-# global default (resolved per target at deploy). A config that SETS it overrides with its literal value.
-# Same mechanism as _BULK_STATS_VAR_REF; require_retry_transport_timeout_declared fails closed at
-# generation if the variable is missing.
-_RETRY_TRANSPORT_TIMEOUT_VAR_REF = "${var.retry_transport_timeout}"
-
-# The bundle-variable reference the generator bakes as the DEFAULT of the bypass_fast_path job parameter
-# when a config OMITS it: the toggle then defers to the target-wide ${var.bypass_fast_path} global default
-# (resolved per target at deploy). A config that SETS it overrides with its literal value. Same mechanism
-# as _BULK_STATS_VAR_REF; require_bypass_fast_path_declared fails closed at generation if the variable is
-# missing.
-_BYPASS_FAST_PATH_VAR_REF = "${var.bypass_fast_path}"
+# The DEFAULT the generator bakes for every run-time job parameter that a config OMITS: the knob's
+# target-wide ${var.<name>} global reference (resolved per target at deploy), so an omitted knob defers to
+# that target's global default. A config that SETS the knob overrides this with its literal value. This is
+# ONE dict for all run-time knobs, derived from the pipeline_lib.config._RUNTIME_KNOBS registry (the single
+# source of truth for the knob set/order), so adding a knob there wires its global fallback here with no
+# edit. Mirrors how ca_certs / checkpoint_base_path are threaded as ${var.*} references (see
+# job_base_parameters); require_runtime_knobs_declared fails closed at generation if any variable is missing.
+_RUNTIME_KNOB_GLOBAL_REFS = runtime_knob_global_refs()
 
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "pipeline_configs")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
@@ -302,34 +280,22 @@ def _require_global_var_declared(name: str, validator, path: str = _DATABRICKS_Y
         raise ValueError(str(exc)) from exc
 
 
-def require_bulk_stats_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
-    """Fail closed at generation if databricks.yml declares no legal `bulk_stats` variable
-    (""/true/false). See _require_global_var_declared."""
-    _require_global_var_declared("bulk_stats", require_es_flag, path, doc)
+def require_runtime_knobs_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+    """Fail closed at generation unless databricks.yml declares a legal global default for EVERY run-time
+    knob (pipeline_lib.config._RUNTIME_KNOBS).
 
-
-def require_request_timeout_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
-    """Fail closed at generation if databricks.yml declares no legal `request_timeout` variable (""/a
-    positive int of seconds). See _require_global_var_declared."""
-    _require_global_var_declared("request_timeout", require_request_timeout, path, doc)
-
-
-def require_retry_transport_timeout_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
-    """Fail closed at generation if databricks.yml declares no legal `retry_transport_timeout` variable
-    (""/true/false). See _require_global_var_declared."""
-    _require_global_var_declared("retry_transport_timeout", require_es_flag, path, doc)
-
-
-def require_bypass_fast_path_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
-    """Fail closed at generation if databricks.yml declares no legal `bypass_fast_path` variable
-    (""/true/false). See _require_global_var_declared."""
-    _require_global_var_declared("bypass_fast_path", require_es_flag, path, doc)
-
-
-def require_transport_max_retries_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
-    """Fail closed at generation if databricks.yml declares no legal `transport_max_retries` variable
-    (""/a non-negative int). See _require_global_var_declared."""
-    _require_global_var_declared("transport_max_retries", require_transport_max_retries, path, doc)
+    Each run-time job parameter's default is baked as ${var.<name>} for any pipeline that OMITS the knob
+    (see _RUNTIME_KNOB_GLOBAL_REFS / job_parameters), so the bundle must declare each variable AND its
+    static default must pass that knob's own validator - the SAME require_* helper the runner applies to
+    the effective value. One loop over the registry (each entry carries its name and validator), so a knob
+    added to _RUNTIME_KNOBS is gated here automatically, with no per-knob function to add. Delegates each
+    knob to _require_global_var_declared (which validates declaration + default, and whose message tells
+    the operator to add the missing variable). Per-target/--var overrides are deploy-time and not visible
+    here; the runner re-validates the effective value, so a bad per-target value still fails closed at run.
+    """
+    bundle_doc = doc if doc is not None else _read_bundle_doc(path)
+    for knob in _RUNTIME_KNOBS:
+        _require_global_var_declared(knob.name, knob.validator, path, bundle_doc)
 
 
 def require_support_email_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
@@ -472,8 +438,7 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
         streaming_trigger_interval,
     )
     if include_run_time_knobs:
-        for p in job_parameters(cfg, _BULK_STATS_VAR_REF, _REQUEST_TIMEOUT_VAR_REF, _TRANSPORT_MAX_RETRIES_VAR_REF,
-                                _RETRY_TRANSPORT_TIMEOUT_VAR_REF, _BYPASS_FAST_PATH_VAR_REF):
+        for p in job_parameters(cfg, _RUNTIME_KNOB_GLOBAL_REFS):
             base_parameters[p["name"]] = p["default"]
     task["notebook_task"] = {
         "notebook_path": "../notebooks/run_index_pipeline.py",
@@ -589,8 +554,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     job_def = _assemble_job(
         _job_display_name(postfix),
         description,
-        job_parameters(cfg, _BULK_STATS_VAR_REF, _REQUEST_TIMEOUT_VAR_REF, _TRANSPORT_MAX_RETRIES_VAR_REF,
-                       _RETRY_TRANSPORT_TIMEOUT_VAR_REF, _BYPASS_FAST_PATH_VAR_REF),
+        job_parameters(cfg, _RUNTIME_KNOB_GLOBAL_REFS),
         _trigger_block(cfg["schedule"], cfg["continuous"]),
         _job_clusters_for([(name, cfg, job_cluster_spec)]),
         [task],
@@ -810,11 +774,7 @@ def main(argv: list[str] | None = None) -> int:
     bundle_doc = _read_bundle_doc()
     require_job_name_prefix_declared(doc=bundle_doc)
     require_support_email_declared(doc=bundle_doc)
-    require_bulk_stats_declared(doc=bundle_doc)
-    require_request_timeout_declared(doc=bundle_doc)
-    require_transport_max_retries_declared(doc=bundle_doc)
-    require_retry_transport_timeout_declared(doc=bundle_doc)
-    require_bypass_fast_path_declared(doc=bundle_doc)
+    require_runtime_knobs_declared(doc=bundle_doc)
     es_host_configs = load_es_host_configs(doc=bundle_doc)
     default_es_host_config = load_default_es_host_config(doc=bundle_doc)
     cluster_configs = load_cluster_configs(doc=bundle_doc)

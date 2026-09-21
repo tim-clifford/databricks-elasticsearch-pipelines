@@ -10,10 +10,14 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
     es_id_field:   <column>              # OPTIONAL view output column passed to the connector as the ES
                                          #   _id (idempotent upserts). Omit => ES assigns random _ids,
                                          #   so replays can duplicate documents. See below.
-    pipeline_mode: batch | streaming     # THIS index's DEFAULT export mode (required); a job parameter,
-                                         #   so it is overridable per run with --params pipeline_mode=...
-                                         #   (clearing a checkpoint is the dedicated _checkpoint clear
-                                         #   job, not a pipeline_mode).
+    pipeline_mode: batch | streaming     # THIS index's DEFAULT export mode. OPTIONAL: omit => the
+                                         #   target-wide ${var.pipeline_mode} global (databricks.yml,
+                                         #   default batch). A job parameter, so it is overridable per run
+                                         #   with --params pipeline_mode=... (clearing a checkpoint is the
+                                         #   dedicated _checkpoint clear job, not a pipeline_mode). A
+                                         #   continuous pipeline must set pipeline_mode: streaming
+                                         #   explicitly (it cannot inherit the global; see the continuous
+                                         #   cross-field rule below).
     filter_condition: <sql predicate>    # OPTIONAL default row filter (a Spark SQL boolean expr);
                                          #   also a job parameter, overridable per run. Empty => no filter.
     chunk_size: <positive int>           # OPTIONAL EsWriteConfig tuning: docs per bulk request.
@@ -61,6 +65,12 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   layering as bulk_stats (config value > ${var.bypass_fast_path}
                                          #   global > connector default OFF). Requires connector 0.10.0+
                                          #   (older wheels ignore it, fail-soft).
+    streaming_start: new | full          # OPTIONAL first-run stream position: "new" (start at the source's
+                                         #   current version, only new commits exported) or "full" (backfill
+                                         #   the whole table). Omit => the target-wide ${var.streaming_start}
+                                         #   global (databricks.yml, default new). A job parameter,
+                                         #   overridable per run. Streaming mode only; honored only on a
+                                         #   first run before a checkpoint exists.
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -104,6 +114,7 @@ bad environment value (a hyphen, say) fails closed at resolve time rather than p
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 # A resolved value substituted into SQL as a bare (unquoted) identifier: a letter/underscore, then
 # letters, digits, underscores. Rejects a hyphen, space, dot, quote, or reserved punctuation.
@@ -728,6 +739,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "chunk_size", "write_concurrency", "request_timeout", "transport_max_retries",
         "require_existing_index", "verify_certs", "bulk_stats", "retry_transport_timeout",
         "op_type", "bypass_fast_path",
+        "streaming_start",
         "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
@@ -737,7 +749,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     if unknown:
         raise PipelineConfigError(f"{source}: unknown key(s): {', '.join(unknown)}; allowed: {', '.join(sorted(allowed_top))}")
 
-    for required in ("es_index_name", "pipeline_mode", "view", "source"):
+    for required in ("es_index_name", "view", "source"):
         if required not in raw:
             raise PipelineConfigError(f"{source}: missing required key '{required}'")
 
@@ -765,7 +777,16 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         _require_identifier(raw["es_host_config"], f"{source}: es_host_config")
         if "es_host_config" in raw else None
     )
-    pipeline_mode = require_pipeline_mode(raw["pipeline_mode"], f"{source}: pipeline_mode")
+    # pipeline_mode is OPTIONAL: absent -> "" (inherit the target-wide ${var.pipeline_mode} global default,
+    # which databricks.yml sets to "batch"). A PRESENT value is allow-list validated (batch|streaming;
+    # clearing a checkpoint is the dedicated _checkpoint clear job, not a pipeline_mode). Stored "" when
+    # omitted so job_parameters' `cfg[name] or ref` reaches the global. A continuous pipeline must still
+    # declare pipeline_mode: streaming EXPLICITLY (the cross-field guard below fails an omitted/"" mode),
+    # because generation can't see a deploy-resolved var.
+    pipeline_mode = (
+        require_pipeline_mode(raw["pipeline_mode"], f"{source}: pipeline_mode")
+        if "pipeline_mode" in raw else ""
+    )
     # filter_condition is OPTIONAL: absent -> "" (no filter). It is a SQL predicate, not an object
     # name, so it is not an identifier and carries no ${environment} token.
     filter_condition = require_filter_condition(raw.get("filter_condition", ""), f"{source}: filter_condition")
@@ -818,14 +839,31 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # an older wheel the runner drops it fail-soft (see runner).
     bypass_fast_path = require_es_flag(raw.get("bypass_fast_path", ""),
                                        f"{source}: bypass_fast_path")
-    # write_repartition is OPTIONAL but, unlike the tuning knobs above, an absent value does NOT mean
-    # "unset": it falls back to the built-in default (require_write_repartition turns "" into
-    # _DEFAULT_WRITE_REPARTITION), so a config that omits it still parallelizes the write instead of
-    # inheriting the read's ~few partitions. Stored in canonical string form (a job-parameter default).
-    write_repartition = require_write_repartition(raw.get("write_repartition", ""), f"{source}: write_repartition")
-    # max_partition_bytes is OPTIONAL: absent -> the built-in default (require_max_partition_bytes turns
-    # "" into _DEFAULT_MAX_PARTITION_BYTES). It governs read/scan parallelism; "0" means leave it unset.
-    max_partition_bytes = require_max_partition_bytes(raw.get("max_partition_bytes", ""), f"{source}: max_partition_bytes")
+    # streaming_start selects where a FIRST streaming run positions: "new" (start at the source's current
+    # version, only new commits exported) or "full" (backfill the whole existing table). OPTIONAL: absent
+    # -> "" (inherit the target-wide ${var.streaming_start} global, which databricks.yml sets to "new"). A
+    # PRESENT value is allow-list validated (new|full). Streaming mode only; ignored by batch; honored only
+    # on a first run before a checkpoint exists. Stored "" when omitted so job_parameters' `cfg[name] or
+    # ref` reaches the global.
+    streaming_start = (
+        require_streaming_start(raw["streaming_start"], f"{source}: streaming_start")
+        if "streaming_start" in raw else ""
+    )
+    # write_repartition and max_partition_bytes are OPTIONAL. Unlike today, an absent value is stored ""
+    # (NOT the built-in default) so job_parameters' `cfg[name] or ref` inherits the target-wide global
+    # (${var.write_repartition} / ${var.max_partition_bytes}). The built-in default is applied by the
+    # RUNNER as the final fallback (require_write_repartition turns "" into _DEFAULT_WRITE_REPARTITION,
+    # require_max_partition_bytes turns "" into _DEFAULT_MAX_PARTITION_BYTES), so an omitted config with an
+    # empty global still gets the same effective default as before - it just now also honors a per-target
+    # global. A PRESENT value (including write_repartition: 0) is canonicalized and overrides the global.
+    write_repartition = (
+        require_write_repartition(raw["write_repartition"], f"{source}: write_repartition")
+        if "write_repartition" in raw else ""
+    )
+    max_partition_bytes = (
+        require_max_partition_bytes(raw["max_partition_bytes"], f"{source}: max_partition_bytes")
+        if "max_partition_bytes" in raw else ""
+    )
     # max_files_per_trigger / max_bytes_per_trigger are OPTIONAL streaming read rate-limits: absent -> ""
     # (leave Spark's own default). They bound each streaming micro-batch (see the require_* helpers);
     # ignored by a batch run. Stored in canonical string form (a job-parameter default).
@@ -880,7 +918,10 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         if pipeline_mode != "streaming":
             raise PipelineConfigError(
                 f"{source}: continuous requires pipeline_mode: streaming (an always-on run only applies "
-                f"to a stream), got pipeline_mode={pipeline_mode!r}"
+                f"to a stream), got pipeline_mode={pipeline_mode!r}. A continuous pipeline must declare "
+                f"pipeline_mode: streaming EXPLICITLY - it cannot inherit the ${{var.pipeline_mode}} global "
+                f"default, because generation resolves this cross-field guard before the bundle resolves "
+                f"the variable at deploy."
             )
         if compute["type"] not in ("job_cluster", "existing_cluster"):
             raise PipelineConfigError(
@@ -926,6 +967,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "retry_transport_timeout": retry_transport_timeout,
         "op_type": op_type,
         "bypass_fast_path": bypass_fast_path,
+        "streaming_start": streaming_start,
         "write_repartition": write_repartition,
         "max_partition_bytes": max_partition_bytes,
         "max_files_per_trigger": max_files_per_trigger,
@@ -1210,6 +1252,10 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # bypass_fast_path (connector write-path toggle): a connector setting, passed through verbatim
         # (canonical string form), like bulk_stats.
         "bypass_fast_path": cfg["bypass_fast_path"],
+        # streaming_start (first-run stream position): a run behavior, not an object name: passed through
+        # verbatim (canonical string form). The runner reads it from the job-parameter widget, not from
+        # here; carried for consistency with its sibling run-time knobs.
+        "streaming_start": cfg["streaming_start"],
         # write_repartition (partitions for the pre-write repartition) and max_partition_bytes (read
         # scan parallelism) are run behaviors, not object names: passed through verbatim (canonical
         # string form), like the tuning knobs.
@@ -1434,104 +1480,91 @@ def job_base_parameters(
     }
 
 
-def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
-                   request_timeout_default_ref: str = "",
-                   transport_max_retries_default_ref: str = "",
-                   retry_transport_timeout_default_ref: str = "",
-                   bypass_fast_path_default_ref: str = "") -> list:
+class _RuntimeKnob(NamedTuple):
+    """One run-time-overridable job parameter: its widget/parameter NAME and the require_* VALIDATOR
+    that canonicalizes it (the same helper validate_config and the runner apply). See _RUNTIME_KNOBS."""
+    name: str
+    validator: object  # a require_*(value, where) -> canonical str helper
+
+
+# The SINGLE SOURCE OF TRUTH for the run-time-overridable job parameters, in the order they appear under
+# a job's `parameters:` key. Every knob here follows ONE uniform pattern (the "three-layer" pattern):
+#   target-wide global default (${var.<name>} in databricks.yml)
+#     < a per-pipeline config value (the config key, when set)
+#       < a per-run override (--params <name>=<value>)
+# job_parameters bakes `cfg[<name>] or ${var.<name>}` as each parameter's default, so a config that OMITS
+# a knob inherits the target-wide global, a config that SETS it overrides the global, and --params wins per
+# run (the runner re-validates the effective value). runtime_knob_global_refs() supplies the ${var.*} refs
+# and require_runtime_knobs_declared (scripts/gen_jobs.py) fails closed at generation if databricks.yml does
+# not declare a legal default for any of them. Adding a run-time knob is a ONE-LINE change here plus its
+# databricks.yml variable: the registry wires it through job_parameters, the generation gate, and the
+# order/shape tests, so the pattern can never drift knob-to-knob.
+#
+# For a knob to inherit the global when omitted, its canonical "unset" form must be FALSY (""): validate_config
+# stores "" for an omitted knob (see the parse block there), so `cfg[name] or ref` reaches the ref. Knobs
+# whose validator injects a non-empty built-in default (write_repartition -> "0", max_partition_bytes ->
+# "2m") therefore store "" at the CONFIG layer when omitted and let the RUNNER apply that built-in default
+# as the final fallback, so an omitted config still inherits the global rather than short-circuiting on the
+# built-in. pipeline_mode / streaming_start have no "connector default" (there is no meaningful empty value),
+# so their databricks.yml global defaults are concrete (batch / new) and their validators reject "".
+_RUNTIME_KNOBS = (
+    _RuntimeKnob("pipeline_mode", require_pipeline_mode),
+    _RuntimeKnob("filter_condition", require_filter_condition),
+    _RuntimeKnob("chunk_size", require_chunk_size),
+    _RuntimeKnob("write_concurrency", require_write_concurrency),
+    _RuntimeKnob("op_type", require_op_type),
+    _RuntimeKnob("request_timeout", require_request_timeout),
+    _RuntimeKnob("transport_max_retries", require_transport_max_retries),
+    _RuntimeKnob("require_existing_index", require_es_flag),
+    _RuntimeKnob("verify_certs", require_es_flag),
+    _RuntimeKnob("bulk_stats", require_es_flag),
+    _RuntimeKnob("retry_transport_timeout", require_es_flag),
+    _RuntimeKnob("bypass_fast_path", require_es_flag),
+    _RuntimeKnob("streaming_start", require_streaming_start),
+    _RuntimeKnob("write_repartition", require_write_repartition),
+    _RuntimeKnob("max_partition_bytes", require_max_partition_bytes),
+    _RuntimeKnob("max_files_per_trigger", require_max_files_per_trigger),
+    _RuntimeKnob("max_bytes_per_trigger", require_max_bytes_per_trigger),
+)
+
+# The knob names in registry order (stable public list for callers/tests that need the set of run-time
+# job parameters without reaching into the registry tuples).
+RUNTIME_KNOB_NAMES = tuple(k.name for k in _RUNTIME_KNOBS)
+
+
+def runtime_knob_global_refs() -> dict:
+    """Map each run-time knob name to its `${var.<name>}` bundle-variable reference.
+
+    This is the target-wide global DEFAULT the generator bakes for a config that OMITS the knob, so the
+    knob inherits that target's `${var.<name>}` value (resolved by DAB at deploy). One entry per
+    _RUNTIME_KNOBS knob, derived from the name, so the `${var.*}` convention lives in exactly one place and
+    a knob added to the registry is wired automatically. scripts/gen_jobs.py passes the result to
+    job_parameters; unit tests may pass {} (or a subset) to bake literal "" defaults instead."""
+    return {name: "${var." + name + "}" for name in RUNTIME_KNOB_NAMES}
+
+
+def job_parameters(cfg: dict, global_refs: dict | None = None) -> list:
     """The RUN-TIME-overridable job-level parameters for a per-index job, as JobParameterDefinitions.
 
     Unlike base_parameters (fixed at deploy), a job parameter can be overridden per run with
     `--params <name>=<value>` and surfaces to the notebook as a widget of the same name. The runner
     re-validates each effective value, so a bad --params override fails closed.
 
-    - pipeline_mode: DEFAULT from the config (already allow-list validated); flip batch<->streaming
-      for one run without redeploying.
-    - filter_condition: DEFAULT from the config ("" if the config omits it); an optional row filter
-      applied before the write, overridable per run.
-    - chunk_size / write_concurrency / request_timeout / transport_max_retries / require_existing_index /
-      verify_certs: EsWriteConfig tuning knobs. DEFAULT from the config ("" if the config omits it,
-      meaning "use the connector's own default"); overridable per run. The config stores each in
-      canonical string form (see validate_config), which is exactly the string a job-parameter default
-      must be. Parsed + validated by write_config_overrides at run time (an unset one leaves the
-      connector default untouched). request_timeout (positive int seconds; connector default 60) and
-      transport_max_retries (non-negative int, 0 disables; connector default 3) are the levers for a
-      write that times out mid-send ("The write operation timed out"): raise request_timeout and/or
-      transport_max_retries so a slow/large bulk send has longer to complete and is re-sent on a
-      transport failure. transport_max_retries is the whole-request retry, distinct from per-document
-      429 retries (a separate connector knob not exposed here). Both take a target-wide global default
-      the same way bulk_stats does: when the config OMITS the knob, its job-parameter default falls back
-      to `request_timeout_default_ref` / `transport_max_retries_default_ref` - the caller (the generator)
-      passes the ${var.request_timeout} / ${var.transport_max_retries} bundle variables, so an omitted
-      config defers to the target-wide default, and with NO ref supplied (unit tests) it stays "" (the
-      connector's own default). A config value overrides the global; a per-run --params override wins
-      over both.
-    - bulk_stats: EsWriteConfig diagnostics toggle, now behaving like the other bool knobs. DEFAULT from
-      the config when set; when the config OMITS it (stored ""), the default falls back to
-      `bulk_stats_default_ref` - the caller (the generator) passes the ${var.bulk_stats} bundle variable,
-      so an omitted config defers to the target-wide global default, and when NO ref is supplied (unit
-      tests) it stays "" (the connector's own default, off). A config value overrides the global; the
-      job parameter (--params bulk_stats=...) overrides per run. Canonical string form, parsed by
-      write_config_overrides. Requires connector 0.9.3+ (older wheels drop it fail-soft in the runner).
-    - retry_transport_timeout: EsWriteConfig connector-owned-timeout-retry toggle, same layering as
-      bulk_stats (config value, else `retry_transport_timeout_default_ref` = ${var.retry_transport_timeout},
-      else "" for the connector default off). Requires connector 0.9.7+ (older wheels drop it fail-soft).
-    - op_type: EsWriteConfig bulk-action selector, index (default) | create. DEFAULT from the config when
-      set, else "" (the connector default op_type, "index"). PER-CONFIG with NO global ${var.*} ref (a
-      feed opts into create explicitly), so unlike bulk_stats it takes no *_default_ref. Canonical string
-      form, parsed/passed-through by write_config_overrides. Requires connector 0.10.0+ (older wheels
-      drop it fail-soft in the runner).
-    - bypass_fast_path: EsWriteConfig write-path toggle, same layering as bulk_stats (config value, else
-      `bypass_fast_path_default_ref` = ${var.bypass_fast_path}, else "" for the connector default off).
-      When on, the connector skips the errors-probe fast path and classifies every chunk per-item, which
-      makes docs_deduped/written exact for op_type=create at the cost of the fast path's throughput.
-      Requires connector 0.10.0+ (older wheels drop it fail-soft).
-    - streaming_start: new|full, DEFAULT "new" (start the stream at the source's current version, so
-      only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
-      run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
-      default rather than a config key: it is a per-rollout operator choice, not a per-index property.
-    - max_partition_bytes: spark.sql.files.maxPartitionBytes for the source read (read/scan
-      parallelism); DEFAULT from the config, which defaults to _DEFAULT_MAX_PARTITION_BYTES when the
-      config omits it. "0" leaves it unset. The primary parallelism lever; applies to both modes.
-    - write_repartition: how many partitions to repartition the write input into before bulk_write; 0
-      (the default) leaves the read's partitioning in place (see max_partition_bytes). DEFAULT from the
-      config, which defaults to _DEFAULT_WRITE_REPARTITION. Applies to both modes.
-    - max_files_per_trigger / max_bytes_per_trigger: streaming read rate-limits that bound each
-      micro-batch; DEFAULT from the config ("" when the config omits it => Spark's own default).
-      Streaming only; ignored by batch. Overridable per run to throttle a backfill/catch-up.
+    Every parameter is generated from the _RUNTIME_KNOBS registry, so all of them follow ONE uniform
+    three-layer pattern: the baked default is `cfg[<name>] or global_refs[<name>]` - the per-pipeline
+    config value when the config SETS the knob, else the target-wide `${var.<name>}` global reference
+    (resolved per target at deploy) when the config OMITS it, else "" when no ref is supplied (unit tests).
+    A per-run --params override then wins over the baked default. See _RUNTIME_KNOBS for the knob list,
+    the ordering, and why an omitted knob must store "" to reach the global ref.
 
-    Returns the list shape DAB expects under a job's `parameters:` key.
+    `global_refs` maps knob name -> the `${var.<name>}` reference; the generator passes
+    runtime_knob_global_refs(). A knob missing from the dict bakes a literal "" default (so a test can
+    pass {} to assert the pure config-value shape, or a subset to assert one knob's layering).
+
+    Returns the list shape DAB expects under a job's `parameters:` key, in _RUNTIME_KNOBS order.
     """
+    refs = global_refs or {}
     return [
-        {"name": "pipeline_mode", "default": cfg["pipeline_mode"]},
-        {"name": "filter_condition", "default": cfg["filter_condition"]},
-        {"name": "chunk_size", "default": cfg["chunk_size"]},
-        {"name": "write_concurrency", "default": cfg["write_concurrency"]},
-        # op_type: the config value when set, else "" (the connector default op_type, "index"). PER-CONFIG
-        # with NO global ref (a feed opts into create explicitly), so it takes no *_default_ref layering.
-        {"name": "op_type", "default": cfg["op_type"]},
-        # request_timeout / transport_max_retries: the config value when set, else the caller-supplied
-        # global ref (${var.request_timeout} / ${var.transport_max_retries}, resolved per target at
-        # deploy), else "" (connector default) when no ref is supplied. Same layering as bulk_stats.
-        # transport_max_retries=0 stores canonical "0" (truthy), so a config setting 0 wins over the ref.
-        {"name": "request_timeout", "default": cfg["request_timeout"] or request_timeout_default_ref},
-        {"name": "transport_max_retries", "default": cfg["transport_max_retries"] or transport_max_retries_default_ref},
-        {"name": "require_existing_index", "default": cfg["require_existing_index"]},
-        {"name": "verify_certs", "default": cfg["verify_certs"]},
-        # bulk_stats: the config value when set, else the caller-supplied global ref (${var.bulk_stats},
-        # resolved per target at deploy), else "" (connector default off) when no ref is supplied.
-        {"name": "bulk_stats", "default": cfg["bulk_stats"] or bulk_stats_default_ref},
-        # retry_transport_timeout: same layering as bulk_stats (config value, else the
-        # ${var.retry_transport_timeout} global ref, else "" for the connector default off).
-        {"name": "retry_transport_timeout",
-         "default": cfg["retry_transport_timeout"] or retry_transport_timeout_default_ref},
-        # bypass_fast_path: same layering as bulk_stats (config value, else the ${var.bypass_fast_path}
-        # global ref, else "" for the connector default off).
-        {"name": "bypass_fast_path",
-         "default": cfg["bypass_fast_path"] or bypass_fast_path_default_ref},
-        {"name": "streaming_start", "default": "new"},
-        {"name": "write_repartition", "default": cfg["write_repartition"]},
-        {"name": "max_partition_bytes", "default": cfg["max_partition_bytes"]},
-        {"name": "max_files_per_trigger", "default": cfg["max_files_per_trigger"]},
-        {"name": "max_bytes_per_trigger", "default": cfg["max_bytes_per_trigger"]},
+        {"name": knob.name, "default": cfg[knob.name] or refs.get(knob.name, "")}
+        for knob in _RUNTIME_KNOBS
     ]

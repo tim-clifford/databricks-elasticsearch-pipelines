@@ -108,7 +108,7 @@ in for the environments you deploy to, so a routine deploy needs no `--var`. (`s
 also per-environment but is the exception: it defaults to `PAUSED` globally and only `prd` overrides it,
 and it is `--var`-settable too; see [Scheduling](#scheduling).) The simple per-target string
 variables (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`, `ca_certs`, and the
-global `bulk_stats` diagnostics default) can still
+per-target global default for every run-time knob) can still
 be overridden at deploy with `--var=<name>=<value>`; the `type: complex` variables (the ES host configs, and any `cluster_config`)
 **cannot** be set via `--var` at all (the CLI rejects it: *"setting variables of complex type via --var
 flag is not supported"*), so override those through the git-ignored `variable-overrides.json` (see
@@ -132,6 +132,7 @@ value fails closed wherever the value is required. The bundle variables are:
 | `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log; connector **>= 0.9.3**). Empty default (off; the connector default stands). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
 | `retry_transport_timeout` | global default for the connector's `retry_transport_timeout` reliability toggle (connector **>= 0.9.7**): when on, the connector OWNS whole-request timeout retries (re-sends a timed-out bulk with backoff instead of letting the transport re-send it invisibly and then failing the batch). Empty default (off; the connector default stands). Threaded exactly like `bulk_stats`: the generator bakes `${var.retry_transport_timeout}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=retry_transport_timeout=true`) turns it on for a whole environment, and a pipeline's own `retry_transport_timeout:` or a per-run `--params retry_transport_timeout=<v>` override it (see [Configuration](#configuration)) |
 | `bypass_fast_path` | global default for the connector's `bypass_fast_path` write-path toggle (connector **>= 0.10.0**): when on, the connector skips its `filter_path="errors"` probe and classifies every chunk per-item, which makes the `docs_deduped` / `written` counts EXACT for `op_type=create` on chunks mixing new and existing `_id`s (and avoids the auto-id re-ship duplication), at the cost of the fast path's throughput on clean chunks. Empty default (off; the fast path is used). Threaded exactly like `bulk_stats`: the generator bakes `${var.bypass_fast_path}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bypass_fast_path=true`) turns it on for a whole environment, and a pipeline's own `bypass_fast_path:` or a per-run `--params bypass_fast_path=<v>` override it (see [Configuration](#configuration)) |
+| `pipeline_mode`, `filter_condition`, `chunk_size`, `write_concurrency`, `op_type`, `request_timeout`, `transport_max_retries`, `require_existing_index`, `verify_certs`, `streaming_start`, `write_repartition`, `max_partition_bytes`, `max_files_per_trigger`, `max_bytes_per_trigger` | the **remaining run-time knobs**, each threaded exactly like `bulk_stats`: the generator bakes `${var.<name>}` as that knob's job-parameter default for any pipeline that omits it, so **every** run-time knob follows one uniform pattern (this global default < a per-pipeline config value < a per-run `--params <name>=<value>`). All ship at a default that reproduces the prior behavior: `pipeline_mode` **`batch`** and `streaming_start` **`new`** (concrete, since their validators reject `""`), the rest empty (`""` = "the connector/Spark/built-in default stands" - `op_type` empty defers to the connector default `index`, and stays empty rather than a literal `index` so a pre-0.10.0 wheel's version-gate does not spuriously drop it). Leaving them unset changes nothing; set one per target (or `--var=<name>=<value>`) to move a whole environment. Note: setting a non-empty global for an empty-sentinel knob applies to every omitting pipeline with no per-config opt-out (watch `filter_condition`). Validated at generation and at run (see [Configuration](#configuration)) |
 
 The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
 pipeline selects, with values that differ per environment. See
@@ -150,7 +151,7 @@ its `.sql` filename):
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # OPTIONAL: view output column passed to the connector as the ES document _id (idempotent upserts). Omit to let ES auto-generate _ids (replays may duplicate; see below)
 es_host_config: es_host_primary   # OPTIONAL: which ES host config to write to; declared in databricks.yml (see below). Omit to use the bundle default
-pipeline_mode: batch              # default export mode: batch | streaming (required; can override per run)
+pipeline_mode: batch              # OPTIONAL default export mode: batch | streaming. Omit to defer to the global ${var.pipeline_mode} default (batch), or set here; override per run. A continuous pipeline must set streaming explicitly (can't inherit the global)
 filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL); omit for no filter
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
@@ -160,10 +161,11 @@ request_timeout: 120              # OPTIONAL EsWriteConfig tuning (per-request E
 transport_max_retries: 5          # OPTIONAL EsWriteConfig tuning (whole-request retries on a transport failure: connection reset/timeout, 429/503 on the bulk call; connector >= 0.6.0); omit for connector default 3. 0 disables them
 bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log; connector >= 0.9.3). Behaves like verify_certs: omit to defer to the global ${var.bulk_stats} default (off), or set true|false here to override it for this pipeline
 retry_transport_timeout: true     # OPTIONAL EsWriteConfig reliability toggle: connector OWNS whole-request timeout retries (re-send a timed-out bulk with backoff instead of failing the batch; connector >= 0.9.7). Behaves like bulk_stats: omit to defer to the global ${var.retry_transport_timeout} default (off), or set true|false here to override it for this pipeline
-op_type: create                   # OPTIONAL EsWriteConfig write action: index (default, upsert by _id) | create (append-only; a resend of an existing _id is a benign 409 dedup, not overwritten or duplicated; connector >= 0.10.0). Per-feed only (NO global var). Requires es_id_field; use only for feeds that never update an existing _id. Omit for connector default (index)
+op_type: create                   # OPTIONAL EsWriteConfig write action: index (default, upsert by _id) | create (append-only; a resend of an existing _id is a benign 409 dedup, not overwritten or duplicated; connector >= 0.10.0). Behaves like bulk_stats: omit to defer to the global ${var.op_type} (empty default => connector default index), or set here to override it for this pipeline. create needs es_id_field to dedup a resend (else replays duplicate; the runner warns if create runs without one)
 bypass_fast_path: true            # OPTIONAL EsWriteConfig write-path toggle: skip the errors-probe fast path and classify every chunk per-item (connector >= 0.10.0). Makes docs_deduped/written counts EXACT for op_type=create at the cost of fast-path throughput. Behaves like bulk_stats: omit to defer to the global ${var.bypass_fast_path} default (off), or set true|false here to override it for this pipeline
-max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
-write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
+streaming_start: new              # OPTIONAL first-run stream position: new (only new commits) | full (backfill whole table). Omit to defer to the global ${var.streaming_start} default (new), or set here; override per run. Streaming only; honored on a first run before a checkpoint exists
+max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit to defer to the global ${var.max_partition_bytes} (built-in default 2m)
+write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off); set > 0 only when the view shuffles; omit to defer to the global ${var.write_repartition} (built-in default 0)
 max_files_per_trigger: 1000       # OPTIONAL streaming read rate-limit: max Delta files per micro-batch; omit for Spark default 1000. Useful to throttle a full backfill / post-restart catch-up
 max_bytes_per_trigger: 128m       # OPTIONAL streaming read rate-limit: max bytes per micro-batch; omit for no cap
 view:                             # the view this pipeline uses
@@ -518,11 +520,12 @@ point at any workspace.
 Two different mechanisms carry values into a job, and they resolve at different times:
 
 - **Bundle variables** (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`,
-  `ca_certs`, the global `bulk_stats`, `retry_transport_timeout` and `bypass_fast_path` defaults, and the
+  `ca_certs`, a global default for **every run-time knob** (`pipeline_mode`, `op_type`, `streaming_start`,
+  `bulk_stats`, and the rest; see the variables table), and the
   ES host configs) are resolved into the job at
   **deploy** time. Each is set **per
   target** in `databricks.yml` (`targets.<env>.variables`), so a routine deploy takes no `--var` at all.
-  The five simple string variables can still be overridden at deploy with `--var=<name>=<value>`, which wins over
+  The simple string variables can still be overridden at deploy with `--var=<name>=<value>`, which wins over
   the per-target value; the `type: complex` variables (the ES host configs, and any `cluster_config`)
   cannot be set via `--var` at all (the CLI rejects it: *"setting variables of complex type via --var
   flag is not supported"*), so override those through the git-ignored `variable-overrides.json`. A
@@ -537,11 +540,18 @@ Two different mechanisms carry values into a job, and they resolve at different 
   [job group](#job-groups) instead bakes these per member at deploy (not `--params`-overridable):
   - `pipeline_mode` (`batch` | `streaming`), `filter_condition` (a Spark SQL predicate), and the
     connector-write tuning knobs `chunk_size`, `write_concurrency`, `request_timeout`,
-    `transport_max_retries`, `require_existing_index`, `verify_certs` all default to their config values
-    (each is an optional config key; see [Configuration](#configuration)). Clearing a stale streaming
-    checkpoint is a separate operation, not a `pipeline_mode` (see [Resetting a checkpoint](#resetting-a-checkpoint)).
-  - For the tuning knobs, a config that omits a knob (and a run that doesn't override it) leaves the
-    connector's own default in force.
+    `transport_max_retries`, `require_existing_index`, `verify_certs` (each an optional config key; see
+    [Configuration](#configuration)). Clearing a stale streaming checkpoint is a separate operation, not
+    a `pipeline_mode` (see [Resetting a checkpoint](#resetting-a-checkpoint)).
+  - **Every run-time knob follows one uniform three-layer pattern**: a per-run `--params <name>=<value>`
+    (highest) > the pipeline's own config value > the target-wide `${var.<name>}` global default in
+    `databricks.yml` > the connector/Spark/built-in default. So a config that omits a knob (and a run that
+    doesn't override it) inherits that target's global, and when the global is left at its shipped default
+    the connector's/Spark's own default stands, exactly as before. `pipeline_mode` and `streaming_start`
+    ship concrete globals (`batch` / `new`, since their validators reject `""`); the rest ship empty
+    (`op_type` included, so its connector default `index` stands and a pre-0.10.0 wheel's version-gate
+    does not spuriously drop it). This is why a knob can be moved for a whole environment from
+    `databricks.yml` alone, without editing any pipeline.
   - `write_concurrency` (a positive integer, default the connector's `1`) runs that many bulk request
     streams in parallel *within each write partition* (requires connector **>= 0.7.0**). Raise it when
     the write is latency-bound on ES round-trips (executors idle, CPU and network both under-used)
@@ -629,9 +639,11 @@ Two different mechanisms carry values into a job, and they resolve at different 
     `bypass_fast_path` in databricks.yml (per target, or `--var=bypass_fast_path=true`) to turn it on for
     a whole environment. On a connector older than 0.10.0 the runner drops the knob with a warning and
     writes with the fast path. Applies to **both** modes.
-  - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
+  - `streaming_start` (`new` | `full`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
-    `full` backfills the whole existing table first. See [Streaming](#streaming).
+    `full` backfills the whole existing table first. Now an optional config key on the same three-layer
+    pattern (a `${var.streaming_start}` global default of `new` < a pipeline's config value < `--params`).
+    See [Streaming](#streaming).
   - `max_files_per_trigger` / `max_bytes_per_trigger` (a count and a Spark byte-size; default unset)
     bound each **streaming** micro-batch (Spark defaults: 1000 files, no byte cap). Most useful to
     throttle a `streaming_start=full` backfill or a large post-restart catch-up so one micro-batch does
@@ -656,7 +668,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
 # Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, ca_certs,
-# the global bulk_stats, retry_transport_timeout and bypass_fast_path defaults, and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
+# the per-target global default for every run-time knob, and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
 # deploy to BEFORE running an index pipeline: the shipped configs embed ${environment} and install the
 # connector wheel, so an index run with those still empty fails closed (deploy itself always succeeds).
 # Filled in, the deploy needs no --var:

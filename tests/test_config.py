@@ -8,11 +8,14 @@ import copy
 import pytest
 
 from pipeline_lib.config import (
+    _RUNTIME_KNOBS,
+    RUNTIME_KNOB_NAMES,
     PipelineConfigError,
     column_present,
     job_base_parameters,
     job_parameters,
     render_view_sql,
+    runtime_knob_global_refs,
     require_chunk_size,
     require_es_flag,
     require_filter_condition,
@@ -94,11 +97,16 @@ def test_minimal_valid():
     # defers to the global ${var.bulk_stats} default (baked by the generator) and ultimately the
     # connector default (off). It is no longer forced "true" here.
     assert out["bulk_stats"] == ""
-    # write_repartition and max_partition_bytes are the exceptions: omitted, they take a built-in
-    # default (NOT "unset"). write_repartition defaults to 0 (off - read parallelism is the primary
-    # lever); max_partition_bytes defaults to the built-in scan-parallelism size.
-    assert out["write_repartition"] == "0"
-    assert out["max_partition_bytes"] == "2m"
+    # write_repartition and max_partition_bytes now store "" when omitted (like the other knobs), so the
+    # job-parameter default can inherit the target-wide global ${var.*}. Their built-in defaults (0 / 2m)
+    # are applied by the RUNNER as the final fallback when the effective value is empty, so an omitted
+    # config with an empty global still gets the same effective default; see the runner-fallback tests.
+    assert out["write_repartition"] == ""
+    assert out["max_partition_bytes"] == ""
+    # pipeline_mode and streaming_start are OPTIONAL too: omitted => "" (inherit the ${var.*} global,
+    # defaulting to batch / new). This config sets pipeline_mode: batch, so it is not "".
+    assert out["pipeline_mode"] == "batch"
+    assert out["streaming_start"] == ""
 
 
 def test_write_concurrency_config_default_parsed_and_validated():
@@ -157,12 +165,23 @@ def test_environment_token_accepted_as_template():
 # --------------------------------------------------------------------------- fail-closed: structure
 
 
-@pytest.mark.parametrize("missing", ["es_index_name", "pipeline_mode", "view", "source"])
+@pytest.mark.parametrize("missing", ["es_index_name", "view", "source"])
 def test_missing_required_key(missing):
     cfg = _base()
     del cfg[missing]
     with pytest.raises(PipelineConfigError, match="missing required key"):
         validate_config(cfg)
+
+
+def test_pipeline_mode_optional_defaults_empty_when_omitted():
+    # pipeline_mode is no longer required: omit it and it stores "" (inherit the ${var.pipeline_mode}
+    # global, which databricks.yml defaults to batch), rather than failing closed. A PRESENT value is
+    # still allow-list validated.
+    cfg = {k: v for k, v in _base().items() if k != "pipeline_mode"}
+    assert validate_config(cfg)["pipeline_mode"] == ""
+    assert validate_config({**cfg, "pipeline_mode": "streaming"})["pipeline_mode"] == "streaming"
+    with pytest.raises(PipelineConfigError, match="pipeline_mode"):
+        validate_config({**cfg, "pipeline_mode": "turbo"})
 
 
 def test_source_primary_key_optional():
@@ -655,8 +674,11 @@ def test_job_parameters_pipeline_mode_default_from_config(mode):
 
 
 def test_job_parameters_full_shape_and_order():
-    # The generated job exposes exactly these run-time parameters, in this order. filter_condition's
-    # default comes from the config; the tuning knobs default to "" (meaning "use connector default").
+    # The generated job exposes exactly these run-time parameters, in this order (the _RUNTIME_KNOBS
+    # registry order). With NO global_refs supplied (the pure/unit-test call), every default is the
+    # config value or "" - pipeline_mode comes from the config here (batch), filter_condition is set, and
+    # every omitted knob (including streaming_start / write_repartition / max_partition_bytes, which now
+    # store "" when omitted) defaults to "".
     cfg = _base()
     cfg["filter_condition"] = "action = 'allowed'"
     assert job_parameters(validate_config(cfg)) == [
@@ -672,12 +694,27 @@ def test_job_parameters_full_shape_and_order():
         {"name": "bulk_stats", "default": ""},
         {"name": "retry_transport_timeout", "default": ""},
         {"name": "bypass_fast_path", "default": ""},
-        {"name": "streaming_start", "default": "new"},
-        {"name": "write_repartition", "default": "0"},
-        {"name": "max_partition_bytes", "default": "2m"},
+        {"name": "streaming_start", "default": ""},
+        {"name": "write_repartition", "default": ""},
+        {"name": "max_partition_bytes", "default": ""},
         {"name": "max_files_per_trigger", "default": ""},
         {"name": "max_bytes_per_trigger", "default": ""},
     ]
+
+
+def test_job_parameters_full_shape_with_global_refs():
+    # With runtime_knob_global_refs() (what the generator passes), every knob the config OMITS bakes its
+    # ${var.<name>} global reference as the default; a knob the config SETS bakes its literal value. Here
+    # only pipeline_mode is set (batch), so it stays literal and every other knob inherits its global.
+    refs = runtime_knob_global_refs()
+    params = job_parameters(validate_config(_base()), refs)
+    by_name = {p["name"]: p["default"] for p in params}
+    assert by_name["pipeline_mode"] == "batch"                     # set in the config -> literal
+    for name in RUNTIME_KNOB_NAMES:
+        if name != "pipeline_mode":
+            assert by_name[name] == "${var." + name + "}"          # omitted -> global ref
+    # Every registry knob appears exactly once, in registry order.
+    assert [p["name"] for p in params] == list(RUNTIME_KNOB_NAMES)
 
 
 def test_job_parameters_bulk_stats_defaults_empty_without_ref():
@@ -688,9 +725,9 @@ def test_job_parameters_bulk_stats_defaults_empty_without_ref():
 
 
 def test_job_parameters_bulk_stats_omitted_uses_global_ref():
-    # When the config OMITS bulk_stats, the generator's ref becomes the job-parameter default, so an
-    # omitted pipeline defers to the target-wide ${var.bulk_stats} global default.
-    params = job_parameters(validate_config(_base()), "${var.bulk_stats}")
+    # When the config OMITS bulk_stats, the generator's ref (runtime_knob_global_refs) becomes the
+    # job-parameter default, so an omitted pipeline defers to the target-wide ${var.bulk_stats} global.
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
     assert {"name": "bulk_stats", "default": "${var.bulk_stats}"} in params
 
 
@@ -700,7 +737,7 @@ def test_job_parameters_bulk_stats_config_value_overrides_ref(value, expected):
     # wins over the target-wide default).
     cfg = _base()
     cfg["bulk_stats"] = value
-    params = job_parameters(validate_config(cfg), "${var.bulk_stats}")
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
     assert {"name": "bulk_stats", "default": expected} in params
 
 
@@ -720,11 +757,9 @@ def test_job_parameters_retry_transport_timeout_defaults_empty_without_ref():
 
 
 def test_job_parameters_retry_transport_timeout_omitted_uses_global_ref():
-    # When the config OMITS retry_transport_timeout, the generator's ref (4th positional) becomes the
-    # job-parameter default, so an omitted pipeline defers to ${var.retry_transport_timeout}.
-    params = job_parameters(validate_config(_base()), "${var.bulk_stats}",
-                            "${var.request_timeout}", "${var.transport_max_retries}",
-                            "${var.retry_transport_timeout}")
+    # When the config OMITS retry_transport_timeout, the generator's ref becomes the job-parameter
+    # default, so an omitted pipeline defers to ${var.retry_transport_timeout}.
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
     assert {"name": "retry_transport_timeout", "default": "${var.retry_transport_timeout}"} in params
 
 
@@ -733,9 +768,7 @@ def test_job_parameters_retry_transport_timeout_config_value_overrides_ref(value
     # A config that SETS retry_transport_timeout bakes its literal value, overriding the global ref.
     cfg = _base()
     cfg["retry_transport_timeout"] = value
-    params = job_parameters(validate_config(cfg), "${var.bulk_stats}",
-                            "${var.request_timeout}", "${var.transport_max_retries}",
-                            "${var.retry_transport_timeout}")
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
     assert {"name": "retry_transport_timeout", "default": expected} in params
 
 
@@ -788,11 +821,9 @@ def test_job_parameters_bypass_fast_path_defaults_empty_without_ref():
 
 
 def test_job_parameters_bypass_fast_path_omitted_uses_global_ref():
-    # When the config OMITS bypass_fast_path, the generator's ref (5th positional) becomes the
-    # job-parameter default, so an omitted pipeline defers to ${var.bypass_fast_path}.
-    params = job_parameters(validate_config(_base()), "${var.bulk_stats}",
-                            "${var.request_timeout}", "${var.transport_max_retries}",
-                            "${var.retry_transport_timeout}", "${var.bypass_fast_path}")
+    # When the config OMITS bypass_fast_path, the generator's ref becomes the job-parameter default, so an
+    # omitted pipeline defers to ${var.bypass_fast_path}.
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
     assert {"name": "bypass_fast_path", "default": "${var.bypass_fast_path}"} in params
 
 
@@ -801,9 +832,7 @@ def test_job_parameters_bypass_fast_path_config_value_overrides_ref(value, expec
     # A config that SETS bypass_fast_path bakes its literal value, overriding the global ref.
     cfg = _base()
     cfg["bypass_fast_path"] = value
-    params = job_parameters(validate_config(cfg), "${var.bulk_stats}",
-                            "${var.request_timeout}", "${var.transport_max_retries}",
-                            "${var.retry_transport_timeout}", "${var.bypass_fast_path}")
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
     assert {"name": "bypass_fast_path", "default": expected} in params
 
 
@@ -815,30 +844,36 @@ def test_write_config_overrides_includes_bypass_fast_path():
     assert "bypass_fast_path" not in write_config_overrides("", "", "", bypass_fast_path="")
 
 
-# --- op_type (connector 0.10.0+): per-config bulk action, "index" (default) | "create" -------------
-# Unlike bulk_stats/retry_transport_timeout, op_type has NO global ${var.*} default: it is a per-feed
-# choice (like es_id_field), so its job-parameter default is the config value alone (no ref fallback).
-# The allowed set (index|create) is NOT re-enumerated here - the connector's EsWriteConfig is the single
-# source of truth and validates the value; this layer only passes a bare token through / fails closed on
-# a non-string or a malformed one.
+# --- op_type (connector 0.10.0+): bulk action, "index" (default) | "create" ------------------------
+# op_type now follows the same three-layer pattern as the other run-time knobs: a target-wide
+# ${var.op_type} global (databricks.yml default "index") < a per-pipeline config value < a --params
+# override. The allowed set (index|create) is NOT re-enumerated here - the connector's EsWriteConfig is
+# the single source of truth and validates the value; this layer only passes a bare token through / fails
+# closed on a non-string or a malformed one. create needs a deterministic es_id_field to dedup a resend
+# (a config that statically sets create without one fails closed at validate_config; the dynamic
+# global/--params path is warned at run time in the notebook).
 
 
-def test_job_parameters_op_type_defaults_empty():
-    # Omitted config => "" job-parameter default; the connector's own default op_type ("index") stands.
-    # op_type takes no *_default_ref (it is not globally-var'd), so the pure call already reflects it.
+def test_job_parameters_op_type_defaults_empty_without_ref():
+    # With NO global_refs supplied (the pure/unit-test call), an omitted op_type stays "" - the
+    # connector's own default op_type ("index") stands.
     params = job_parameters(validate_config(_base()))
     assert {"name": "op_type", "default": ""} in params
 
 
+def test_job_parameters_op_type_omitted_uses_global_ref():
+    # When the config OMITS op_type, the generator's ref becomes the job-parameter default, so an omitted
+    # pipeline defers to the target-wide ${var.op_type} global (databricks.yml default "index").
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
+    assert {"name": "op_type", "default": "${var.op_type}"} in params
+
+
 @pytest.mark.parametrize("value", ["index", "create"])
-def test_job_parameters_op_type_config_value_baked(value):
-    # A config that SETS op_type bakes its literal value as the job-parameter default (per-config, no ref
-    # fallback even when the globally-var'd refs are supplied).
+def test_job_parameters_op_type_config_value_overrides_ref(value):
+    # A config that SETS op_type bakes its literal value, overriding the global ref (per-pipeline wins).
     cfg = _base()
     cfg["op_type"] = value
-    params = job_parameters(validate_config(cfg), "${var.bulk_stats}",
-                            "${var.request_timeout}", "${var.transport_max_retries}",
-                            "${var.retry_transport_timeout}")
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
     assert {"name": "op_type", "default": value} in params
 
 
@@ -879,8 +914,7 @@ def test_write_config_overrides_includes_op_type():
 def test_job_parameters_reliability_knobs_omitted_use_global_ref():
     # When the config OMITS them, the generator's refs become the job-parameter defaults, so an omitted
     # pipeline defers to the target-wide ${var.request_timeout} / ${var.transport_max_retries} globals.
-    params = job_parameters(validate_config(_base()), "${var.bulk_stats}",
-                            "${var.request_timeout}", "${var.transport_max_retries}")
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
     assert {"name": "request_timeout", "default": "${var.request_timeout}"} in params
     assert {"name": "transport_max_retries", "default": "${var.transport_max_retries}"} in params
 
@@ -891,16 +925,66 @@ def test_job_parameters_reliability_knobs_config_value_overrides_ref():
     cfg = _base()
     cfg["request_timeout"] = 120
     cfg["transport_max_retries"] = 0
-    params = job_parameters(validate_config(cfg), "${var.bulk_stats}",
-                            "${var.request_timeout}", "${var.transport_max_retries}")
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
     assert {"name": "request_timeout", "default": "120"} in params
     assert {"name": "transport_max_retries", "default": "0"} in params
 
 
-def test_job_parameters_streaming_start_defaults_new():
-    # streaming_start is a literal default (not a config key), always "new" regardless of the config.
+def test_job_parameters_streaming_start_defaults_empty_without_ref():
+    # streaming_start is now a config key on the same three-layer pattern. With NO global_refs and the
+    # config omitting it, the default is "" (the runner turns "" into "new" as the final fallback).
     params = job_parameters(validate_config(_base()))
-    assert {"name": "streaming_start", "default": "new"} in params
+    assert {"name": "streaming_start", "default": ""} in params
+
+
+def test_job_parameters_streaming_start_omitted_uses_global_ref():
+    # Omitted config => the ${var.streaming_start} global ref (databricks.yml default "new").
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
+    assert {"name": "streaming_start", "default": "${var.streaming_start}"} in params
+
+
+@pytest.mark.parametrize("value", ["new", "full"])
+def test_job_parameters_streaming_start_config_value_overrides_ref(value):
+    # A config that SETS streaming_start bakes its literal value, overriding the global ref.
+    cfg = {**_base(), "streaming_start": value}
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
+    assert {"name": "streaming_start", "default": value} in params
+
+
+def test_validate_config_streaming_start_optional_and_validated():
+    # OPTIONAL: omitted => "" (inherit the global). A PRESENT value is allow-list validated (new|full);
+    # a bad value fails closed. Carried through resolve_config verbatim (a run behavior, not a name).
+    assert validate_config(_base())["streaming_start"] == ""                       # omitted
+    assert validate_config({**_base(), "streaming_start": "full"})["streaming_start"] == "full"
+    with pytest.raises(PipelineConfigError, match="streaming_start"):
+        validate_config({**_base(), "streaming_start": "sideways"})
+    assert resolve_config(validate_config({**_base(), "streaming_start": "full"}), "")["streaming_start"] == "full"
+
+
+def test_job_parameters_pipeline_mode_omitted_uses_global_ref():
+    # When the config OMITS pipeline_mode, the generator's ref becomes the job-parameter default, so an
+    # omitted pipeline defers to the target-wide ${var.pipeline_mode} global (databricks.yml default batch).
+    cfg = {k: v for k, v in _base().items() if k != "pipeline_mode"}
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
+    assert {"name": "pipeline_mode", "default": "${var.pipeline_mode}"} in params
+
+
+def test_runtime_knob_registry_shape():
+    # The registry is the single source of truth for the run-time job parameters: exactly these knobs, in
+    # this order. job_parameters, the generation gate, and the shape tests all derive from it, so this
+    # asserts the canonical set/order in one place.
+    assert RUNTIME_KNOB_NAMES == (
+        "pipeline_mode", "filter_condition", "chunk_size", "write_concurrency", "op_type",
+        "request_timeout", "transport_max_retries", "require_existing_index", "verify_certs",
+        "bulk_stats", "retry_transport_timeout", "bypass_fast_path", "streaming_start",
+        "write_repartition", "max_partition_bytes", "max_files_per_trigger", "max_bytes_per_trigger",
+    )
+    # Every knob carries a callable validator (the same require_* helper used at parse + run time).
+    for knob in _RUNTIME_KNOBS:
+        assert callable(knob.validator)
+    # runtime_knob_global_refs() maps each knob to its ${var.<name>} reference, one per knob.
+    refs = runtime_knob_global_refs()
+    assert refs == {name: "${var." + name + "}" for name in RUNTIME_KNOB_NAMES}
 
 
 def test_job_parameters_filter_condition_defaults_empty_when_absent():
@@ -1258,10 +1342,14 @@ def test_require_write_repartition_fails_closed(bad):
         require_write_repartition(bad)
 
 
-def test_write_repartition_absent_defaults_builtin_in_config():
-    # A config that omits write_repartition stores the built-in default (canonical string), which then
-    # becomes the job-parameter default. Default is 0 = off.
-    assert validate_config(_base())["write_repartition"] == "0"
+def test_write_repartition_absent_stores_empty_in_config():
+    # A config that OMITS write_repartition now stores "" (so the job-parameter default can inherit the
+    # ${var.write_repartition} global). The built-in default (0 = off) is applied by the RUNNER as the
+    # final fallback: require_write_repartition("") == "0" (asserted in
+    # test_require_write_repartition_empty_takes_builtin_default), so an omitted config with an empty
+    # global still effectively repartitions by 0.
+    assert validate_config(_base())["write_repartition"] == ""
+    assert require_write_repartition("") == "0"   # runner still resolves the built-in default
 
 
 @pytest.mark.parametrize("value,expected", [(256, "256"), ("256", "256"), (0, "0")])
@@ -1320,8 +1408,13 @@ def test_require_max_partition_bytes_fails_closed(bad):
         require_max_partition_bytes(bad)
 
 
-def test_max_partition_bytes_absent_defaults_builtin_in_config():
-    assert validate_config(_base())["max_partition_bytes"] == "2m"
+def test_max_partition_bytes_absent_stores_empty_in_config():
+    # A config that OMITS max_partition_bytes now stores "" (so the job-parameter default can inherit the
+    # ${var.max_partition_bytes} global). The built-in default (2m) is applied by the RUNNER as the final
+    # fallback: require_max_partition_bytes("") == "2m", so an omitted config with an empty global still
+    # gets the built-in scan-parallelism size.
+    assert validate_config(_base())["max_partition_bytes"] == ""
+    assert require_max_partition_bytes("") == "2m"   # runner still resolves the built-in default
 
 
 @pytest.mark.parametrize("value,expected", [("16m", "16m"), (67108864, "67108864"), ("0", "0")])
@@ -1705,6 +1798,18 @@ def test_continuous_requires_streaming():
     cfg["pipeline_mode"] = "batch"
     cfg["continuous"] = {"trigger_interval": "30 seconds"}
     with pytest.raises(PipelineConfigError, match="continuous requires pipeline_mode: streaming"):
+        validate_config(cfg)
+
+
+def test_continuous_omitting_pipeline_mode_fails_closed():
+    # pipeline_mode is now optional (omit => "" => inherit the ${var.pipeline_mode} global), BUT a
+    # continuous pipeline must declare streaming EXPLICITLY: generation resolves this cross-field guard
+    # before the bundle resolves the variable, so an omitted mode ("") can't be seen as streaming and
+    # fails closed. The message points the author at declaring it explicitly.
+    cfg = _continuous_ready()
+    del cfg["pipeline_mode"]
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    with pytest.raises(PipelineConfigError, match="cannot inherit"):
         validate_config(cfg)
 
 
