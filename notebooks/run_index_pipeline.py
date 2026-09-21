@@ -713,11 +713,13 @@ if PIPELINE_MODE == "streaming":
         #                  startingVersion-on-the-main-reader path (a no-op on resume, a correct seed on a
         #                  true first run) rather than the no-op drain, which on a MISCLASSIFIED resume
         #                  would advance the offset past an un-sent backlog and lose those records.
-        # We NEVER infer "empty" from an error string on the offsets dir ITSELF: a transient failure while
-        # reading an EXISTING offsets dir must not read as a first run. Absence is confirmed positively -
-        # an offsets dir that lists is classified by its contents; one that does not list is "empty" only
-        # when its PARENT positively shows no "offsets" child (or the parent itself is a clean not-found,
-        # so no checkpoint - hence no backlog - exists). Every other failure is "unknown".
+        # We do NOT infer "empty" from an error string on the offsets dir ITSELF: a transient failure while
+        # reading an EXISTING offsets dir must not read as a first run. Absence is confirmed positively
+        # wherever possible - an offsets dir that lists is classified by its contents; one that does not
+        # list is "empty" when its PARENT positively shows no "offsets" child. Only when the parent ALSO
+        # fails to list do we fall back to a fuzzy not-found match on the parent error, which carries a
+        # narrow residual misclassification risk (see the parent-except branch below). Every other failure
+        # is "unknown" (safe fallback: startingVersion on the main reader, which never skips a backlog).
         base = cp_location.rstrip("/")
         offsets_dir = f"{base}/offsets"
         try:
@@ -728,9 +730,17 @@ if PIPELINE_MODE == "streaming":
             try:
                 parent_entries = dbutils.fs.ls(base)
             except Exception as _pe:
-                # Parent did not list either. Only a clean not-found on the PARENT is a genuine first run:
-                # no checkpoint dir exists, so there is no committed offset and no backlog to skip (a false
-                # not-found match here is safe for that same reason). Anything else is ambiguous.
+                # Parent did not list either. Fall back to the fuzzy not-found match on the PARENT error:
+                # a clean not-found means no checkpoint dir exists (no offset, no backlog), so seeding is
+                # safe. RESIDUAL RISK (narrow, accepted): this is still an exception-string inference, so a
+                # transient/permission error on an EXISTING checkpoint whose message coincidentally
+                # contains a not-found phrase would misclassify as "empty" and could drain over a real
+                # backlog. It is narrow - such errors normally read as "timeout"/"denied", not "does not
+                # exist", and the offsets dir would normally list rather than throw - but NOT provably
+                # safe. A fully robust fix would confirm absence POSITIVELY (e.g. os.path.exists on the
+                # /Volumes FUSE mount, a clean boolean) instead of inferring it from an error string;
+                # deferred pending live verification on the target compute. Anything not matching is
+                # "unknown" (safe fallback).
                 return "empty" if _is_clean_not_found(_pe) else "unknown"
             # Parent listed: no "offsets" child => the offsets dir truly does not exist (first run); an
             # "offsets" child present => it EXISTS but we failed to read it => ambiguous, fail closed.
