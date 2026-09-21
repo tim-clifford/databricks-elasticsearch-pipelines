@@ -853,6 +853,19 @@ if PIPELINE_MODE == "streaming":
             # each (empty-effect) micro-batch, which is precisely the resume point we want. availableNow
             # drains all currently-available data this way, then stops. A UNIQUE seed query name avoids
             # colliding with the main query on a reused SparkSession.
+            #
+            # START BOUNDARY (intentional): availableNow snapshots its END offset at query LAUNCH (Delta's
+            # lastOffsetForTriggerAvailableNow) and drains only up to that snapshot, so the resume point is
+            # the source's latest version AT SEED LAUNCH. Two consequences, both intended for
+            # streaming_start=new ("start from ~now", never backfill history):
+            #   - Commits that land WHILE the drain runs (which can be many hours on a large-history
+            #     source) are NOT lost: they are past the seed's snapshot, so the main stream below resumes
+            #     from the committed offset and exports everything after it.
+            #   - The only commits the seed skips are any that land in the sub-second window between the
+            #     `DESCRIBE HISTORY` version resolution above and this .start() (i.e. strictly-after the
+            #     pinned startingVersion but at/under the launch snapshot). That near-instant startup
+            #     boundary is deliberately treated as part of "now" and not exported - consistent with the
+            #     feature's contract of starting fresh rather than replaying recent history.
             seed_query = (
                 seed_reader.table(SOURCE_FQN).writeStream
                 .queryName(f"{CONFIG_NAME}-seed-{uuid.uuid4().hex[:8]}")
