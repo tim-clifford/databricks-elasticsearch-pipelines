@@ -205,6 +205,10 @@ from pipeline_lib.observability import (  # noqa: E402
     format_progress,
     format_tail_summary,
 )
+# Streaming checkpoint offsets-state classifier (pure Python, dependency-injected ls; unit-tested
+# off-cluster). Decides seed-vs-resume for streaming_start=new; fail-closed so an existing checkpoint is
+# never misread as a first run (which would drain over an un-exported backlog).
+from pipeline_lib.checkpoint import EMPTY, HAS_OFFSET, checkpoint_offsets_state  # noqa: E402
 
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
 # override fails closed immediately without wasting the config load/resolve on a run that can't
@@ -667,7 +671,7 @@ if PIPELINE_MODE == "streaming":
 #
 # streaming_start controls where a FIRST run (no checkpoint yet) begins; once a checkpoint exists it is
 # the position of record (Spark resumes from the checkpoint), so we POSITIVELY classify the checkpoint's
-# offsets and skip all first-run seeding on a resume (see _checkpoint_offsets_state).
+# offsets and skip all first-run seeding on a resume (see checkpoint_offsets_state in pipeline_lib).
 # - "new": establish the checkpoint at the source's CURRENT position WITHOUT exporting existing data,
 #   then subsequent runs pick up only new commits. On a genuine first run we do this with a dedicated
 #   NO-OP SEED: a Trigger.availableNow stream (startingVersion = current version, a bounded
@@ -688,68 +692,6 @@ if PIPELINE_MODE == "streaming":
 # - "full": omit startingVersion and use the REAL foreachBatch, so the first micro-batches backfill the
 #   whole existing table to ES (intentional history export).
 if PIPELINE_MODE == "streaming":
-    def _is_clean_not_found(_e: Exception) -> bool:
-        # Whether a dbutils.fs.ls failure is a "path does not exist" signal (vs a transient IO or
-        # permission error). Verified elsewhere in this notebook (see the metrics-dir listing below): a
-        # missing UC-Volume path is wrapped as an error whose text contains FileNotFoundException /
-        # CloudFileNotFoundException / "No such file or directory"; some engines phrase it "... does not
-        # exist". Substring-matching an exception string is inherently fuzzy, so this helper is only ever
-        # consulted where a false positive is SAFE - in _checkpoint_offsets_state, ONLY when the
-        # checkpoint's PARENT dir is absent, i.e. no checkpoint exists at all and so no un-sent backlog
-        # could be dropped.
-        _msg = str(_e)
-        return ("FileNotFoundException" in _msg or "No such file or directory" in _msg
-                or "does not exist" in _msg)
-
-    def _checkpoint_offsets_state(cp_location: str) -> str:
-        # POSITIVELY classify the checkpoint's offsets directory, so the "new" first-run seeding path is
-        # chosen without ever silently dropping data (allow-list, fail closed):
-        #   "has_offset" - at least one integer-named batch offset file exists => Spark will RESUME from
-        #                  the checkpoint (startingVersion ignored); no first-run seeding.
-        #   "empty"      - the offsets dir is POSITIVELY absent => a genuine first run => safe to run the
-        #                  no-op seed drain.
-        #   "unknown"    - we cannot distinguish resume from first run (a transient/permission error while
-        #                  reading a checkpoint that MAY exist): the caller must fall back to the
-        #                  startingVersion-on-the-main-reader path (a no-op on resume, a correct seed on a
-        #                  true first run) rather than the no-op drain, which on a MISCLASSIFIED resume
-        #                  would advance the offset past an un-sent backlog and lose those records.
-        # We do NOT infer "empty" from an error string on the offsets dir ITSELF: a transient failure while
-        # reading an EXISTING offsets dir must not read as a first run. Absence is confirmed positively
-        # wherever possible - an offsets dir that lists is classified by its contents; one that does not
-        # list is "empty" when its PARENT positively shows no "offsets" child. Only when the parent ALSO
-        # fails to list do we fall back to a fuzzy not-found match on the parent error, which carries a
-        # narrow residual misclassification risk (see the parent-except branch below). Every other failure
-        # is "unknown" (safe fallback: startingVersion on the main reader, which never skips a backlog).
-        base = cp_location.rstrip("/")
-        offsets_dir = f"{base}/offsets"
-        try:
-            entries = dbutils.fs.ls(offsets_dir)
-        except Exception:
-            # The offsets dir did not list. Decide first-run vs ambiguous by POSITIVELY inspecting the
-            # parent, not by the offsets-dir error text.
-            try:
-                parent_entries = dbutils.fs.ls(base)
-            except Exception as _pe:
-                # Parent did not list either. Fall back to the fuzzy not-found match on the PARENT error:
-                # a clean not-found means no checkpoint dir exists (no offset, no backlog), so seeding is
-                # safe. RESIDUAL RISK (narrow, accepted): this is still an exception-string inference, so a
-                # transient/permission error on an EXISTING checkpoint whose message coincidentally
-                # contains a not-found phrase would misclassify as "empty" and could drain over a real
-                # backlog. It is narrow - such errors normally read as "timeout"/"denied", not "does not
-                # exist", and the offsets dir would normally list rather than throw - but NOT provably
-                # safe. A fully robust fix would confirm absence POSITIVELY (e.g. os.path.exists on the
-                # /Volumes FUSE mount, a clean boolean) instead of inferring it from an error string;
-                # deferred pending live verification on the target compute. Anything not matching is
-                # "unknown" (safe fallback).
-                return "empty" if _is_clean_not_found(_pe) else "unknown"
-            # Parent listed: no "offsets" child => the offsets dir truly does not exist (first run); an
-            # "offsets" child present => it EXISTS but we failed to read it => ambiguous, fail closed.
-            return "empty" if not any(e.name.rstrip("/") == "offsets" for e in parent_entries) else "unknown"
-        # Structured Streaming names each committed batch offset file by its integer batch id ("0", "1",
-        # ...). An integer-named entry is a persisted resume point; digit-filtering ignores transient
-        # temp/hidden files and non-batch markers. No such entry (empty dir) is still a first run.
-        return "has_offset" if any(e.name.rstrip("/").isdigit() for e in entries) else "empty"
-
     # The seed drain's batch bound (used by the "new" first-run path below). maxFilesPerTrigger MUST be
     # set on the no-op seed so the source's initial snapshot is consumed as bounded, resumable
     # micro-batches instead of one unbounded batch that can stall on a large-history source. Reuse the
@@ -770,9 +712,9 @@ if PIPELINE_MODE == "streaming":
         reader = reader.option("maxBytesPerTrigger", MAX_BYTES_PER_TRIGGER)
     if STREAMING_START == "new":
         # Choose the first-run seeding strategy from the checkpoint's POSITIVELY classified state, so a
-        # misread never silently drops data (see _checkpoint_offsets_state).
-        _cp_state = _checkpoint_offsets_state(checkpoint_location)
-        if _cp_state == "has_offset":
+        # misread never silently drops data (see checkpoint_offsets_state).
+        _cp_state = checkpoint_offsets_state(checkpoint_location, dbutils.fs.ls)
+        if _cp_state == HAS_OFFSET:
             # A prior run persisted an offset: Spark resumes from the checkpoint (startingVersion is
             # ignored), so no seed is needed. A committed offset ALWAYS means "resume" - we never re-run
             # the no-op drain when offsets exist. Consequences:
@@ -784,7 +726,7 @@ if PIPELINE_MODE == "streaming":
             #     (slower, and partial history reaches ES). That is the SAFE direction - it over-sends,
             #     never drops - and is self-limiting to the tail; a clean seed avoids it entirely.
             print("streaming_start=new: resuming from existing checkpoint (no seed needed)")
-        elif _cp_state == "empty":
+        elif _cp_state == EMPTY:
             # GENUINE first run (offsets dir positively absent): establish the checkpoint at the source's
             # current position WITHOUT exporting existing data, via a no-op Trigger.availableNow seed
             # drain, then let the main stream below resume from it incrementally. On a large-history
@@ -853,7 +795,7 @@ if PIPELINE_MODE == "streaming":
             # feature prevents. So VERIFY an offset was actually committed; if not, pin startingVersion on
             # the main reader as a fallback (it reads only from the current version forward, never
             # re-exporting history, and is a no-op in the normal case where the seed did commit).
-            if _checkpoint_offsets_state(checkpoint_location) == "has_offset":
+            if checkpoint_offsets_state(checkpoint_location, dbutils.fs.ls) == HAS_OFFSET:
                 print(f"streaming_start=new: seed drain complete; the main stream resumes incrementally "
                       f"from {checkpoint_location}")
             else:
