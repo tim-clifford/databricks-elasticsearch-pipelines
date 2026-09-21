@@ -60,6 +60,13 @@ _TRANSPORT_MAX_RETRIES_VAR_REF = "${var.transport_max_retries}"
 # generation if the variable is missing.
 _RETRY_TRANSPORT_TIMEOUT_VAR_REF = "${var.retry_transport_timeout}"
 
+# The bundle-variable reference the generator bakes as the DEFAULT of the bypass_fast_path job parameter
+# when a config OMITS it: the toggle then defers to the target-wide ${var.bypass_fast_path} global default
+# (resolved per target at deploy). A config that SETS it overrides with its literal value. Same mechanism
+# as _BULK_STATS_VAR_REF; require_bypass_fast_path_declared fails closed at generation if the variable is
+# missing.
+_BYPASS_FAST_PATH_VAR_REF = "${var.bypass_fast_path}"
+
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "pipeline_configs")
 _RESOURCES_DIR = os.path.join(_REPO_ROOT, "resources")
 # Reusable job-cluster specs referenced by a config's compute.job_cluster_config key (see load_job_cluster_spec).
@@ -313,6 +320,12 @@ def require_retry_transport_timeout_declared(path: str = _DATABRICKS_YML, doc: d
     _require_global_var_declared("retry_transport_timeout", require_es_flag, path, doc)
 
 
+def require_bypass_fast_path_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+    """Fail closed at generation if databricks.yml declares no legal `bypass_fast_path` variable
+    (""/true/false). See _require_global_var_declared."""
+    _require_global_var_declared("bypass_fast_path", require_es_flag, path, doc)
+
+
 def require_transport_max_retries_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
     """Fail closed at generation if databricks.yml declares no legal `transport_max_retries` variable
     (""/a non-negative int). See _require_global_var_declared."""
@@ -460,7 +473,7 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
     )
     if include_run_time_knobs:
         for p in job_parameters(cfg, _BULK_STATS_VAR_REF, _REQUEST_TIMEOUT_VAR_REF, _TRANSPORT_MAX_RETRIES_VAR_REF,
-                                _RETRY_TRANSPORT_TIMEOUT_VAR_REF):
+                                _RETRY_TRANSPORT_TIMEOUT_VAR_REF, _BYPASS_FAST_PATH_VAR_REF):
             base_parameters[p["name"]] = p["default"]
     task["notebook_task"] = {
         "notebook_path": "../notebooks/run_index_pipeline.py",
@@ -577,7 +590,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
         _job_display_name(postfix),
         description,
         job_parameters(cfg, _BULK_STATS_VAR_REF, _REQUEST_TIMEOUT_VAR_REF, _TRANSPORT_MAX_RETRIES_VAR_REF,
-                       _RETRY_TRANSPORT_TIMEOUT_VAR_REF),
+                       _RETRY_TRANSPORT_TIMEOUT_VAR_REF, _BYPASS_FAST_PATH_VAR_REF),
         _trigger_block(cfg["schedule"], cfg["continuous"]),
         _job_clusters_for([(name, cfg, job_cluster_spec)]),
         [task],
@@ -801,6 +814,7 @@ def main(argv: list[str] | None = None) -> int:
     require_request_timeout_declared(doc=bundle_doc)
     require_transport_max_retries_declared(doc=bundle_doc)
     require_retry_transport_timeout_declared(doc=bundle_doc)
+    require_bypass_fast_path_declared(doc=bundle_doc)
     es_host_configs = load_es_host_configs(doc=bundle_doc)
     default_es_host_config = load_default_es_host_config(doc=bundle_doc)
     cluster_configs = load_cluster_configs(doc=bundle_doc)

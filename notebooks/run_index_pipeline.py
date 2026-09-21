@@ -123,6 +123,7 @@ dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false
 dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default from ${var.bulk_stats}/config; empty => connector default off; needs connector 0.9.3+)")
 dbutils.widgets.text("retry_transport_timeout", "", "EsWriteConfig retry_transport_timeout: true|false; connector OWNS whole-request timeout retry (re-send with backoff instead of failing the batch) (default from ${var.retry_transport_timeout}/config; empty => connector default off; needs connector 0.9.7+)")
 dbutils.widgets.text("op_type", "", "EsWriteConfig op_type: index (default) | create; 'create' is append-only (a resend of an already-indexed doc is a 409 no-op, deduped not overwritten) (default from config; empty => connector default 'index'; needs connector 0.10.0+)")
+dbutils.widgets.text("bypass_fast_path", "", "EsWriteConfig bypass_fast_path: true|false; skip the errors-probe fast path and classify every chunk per-item (exact docs_deduped/written counts for op_type=create, at the cost of fast-path throughput) (default from ${var.bypass_fast_path}/config; empty => connector default off; needs connector 0.10.0+)")
 dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
 dbutils.widgets.text("max_partition_bytes", "", "spark.sql.files.maxPartitionBytes for the source read, e.g. 32m (0 leaves it unset; empty => default)")
 # Streaming-only widgets. checkpoint_base_path is a deploy-time base_parameter (bundle variable);
@@ -153,6 +154,7 @@ VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
 BULK_STATS = dbutils.widgets.get("bulk_stats").strip()
 RETRY_TRANSPORT_TIMEOUT = dbutils.widgets.get("retry_transport_timeout").strip()
 OP_TYPE = dbutils.widgets.get("op_type").strip()
+BYPASS_FAST_PATH = dbutils.widgets.get("bypass_fast_path").strip()
 WRITE_REPARTITION = dbutils.widgets.get("write_repartition").strip()
 MAX_PARTITION_BYTES = dbutils.widgets.get("max_partition_bytes").strip()
 CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
@@ -253,9 +255,10 @@ if STREAMING_TRIGGER_INTERVAL:
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS,
                                          request_timeout=REQUEST_TIMEOUT, transport_max_retries=TRANSPORT_MAX_RETRIES,
-                                         retry_transport_timeout=RETRY_TRANSPORT_TIMEOUT, op_type=OP_TYPE)
-# Three knobs were added to EsWriteConfig in specific connector releases: bulk_stats (0.9.3+),
-# retry_transport_timeout (0.9.7+), and op_type (0.10.0+). Each is only present in write_overrides when
+                                         retry_transport_timeout=RETRY_TRANSPORT_TIMEOUT, op_type=OP_TYPE,
+                                         bypass_fast_path=BYPASS_FAST_PATH)
+# Four knobs were added to EsWriteConfig in specific connector releases: bulk_stats (0.9.3+),
+# retry_transport_timeout (0.9.7+), and op_type + bypass_fast_path (both 0.10.0+). Each is only present in write_overrides when
 # its effective value (the global ${var.*} default where one exists, a per-pipeline config value, or a
 # --params override) resolves to a non-empty setting. On an OLDER wheel, a present-but-unknown kwarg would
 # make EsWriteConfig(**write_overrides) raise TypeError and fail EVERY such run. All are OPTIONAL
@@ -266,7 +269,7 @@ write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VER
 # connector's default op_type ("index"): benign for append-only data (a resend re-writes identical
 # content instead of deduping), but the warning makes the downgrade visible. The other tuning knobs have
 # existed since well before this framework, so only these version-gated ones are guarded.
-_VERSION_GATED_KNOBS = {"bulk_stats": "0.9.3+", "retry_transport_timeout": "0.9.7+", "op_type": "0.10.0+"}
+_VERSION_GATED_KNOBS = {"bulk_stats": "0.9.3+", "retry_transport_timeout": "0.9.7+", "op_type": "0.10.0+", "bypass_fast_path": "0.10.0+"}
 if any(k in write_overrides for k in _VERSION_GATED_KNOBS):
     import dataclasses  # noqa: E402
     _es_fields = {f.name for f in dataclasses.fields(EsWriteConfig)}

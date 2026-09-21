@@ -666,6 +666,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "verify_certs", "default": ""},
         {"name": "bulk_stats", "default": ""},
         {"name": "retry_transport_timeout", "default": ""},
+        {"name": "bypass_fast_path", "default": ""},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": "0"},
         {"name": "max_partition_bytes", "default": "2m"},
@@ -748,6 +749,65 @@ def test_write_config_overrides_includes_retry_transport_timeout():
     assert write_config_overrides("", "", "", retry_transport_timeout="true")["retry_transport_timeout"] is True
     assert write_config_overrides("", "", "", retry_transport_timeout="false")["retry_transport_timeout"] is False
     assert "retry_transport_timeout" not in write_config_overrides("", "", "", retry_transport_timeout="")
+
+
+def test_validate_config_bypass_fast_path_canonicalized_and_rejected():
+    # Stored canonical ("true"/"false"/"") like the other bool flags; a bad value fails closed.
+    assert validate_config({**_base(), "bypass_fast_path": True})["bypass_fast_path"] == "true"
+    assert validate_config({**_base(), "bypass_fast_path": False})["bypass_fast_path"] == "false"
+    assert validate_config(_base())["bypass_fast_path"] == ""    # omitted => unset
+    with pytest.raises(PipelineConfigError, match="bypass_fast_path"):
+        validate_config({**_base(), "bypass_fast_path": "maybe"})
+
+
+def test_bypass_fast_path_carried_through_resolve():
+    # bypass_fast_path is a connector setting, not an object name: resolve_config passes it through verbatim.
+    cfg = _base()
+    cfg["bypass_fast_path"] = True
+    assert resolve_config(validate_config(cfg), "")["bypass_fast_path"] == "true"
+
+
+def test_op_type_carried_through_resolve():
+    # op_type is a connector setting, not an object name: resolve_config passes it through verbatim.
+    # (Cleanup from the op_type PR, which added the field everywhere else but missed this passthrough.)
+    cfg = _base()
+    cfg["op_type"] = "create"
+    assert resolve_config(validate_config(cfg), "")["op_type"] == "create"
+
+
+def test_job_parameters_bypass_fast_path_defaults_empty_without_ref():
+    # With no ref supplied (the pure/unit-test call), an omitted bypass_fast_path stays "" - the
+    # connector's own default (off, fast path used) stands.
+    params = job_parameters(validate_config(_base()))
+    assert {"name": "bypass_fast_path", "default": ""} in params
+
+
+def test_job_parameters_bypass_fast_path_omitted_uses_global_ref():
+    # When the config OMITS bypass_fast_path, the generator's ref (5th positional) becomes the
+    # job-parameter default, so an omitted pipeline defers to ${var.bypass_fast_path}.
+    params = job_parameters(validate_config(_base()), "${var.bulk_stats}",
+                            "${var.request_timeout}", "${var.transport_max_retries}",
+                            "${var.retry_transport_timeout}", "${var.bypass_fast_path}")
+    assert {"name": "bypass_fast_path", "default": "${var.bypass_fast_path}"} in params
+
+
+@pytest.mark.parametrize("value,expected", [(True, "true"), (False, "false")])
+def test_job_parameters_bypass_fast_path_config_value_overrides_ref(value, expected):
+    # A config that SETS bypass_fast_path bakes its literal value, overriding the global ref.
+    cfg = _base()
+    cfg["bypass_fast_path"] = value
+    params = job_parameters(validate_config(cfg), "${var.bulk_stats}",
+                            "${var.request_timeout}", "${var.transport_max_retries}",
+                            "${var.retry_transport_timeout}", "${var.bypass_fast_path}")
+    assert {"name": "bypass_fast_path", "default": expected} in params
+
+
+def test_write_config_overrides_includes_bypass_fast_path():
+    # The runner's override parser converts the effective flag to a typed bool kwarg, and omits it when
+    # unset (so the connector default stands).
+    assert write_config_overrides("", "", "", bypass_fast_path="true")["bypass_fast_path"] is True
+    assert write_config_overrides("", "", "", bypass_fast_path="false")["bypass_fast_path"] is False
+    assert "bypass_fast_path" not in write_config_overrides("", "", "", bypass_fast_path="")
 
 
 # --- op_type (connector 0.10.0+): per-config bulk action, "index" (default) | "create" -------------

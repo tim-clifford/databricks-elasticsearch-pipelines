@@ -131,6 +131,7 @@ value fails closed wherever the value is required. The bundle variables are:
 | `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
 | `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log; connector **>= 0.9.3**). Empty default (off; the connector default stands). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
 | `retry_transport_timeout` | global default for the connector's `retry_transport_timeout` reliability toggle (connector **>= 0.9.7**): when on, the connector OWNS whole-request timeout retries (re-sends a timed-out bulk with backoff instead of letting the transport re-send it invisibly and then failing the batch). Empty default (off; the connector default stands). Threaded exactly like `bulk_stats`: the generator bakes `${var.retry_transport_timeout}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=retry_transport_timeout=true`) turns it on for a whole environment, and a pipeline's own `retry_transport_timeout:` or a per-run `--params retry_transport_timeout=<v>` override it (see [Configuration](#configuration)) |
+| `bypass_fast_path` | global default for the connector's `bypass_fast_path` write-path toggle (connector **>= 0.10.0**): when on, the connector skips its `filter_path="errors"` probe and classifies every chunk per-item, which makes the `docs_deduped` / `written` counts EXACT for `op_type=create` on chunks mixing new and existing `_id`s (and avoids the auto-id re-ship duplication), at the cost of the fast path's throughput on clean chunks. Empty default (off; the fast path is used). Threaded exactly like `bulk_stats`: the generator bakes `${var.bypass_fast_path}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bypass_fast_path=true`) turns it on for a whole environment, and a pipeline's own `bypass_fast_path:` or a per-run `--params bypass_fast_path=<v>` override it (see [Configuration](#configuration)) |
 
 The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
 pipeline selects, with values that differ per environment. See
@@ -160,6 +161,7 @@ transport_max_retries: 5          # OPTIONAL EsWriteConfig tuning (whole-request
 bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log; connector >= 0.9.3). Behaves like verify_certs: omit to defer to the global ${var.bulk_stats} default (off), or set true|false here to override it for this pipeline
 retry_transport_timeout: true     # OPTIONAL EsWriteConfig reliability toggle: connector OWNS whole-request timeout retries (re-send a timed-out bulk with backoff instead of failing the batch; connector >= 0.9.7). Behaves like bulk_stats: omit to defer to the global ${var.retry_transport_timeout} default (off), or set true|false here to override it for this pipeline
 op_type: create                   # OPTIONAL EsWriteConfig write action: index (default, upsert by _id) | create (append-only; a resend of an existing _id is a benign 409 dedup, not overwritten or duplicated; connector >= 0.10.0). Per-feed only (NO global var). Requires es_id_field; use only for feeds that never update an existing _id. Omit for connector default (index)
+bypass_fast_path: true            # OPTIONAL EsWriteConfig write-path toggle: skip the errors-probe fast path and classify every chunk per-item (connector >= 0.10.0). Makes docs_deduped/written counts EXACT for op_type=create at the cost of fast-path throughput. Behaves like bulk_stats: omit to defer to the global ${var.bypass_fast_path} default (off), or set true|false here to override it for this pipeline
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit for default 2m
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off, the default); set > 0 only when the view shuffles
 max_files_per_trigger: 1000       # OPTIONAL streaming read rate-limit: max Delta files per micro-batch; omit for Spark default 1000. Useful to throttle a full backfill / post-restart catch-up
@@ -516,8 +518,8 @@ point at any workspace.
 Two different mechanisms carry values into a job, and they resolve at different times:
 
 - **Bundle variables** (`environment`, `wheel_path`, `checkpoint_base_path`, `cluster_policy_id`,
-  `ca_certs`, the global `bulk_stats` and `retry_transport_timeout` defaults, and the ES host configs)
-  are resolved into the job at
+  `ca_certs`, the global `bulk_stats`, `retry_transport_timeout` and `bypass_fast_path` defaults, and the
+  ES host configs) are resolved into the job at
   **deploy** time. Each is set **per
   target** in `databricks.yml` (`targets.<env>.variables`), so a routine deploy takes no `--var` at all.
   The five simple string variables can still be overridden at deploy with `--var=<name>=<value>`, which wins over
@@ -607,10 +609,26 @@ Two different mechanisms carry values into a job, and they resolve at different 
     `retry_transport_timeout`, this is **per-feed only** (no global `${var.*}` default): set it in a
     pipeline's config, or `--params op_type=create` for one run. It requires `es_id_field` (a create
     without an explicit `_id` never conflicts) and must be used **only** for feeds that never legitimately
-    update an existing `_id` (a real update is silently absorbed as a 409). See the connector README's
-    `op_type` notes for the count caveat and the `bypass_fast_path` option that makes the
-    `docs_deduped` / `written` counts exact. On a connector older than 0.10.0 the runner drops the knob
-    with a warning and writes with the default `index` action. Applies to **both** modes.
+    update an existing `_id` (a real update is silently absorbed as a 409). Under the default fast path,
+    a chunk that mixes a NEW `_id` with already-indexed ones can MISCOUNT: the probe creates the new doc,
+    then the whole-chunk re-ship self-409s it, so it is tallied as `docs_deduped` rather than `written`
+    (the data is still correct: one copy, no overwrite; only the attribution is off). All-new and
+    all-existing chunks count exactly. Set `bypass_fast_path` (below) to make the counts exact, or accept
+    the possible miscount. On a connector older than 0.10.0 the runner drops the knob with a warning and
+    writes with the default `index` action. Applies to **both** modes.
+  - `bypass_fast_path` (`true` | `false`; requires connector **>= 0.10.0**) turns off the connector's
+    `filter_path="errors"` fast path so every chunk is classified per-item on the first send (no
+    whole-chunk re-ship). This makes the `docs_deduped` / `written` counts **exact** for `op_type=create`
+    on chunks that mix new and already-indexed `_id`s (the miscount described above), and it also avoids
+    the auto-id re-ship duplication, at the cost of a per-item response decode on clean chunks (it gives
+    up the GIL-avoidance throughput of the fast path). It is useful beyond `op_type=create` too: any run
+    that wants a full per-item check on the first try. It has the **same layering as `bulk_stats`**,
+    including the global default. Precedence, highest first: a per-run `--params bypass_fast_path=<v>` >
+    a pipeline's own `bypass_fast_path:` config value > the target-wide `${var.bypass_fast_path}`
+    databricks.yml variable > the connector's own default (**off**; the fast path is used). So set
+    `bypass_fast_path` in databricks.yml (per target, or `--var=bypass_fast_path=true`) to turn it on for
+    a whole environment. On a connector older than 0.10.0 the runner drops the knob with a warning and
+    writes with the fast path. Applies to **both** modes.
   - `streaming_start` (`new` | `full`, default `new`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. See [Streaming](#streaming).
@@ -638,7 +656,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
 python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
 # Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, ca_certs,
-# the global bulk_stats and retry_transport_timeout defaults, and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
+# the global bulk_stats, retry_transport_timeout and bypass_fast_path defaults, and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
 # deploy to BEFORE running an index pipeline: the shipped configs embed ${environment} and install the
 # connector wheel, so an index run with those still empty fails closed (deploy itself always succeeds).
 # Filled in, the deploy needs no --var:

@@ -53,6 +53,7 @@ resources:
             verify_certs: ''
             bulk_stats: ${var.bulk_stats}
             retry_transport_timeout: ${var.retry_transport_timeout}
+            bypass_fast_path: ${var.bypass_fast_path}
             streaming_start: new
             write_repartition: '0'
             max_partition_bytes: 2m
@@ -83,6 +84,7 @@ resources:
             verify_certs: ''
             bulk_stats: ${var.bulk_stats}
             retry_transport_timeout: ${var.retry_transport_timeout}
+            bypass_fast_path: ${var.bypass_fast_path}
             streaming_start: new
             write_repartition: '0'
             max_partition_bytes: 2m

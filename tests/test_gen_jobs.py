@@ -657,6 +657,52 @@ def test_render_singleton_set_retry_transport_timeout_bakes_literal():
     assert {"name": "retry_transport_timeout", "default": "true"} in job["parameters"]
 
 
+# --- bypass_fast_path global-var declaration + render guards (mirror retry_transport_timeout) ---
+
+
+@pytest.mark.parametrize("default", ["true", "false", ""])
+def test_require_bypass_fast_path_declared_accepts_legal_default(tmp_path, default):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  bypass_fast_path:\n    default: '{default}'\n")
+    gen_jobs.require_bypass_fast_path_declared(str(yml))  # no raise
+
+
+def test_require_bypass_fast_path_declared_missing_fails_closed(tmp_path):
+    # An omitted-knob config bakes ${var.bypass_fast_path}; if the variable is not declared, fail closed
+    # at generation rather than let the reference break confusingly at deploy.
+    yml = tmp_path / "databricks.yml"
+    yml.write_text("variables:\n  wheel_path:\n    default: ''\n")
+    with pytest.raises(ValueError, match="bypass_fast_path is not declared"):
+        gen_jobs.require_bypass_fast_path_declared(str(yml))
+
+
+@pytest.mark.parametrize("bad", ["yes", "on", "1"])
+def test_require_bypass_fast_path_declared_bad_default_fails_closed(tmp_path, bad):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(f"variables:\n  bypass_fast_path:\n    default: '{bad}'\n")
+    with pytest.raises(ValueError, match="bypass_fast_path"):
+        gen_jobs.require_bypass_fast_path_declared(str(yml))
+
+
+def test_shipped_databricks_yml_declares_bypass_fast_path():
+    gen_jobs.require_bypass_fast_path_declared()  # the repo's databricks.yml declares it
+
+
+def test_render_singleton_omitted_bypass_fast_path_bakes_global_ref():
+    cfg = _cfg()
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
+    assert {"name": "bypass_fast_path", "default": "${var.bypass_fast_path}"} in job["parameters"]
+
+
+def test_render_singleton_set_bypass_fast_path_bakes_literal():
+    cfg = _cfg()
+    cfg["bypass_fast_path"] = "true"
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
+    assert {"name": "bypass_fast_path", "default": "true"} in job["parameters"]
+
+
 # --- request_timeout / transport_max_retries global-var declaration guards (mirror bulk_stats) ---
 
 
@@ -849,7 +895,7 @@ def test_group_has_no_job_level_parameters_block():
 
 
 def test_group_run_time_knobs_move_into_task_base_parameters():
-    # The 14 run-time knobs (from job_parameters) become each task's base_parameters, with per-member
+    # The 17 run-time knobs (from job_parameters) become each task's base_parameters, with per-member
     # defaults; the notebook reads the same widget names, so no notebook change.
     cfg = validate_config({
         "es_index_name": "idx-a", "es_id_field": "dsl_id", "es_host_config": "es_host_primary",
@@ -864,7 +910,7 @@ def test_group_run_time_knobs_move_into_task_base_parameters():
     # grouped tasks defer to the target-wide defaults too.
     for p in job_parameters(cfg, gen_jobs._BULK_STATS_VAR_REF,
                             gen_jobs._REQUEST_TIMEOUT_VAR_REF, gen_jobs._TRANSPORT_MAX_RETRIES_VAR_REF,
-                            gen_jobs._RETRY_TRANSPORT_TIMEOUT_VAR_REF):
+                            gen_jobs._RETRY_TRANSPORT_TIMEOUT_VAR_REF, gen_jobs._BYPASS_FAST_PATH_VAR_REF):
         assert bp[p["name"]] == p["default"]
     assert bp["chunk_size"] == "500" and bp["write_concurrency"] == "4"  # per-member defaults carried
     assert bp["bulk_stats"] == "${var.bulk_stats}"  # omitted => defers to the global default
