@@ -51,6 +51,16 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   global default (a feed opts into create explicitly); omitted
                                          #   => the connector default ("index"). Requires connector
                                          #   0.10.0+ (older wheels ignore it, fail-soft).
+    bypass_fast_path: true | false       # OPTIONAL EsWriteConfig write-path toggle: skip the connector's
+                                         #   filter_path="errors" probe and classify EVERY chunk on the
+                                         #   full per-item path (one send, no whole-chunk re-ship). Makes
+                                         #   the docs_deduped / written counts EXACT for op_type=create on
+                                         #   chunks that mix new and existing _ids (and avoids the auto-id
+                                         #   re-ship duplication), at the cost of per-item response decode
+                                         #   on clean chunks (loses the GIL-avoidance fast path). Same
+                                         #   layering as bulk_stats (config value > ${var.bypass_fast_path}
+                                         #   global > connector default OFF). Requires connector 0.10.0+
+                                         #   (older wheels ignore it, fail-soft).
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -474,7 +484,8 @@ def require_op_type(value: object, where: str = "op_type") -> str:
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
                            write_concurrency: object = "", bulk_stats: object = "",
                            request_timeout: object = "", transport_max_retries: object = "",
-                           retry_transport_timeout: object = "", op_type: object = "") -> dict:
+                           retry_transport_timeout: object = "", op_type: object = "",
+                           bypass_fast_path: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
     Called by the runner on the effective (config-default or --params override) widget values. Each
@@ -501,6 +512,13 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     connector's default op_type ("index") stands. Requires connector 0.10.0+, dropped fail-soft on an
     older wheel like bulk_stats. It is per-config (no global ${var.*}), so unlike bulk_stats it has no
     target-wide default: a feed opts into create explicitly.
+
+    bypass_fast_path is the same shape of bool knob as bulk_stats/retry_transport_timeout (canonical
+    "true"/"false"/"" via require_es_flag): when true the connector skips the filter_path="errors" probe
+    and classifies every chunk on the full per-item path, which makes the docs_deduped/written counts
+    exact for op_type=create (and avoids auto-id re-ship duplication) at the cost of the fast path's
+    throughput. It requires connector 0.10.0+, so the runner drops it fail-soft on an older wheel the
+    same way it does bulk_stats.
 
     request_timeout (positive int seconds) and transport_max_retries (non-negative int; 0 disables
     transport retries) are connection/reliability knobs inherited from EsConnection. Both are unset by
@@ -530,7 +548,8 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
 
     for name, value in (("require_existing_index", require_existing_index),
                         ("verify_certs", verify_certs), ("bulk_stats", bulk_stats),
-                        ("retry_transport_timeout", retry_transport_timeout)):
+                        ("retry_transport_timeout", retry_transport_timeout),
+                        ("bypass_fast_path", bypass_fast_path)):
         flag = require_es_flag(value, name)
         if flag:
             overrides[name] = flag == "true"
@@ -719,7 +738,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
         "chunk_size", "write_concurrency", "request_timeout", "transport_max_retries",
         "require_existing_index", "verify_certs", "bulk_stats", "retry_transport_timeout",
-        "op_type",
+        "op_type", "bypass_fast_path",
         "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
@@ -801,6 +820,15 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # NOT re-enumerated here); a non-string/malformed token fails closed. Requires connector 0.10.0+; on
     # an older wheel the runner drops it fail-soft.
     op_type = require_op_type(raw.get("op_type", ""), f"{source}: op_type")
+    # bypass_fast_path is the connector write-path toggle. Behaves EXACTLY like bulk_stats: an absent value
+    # is "" (unset at the config level), deferring to the GLOBAL default (the generator bakes the omitted
+    # job-parameter default as the ${var.bypass_fast_path} databricks.yml variable per target), and when
+    # that is empty too the connector's own default (OFF, i.e. the fast path is used) stands. A config value
+    # here (`bypass_fast_path: true|false`) OVERRIDES the global for this pipeline; the run-time job
+    # parameter overrides it per run. Stored canonical ("true"/"false"/""). Requires connector 0.10.0+; on
+    # an older wheel the runner drops it fail-soft (see runner).
+    bypass_fast_path = require_es_flag(raw.get("bypass_fast_path", ""),
+                                       f"{source}: bypass_fast_path")
     # write_repartition is OPTIONAL but, unlike the tuning knobs above, an absent value does NOT mean
     # "unset": it falls back to the built-in default (require_write_repartition turns "" into
     # _DEFAULT_WRITE_REPARTITION), so a config that omits it still parallelizes the write instead of
@@ -908,6 +936,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "bulk_stats": bulk_stats,
         "retry_transport_timeout": retry_transport_timeout,
         "op_type": op_type,
+        "bypass_fast_path": bypass_fast_path,
         "write_repartition": write_repartition,
         "max_partition_bytes": max_partition_bytes,
         "max_files_per_trigger": max_files_per_trigger,
@@ -1184,6 +1213,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # retry_transport_timeout (connector-owned timeout retry toggle): a connector setting, passed
         # through verbatim (canonical string form), like bulk_stats.
         "retry_transport_timeout": cfg["retry_transport_timeout"],
+        # bypass_fast_path (connector write-path toggle): a connector setting, passed through verbatim
+        # (canonical string form), like bulk_stats.
+        "bypass_fast_path": cfg["bypass_fast_path"],
         # write_repartition (partitions for the pre-write repartition) and max_partition_bytes (read
         # scan parallelism) are run behaviors, not object names: passed through verbatim (canonical
         # string form), like the tuning knobs.
@@ -1411,7 +1443,8 @@ def job_base_parameters(
 def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
                    request_timeout_default_ref: str = "",
                    transport_max_retries_default_ref: str = "",
-                   retry_transport_timeout_default_ref: str = "") -> list:
+                   retry_transport_timeout_default_ref: str = "",
+                   bypass_fast_path_default_ref: str = "") -> list:
     """The RUN-TIME-overridable job-level parameters for a per-index job, as JobParameterDefinitions.
 
     Unlike base_parameters (fixed at deploy), a job parameter can be overridden per run with
@@ -1454,6 +1487,11 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
       feed opts into create explicitly), so unlike bulk_stats it takes no *_default_ref. Canonical string
       form, parsed/passed-through by write_config_overrides. Requires connector 0.10.0+ (older wheels
       drop it fail-soft in the runner).
+    - bypass_fast_path: EsWriteConfig write-path toggle, same layering as bulk_stats (config value, else
+      `bypass_fast_path_default_ref` = ${var.bypass_fast_path}, else "" for the connector default off).
+      When on, the connector skips the errors-probe fast path and classifies every chunk per-item, which
+      makes docs_deduped/written exact for op_type=create at the cost of the fast path's throughput.
+      Requires connector 0.10.0+ (older wheels drop it fail-soft).
     - streaming_start: new|full, DEFAULT "new" (start the stream at the source's current version, so
       only new commits are exported; batch mode owns the history). Set to "full" for a one-off first
       run that backfills the whole existing table. Streaming mode only; ignored by batch. A literal
@@ -1493,6 +1531,10 @@ def job_parameters(cfg: dict, bulk_stats_default_ref: str = "",
         # ${var.retry_transport_timeout} global ref, else "" for the connector default off).
         {"name": "retry_transport_timeout",
          "default": cfg["retry_transport_timeout"] or retry_transport_timeout_default_ref},
+        # bypass_fast_path: same layering as bulk_stats (config value, else the ${var.bypass_fast_path}
+        # global ref, else "" for the connector default off).
+        {"name": "bypass_fast_path",
+         "default": cfg["bypass_fast_path"] or bypass_fast_path_default_ref},
         {"name": "streaming_start", "default": "new"},
         {"name": "write_repartition", "default": cfg["write_repartition"]},
         {"name": "max_partition_bytes", "default": cfg["max_partition_bytes"]},
