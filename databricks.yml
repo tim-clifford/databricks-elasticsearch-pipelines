@@ -195,6 +195,21 @@ variables:
     description: "Global default for EsWriteConfig retry_transport_timeout (connector-owned whole-request timeout retry with backoff). Empty default (off; connector default stands). A pipeline's own retry_transport_timeout and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.9.7."
     default: ""
 
+  # GLOBAL default for the connector's bypass_fast_path, threaded exactly like bulk_stats (a bool flag).
+  # When ON, the connector skips its filter_path="errors" probe and classifies EVERY chunk on the full
+  # per-item path (one send, no whole-chunk re-ship). This makes the docs_deduped / written counts EXACT
+  # for op_type=create on chunks that mix new and already-indexed _ids (and avoids the auto-id re-ship
+  # duplication), at the cost of a per-item response decode on clean chunks: it gives up the GIL-avoidance
+  # fast path, so leave it OFF for feeds that do not need exact create counts. Precedence, highest first: a
+  # per-run `--params bypass_fast_path=<v>` > a pipeline's own `bypass_fast_path:` in its config > this
+  # global default > the connector's own default (OFF, fast path used). Empty default so the fast path is
+  # used everywhere out of the box; set it "true" per target below (or --var) to turn it on target-wide. A
+  # legal value is "" / true / false (validated at generation and at run). Requires connector >= 0.10.0
+  # (older wheels drop it fail-soft).
+  bypass_fast_path:
+    description: "Global default for EsWriteConfig bypass_fast_path (skip the errors-probe fast path; classify every chunk per-item for exact op_type=create counts, at the cost of fast-path throughput). Empty default (off; connector fast path used). A pipeline's own bypass_fast_path and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.10.0."
+    default: ""
+
   # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
   # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
   # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds
@@ -320,6 +335,11 @@ targets:
                                    # backoff instead of failing the batch) for the whole dev target. A
                                    # pipeline's own value or a --params override still wins. Empty default
                                    # (off) inherited when omitted. Requires connector >= 0.9.7.
+      # bypass_fast_path: "true"   # skip the errors-probe fast path and classify every chunk per-item for
+                                   # the whole dev target (exact docs_deduped/written counts for
+                                   # op_type=create, at the cost of fast-path throughput). A pipeline's own
+                                   # value or a --params override still wins. Empty default (off, fast path
+                                   # used) inherited when omitted. Requires connector >= 0.10.0.
       # DEV Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-dev-es-host:9200

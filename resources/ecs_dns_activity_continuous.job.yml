@@ -39,6 +39,8 @@ resources:
         default: ${var.bulk_stats}
       - name: retry_transport_timeout
         default: ${var.retry_transport_timeout}
+      - name: bypass_fast_path
+        default: ${var.bypass_fast_path}
       - name: streaming_start
         default: new
       - name: write_repartition
