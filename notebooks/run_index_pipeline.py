@@ -719,37 +719,63 @@ if PIPELINE_MODE == "streaming":
 #   main reader: on a large-history source, first-run positioning enumerates a task per active file and
 #   can run for many hours before the main stream makes progress; doing it as a no-op (no transform, no
 #   ES write) bounded by maxFilesPerTrigger lets it complete and commit a resume point cheaply. We use a
-#   numeric startingVersion (not "latest") so the seed persists a real offset even with no new data;
-#   "latest" runs zero batches and persists none, so the next run would re-seed and could skip real data.
-#   If the checkpoint state cannot be positively classified (a listing error, neither clearly resume nor
-#   clearly first-run), we fall back to seeding startingVersion on the main reader instead of the no-op
-#   drain - safe on both a resume and a true first run, and it never skips a backlog.
+#   numeric startingVersion (not "latest") to pin a deterministic boundary, and after the seed we VERIFY
+#   an offset was actually committed: if it was not (nothing to drain at that version, so availableNow
+#   ran zero batches), we pin startingVersion on the main reader instead, so existing history is never
+#   re-exported. If the checkpoint state cannot be positively classified (a listing error, neither
+#   clearly resume nor clearly first-run), we likewise fall back to seeding startingVersion on the main
+#   reader instead of the no-op drain - safe on both a resume and a true first run, and it never skips a
+#   backlog.
 # - "full": omit startingVersion and use the REAL foreachBatch, so the first micro-batches backfill the
 #   whole existing table to ES (intentional history export).
 if PIPELINE_MODE == "streaming":
+    def _is_clean_not_found(_e: Exception) -> bool:
+        # Whether a dbutils.fs.ls failure is a "path does not exist" signal (vs a transient IO or
+        # permission error). Verified elsewhere in this notebook (see the metrics-dir listing below): a
+        # missing UC-Volume path is wrapped as an error whose text contains FileNotFoundException /
+        # CloudFileNotFoundException / "No such file or directory"; some engines phrase it "... does not
+        # exist". Substring-matching an exception string is inherently fuzzy, so this helper is only ever
+        # consulted where a false positive is SAFE - in _checkpoint_offsets_state, ONLY when the
+        # checkpoint's PARENT dir is absent, i.e. no checkpoint exists at all and so no un-sent backlog
+        # could be dropped.
+        _msg = str(_e)
+        return ("FileNotFoundException" in _msg or "No such file or directory" in _msg
+                or "does not exist" in _msg)
+
     def _checkpoint_offsets_state(cp_location: str) -> str:
         # POSITIVELY classify the checkpoint's offsets directory, so the "new" first-run seeding path is
         # chosen without ever silently dropping data (allow-list, fail closed):
         #   "has_offset" - at least one integer-named batch offset file exists => Spark will RESUME from
         #                  the checkpoint (startingVersion ignored); no first-run seeding.
-        #   "empty"      - the offsets dir POSITIVELY does not exist (clean not-found) or holds no batch
-        #                  offset => a genuine first run => safe to run the no-op seed drain.
-        #   "unknown"    - the listing FAILED for any OTHER reason (transient IO, permissions): we cannot
-        #                  distinguish resume from first run, so the caller must fall back to the
+        #   "empty"      - the offsets dir is POSITIVELY absent => a genuine first run => safe to run the
+        #                  no-op seed drain.
+        #   "unknown"    - we cannot distinguish resume from first run (a transient/permission error while
+        #                  reading a checkpoint that MAY exist): the caller must fall back to the
         #                  startingVersion-on-the-main-reader path (a no-op on resume, a correct seed on a
         #                  true first run) rather than the no-op drain, which on a MISCLASSIFIED resume
         #                  would advance the offset past an un-sent backlog and lose those records.
-        offsets_dir = f"{cp_location.rstrip('/')}/offsets"
+        # We NEVER infer "empty" from an error string on the offsets dir ITSELF: a transient failure while
+        # reading an EXISTING offsets dir must not read as a first run. Absence is confirmed positively -
+        # an offsets dir that lists is classified by its contents; one that does not list is "empty" only
+        # when its PARENT positively shows no "offsets" child (or the parent itself is a clean not-found,
+        # so no checkpoint - hence no backlog - exists). Every other failure is "unknown".
+        base = cp_location.rstrip("/")
+        offsets_dir = f"{base}/offsets"
         try:
             entries = dbutils.fs.ls(offsets_dir)
-        except Exception as _e:
-            # Only a clean not-found is a genuine first run. Match the not-found signals this runtime
-            # raises (verified elsewhere in this notebook: a missing UC-Volume path raises with "No such
-            # file or directory" / FileNotFoundException); ANY other error is ambiguous, not "empty".
-            _msg = str(_e)
-            if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
-                return "empty"
-            return "unknown"
+        except Exception:
+            # The offsets dir did not list. Decide first-run vs ambiguous by POSITIVELY inspecting the
+            # parent, not by the offsets-dir error text.
+            try:
+                parent_entries = dbutils.fs.ls(base)
+            except Exception as _pe:
+                # Parent did not list either. Only a clean not-found on the PARENT is a genuine first run:
+                # no checkpoint dir exists, so there is no committed offset and no backlog to skip (a false
+                # not-found match here is safe for that same reason). Anything else is ambiguous.
+                return "empty" if _is_clean_not_found(_pe) else "unknown"
+            # Parent listed: no "offsets" child => the offsets dir truly does not exist (first run); an
+            # "offsets" child present => it EXISTS but we failed to read it => ambiguous, fail closed.
+            return "empty" if not any(e.name.rstrip("/") == "offsets" for e in parent_entries) else "unknown"
         # Structured Streaming names each committed batch offset file by its integer batch id ("0", "1",
         # ...). An integer-named entry is a persisted resume point; digit-filtering ignores transient
         # temp/hidden files and non-batch markers. No such entry (empty dir) is still a first run.
@@ -836,8 +862,23 @@ if PIPELINE_MODE == "streaming":
                 .start()
             )
             seed_query.awaitTermination()
-            print(f"streaming_start=new: seed drain complete; the main stream resumes incrementally from "
-                  f"{checkpoint_location}")
+            # The seed exists to persist a resume offset. A numeric startingVersion under availableNow
+            # normally commits at least one offset even with no new data, but we do NOT rely on that: if
+            # there is nothing to drain at/after the pinned version (e.g. the current version is a
+            # metadata-only commit with no data files and no later commits), availableNow can run ZERO
+            # micro-batches and persist NO offset. The main reader below carries no startingVersion, so
+            # against an empty checkpoint it would backfill the ENTIRE table to ES - exactly what this
+            # feature prevents. So VERIFY an offset was actually committed; if not, pin startingVersion on
+            # the main reader as a fallback (it reads only from the current version forward, never
+            # re-exporting history, and is a no-op in the normal case where the seed did commit).
+            if _checkpoint_offsets_state(checkpoint_location) == "has_offset":
+                print(f"streaming_start=new: seed drain complete; the main stream resumes incrementally "
+                      f"from {checkpoint_location}")
+            else:
+                print(f"streaming_start=new: seed committed no offset (nothing to drain at "
+                      f"startingVersion={current_version}); pinning startingVersion={current_version} on "
+                      f"the main reader so existing history is NOT re-exported")
+                reader = reader.option("startingVersion", str(current_version))
         else:  # "unknown"
             # The offsets listing FAILED for a reason other than a clean not-found, so we cannot tell a
             # resume from a first run. Fall back to the PROVEN-SAFE original behavior: seed startingVersion
