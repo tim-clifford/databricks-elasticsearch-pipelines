@@ -767,6 +767,14 @@ def test_bypass_fast_path_carried_through_resolve():
     assert resolve_config(validate_config(cfg), "")["bypass_fast_path"] == "true"
 
 
+def test_op_type_carried_through_resolve():
+    # op_type is a connector setting, not an object name: resolve_config passes it through verbatim.
+    # (Cleanup from the op_type PR, which added the field everywhere else but missed this passthrough.)
+    cfg = _base()
+    cfg["op_type"] = "create"
+    assert resolve_config(validate_config(cfg), "")["op_type"] == "create"
+
+
 def test_job_parameters_bypass_fast_path_defaults_empty_without_ref():
     # With no ref supplied (the pure/unit-test call), an omitted bypass_fast_path stays "" - the
     # connector's own default (off, fast path used) stands.

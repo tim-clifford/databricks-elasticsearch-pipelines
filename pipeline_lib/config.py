@@ -1213,6 +1213,11 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # retry_transport_timeout (connector-owned timeout retry toggle): a connector setting, passed
         # through verbatim (canonical string form), like bulk_stats.
         "retry_transport_timeout": cfg["retry_transport_timeout"],
+        # op_type (bulk-action selector): a connector setting, not an object name: passed through verbatim
+        # (canonical string form), like bulk_stats. (Cleanup: the op_type PR added the field everywhere
+        # else but missed this passthrough; harmless since the runner reads knobs from job-parameter
+        # widgets, not the resolved cfg, but included here for consistency with its sibling knobs.)
+        "op_type": cfg["op_type"],
         # bypass_fast_path (connector write-path toggle): a connector setting, passed through verbatim
         # (canonical string form), like bulk_stats.
         "bypass_fast_path": cfg["bypass_fast_path"],
