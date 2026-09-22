@@ -160,14 +160,14 @@ def parse_indexing_pressure(nodes_stats):
 
     Path per node: indexing_pressure.memory.{current.combined_coordinating_and_primary_in_bytes,
     limit_in_bytes, total.{coordinating_rejections, primary_rejections, replica_rejections}}.
-    Returns {node_name: {"current_bytes","limit_bytes","pct" (current/limit or None),
-    "coordinating_rejections","primary_rejections","replica_rejections","rejections_total"}}.
+    Returns {node_id: {"name","current_bytes","limit_bytes","pct" (current/limit or None),
+    "coordinating_rejections","primary_rejections","replica_rejections","rejections_total"}}, keyed on the
+    unique node_id (display name carried as a field) so same-named nodes never collapse in the delta reducers.
     """
     result = {}
     for node_id, node in _nodes_map(nodes_stats).items():
         if not isinstance(node, dict):
             continue
-        name = node.get("name") or node_id
         mem = _dig(node, "indexing_pressure", "memory", default={})
         current = _to_int(_dig(mem, "current", "combined_coordinating_and_primary_in_bytes"))
         limit = _to_int(_dig(mem, "limit_in_bytes"))
@@ -175,7 +175,10 @@ def parse_indexing_pressure(nodes_stats):
         primary = _to_int(_dig(mem, "total", "primary_rejections"), 0)
         replica = _to_int(_dig(mem, "total", "replica_rejections"), 0)
         pct = (current / limit) if (current is not None and limit not in (None, 0)) else None
-        result[name] = {
+        # Keyed on the guaranteed-unique node_id (the _nodes_map key), never the display name, which ES
+        # does not guarantee unique: two same-named nodes must not collapse and mispair their delta counters.
+        result[node_id] = {
+            "name": node.get("name") or node_id,
             "current_bytes": current,
             "limit_bytes": limit,
             "pct": pct,
@@ -188,16 +191,16 @@ def parse_indexing_pressure(nodes_stats):
 
 
 def parse_jvm(nodes_stats):
-    """Parse `_nodes/stats/jvm` into per-node {heap_used_percent, gc_collection_count, gc_time_ms}.
+    """Parse `_nodes/stats/jvm` into {node_id: {name, heap_used_percent, gc_collection_count, gc_time_ms}}.
 
     GC is summed across young+old collectors (jvm.gc.collectors.<name>.collection_count /
-    collection_time_in_millis). Both counters are cumulative-since-boot => diff them across samples.
+    collection_time_in_millis). Both counters are cumulative-since-boot => diff them across samples. Keyed
+    on the unique node_id (not the non-unique display name) so same-named nodes never collapse.
     """
     result = {}
     for node_id, node in _nodes_map(nodes_stats).items():
         if not isinstance(node, dict):
             continue
-        name = node.get("name") or node_id
         heap_pct = _to_int(_dig(node, "jvm", "mem", "heap_used_percent"))
         collectors = _dig(node, "jvm", "gc", "collectors", default={})
         gc_count = 0
@@ -206,7 +209,9 @@ def parse_jvm(nodes_stats):
             for coll in collectors.values():
                 gc_count += _to_int(_dig(coll, "collection_count"), 0)
                 gc_time += _to_int(_dig(coll, "collection_time_in_millis"), 0)
-        result[name] = {
+        # Keyed on the unique node_id (see parse_indexing_pressure), not the non-unique display name.
+        result[node_id] = {
+            "name": node.get("name") or node_id,
             "heap_used_percent": heap_pct,
             "gc_collection_count": gc_count,
             "gc_time_ms": gc_time,
@@ -215,15 +220,15 @@ def parse_jvm(nodes_stats):
 
 
 def parse_breakers(nodes_stats):
-    """Parse `_nodes/stats/breaker` into {node: {breaker_name: {tripped, estimated_bytes, limit_bytes}}}.
+    """Parse `_nodes/stats/breaker` into {node_id: {breaker_name: {tripped, estimated_bytes, limit_bytes}}}.
 
-    `tripped` is cumulative-since-boot => diff across samples to see trips DURING the window.
+    `tripped` is cumulative-since-boot => diff across samples to see trips DURING the window. Keyed on the
+    unique node_id (not the non-unique display name) so same-named nodes never collapse.
     """
     result = {}
     for node_id, node in _nodes_map(nodes_stats).items():
         if not isinstance(node, dict):
             continue
-        name = node.get("name") or node_id
         breakers = _dig(node, "breakers", default={})
         node_breakers = {}
         if isinstance(breakers, dict):
@@ -233,7 +238,8 @@ def parse_breakers(nodes_stats):
                     "estimated_bytes": _to_int(_dig(b, "estimated_size_in_bytes")),
                     "limit_bytes": _to_int(_dig(b, "limit_size_in_bytes")),
                 }
-        result[name] = node_breakers
+        # Keyed on the unique node_id (see parse_indexing_pressure), not the non-unique display name.
+        result[node_id] = node_breakers
     return result
 
 

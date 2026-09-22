@@ -263,16 +263,16 @@ if not SAMPLE_B["tp"]:
     print("  (write thread-pool not collected)")
 
 print("\n=== INDEXING PRESSURE (per node, latest sample) ===")
-for node, v in SAMPLE_B["ip"].items():
+for v in SAMPLE_B["ip"].values():
     pct = f"{v['pct']*100:.0f}%" if v["pct"] is not None else "n/a"
-    print(f"  {node}: current={human_bytes(v['current_bytes'])} limit={human_bytes(v['limit_bytes'])} "
+    print(f"  {v['name']}: current={human_bytes(v['current_bytes'])} limit={human_bytes(v['limit_bytes'])} "
           f"({pct} of limit) rejections(lifetime)={v['rejections_total']}")
 if not SAMPLE_B["ip"]:
     print("  (indexing pressure not collected)")
 
 print("\n=== JVM HEAP / GC + BREAKERS (per node, latest sample) ===")
-for node, v in SAMPLE_B["jvm"].items():
-    print(f"  {node}: heap_used={v['heap_used_percent']}% gc_time(lifetime)={v['gc_time_ms']}ms")
+for v in SAMPLE_B["jvm"].values():
+    print(f"  {v['name']}: heap_used={v['heap_used_percent']}% gc_time(lifetime)={v['gc_time_ms']}ms")
 for node, breakers in SAMPLE_B["breakers"].items():
     for bname, b in breakers.items():
         if b["tripped"]:

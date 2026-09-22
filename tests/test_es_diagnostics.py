@@ -78,14 +78,23 @@ def _ip_node(name, current, limit, coord=0, primary=0, replica=0):
 def test_parse_indexing_pressure_pct_and_rejections():
     stats = {"nodes": {"abc": _ip_node("n1", current=200, limit=1000, coord=1, primary=2, replica=3)}}
     parsed = parse_indexing_pressure(stats)
-    assert parsed["n1"]["pct"] == pytest.approx(0.2)
-    assert parsed["n1"]["rejections_total"] == 6
+    assert parsed["abc"]["name"] == "n1"  # keyed by unique node_id, display name carried as a field
+    assert parsed["abc"]["pct"] == pytest.approx(0.2)
+    assert parsed["abc"]["rejections_total"] == 6
 
 
 def test_parse_indexing_pressure_zero_limit_yields_none_pct():
     # A zero (or missing) limit must not divide-by-zero; pct is None, not a crash or a bogus number.
     stats = {"nodes": {"abc": _ip_node("n1", current=200, limit=0)}}
-    assert parse_indexing_pressure(stats)["n1"]["pct"] is None
+    assert parse_indexing_pressure(stats)["abc"]["pct"] is None
+
+
+def test_parse_indexing_pressure_same_named_nodes_do_not_collapse():
+    # THE node-keying regression for the nodes/stats parsers: two DISTINCT nodes sharing a display name
+    # must remain two entries (keyed by unique node_id), else their delta counters mispair/drop.
+    stats = {"nodes": {"id_a": _ip_node("dup", 100, 1000, coord=1),
+                       "id_b": _ip_node("dup", 200, 1000, coord=2)}}
+    assert set(parse_indexing_pressure(stats)) == {"id_a", "id_b"}
 
 
 def test_parse_indexing_pressure_empty_nodes():
@@ -103,7 +112,8 @@ def test_parse_jvm_sums_collectors():
         }},
     }}}}
     parsed = parse_jvm(stats)
-    assert parsed["n1"] == {"heap_used_percent": 88, "gc_collection_count": 105, "gc_time_ms": 2500}
+    assert parsed["abc"] == {"name": "n1", "heap_used_percent": 88, "gc_collection_count": 105,
+                             "gc_time_ms": 2500}
 
 
 # ============================================================ parse_breakers
@@ -112,7 +122,7 @@ def test_parse_breakers():
         "parent": {"tripped": 7, "estimated_size_in_bytes": 500, "limit_size_in_bytes": 1000},
     }}}}
     parsed = parse_breakers(stats)
-    assert parsed["n1"]["parent"]["tripped"] == 7
+    assert parsed["abc"]["parent"]["tripped"] == 7
 
 
 # ============================================================ parse_index_stats
