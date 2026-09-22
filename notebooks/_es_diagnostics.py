@@ -193,7 +193,7 @@ def snapshot():
     """Collect one sample of every counter/gauge endpoint. Missing endpoints degrade to empty structures
     (which the reducers read as 'not collected'), never to a crash."""
     ok_tp, tp_raw, _ = es_get("_cat/thread_pool/write?format=json"
-                              "&h=node_name,active,queue,queue_size,rejected,completed")
+                              "&h=node_id,node_name,active,queue,queue_size,rejected,completed")
     ns = _nodes_stats()
     snap = {
         "tp": parse_cat_thread_pool(tp_raw) if ok_tp else [],
@@ -236,9 +236,13 @@ if WINDOW_SECS > 0:
 else:
     write_rejected_delta = ip_rejected_delta = breaker_tripped_delta = gc_time_delta_ms = None
 
-# Endpoint-collection flags gate the fail-closed HEALTHY verdict: a parsed structure is non-empty only if
-# that endpoint actually responded in at least one sample. Keyed on collection (not on a derived scalar),
-# so a present-but-limitless indexing-pressure reading still counts as collected.
+# Endpoint-collection flags gate the fail-closed HEALTHY verdict. We key on whether the parse produced
+# ACTUAL DATA (a non-empty structure), NOT merely on an HTTP 200: on an ES version that lacks the
+# indexing_pressure metric the _nodes/stats call still 200s but returns no IP section, and clearing a host
+# we never assessed for pressure would be a fail-OPEN hole. A healthy cluster always returns >= 1 write-pool
+# row and populated indexing_pressure, so this is False only when the data is genuinely absent (or the
+# endpoint failed - which is reported separately in ENDPOINTS_FAILED); INCONCLUSIVE is the correct outcome
+# in every such case.
 write_pool_collected = bool(SAMPLE_A["tp"]) or bool(SAMPLE_B["tp"])
 indexing_pressure_collected = bool(SAMPLE_A["ip"]) or bool(SAMPLE_B["ip"])
 

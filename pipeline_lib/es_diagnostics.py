@@ -98,10 +98,12 @@ def parse_cat_thread_pool(rows):
     """Parse `_cat/thread_pool/write?format=json` rows into a list of per-node write-pool dicts.
 
     Each input row is a dict with string values, e.g.
-        {"node_name": "n1", "active": "3", "queue": "120", "queue_size": "10000",
+        {"node_id": "aBc", "node_name": "n1", "active": "3", "queue": "120", "queue_size": "10000",
          "rejected": "42", "completed": "99999"}
-    Returns [{"node": str, "active": int|None, "queue": int|None, "queue_size": int|None,
-              "rejected": int|None, "completed": int|None}, ...]. A non-list input yields [].
+    Returns [{"node_id": str|None, "node": str, "active": int|None, "queue": int|None,
+              "queue_size": int|None, "rejected": int|None, "completed": int|None}, ...]. Non-list => [].
+    `node_id` is the stable, always-unique match key for the delta reducers (`node` is the display name,
+    which could in principle be blank/duplicated); a row missing both is still parsed but unmatchable.
     """
     if not isinstance(rows, list):
         return []
@@ -110,6 +112,7 @@ def parse_cat_thread_pool(rows):
         if not isinstance(row, dict):
             continue
         out.append({
+            "node_id": row.get("node_id") or None,
             "node": row.get("node_name") or row.get("node") or row.get("name") or "",
             "active": _to_int(row.get("active")),
             "queue": _to_int(row.get("queue")),
@@ -268,14 +271,20 @@ def parse_index_stats(stats):
 
 
 # --------------------------------------------------------------------------- reducers (across nodes)
+def _tp_key(row):
+    """Stable match key for a write-pool row: the always-unique node_id, falling back to the display name."""
+    return row.get("node_id") or row.get("node")
+
+
 def total_rejected_delta(tp_before, tp_after):
-    """Sum of (after - before) write-pool `rejected` across nodes, matched by node name.
+    """Sum of (after - before) write-pool `rejected` across nodes, matched by node id.
 
     Returns None if NEITHER sample carried a usable rejected count (signal not collected); otherwise an int
     >= 0. A node present only in one sample contributes 0 (we can't diff it) rather than a spurious spike.
+    Keyed on node_id so two nodes never collapse to one entry even if their display names are blank/equal.
     """
-    before = {r["node"]: r["rejected"] for r in tp_before if r.get("rejected") is not None}
-    after = {r["node"]: r["rejected"] for r in tp_after if r.get("rejected") is not None}
+    before = {_tp_key(r): r["rejected"] for r in tp_before if r.get("rejected") is not None}
+    after = {_tp_key(r): r["rejected"] for r in tp_after if r.get("rejected") is not None}
     if not before and not after:
         return None
     delta = 0

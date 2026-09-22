@@ -36,10 +36,10 @@ from pipeline_lib.es_diagnostics import (
 
 # ============================================================ parse_cat_thread_pool
 def test_parse_cat_thread_pool_string_values():
-    rows = [{"node_name": "n1", "active": "3", "queue": "120", "queue_size": "10000",
+    rows = [{"node_id": "aBc", "node_name": "n1", "active": "3", "queue": "120", "queue_size": "10000",
              "rejected": "42", "completed": "99999"}]
     parsed = parse_cat_thread_pool(rows)
-    assert parsed == [{"node": "n1", "active": 3, "queue": 120, "queue_size": 10000,
+    assert parsed == [{"node_id": "aBc", "node": "n1", "active": 3, "queue": 120, "queue_size": 10000,
                        "rejected": 42, "completed": 99999}]
 
 
@@ -160,6 +160,14 @@ def test_total_rejected_delta_node_only_in_one_sample_contributes_zero():
     before = parse_cat_thread_pool([{"node_name": "n1", "rejected": "100"}])
     after = parse_cat_thread_pool([{"node_name": "n2", "rejected": "5"}])
     assert total_rejected_delta(before, after) == 0
+
+
+def test_total_rejected_delta_distinct_ids_do_not_collapse_when_names_blank():
+    # The node-keying regression: two DISTINCT nodes with blank display names must be matched by node_id,
+    # not collapse into one "" key. Each gained 3 rejections => total 6.
+    before = parse_cat_thread_pool([{"node_id": "a", "rejected": "10"}, {"node_id": "b", "rejected": "20"}])
+    after = parse_cat_thread_pool([{"node_id": "a", "rejected": "13"}, {"node_id": "b", "rejected": "23"}])
+    assert total_rejected_delta(before, after) == 6
 
 
 def test_max_write_queue():
