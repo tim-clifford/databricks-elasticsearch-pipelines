@@ -39,13 +39,23 @@
 # rather than aborting the run, so one dead endpoint never costs us the rest of the picture. (A run that
 # collects NOTHING is failed at the end - see the RESULTS cell.)
 import json
+import os
 import re
+import sys
 import time
 
 import requests
 import urllib3
 
-from pipeline_lib.es_diagnostics import (
+# The bundle syncs this notebook to <files>/notebooks/_es_diagnostics.py and the shared package to
+# <files>/pipeline_lib/; add the files root to sys.path so `pipeline_lib` imports on the cluster, exactly
+# as notebooks/run_index_pipeline.py does. (Must run before the pipeline_lib import below.)
+_nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+_FILES_ROOT = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # .../files
+if _FILES_ROOT not in sys.path:
+    sys.path.insert(0, _FILES_ROOT)
+
+from pipeline_lib.es_diagnostics import (  # noqa: E402
     classify_verdict,
     human_bytes,
     max_gc_time_delta_ms,
