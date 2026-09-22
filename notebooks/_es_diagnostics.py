@@ -51,6 +51,7 @@ from pipeline_lib.es_diagnostics import (
     max_heap_percent,
     max_indexing_pressure_pct,
     max_write_queue,
+    max_write_queue_fill,
     parse_breakers,
     parse_cat_nodes,
     parse_cat_thread_pool,
@@ -235,15 +236,24 @@ if WINDOW_SECS > 0:
 else:
     write_rejected_delta = ip_rejected_delta = breaker_tripped_delta = gc_time_delta_ms = None
 
+# Endpoint-collection flags gate the fail-closed HEALTHY verdict: a parsed structure is non-empty only if
+# that endpoint actually responded in at least one sample. Keyed on collection (not on a derived scalar),
+# so a present-but-limitless indexing-pressure reading still counts as collected.
+write_pool_collected = bool(SAMPLE_A["tp"]) or bool(SAMPLE_B["tp"])
+indexing_pressure_collected = bool(SAMPLE_A["ip"]) or bool(SAMPLE_B["ip"])
+
 SIGNALS = {
     "write_rejected_delta": write_rejected_delta,
     "write_queue_max": _max_opt(max_write_queue(SAMPLE_A["tp"]), max_write_queue(SAMPLE_B["tp"])),
+    "write_queue_fill_max": _max_opt(max_write_queue_fill(SAMPLE_A["tp"]), max_write_queue_fill(SAMPLE_B["tp"])),
     "indexing_pressure_pct_max": _max_opt(max_indexing_pressure_pct(SAMPLE_A["ip"]),
                                           max_indexing_pressure_pct(SAMPLE_B["ip"])),
     "indexing_pressure_rejected_delta": ip_rejected_delta,
     "breaker_tripped_delta": breaker_tripped_delta,
     "heap_percent_max": _max_opt(max_heap_percent(SAMPLE_A["jvm"]), max_heap_percent(SAMPLE_B["jvm"])),
     "gc_time_delta_ms": gc_time_delta_ms,
+    "write_pool_collected": write_pool_collected,
+    "indexing_pressure_collected": indexing_pressure_collected,
 }
 
 VERDICT, VERDICT_REASONS = classify_verdict(SIGNALS, WINDOW_SECS)

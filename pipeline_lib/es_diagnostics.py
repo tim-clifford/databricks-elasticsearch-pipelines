@@ -30,18 +30,21 @@ VERDICT_INCONCLUSIVE = "INCONCLUSIVE"  # a load-bearing signal could not be coll
 
 # --------------------------------------------------------------------------- verdict thresholds
 # Named so the tests and the notebook read off the same numbers, and so tuning is one edit.
+_QUEUE_WARN_FRACTION = 0.10      # write queue >= 10% of its (bounded) queue_size => genuine build-up.
+_QUEUE_WARN_DEPTH = 100          # absolute backstop for SATURATED when queue_size is unknown/unbounded.
 _PRESSURE_WARN_FRACTION = 0.70   # indexing-pressure current >= 70% of its limit => PRESSURED.
 _HEAP_WARN_PERCENT = 85          # any node's JVM heap >= 85% => heap pressure.
 _GC_WARN_WINDOW_FRACTION = 0.30  # GC collection time in the window >= 30% of wall-clock => GC pressure.
 
-# Signal keys the verdict treats as LOAD-BEARING: without at least one of these positively collected, the
-# host cannot be cleared as healthy (fail closed to INCONCLUSIVE). These are exactly the direct
-# backpressure signals - queue depth, write rejections, and indexing pressure.
-_LOAD_BEARING_SIGNALS = (
-    "write_rejected_delta",
-    "write_queue_max",
-    "indexing_pressure_pct_max",
-    "indexing_pressure_rejected_delta",
+# The two direct backpressure ENDPOINTS whose collection HEALTHY depends on. The verdict clears a host as
+# healthy only when both responded (passed as the booleans write_pool_collected / indexing_pressure_collected
+# the notebook sets from whether each endpoint returned data). This is deliberately keyed on endpoint
+# collection, NOT on whether a derived scalar (e.g. indexing-pressure pct) is None: a present-but-limitless
+# indexing-pressure reading, or a single-snapshot run whose rate deltas are legitimately None, still counts
+# as collected and must not be mistaken for a missing signal.
+_REQUIRED_COLLECTION_FLAGS = (
+    ("write_pool_collected", "write thread-pool (_cat/thread_pool/write)"),
+    ("indexing_pressure_collected", "indexing pressure (_nodes/stats/indexing_pressure)"),
 )
 
 
@@ -289,6 +292,21 @@ def max_write_queue(tp_sample):
     return max(queues) if queues else None
 
 
+def max_write_queue_fill(tp_sample):
+    """Max write-pool queue FILL (queue / queue_size) across nodes with a positive bounded queue_size.
+
+    Returns a fraction in [0, 1+] or None when no node reported a usable (queue, queue_size) pair (e.g. an
+    unbounded/resizable pool reports queue_size -1). Fill, not raw depth, is what says "near capacity": a
+    transient depth of a few is nothing against a 10000-deep bound, so the SATURATED verdict gates on this.
+    """
+    fills = []
+    for r in tp_sample:
+        q, qs = r.get("queue"), r.get("queue_size")
+        if q is not None and qs is not None and qs > 0:
+            fills.append(q / qs)
+    return max(fills) if fills else None
+
+
 def max_indexing_pressure_pct(ip_sample):
     """Max indexing-pressure fraction-of-limit across nodes, or None if none reported a pct."""
     pcts = [v["pct"] for v in ip_sample.values() if v.get("pct") is not None]
@@ -354,15 +372,18 @@ def classify_verdict(signals, window_secs):
 
     `signals` is a flat dict the notebook assembles from the reducers above; any key may be None meaning
     "not collected this run". Recognized keys:
-        write_rejected_delta, write_queue_max, indexing_pressure_pct_max,
-        indexing_pressure_rejected_delta, breaker_tripped_delta, heap_percent_max, gc_time_delta_ms
+        write_rejected_delta, write_queue_max, write_queue_fill_max, indexing_pressure_pct_max,
+        indexing_pressure_rejected_delta, breaker_tripped_delta, heap_percent_max, gc_time_delta_ms,
+        write_pool_collected (bool), indexing_pressure_collected (bool)
     `window_secs` is the wall-clock gap between the two samples (0 for a single snapshot), used only to
     scale the GC-pressure test.
 
-    FAIL CLOSED: HEALTHY is returned ONLY when every load-bearing signal was collected AND clear. If any
-    load-bearing signal is missing, the verdict is INCONCLUSIVE with a note naming what could not be read -
-    an un-collected signal is never silently treated as "no problem". The severity order (rejecting >
-    saturated > pressured > heap/GC) reports the most acute recognized signature first.
+    FAIL CLOSED: HEALTHY is returned ONLY when the two direct backpressure ENDPOINTS (write pool + indexing
+    pressure) were both collected AND no acute signature fired. If either endpoint did not respond, the
+    verdict is INCONCLUSIVE naming which - an un-collected endpoint is never silently treated as "no
+    problem". The gate keys on endpoint collection, not on derived scalars: a present-but-limitless
+    indexing-pressure reading (pct None) or a single-snapshot run (rate deltas None) is still "collected".
+    The severity order (rejecting > saturated > pressured > heap/GC) reports the most acute signature first.
     """
     def sig(key):
         return signals.get(key)
@@ -381,10 +402,17 @@ def classify_verdict(signals, window_secs):
         rej_reasons.append("=> ES is shedding load with 429s; reduce bulk size / write concurrency and back off on 429.")
         return VERDICT_REJECTING, rej_reasons
 
-    # 2. SATURATED - write queue building but not yet rejecting: near capacity.
+    # 2. SATURATED - write queue building toward its bound but not yet rejecting. Gate on FILL (a fraction
+    #    of the pool's queue_size), so a transient depth of a few against a 10000-deep bound is not flagged;
+    #    fall back to an absolute depth only when queue_size is unknown (an unbounded/resizable pool).
+    fill = sig("write_queue_fill_max")
     q = sig("write_queue_max")
-    if q is not None and q > 0:
-        reasons.append(f"write thread-pool queue depth {q} (building, not yet rejecting) => near write capacity.")
+    if (fill is not None and fill >= _QUEUE_WARN_FRACTION) or \
+            (fill is None and q is not None and q >= _QUEUE_WARN_DEPTH):
+        depth = f"depth {q}" if q is not None else "depth n/a"
+        pct = f" ({fill*100:.0f}% of the queue bound)" if fill is not None else ""
+        reasons.append(f"write thread-pool queue {depth}{pct} building toward its bound (not yet rejecting) "
+                       f"=> near write capacity.")
         return VERDICT_SATURATED, reasons
 
     # 3. PRESSURED - indexing-pressure memory a high fraction of its limit (will reject soon).
@@ -414,17 +442,18 @@ def classify_verdict(signals, window_secs):
             )
         return VERDICT_HEAP_GC, reasons
 
-    # 5. Nothing acute observed. Only call HEALTHY if the load-bearing signals were actually collected;
-    #    otherwise we cannot clear the host - fail closed to INCONCLUSIVE naming what was missing.
-    missing = [key for key in _LOAD_BEARING_SIGNALS if sig(key) is None]
+    # 5. Nothing acute observed. Only call HEALTHY if BOTH direct backpressure endpoints responded;
+    #    otherwise we cannot clear the host - fail closed to INCONCLUSIVE naming the endpoint(s) missing.
+    missing = [label for key, label in _REQUIRED_COLLECTION_FLAGS if not sig(key)]
     if missing:
         reasons.append(
-            "no acute congestion in the signals we DID read, but these load-bearing signals were not "
-            f"collected: {', '.join(missing)} => cannot clear the host as healthy (check the endpoint errors above)."
+            "no acute congestion in the signals we DID read, but these backpressure endpoints were not "
+            f"collected: {'; '.join(missing)} => cannot clear the host as healthy (check the endpoint "
+            f"errors above)."
         )
         return VERDICT_INCONCLUSIVE, reasons
 
-    reasons.append("write queue idle, no rejections, indexing pressure and heap/GC within limits.")
+    reasons.append("write queue not building, no rejections, indexing pressure and heap/GC within limits.")
     return VERDICT_HEALTHY, reasons
 
 

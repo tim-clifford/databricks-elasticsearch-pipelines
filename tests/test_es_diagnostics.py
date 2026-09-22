@@ -20,6 +20,7 @@ from pipeline_lib.es_diagnostics import (
     max_heap_percent,
     max_indexing_pressure_pct,
     max_write_queue,
+    max_write_queue_fill,
     parse_breakers,
     parse_cat_nodes,
     parse_cat_thread_pool,
@@ -171,6 +172,18 @@ def test_max_write_queue_none_when_absent():
     assert max_write_queue(parse_cat_thread_pool([{"node_name": "n1"}])) is None
 
 
+def test_max_write_queue_fill_is_fraction_of_queue_size():
+    sample = parse_cat_thread_pool([{"node_name": "n1", "queue": "1000", "queue_size": "10000"},
+                                    {"node_name": "n2", "queue": "50", "queue_size": "10000"}])
+    assert max_write_queue_fill(sample) == pytest.approx(0.1)
+
+
+def test_max_write_queue_fill_none_without_bounded_queue_size():
+    # An unbounded/resizable pool reports queue_size -1 (or omits it); no usable fill => None.
+    sample = parse_cat_thread_pool([{"node_name": "n1", "queue": "5", "queue_size": "-1"}])
+    assert max_write_queue_fill(sample) is None
+
+
 def test_max_indexing_pressure_pct():
     stats = {"nodes": {"a": _ip_node("n1", 700, 1000), "b": _ip_node("n2", 100, 1000)}}
     assert max_indexing_pressure_pct(parse_indexing_pressure(stats)) == pytest.approx(0.7)
@@ -209,11 +222,14 @@ def _clear_signals():
     return {
         "write_rejected_delta": 0,
         "write_queue_max": 0,
+        "write_queue_fill_max": 0.0,
         "indexing_pressure_pct_max": 0.1,
         "indexing_pressure_rejected_delta": 0,
         "breaker_tripped_delta": 0,
         "heap_percent_max": 40,
         "gc_time_delta_ms": 50,
+        "write_pool_collected": True,
+        "indexing_pressure_collected": True,
     }
 
 
@@ -246,13 +262,31 @@ def test_verdict_rejecting_takes_precedence_over_saturation():
     # Both a full queue AND rejections: the more acute REJECTING must win.
     s = _clear_signals()
     s["write_rejected_delta"] = 1
-    s["write_queue_max"] = 500
+    s["write_queue_fill_max"] = 0.5
     assert classify_verdict(s, window_secs=5)[0] == VERDICT_REJECTING
 
 
-def test_verdict_saturated_when_queue_building_no_rejections():
+def test_verdict_saturated_when_queue_fill_over_threshold():
     s = _clear_signals()
-    s["write_queue_max"] = 300
+    s["write_queue_fill_max"] = 0.10  # at the 10% bound => building
+    s["write_queue_max"] = 1000
+    assert classify_verdict(s, window_secs=5)[0] == VERDICT_SATURATED
+
+
+def test_verdict_not_saturated_on_transient_nonzero_queue_below_threshold():
+    # THE finding-1 regression: a small transient queue on a healthy, actively-writing cluster (well under
+    # 10% of the bound) must NOT be flagged SATURATED.
+    s = _clear_signals()
+    s["write_queue_max"] = 30
+    s["write_queue_fill_max"] = 0.003  # 30 / 10000
+    assert classify_verdict(s, window_secs=5)[0] == VERDICT_HEALTHY
+
+
+def test_verdict_saturated_absolute_backstop_when_queue_size_unknown():
+    # No bounded queue_size (fill None), but a large absolute depth => SATURATED via the backstop.
+    s = _clear_signals()
+    s["write_queue_fill_max"] = None
+    s["write_queue_max"] = 500
     assert classify_verdict(s, window_secs=5)[0] == VERDICT_SATURATED
 
 
@@ -295,14 +329,32 @@ def test_verdict_gc_ignored_on_single_snapshot_window_zero():
     assert classify_verdict(s, window_secs=0)[0] == VERDICT_HEALTHY
 
 
-def test_verdict_inconclusive_when_load_bearing_signal_missing():
-    # THE fail-closed regression: no acute problem in what we read, but a load-bearing signal (write
-    # rejections) was NOT collected => must be INCONCLUSIVE, never HEALTHY.
+def test_verdict_inconclusive_when_a_backpressure_endpoint_missing():
+    # THE fail-closed regression: no acute problem in what we read, but the write-pool endpoint did not
+    # respond => must be INCONCLUSIVE, never HEALTHY, and the reason names the endpoint.
     s = _clear_signals()
-    s["write_rejected_delta"] = None
+    s["write_pool_collected"] = False
     code, reasons = classify_verdict(s, window_secs=5)
     assert code == VERDICT_INCONCLUSIVE
-    assert any("write_rejected_delta" in r for r in reasons)
+    assert any("write thread-pool" in r for r in reasons)
+
+
+def test_verdict_healthy_when_ip_limit_absent_but_endpoint_collected():
+    # THE finding-2 regression: indexing pressure responded but a node reported no limit (pct None). That
+    # is a COLLECTED-but-limitless reading, not a missing endpoint, so a clear host must still be HEALTHY.
+    s = _clear_signals()
+    s["indexing_pressure_pct_max"] = None
+    assert classify_verdict(s, window_secs=5)[0] == VERDICT_HEALTHY
+
+
+def test_verdict_healthy_on_single_snapshot_when_endpoints_collected():
+    # Single snapshot (window 0): rate deltas are legitimately None, but the endpoints were collected and
+    # the gauges are clear => HEALTHY, not falsely INCONCLUSIVE for the None deltas.
+    s = _clear_signals()
+    s["write_rejected_delta"] = None
+    s["indexing_pressure_rejected_delta"] = None
+    s["gc_time_delta_ms"] = None
+    assert classify_verdict(s, window_secs=0)[0] == VERDICT_HEALTHY
 
 
 def test_verdict_inconclusive_when_all_signals_missing():
