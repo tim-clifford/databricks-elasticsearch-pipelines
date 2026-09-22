@@ -1,0 +1,67 @@
+resources:
+  jobs:
+    _es_diagnostics:
+      name: "[${bundle.target}] ${var.job_name_prefix}: _es diagnostics"
+      description: >-
+        A serverless, READ-ONLY maintenance job that gathers congestion diagnostics about the
+        Elasticsearch host (and, optionally, one index): write thread-pool saturation and rejections,
+        indexing pressure, circuit breakers, node heap/GC, cluster health and pending tasks, in-flight
+        bulk tasks, hot threads, and per-index stats/settings/shards. It samples the counter endpoints
+        twice (sample_interval_secs apart) so rejection/GC rates are meaningful, then prints a fail-closed
+        congestion verdict. It only issues GET requests and never writes to ES. Connects to the
+        es_host_primary host config (the same endpoint + api_key secret the pipelines use); point it at a
+        different host by editing the base_parameters below. No cluster block => serverless notebook task.
+
+      # Run-time job parameters, all overridable with `--params <name>=<value>`:
+      # - index_name: an index to deep-dive; blank => cluster/node level only.
+      # - verify_certs: "false" for a self-signed endpoint (ignored when ca_certs is set).
+      # - sample_interval_secs: gap between the two counter samples ("0" => single snapshot).
+      # - request_timeout_secs: per-request client timeout.
+      parameters:
+        - name: index_name
+          default: ""
+        - name: verify_certs
+          default: "true"
+        - name: sample_interval_secs
+          default: "5"
+        - name: request_timeout_secs
+          default: "15"
+
+      # Never run two copies at once, consistent with every index job, checkpoint_clear, and deploy_views.
+      max_concurrent_runs: 1
+
+      # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
+      # rather than queued, matching every generated job and the other maintenance jobs.
+      queue:
+        enabled: false
+
+      # Notify the target's support recipients on a run failure. ${var.support_email} is a complex LIST
+      # var: an empty list in dev/stg (no recipients = off) and a real address in prd. Matches every other
+      # job. A diagnostic run only FAILS when it could collect nothing at all (bad host/auth/total outage);
+      # a "found congestion" verdict is a successful run, so this pages only on a real inability to run.
+      email_notifications:
+        on_failure: ${var.support_email}
+      notification_settings:
+        no_alert_for_skipped_runs: true
+        no_alert_for_canceled_runs: true
+
+      tasks:
+        - task_key: es_diagnostics
+          notebook_task:
+            notebook_path: ../notebooks/_es_diagnostics.py
+            # Deploy-time connection settings from the es_host_primary host config (endpoint + secret
+            # scope/key) and the global CA bundle var, resolved per target exactly like the runner. The
+            # run-time knobs (index_name, verify_certs, sample_interval_secs, request_timeout_secs) arrive
+            # as job parameters above, not here.
+            base_parameters:
+              es_host_url: ${var.es_host_primary.es_host_url}
+              secret_scope_name: ${var.es_host_primary.secret_scope_name}
+              secret_key_name: ${var.es_host_primary.secret_key_name}
+              ca_certs: ${var.ca_certs}
+
+      # On-demand: invoke via `databricks bundle run _es_diagnostics -t <target> -p <profile>
+      # [--params index_name=<idx>]`. CAN_MANAGE_RUN so any teammate in `users` can trigger it, matching
+      # checkpoint_clear and deploy_views.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          group_name: users

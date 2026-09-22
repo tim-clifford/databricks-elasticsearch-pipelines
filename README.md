@@ -759,6 +759,44 @@ For a **continuous** (always-on) pipeline, pause the continuous trigger first (o
 job), run the clear, then resume, so the always-on stream is not re-establishing a checkpoint while you
 clear it.
 
+### Diagnosing a congested Elasticsearch host
+
+When a host looks backed up (writes slowing down, requests timing out), run the read-only `_es_diagnostics`
+job (a serverless maintenance job, `resources/_es_diagnostics.job.yml`) to collect an outside view of what
+the cluster is doing:
+
+```bash
+databricks bundle run _es_diagnostics -t <target> -p <profile>                     # cluster/node level
+databricks bundle run _es_diagnostics -t <target> -p <profile> --params index_name=<index>   # + deep-dive one index
+```
+
+It only issues `GET` requests (it never writes a document or reads the ES secret for anything but the
+`Authorization` header) and connects to the `es_host_primary` host config, the same endpoint and `api_key`
+secret the pipelines use. It gathers: write thread-pool saturation and rejections, indexing pressure,
+circuit breakers, node heap/GC, cluster health and pending tasks, in-flight bulk tasks, hot threads, and
+(when `index_name` is set) that index's `_stats`/`_settings`/`_count`/shard placement. It samples the
+counter endpoints **twice** (`sample_interval_secs` apart, default 5s) so rejection/GC rates reflect the
+window rather than lifetime totals, then prints a one-line **verdict** classifying the signature:
+
+- `REJECTING` — ES is actively shedding load with 429s (write-pool / indexing-pressure / breaker
+  rejections in the window). This is the idiomatic backpressure signal; reduce bulk size / write
+  concurrency and back off on 429.
+- `SATURATED` — the write queue is building but not yet rejecting (near capacity).
+- `PRESSURED` — indexing-pressure memory is a high fraction of its limit (rejections imminent).
+- `HEAP_GC_PRESSURE` — high heap and/or heavy GC in the window: the box is processing slowly rather than
+  queueing. A slow `_bulk` that times out client-side (rather than a fast 429) points here or at the
+  network, not at a full queue.
+- `HEALTHY` — every load-bearing signal was collected and is clear.
+- `INCONCLUSIVE` — a load-bearing signal (write rejections/queue, indexing pressure) could not be
+  collected, so the host cannot be cleared as healthy (fail closed). The failed endpoints are listed.
+
+Run parameters (all `--params`-overridable): `index_name` (blank => cluster/node level only),
+`verify_certs` (`false` for a self-signed endpoint; ignored when `ca_certs` is set), `sample_interval_secs`
+(`0` => single snapshot, no rate counters), and `request_timeout_secs`. The run FAILS only when it could
+collect nothing at all (bad host / api_key / TLS / egress); a "found congestion" verdict is a successful
+run, since reporting congestion is the job's purpose. To point it at a host config other than
+`es_host_primary`, edit the `base_parameters` in `resources/_es_diagnostics.job.yml`.
+
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
