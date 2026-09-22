@@ -27,11 +27,48 @@ from pipeline_lib.es_diagnostics import (
     parse_index_stats,
     parse_indexing_pressure,
     parse_jvm,
+    resolve_es_host_config,
     total_breaker_tripped_delta,
     total_indexing_pressure_rejected_delta,
     total_rejected_delta,
     write_pool_saturated,
 )
+
+
+# ============================================================ resolve_es_host_config (fail-closed lookup)
+_HOSTS = {
+    "es_host_primary": {"es_host_url": "https://p:443", "secret_scope_name": "es_poc", "secret_key_name": "api_key"},
+    "es_host_secondary": {"es_host_url": "https://s:443", "secret_scope_name": "sc", "secret_key_name": "k"},
+}
+
+
+def test_resolve_es_host_config_picks_named_host():
+    assert resolve_es_host_config("es_host_secondary", _HOSTS) == ("https://s:443", "sc", "k")
+
+
+def test_resolve_es_host_config_unknown_name_fails_closed():
+    # An unknown name must raise (never fall back to a wrong/blank host) and name the configured hosts.
+    with pytest.raises(ValueError) as e:
+        resolve_es_host_config("es_host_typo", _HOSTS)
+    assert "es_host_primary" in str(e.value) and "es_host_secondary" in str(e.value)
+
+
+def test_resolve_es_host_config_empty_map_fails_closed():
+    with pytest.raises(ValueError):
+        resolve_es_host_config("es_host_primary", {})
+
+
+def test_resolve_es_host_config_blank_url_fails_closed():
+    # A configured-but-unfilled host (empty url, e.g. placeholder on main) must fail closed, not connect to "".
+    hosts = {"es_host_primary": {"es_host_url": "", "secret_scope_name": "es_poc", "secret_key_name": "api_key"}}
+    with pytest.raises(ValueError):
+        resolve_es_host_config("es_host_primary", hosts)
+
+
+def test_resolve_es_host_config_missing_secret_fails_closed():
+    hosts = {"es_host_primary": {"es_host_url": "https://p:443", "secret_scope_name": "", "secret_key_name": ""}}
+    with pytest.raises(ValueError):
+        resolve_es_host_config("es_host_primary", hosts)
 
 
 # ============================================================ parse_cat_thread_pool

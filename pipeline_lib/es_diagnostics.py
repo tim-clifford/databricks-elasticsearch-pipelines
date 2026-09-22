@@ -103,6 +103,32 @@ def _dig(mapping, *keys, default=None):
     return cur
 
 
+# --------------------------------------------------------------------------- host config resolution
+def resolve_es_host_config(name, configs):
+    """Resolve a host-config NAME to (es_host_url, secret_scope_name, secret_key_name).
+
+    `configs` is the name -> {es_host_url, secret_scope_name, secret_key_name} map the job renders from the
+    databricks.yml es_host_* complex vars (one entry per configured host config), so the notebook can pick a
+    host by name at run time (bundle var references resolve at deploy, so the values must be carried in, not
+    indexed by name at run time). FAIL CLOSED / allow-list: a name absent from `configs`, or one whose
+    url/scope/key is blank, raises ValueError (never silently falls back to a wrong or empty host), and the
+    error names the configured hosts so a typo is obvious.
+    """
+    if not isinstance(configs, dict) or name not in configs:
+        available = ", ".join(sorted(configs)) if isinstance(configs, dict) and configs else "(none configured)"
+        raise ValueError(f"unknown es_host_config {name!r}; configured host configs: {available}")
+    entry = configs[name] if isinstance(configs.get(name), dict) else {}
+    url = (entry.get("es_host_url") or "").strip()
+    scope = (entry.get("secret_scope_name") or "").strip()
+    key = (entry.get("secret_key_name") or "").strip()
+    if not url:
+        raise ValueError(f"es_host_config {name!r} has an empty es_host_url "
+                         f"(set it per target in databricks.yml under this host config)")
+    if not scope or not key:
+        raise ValueError(f"es_host_config {name!r} is missing secret_scope_name and/or secret_key_name")
+    return url, scope, key
+
+
 # --------------------------------------------------------------------------- per-endpoint parsers
 def parse_cat_thread_pool(rows):
     """Parse `_cat/thread_pool/write?format=json` rows into a list of per-node write-pool dicts.

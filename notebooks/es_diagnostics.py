@@ -16,9 +16,10 @@
 # MAGIC collected AND clear; a signal it could not read degrades the verdict to INCONCLUSIVE.
 # MAGIC
 # MAGIC Parameters:
-# MAGIC - `es_host_url`, `secret_scope_name`, `secret_key_name` (deploy-time base_parameters, from the same
-# MAGIC   `es_host_config` complex var the pipeline uses): where to connect and which secret holds the
-# MAGIC   `api_key`. Required; a blank value fails closed.
+# MAGIC - `es_host_config` (job parameter, default `es_host_primary`): the NAME of a host config declared in
+# MAGIC   databricks.yml to hit. The job renders the configured host configs' url + secret scope/key into
+# MAGIC   `es_host_configs_json` (a deploy-time base_parameter) and this notebook resolves the name against
+# MAGIC   that map, fail-closed on an unknown name. Override per run with `--params es_host_config=<name>`.
 # MAGIC - `ca_certs` (deploy-time base_parameter, from `${var.ca_certs}`): UC Volume path to a CA bundle
 # MAGIC   verifying the ES TLS cert. Empty => system CAs (unless `verify_certs=false`).
 # MAGIC - `verify_certs` (job parameter, default "true"): set "false" to skip TLS verification (self-signed
@@ -68,24 +69,23 @@ from pipeline_lib.es_diagnostics import (  # noqa: E402
     parse_index_stats,
     parse_indexing_pressure,
     parse_jvm,
+    resolve_es_host_config,
     total_breaker_tripped_delta,
     total_indexing_pressure_rejected_delta,
     total_rejected_delta,
     write_pool_saturated,
 )
 
-dbutils.widgets.text("es_host_url", "", "Elasticsearch endpoint, e.g. https://<host>:9200")
-dbutils.widgets.text("secret_scope_name", "", "Databricks secret scope holding the ES api_key")
-dbutils.widgets.text("secret_key_name", "", "Key in the scope whose value is the ES api_key")
+dbutils.widgets.text("es_host_config", "es_host_primary", "Which host config to hit (a name from databricks.yml, e.g. es_host_primary)")
+dbutils.widgets.text("es_host_configs_json", "{}", "Deploy-time JSON map of configured host configs -> {es_host_url, secret_scope_name, secret_key_name}")
 dbutils.widgets.text("ca_certs", "", "UC Volume path to a CA bundle (PEM) verifying the ES TLS cert (empty => system CAs)")
 dbutils.widgets.text("verify_certs", "true", "Verify TLS certs: true|false (false for self-signed; ignored when ca_certs set)")
 dbutils.widgets.text("index_name", "", "Optional index to deep-dive (empty => cluster/node level only)")
 dbutils.widgets.text("sample_interval_secs", "5", "Seconds between the two counter samples (0 => single snapshot)")
 dbutils.widgets.text("request_timeout_secs", "15", "Per-request client timeout in seconds")
 
-ES_HOST_URL = dbutils.widgets.get("es_host_url").strip()
-SECRET_SCOPE_NAME = dbutils.widgets.get("secret_scope_name").strip()
-SECRET_KEY_NAME = dbutils.widgets.get("secret_key_name").strip()
+ES_HOST_CONFIG = dbutils.widgets.get("es_host_config").strip()
+ES_HOST_CONFIGS_JSON = dbutils.widgets.get("es_host_configs_json").strip()
 CA_CERTS = dbutils.widgets.get("ca_certs").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip().lower()
 INDEX_NAME = dbutils.widgets.get("index_name").strip()
@@ -93,10 +93,16 @@ SAMPLE_INTERVAL_SECS = dbutils.widgets.get("sample_interval_secs").strip()
 REQUEST_TIMEOUT_SECS = dbutils.widgets.get("request_timeout_secs").strip()
 
 # --- validate, fail closed ---------------------------------------------------------------------------
-if not ES_HOST_URL:
-    raise ValueError("missing required parameter: es_host_url")
-if not SECRET_SCOPE_NAME or not SECRET_KEY_NAME:
-    raise ValueError("missing required parameter: secret_scope_name and/or secret_key_name")
+# Resolve the ES connection from the host-config NAME (es_host_config) against the map the job rendered
+# from databricks.yml's es_host_* vars (es_host_configs_json). Bundle var references resolve at deploy, so
+# the notebook picks by name from this carried-in map rather than indexing a var by name at run time.
+if not ES_HOST_CONFIG:
+    raise ValueError("missing required parameter: es_host_config (name of a host config in databricks.yml)")
+try:
+    _HOST_CONFIGS = json.loads(ES_HOST_CONFIGS_JSON or "{}")
+except ValueError as exc:
+    raise ValueError(f"es_host_configs_json is not valid JSON: {exc}")
+ES_HOST_URL, SECRET_SCOPE_NAME, SECRET_KEY_NAME = resolve_es_host_config(ES_HOST_CONFIG, _HOST_CONFIGS)
 
 # index_name is optional, but if given it is interpolated into a request PATH, so allow-list a safe
 # ES index-name charset (lowercase alnum plus . _ -, not starting with - _ +) and reject everything else -
@@ -175,6 +181,7 @@ def es_get(path, as_json=True):
 
 
 print("es_diagnostics - parameters:")
+print(f"  es_host_config       = {ES_HOST_CONFIG!r}  (available: {', '.join(sorted(_HOST_CONFIGS)) or '(none)'})")
 print(f"  es_host_url          = {ES_HOST_URL!r}")
 print(f"  secret               = scope {SECRET_SCOPE_NAME!r} key {SECRET_KEY_NAME!r} (value redacted)")
 print(f"  ca_certs             = {CA_CERTS!r}")

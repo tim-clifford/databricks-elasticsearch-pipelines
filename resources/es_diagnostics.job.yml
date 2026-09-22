@@ -8,16 +8,22 @@ resources:
         indexing pressure, circuit breakers, node heap/GC, cluster health and pending tasks, in-flight
         bulk tasks, hot threads, and per-index stats/settings/shards. It samples the counter endpoints
         twice (sample_interval_secs apart) so rejection/GC rates are meaningful, then prints a fail-closed
-        congestion verdict. It only issues GET requests and never writes to ES. Connects to the
-        es_host_primary host config (the same endpoint + api_key secret the pipelines use); point it at a
-        different host by editing the base_parameters below. No cluster block => serverless notebook task.
+        congestion verdict. It only issues GET requests and never writes to ES. Pick which host config to
+        hit at run time with the es_host_config parameter (a name from databricks.yml, default
+        es_host_primary); the job carries every configured host's url + secret scope/key so the notebook
+        resolves the chosen one by name. No cluster block => serverless notebook task (unless a cluster is
+        supplied via the diagnostics_existing_cluster_id / diagnostics_new_cluster vars below).
 
       # Run-time job parameters, all overridable with `--params <name>=<value>`:
+      # - es_host_config: NAME of a host config in databricks.yml to hit (default es_host_primary). The
+      #   notebook resolves it against es_host_configs_json (rendered below), fail-closed on an unknown name.
       # - index_name: an index to deep-dive; blank => cluster/node level only.
       # - verify_certs: "false" for a self-signed endpoint (ignored when ca_certs is set).
       # - sample_interval_secs: gap between the two counter samples ("0" => single snapshot).
       # - request_timeout_secs: per-request client timeout.
       parameters:
+        - name: es_host_config
+          default: es_host_primary
         - name: index_name
           default: ""
         - name: verify_certs
@@ -49,14 +55,19 @@ resources:
         - task_key: es_diagnostics
           notebook_task:
             notebook_path: ../notebooks/es_diagnostics.py
-            # Deploy-time connection settings from the es_host_primary host config (endpoint + secret
-            # scope/key) and the global CA bundle var, resolved per target exactly like the runner. The
-            # run-time knobs (index_name, verify_certs, sample_interval_secs, request_timeout_secs) arrive
-            # as job parameters above, not here.
             base_parameters:
-              es_host_url: ${var.es_host_primary.es_host_url}
-              secret_scope_name: ${var.es_host_primary.secret_scope_name}
-              secret_key_name: ${var.es_host_primary.secret_key_name}
+              # es_host_configs_json carries EVERY configured host config's url + secret scope/key as a
+              # name -> {..} JSON map, rendered from the databricks.yml es_host_* complex vars per target
+              # (bundle var references resolve at deploy, so the notebook picks by es_host_config NAME from
+              # this carried-in map at run time). One "<name>": {..} block per host config; to add
+              # es_host_secondary, uncomment its var in databricks.yml AND its block here.
+              es_host_configs_json: >-
+                {"es_host_primary": {"es_host_url": "${var.es_host_primary.es_host_url}",
+                "secret_scope_name": "${var.es_host_primary.secret_scope_name}",
+                "secret_key_name": "${var.es_host_primary.secret_key_name}"}}
+              # es_host_secondary example (mirror the databricks.yml es_host_secondary var):
+              #  {"es_host_primary": {"es_host_url": "${var.es_host_primary.es_host_url}", "secret_scope_name": "${var.es_host_primary.secret_scope_name}", "secret_key_name": "${var.es_host_primary.secret_key_name}"},
+              #   "es_host_secondary": {"es_host_url": "${var.es_host_secondary.es_host_url}", "secret_scope_name": "${var.es_host_secondary.secret_scope_name}", "secret_key_name": "${var.es_host_secondary.secret_key_name}"}}
               ca_certs: ${var.ca_certs}
 
       # On-demand: invoke via `databricks bundle run es_diagnostics -t <target> -p <profile>
