@@ -271,10 +271,25 @@ def test_total_indexing_pressure_rejected_delta():
     assert total_indexing_pressure_rejected_delta(before, after) == 5
 
 
+def test_total_indexing_pressure_rejected_delta_none_when_disjoint():
+    # Fully disjoint node sets => no node diffable => fail closed to None (not a spurious 0).
+    before = parse_indexing_pressure({"nodes": {"a": _ip_node("n1", 0, 1000, coord=5)}})
+    after = parse_indexing_pressure({"nodes": {"b": _ip_node("n2", 0, 1000, coord=9)}})
+    assert total_indexing_pressure_rejected_delta(before, after) is None
+
+
 def test_total_breaker_tripped_delta():
-    def br(tripped):
-        return parse_breakers({"nodes": {"a": {"name": "n1", "breakers": {"parent": {"tripped": tripped}}}}})
-    assert total_breaker_tripped_delta(br(2), br(6)) == 4
+    def br(node_id, tripped):
+        return parse_breakers({"nodes": {node_id: {"name": node_id,
+                                                   "breakers": {"parent": {"tripped": tripped}}}}})
+    assert total_breaker_tripped_delta(br("a", 2), br("a", 6)) == 4
+
+
+def test_total_breaker_tripped_delta_none_when_disjoint():
+    def br(node_id, tripped):
+        return parse_breakers({"nodes": {node_id: {"name": node_id,
+                                                   "breakers": {"parent": {"tripped": tripped}}}}})
+    assert total_breaker_tripped_delta(br("a", 2), br("b", 6)) is None
 
 
 def test_max_heap_percent():
@@ -302,6 +317,11 @@ def test_max_gc_time_delta_ms_is_per_node_not_summed():
 
 def test_max_gc_time_delta_ms_none_when_one_sample_empty():
     assert max_gc_time_delta_ms(_jvm_gc({"a": 1000}), {}) is None
+
+
+def test_max_gc_time_delta_ms_none_when_disjoint():
+    # Fully disjoint node sets => no node diffable => fail closed to None (not a spurious 0).
+    assert max_gc_time_delta_ms(_jvm_gc({"a": 1000}), _jvm_gc({"b": 1400})) is None
 
 
 def test_verdict_no_false_heap_gc_from_summed_background_gc():
