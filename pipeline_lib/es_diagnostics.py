@@ -103,6 +103,18 @@ def _dig(mapping, *keys, default=None):
     return cur
 
 
+def _dict_at(mapping, *keys):
+    """Like `_dig` but ALWAYS returns a dict: {} unless the resolved value is itself a dict.
+
+    `_dig(default={})` returns the terminal value as-is when the key is PRESENT, so a present-but-non-dict
+    section (a malformed stats payload where e.g. `indexing` came back as a list) would slip through and
+    make a later `.get(...)` raise. Coercing to {} here keeps a parser total (a malformed section degrades
+    to None fields), matching the isinstance guards the nodes/stats parsers use.
+    """
+    val = _dig(mapping, *keys)
+    return val if isinstance(val, dict) else {}
+
+
 # --------------------------------------------------------------------------- host config resolution
 def resolve_es_host_config(name, configs):
     """Resolve a host-config NAME to (es_host_url, secret_scope_name, secret_key_name).
@@ -290,13 +302,16 @@ def parse_index_stats(stats):
     are cumulative (index_total, *_time_in_millis, merges.total, refresh.total) are diffed across samples;
     the *_current and translog/segments gauges are read as point-in-time state.
     """
-    total = _dig(stats, "_all", "total", default={})
-    indexing = _dig(total, "indexing", default={})
-    merges = _dig(total, "merges", default={})
-    refresh = _dig(total, "refresh", default={})
-    flush = _dig(total, "flush", default={})
-    translog = _dig(total, "translog", default={})
-    segments = _dig(total, "segments", default={})
+    # _dict_at (not _dig) so a present-but-non-dict section in a malformed _stats payload coerces to {}
+    # instead of making the .get(...) calls below raise - parse_index_stats runs outside es_get's fail-soft
+    # wrapper, so an exception here would crash the whole run rather than degrading one endpoint.
+    total = _dict_at(stats, "_all", "total")
+    indexing = _dict_at(total, "indexing")
+    merges = _dict_at(total, "merges")
+    refresh = _dict_at(total, "refresh")
+    flush = _dict_at(total, "flush")
+    translog = _dict_at(total, "translog")
+    segments = _dict_at(total, "segments")
     return {
         "index_total": _to_int(indexing.get("index_total")),
         "index_time_ms": _to_int(indexing.get("index_time_in_millis")),

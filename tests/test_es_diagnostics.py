@@ -191,6 +191,17 @@ def test_parse_index_stats_reads_all_total():
     assert parsed["refresh_total"] is None
 
 
+def test_parse_index_stats_malformed_section_does_not_raise():
+    # A present-but-non-dict section (malformed payload: indexing as a list, merges as a scalar) must
+    # degrade to None fields, NOT raise AttributeError - parse_index_stats runs outside es_get's fail-soft
+    # wrapper, so a crash here would take down the whole run.
+    stats = {"_all": {"total": {"indexing": ["oops"], "merges": 7, "translog": None}}}
+    parsed = parse_index_stats(stats)  # must not raise
+    assert parsed["index_total"] is None and parsed["merges_current"] is None
+    # And a total that is itself non-dict.
+    assert parse_index_stats({"_all": {"total": "nope"}})["segments_count"] is None
+
+
 # ============================================================ reducers: deltas over the window
 def test_total_rejected_delta_counts_only_the_window_increment():
     # THE cumulative-counter regression: rejected is since-boot; the delta must be after-before (3), not
