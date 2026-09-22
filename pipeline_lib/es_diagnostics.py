@@ -304,7 +304,8 @@ def total_rejected_delta(tp_before, tp_after):
     Returns None unless BOTH samples carried usable rejected counts: an empty side means the endpoint was
     not collected in that sample, so no trustworthy window rate can be computed and the verdict must fail
     closed (this is what stops a sample-B failure from reading as a spurious 0). Otherwise an int >= 0. When
-    both sides are populated, a node present in only one of them contributes 0 (it came/went, not a spike).
+    both sides are populated AND share at least one node, a node present in only one of them contributes 0
+    (it came/went, not a spike); if the node sets are fully disjoint, nothing is diffable, so this is None.
     Keyed on node_id so two nodes never collapse to one entry even if their display names are blank/equal;
     and if a sample's keys DO collapse (e.g. rows missing node_id AND sharing a blank name), the pairing is
     unreliable, so this returns None (fail closed) rather than under-counting via last-write-wins.
@@ -321,6 +322,8 @@ def total_rejected_delta(tp_before, tp_after):
     after = {_tp_key(r): r["rejected"] for r in tp_after if r.get("rejected") is not None}
     if not before or not after:
         return None
+    if before.keys().isdisjoint(after.keys()):
+        return None  # no node persisted across the window => nothing diffable => rate unmeasurable
     delta = 0
     for node, aft in after.items():
         bef = before.get(node)
@@ -372,6 +375,8 @@ def total_indexing_pressure_rejected_delta(ip_before, ip_after):
     collected (an empty side => rate unmeasurable => fail closed, never a spurious 0)."""
     if not ip_before or not ip_after:
         return None
+    if ip_before.keys().isdisjoint(ip_after.keys()):
+        return None  # no node persisted across the window => rate unmeasurable => fail closed
     delta = 0
     for node, aft in ip_after.items():
         bef = ip_before.get(node)
@@ -389,6 +394,8 @@ def total_breaker_tripped_delta(br_before, br_after):
     were collected (an empty side => rate unmeasurable => fail closed, never a spurious 0)."""
     if not br_before or not br_after:
         return None
+    if br_before.keys().isdisjoint(br_after.keys()):
+        return None  # no node persisted across the window => rate unmeasurable => fail closed
     delta = 0
     for node, breakers in br_after.items():
         bef_node = br_before.get(node, {})
@@ -413,10 +420,13 @@ def max_gc_time_delta_ms(jvm_before, jvm_after):
     Per-node MAX, not a cross-node sum: the GC-pressure gate scales the threshold by ONE window's
     wall-clock, so summing N nodes' ordinary background GC would exceed it even when no single node is
     GC-bound (a spurious HEAP_GC on any multi-node cluster). Mirrors the per-node max_heap_percent gate.
-    Returns 0 when both samples are populated but no node matches (all came/went), never a spurious spike.
+    Returns None when the node sets are fully disjoint (no node diffable over the window); a departed node
+    alongside a persisting one contributes 0, never a spurious spike.
     """
     if not jvm_before or not jvm_after:
         return None
+    if jvm_before.keys().isdisjoint(jvm_after.keys()):
+        return None  # no node persisted across the window => rate unmeasurable => fail closed
     best = 0
     for node, aft in jvm_after.items():
         bef = jvm_before.get(node)

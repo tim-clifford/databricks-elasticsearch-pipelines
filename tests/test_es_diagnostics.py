@@ -185,10 +185,20 @@ def test_total_rejected_delta_counter_reset_contributes_zero():
     assert total_rejected_delta(before, after) == 0
 
 
-def test_total_rejected_delta_node_only_in_one_sample_contributes_zero():
+def test_total_rejected_delta_none_when_node_sets_disjoint():
+    # Fully disjoint node sets (every node replaced in the window) => NO node was diffable, so the rate is
+    # unmeasurable and this MUST fail closed to None, not return a spurious 0 that masks n1's rejections.
     before = parse_cat_thread_pool([{"node_name": "n1", "rejected": "100"}])
     after = parse_cat_thread_pool([{"node_name": "n2", "rejected": "5"}])
-    assert total_rejected_delta(before, after) == 0
+    assert total_rejected_delta(before, after) is None
+
+
+def test_total_rejected_delta_departed_node_ignored_when_a_node_persists():
+    # Partial overlap: n1 persists (diffable), n2 departed. With a shared node present, the departed node
+    # contributes 0 and the delta is n1's window increment (3).
+    before = parse_cat_thread_pool([{"node_id": "n1", "rejected": "100"}, {"node_id": "n2", "rejected": "50"}])
+    after = parse_cat_thread_pool([{"node_id": "n1", "rejected": "103"}])
+    assert total_rejected_delta(before, after) == 3
 
 
 def test_total_rejected_delta_distinct_ids_do_not_collapse_when_names_blank():
