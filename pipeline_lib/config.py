@@ -219,6 +219,12 @@ _VALID_TRIGGER_INTERVAL = re.compile(
 # already-running stream is a no-op until that stream's checkpoint is cleared.
 _VALID_STREAMING_STARTS = ("new", "full")
 
+# The two Databricks Jobs trigger pause states. A per-pipeline `pause_status` config key (optional)
+# picks one to override the target-wide ${var.schedule_pause_status} default for THIS job's trigger;
+# omitting it inherits that global. Allow-list validated so a typo (e.g. "paused"/"UNPAUSE") fails
+# closed at config load rather than deploying an unrecognized pause_status the Jobs API would reject.
+_VALID_PAUSE_STATUSES = ("PAUSED", "UNPAUSED")
+
 # Read/scan parallelism is governed by spark.sql.files.maxPartitionBytes (the size of each source file
 # split): smaller => more, smaller splits => the scan and the view transform fan out across more cores.
 # This is the PRIMARY parallelism lever, because the scan+transform (projections, casts, broadcast
@@ -295,6 +301,23 @@ def require_streaming_start(value: object, where: str = "streaming_start") -> st
     if value not in _VALID_STREAMING_STARTS:
         raise PipelineConfigError(
             f"{where} must be one of {', '.join(_VALID_STREAMING_STARTS)}, got {value!r}"
+        )
+    return value
+
+
+def require_pause_status(value: object, where: str = "pause_status") -> str:
+    """A Databricks Jobs trigger pause state, restricted to the allow-list (PAUSED|UNPAUSED). Fail closed.
+
+    Validates the OPTIONAL per-pipeline pause_status config key (checked at config load). A pipeline
+    that omits it defers to the target-wide ${var.schedule_pause_status} default; a PRESENT value
+    overrides that for this job's own trigger. Only jobs that declare a schedule or continuous trigger
+    can carry it (a cross-field guard in validate_config rejects it on a standalone on-demand job, and
+    the generator rejects it on a triggerless job_group). This is a deploy-time job property baked into
+    the generated trigger block, not a run-time knob, so it is not --params-overridable. See
+    _VALID_PAUSE_STATUSES."""
+    if value not in _VALID_PAUSE_STATUSES:
+        raise PipelineConfigError(
+            f"{where} must be one of {', '.join(_VALID_PAUSE_STATUSES)}, got {value!r}"
         )
     return value
 
@@ -743,7 +766,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
-        "job_group", "job_name_postfix",
+        "pause_status", "job_group", "job_name_postfix",
     }
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
@@ -889,6 +912,18 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # always-on (a Databricks Jobs continuous trigger + a ProcessingTime stream; see _validate_continuous).
     # A deploy-time job property, validated here and passed through resolve unchanged.
     continuous = _validate_continuous(raw.get("continuous"), f"{source}: continuous")
+    # pause_status is OPTIONAL: absent -> "" (inherit the target-wide ${var.schedule_pause_status}
+    # default; databricks.yml sets it to PAUSED, with only prd binding UNPAUSED). A PRESENT value is
+    # allow-list validated (PAUSED|UNPAUSED) and overrides that global for THIS job's trigger only.
+    # Stored "" when omitted so the generator's `cfg_value or "${var.schedule_pause_status}"` reaches
+    # the global. A deploy-time job property (baked into the generated schedule/continuous block, not a
+    # run-time knob), carrying no object names or ${environment}, so it is passed through resolve
+    # unchanged. It is meaningful only on a job that HAS a trigger: the cross-field guard below rejects
+    # it on a standalone on-demand job, and the generator rejects it on a triggerless job_group.
+    pause_status = (
+        require_pause_status(raw["pause_status"], f"{source}: pause_status")
+        if "pause_status" in raw else ""
+    )
     # job_group is OPTIONAL: absent -> None (this config renders as its own standalone job, the 1:1
     # default). Present -> a bare identifier; the generator (scripts/gen_jobs.py) merges every config
     # sharing this value into ONE Databricks job, one independent task each (no dependencies), and the
@@ -935,6 +970,18 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
                 f"always-on continuous trigger or a schedule, not both); remove one"
             )
 
+    # pause_status is meaningful only on a job that HAS a trigger (it sets pause_status inside the
+    # generated schedule/continuous block). Reject it fail-closed on a STANDALONE on-demand job (no
+    # schedule, no continuous, and not part of a job_group), where it would silently do nothing.
+    # A grouped member (job_group set) may set pause_status while inheriting the group's trigger, so it
+    # is NOT rejected here; the generator's group resolver rejects a job_group that has no trigger at all.
+    if pause_status and schedule is None and continuous is None and job_group is None:
+        raise PipelineConfigError(
+            f"{source}: pause_status applies to a job's schedule or continuous trigger, but this "
+            f"config is on-demand (no schedule, no continuous, no job_group), so pause_status would "
+            f"have no effect. Add a schedule/continuous trigger, or remove pause_status."
+        )
+
     # op_type: create is APPEND-ONLY and needs an explicit _id to dedup a resend against. Without
     # es_id_field the connector passes no _id, ES auto-assigns a random one, so a create can never
     # 409-conflict: the resend-dedup the mode promises never fires and a replay accumulates duplicates.
@@ -978,6 +1025,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "compute": compute,
         "schedule": schedule,
         "continuous": continuous,
+        "pause_status": pause_status,
         "job_group": job_group,
         "job_name_postfix": job_name_postfix,
     }
@@ -1278,6 +1326,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "schedule": cfg["schedule"],
         # continuous (always-on trigger) is likewise a deploy-time job property: passed through verbatim.
         "continuous": cfg["continuous"],
+        # pause_status (per-pipeline trigger pause override) is likewise a deploy-time job property, not
+        # an object name: passed through verbatim (canonical string form, "" => inherit the global).
+        "pause_status": cfg["pause_status"],
         # job_group (which job a config is merged into) and job_name_postfix (a cosmetic display segment)
         # are deploy-time job properties, not object names: passed through verbatim, no ${environment}.
         "job_group": cfg["job_group"],

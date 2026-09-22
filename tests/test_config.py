@@ -22,6 +22,7 @@ from pipeline_lib.config import (
     require_max_bytes_per_trigger,
     require_max_files_per_trigger,
     require_max_partition_bytes,
+    require_pause_status,
     require_pipeline_mode,
     require_request_timeout,
     require_streaming_start,
@@ -1690,6 +1691,86 @@ def test_schedule_carried_through_resolve():
 def test_schedule_none_carried_through_resolve():
     out = resolve_config(validate_config(_base()), environment="")
     assert out["schedule"] is None
+
+
+# --------------------------------------------------------------------------- pause_status (per-pipeline)
+
+
+def test_pause_status_absent_defaults_empty():
+    # No pause_status key => "" (inherit the target-wide ${var.schedule_pause_status} global).
+    assert validate_config(_base())["pause_status"] == ""
+
+
+@pytest.mark.parametrize("value", ["PAUSED", "UNPAUSED"])
+def test_pause_status_valid_accepted_with_schedule(value):
+    # A pipeline with a trigger may set its own pause_status (allow-list PAUSED|UNPAUSED).
+    cfg = _base()
+    cfg["schedule"] = {"quartz_cron_expression": "0 0 8 * * ?"}
+    cfg["pause_status"] = value
+    assert validate_config(cfg)["pause_status"] == value
+
+
+@pytest.mark.parametrize("bad", ["paused", "unpaused", "UNPAUSE", "", "PAUSE", True, 1, None])
+def test_pause_status_invalid_rejected(bad):
+    # Allow-list: anything but exactly PAUSED/UNPAUSED fails closed (a typo would deploy a pause_status
+    # the Jobs API rejects, or silently mean nothing). Paired with a schedule so the failure is the
+    # allow-list check, not the on-demand cross-field guard.
+    cfg = _base()
+    cfg["schedule"] = {"quartz_cron_expression": "0 0 8 * * ?"}
+    cfg["pause_status"] = bad
+    with pytest.raises(PipelineConfigError, match="pause_status"):
+        validate_config(cfg)
+
+
+def test_pause_status_on_demand_standalone_rejected():
+    # A standalone on-demand job (no schedule/continuous/job_group) can't use pause_status: it would
+    # have no effect, so fail closed rather than silently ignore it.
+    cfg = _base()
+    cfg["pause_status"] = "UNPAUSED"
+    with pytest.raises(PipelineConfigError, match="pause_status.*no effect|on-demand"):
+        validate_config(cfg)
+
+
+def test_pause_status_allowed_on_continuous():
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    cfg["pause_status"] = "UNPAUSED"
+    assert validate_config(cfg)["pause_status"] == "UNPAUSED"
+
+
+def test_pause_status_allowed_on_grouped_member_without_own_trigger():
+    # A grouped member may set pause_status while inheriting the group's trigger (job_group present), so
+    # it is NOT rejected at the config layer even though this member declares no schedule/continuous.
+    # (The generator rejects a job_group that has no trigger at all.)
+    cfg = _base()
+    cfg["job_group"] = "grp"
+    cfg["pause_status"] = "UNPAUSED"
+    assert validate_config(cfg)["pause_status"] == "UNPAUSED"
+
+
+def test_pause_status_carried_through_resolve():
+    # pause_status is a deploy-time job property, not an object name: resolve passes it through unchanged.
+    cfg = _with_env()
+    cfg["schedule"] = {"quartz_cron_expression": "0 0 8 * * ?"}
+    cfg["pause_status"] = "UNPAUSED"
+    out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["pause_status"] == "UNPAUSED"
+
+
+def test_pause_status_absent_carried_through_resolve_as_empty():
+    out = resolve_config(validate_config(_base()), environment="")
+    assert out["pause_status"] == ""
+
+
+@pytest.mark.parametrize("value", ["PAUSED", "UNPAUSED"])
+def test_require_pause_status_accepts_allowed(value):
+    assert require_pause_status(value) == value
+
+
+@pytest.mark.parametrize("bad", ["paused", "", "UNPAUSE", None, 0, True])
+def test_require_pause_status_rejects_others(bad):
+    with pytest.raises(PipelineConfigError, match="pause_status"):
+        require_pause_status(bad)
 
 
 # --------------------------------------------------------------------------- continuous (always-on)

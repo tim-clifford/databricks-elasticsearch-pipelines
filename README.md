@@ -128,7 +128,7 @@ value fails closed wherever the value is required. The bundle variables are:
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Set per target (empty on `main`). Required for a streaming run (fails closed if empty); unused by batch and `deploy_views`. The `dev` target shows how to append `${workspace.current_user.short_name}` to isolate each developer's checkpoints (see [Streaming](#streaming)) |
 | `cluster_policy_id` | workspace-specific cluster policy id injected into every job cluster (see [Compute](#compute)). Set per target (empty on `main`); required only when a pipeline uses `job_cluster` compute |
 | `ca_certs` | UC Volume path to a CA bundle (PEM) the connector uses to verify the ES server's TLS certificate. One global bundle shared by every host config. Set per target (empty on `main`); empty means fall back to the system CA store. Incompatible with `verify_certs: false` (the connector rejects that combination at run). Per-endpoint CA pinning is not supported (would need `ca_certs` moved onto the `es_host_*` complex variables) |
-| `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
+| `schedule_pause_status` | target-wide default `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. A pipeline config's own top-level `pause_status` overrides this for that one job's trigger. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
 | `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log; connector **>= 0.9.3**). Empty default (off; the connector default stands). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
 | `retry_transport_timeout` | global default for the connector's `retry_transport_timeout` reliability toggle (connector **>= 0.9.7**): when on, the connector OWNS whole-request timeout retries (re-sends a timed-out bulk with backoff instead of letting the transport re-send it invisibly and then failing the batch). Empty default (off; the connector default stands). Threaded exactly like `bulk_stats`: the generator bakes `${var.retry_transport_timeout}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=retry_transport_timeout=true`) turns it on for a whole environment, and a pipeline's own `retry_transport_timeout:` or a per-run `--params retry_transport_timeout=<v>` override it (see [Configuration](#configuration)) |
 | `bypass_fast_path` | global default for the connector's `bypass_fast_path` write-path toggle (connector **>= 0.10.0**): when on, the connector skips its `filter_path="errors"` probe and classifies every chunk per-item, which makes the `docs_deduped` / `written` counts EXACT for `op_type=create` on chunks mixing new and existing `_id`s (and avoids the auto-id re-ship duplication), at the cost of the fast path's throughput on clean chunks. Empty default (off; the fast path is used). Threaded exactly like `bulk_stats`: the generator bakes `${var.bypass_fast_path}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bypass_fast_path=true`) turns it on for a whole environment, and a pipeline's own `bypass_fast_path:` or a per-run `--params bypass_fast_path=<v>` override it (see [Configuration](#configuration)) |
@@ -191,6 +191,7 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
 #   quartz_cron_expression: "0 0 8 * * ?"   # 08:00 UTC daily
 # continuous:                      # OPTIONAL: run always-on instead of scheduled (see Continuous streaming).
 #   trigger_interval: 30 seconds   #   streaming + classic compute only; mutually exclusive with schedule
+# pause_status: UNPAUSED           # OPTIONAL: override the target-wide schedule_pause_status for THIS job's trigger (needs a schedule/continuous; see Scheduling)
 # job_group: ecs_streams           # OPTIONAL: merge every config sharing this name into ONE job, one task each (see Job groups)
 # job_name_postfix: "ECS streams"  # OPTIONAL: cosmetic display-name segment (default: config name, or group name in a group)
 ```
@@ -383,6 +384,22 @@ without touching configs: `dev` and `stg` inherit the paused default, so schedul
 **dormant** in both; only `prd` binds `UNPAUSED` and actually fires them. Unpause a single job in the
 UI/API for a one-off test, or set `--var=schedule_pause_status=UNPAUSED` at deploy to override.
 
+**Per-pipeline pause override.** A single pipeline can opt out of the target-wide default with its own
+top-level `pause_status: PAUSED | UNPAUSED` config key, which overrides `${var.schedule_pause_status}`
+for that one job's trigger (two-layer pattern: target-wide default `<` per-pipeline value). A pipeline
+that omits `pause_status` inherits the target-wide default, so this is fully backward-compatible. It
+applies to the job's `schedule` **or** `continuous` trigger, so it is only valid on a job that has one:
+an on-demand pipeline (no `schedule`, no `continuous`, and not in a `job_group`) that sets `pause_status`
+is rejected at config load, and a `job_group` with no trigger at all that sets it is rejected by
+`gen_jobs.py`. In a `job_group` (one job, one trigger), members follow define-once/conflict-fails: at
+most one distinct `pause_status` across members, others inherit.
+
+```yaml
+pause_status: UNPAUSED          # optional; overrides the target-wide schedule_pause_status default
+schedule:
+  quartz_cron_expression: "0 */10 * * * ?"
+```
+
 ### Continuous (always-on) streaming
 
 A scheduled `streaming` job drains the new commits and stops on each tick. For lower latency you can
@@ -413,8 +430,10 @@ matters only on the very first run.
 
 **Pausing.** Like a schedule, the continuous trigger's `pause_status` is bound to
 `schedule_pause_status` (default `PAUSED`), so `dev`/`stg` deploy the always-on job **dormant** and
-only `prd` (or an explicit `--var=schedule_pause_status=UNPAUSED`) actually runs it. One always-on run
-holds its job cluster for as long as it is unpaused, so treat it as a running-cost commitment.
+only `prd` (or an explicit `--var=schedule_pause_status=UNPAUSED`) actually runs it. A single pipeline
+can override this with its own top-level `pause_status` key (see **Per-pipeline pause override** above),
+which applies to the continuous trigger the same way. One always-on run holds its job cluster for as
+long as it is unpaused, so treat it as a running-cost commitment.
 
 **Failure recovery.** A continuous job's per-task recovery is governed by the continuous trigger's
 `task_retry_mode`, which the generator pins to **`ON_FAILURE`** for every continuous job. This is

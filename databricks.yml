@@ -269,15 +269,18 @@ variables:
     description: "Global default streaming read rate-limit: max bytes per micro-batch (e.g. 128m), for pipelines that omit it. Empty default (no cap). A pipeline's own value and a per-run --params override this. Streaming only."
     default: ""
 
-  # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
-  # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
-  # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds
-  # UNPAUSED to actually run them. Default PAUSED (rather than relying on `mode: development` to pause
-  # dev) because an EXPLICIT pause_status is honored as-is - development mode does not override it
-  # (verified live), so the safe value has to be the default here. Only jobs that declare a schedule
-  # are affected; on-demand jobs have no schedule block.
+  # TARGET-WIDE default pause_status for EVERY generated job trigger (gen_jobs.py emits pause_status:
+  # ${var.schedule_pause_status} into each schedule/continuous block unless the pipeline overrides it).
+  # Default PAUSED (fail-safe): triggers deploy but do NOT fire unless a target explicitly opts in, so
+  # dev and stg inherit PAUSED and never fire, and only prd binds UNPAUSED to actually run them. Default
+  # PAUSED (rather than relying on `mode: development` to pause dev) because an EXPLICIT pause_status is
+  # honored as-is - development mode does not override it (verified live), so the safe value has to be
+  # the default here. Only jobs that declare a schedule or continuous trigger are affected; on-demand
+  # jobs have no trigger block. PER-PIPELINE OVERRIDE: a config may set its own top-level `pause_status:
+  # PAUSED|UNPAUSED` to override this target-wide default for that one job's trigger (two-layer pattern:
+  # this global default < the per-pipeline value); a pipeline that omits pause_status inherits this.
   schedule_pause_status:
-    description: "PAUSED or UNPAUSED for all job schedules (default PAUSED = fail-safe). Only prd binds UNPAUSED so schedules fire there; dev and stg stay paused."
+    description: "Target-wide default PAUSED or UNPAUSED for all job triggers (default PAUSED = fail-safe). Only prd binds UNPAUSED so triggers fire there; dev and stg stay paused. A pipeline config's own pause_status overrides this per job."
     default: "PAUSED"
 
   # Cluster policy id injected into EVERY generated job cluster: gen_jobs.py emits policy_id:
