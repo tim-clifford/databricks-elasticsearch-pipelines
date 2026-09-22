@@ -284,6 +284,18 @@ def test_render_schedule_composes_with_compute():
     assert job["tasks"][0]["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
 
 
+def test_render_schedule_pause_status_override():
+    # A per-pipeline pause_status overrides the target-wide global for THIS job's schedule: the literal
+    # PAUSED|UNPAUSED is emitted instead of ${var.schedule_pause_status}.
+    cfg = _cfg(schedule={"quartz_cron_expression": "0 0 8 * * ?"})
+    cfg["pause_status"] = "UNPAUSED"
+    job = _render_job(cfg)
+    assert job["schedule"]["pause_status"] == "UNPAUSED"
+    # The rest of the schedule block is unchanged.
+    assert job["schedule"]["quartz_cron_expression"] == "0 0 8 * * ?"
+    assert job["schedule"]["timezone_id"] == "UTC"
+
+
 # --------------------------------------------------------------------------- render: continuous
 
 _JC_SPEC = {"spark_version": "17.3.x-scala2.13", "node_type_id": "i3.xlarge", "num_workers": 1}
@@ -321,6 +333,18 @@ def test_render_continuous_emits_trigger_and_no_schedule():
         "task_retry_mode": "ON_FAILURE",
     }
     assert "schedule" not in job
+
+
+def test_render_continuous_pause_status_override():
+    # A per-pipeline pause_status overrides the target-wide global on a continuous trigger too; the
+    # task_retry_mode pin is unaffected.
+    cfg = _continuous_cfg()
+    cfg["pause_status"] = "UNPAUSED"
+    job = _render_job(cfg, _JC_SPEC)
+    assert job["continuous"] == {
+        "pause_status": "UNPAUSED",
+        "task_retry_mode": "ON_FAILURE",
+    }
 
 
 def test_render_continuous_sets_task_retry_mode_on_failure():
@@ -754,7 +778,7 @@ def test_shipped_build_wheel_job_shape():
 
 
 def _member(config_filename, name, es_index, *, group="g1", postfix=None, mode="streaming",
-            continuous=None, schedule=None, job_cluster_config=None, cluster_config=None):
+            continuous=None, schedule=None, pause_status=None, job_cluster_config=None, cluster_config=None):
     """One (config_filename, name, cfg, spec) group member. spec is a job-cluster new_cluster spec when
     job_cluster_config is set (mirrors what main() loads), else None."""
     raw = {
@@ -765,6 +789,8 @@ def _member(config_filename, name, es_index, *, group="g1", postfix=None, mode="
     }
     if postfix is not None:
         raw["job_name_postfix"] = postfix
+    if pause_status is not None:
+        raw["pause_status"] = pause_status
     if continuous is not None:
         raw["continuous"] = {"trigger_interval": continuous}
     if schedule is not None:
@@ -918,6 +944,54 @@ def test_group_continuous_conflicting_interval_fails_closed():
         gen_jobs.render_group_job_yaml("g1", [
             _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="s"),
             _member("b.yml", "b", "idx-b", continuous="1 minute", job_cluster_config="s"),
+        ])
+
+
+def test_group_schedule_omitted_pause_status_inherits_global():
+    # No member sets pause_status => the group schedule inherits the target-wide global (unchanged).
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch", schedule="0 0 8 * * ?"),
+        _member("b.yml", "b", "idx-b", mode="batch", schedule="0 0 8 * * ?"),
+    ])
+    assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
+
+
+def test_group_pause_status_adopted_from_single_declaring_member():
+    # One member sets pause_status, the other omits it: the declared one is adopted for the group's
+    # single trigger (lenient define-once, like job_name_postfix and the cron).
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch", schedule="0 0 8 * * ?", pause_status="UNPAUSED"),
+        _member("b.yml", "b", "idx-b", mode="batch", schedule="0 0 8 * * ?"),
+    ])
+    assert job["schedule"]["pause_status"] == "UNPAUSED"
+
+
+def test_group_continuous_pause_status_override():
+    # A continuous group adopts a member's pause_status onto its continuous trigger.
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="shared", pause_status="UNPAUSED"),
+        _member("b.yml", "b", "idx-b", job_cluster_config="shared"),
+    ])
+    assert job["continuous"]["pause_status"] == "UNPAUSED"
+
+
+def test_group_conflicting_pause_status_fails_closed():
+    # A group is one job with one trigger, so one pause state: two members setting DIFFERENT values fail.
+    with pytest.raises(ValueError, match="conflicting pause_status"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "idx-a", mode="batch", schedule="0 0 8 * * ?", pause_status="PAUSED"),
+            _member("b.yml", "b", "idx-b", mode="batch", schedule="0 0 8 * * ?", pause_status="UNPAUSED"),
+        ])
+
+
+def test_group_pause_status_on_demand_fails_closed():
+    # A member setting pause_status while the GROUP has no trigger at all (all on-demand) fails closed:
+    # there is nothing for pause_status to apply to. (The config layer allows it because the member is
+    # grouped; the group resolver is where the whole-group triggerless case is caught.)
+    with pytest.raises(ValueError, match="pause_status.*no trigger|no effect"):
+        gen_jobs.render_group_job_yaml("g1", [
+            _member("a.yml", "a", "idx-a", mode="batch", pause_status="UNPAUSED"),
+            _member("b.yml", "b", "idx-b", mode="batch"),
         ])
 
 
