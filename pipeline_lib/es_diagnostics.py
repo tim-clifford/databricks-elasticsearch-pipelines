@@ -36,15 +36,18 @@ _PRESSURE_WARN_FRACTION = 0.70   # indexing-pressure current >= 70% of its limit
 _HEAP_WARN_PERCENT = 85          # any node's JVM heap >= 85% => heap pressure.
 _GC_WARN_WINDOW_FRACTION = 0.30  # GC collection time in the window >= 30% of wall-clock => GC pressure.
 
-# The two direct backpressure ENDPOINTS whose collection HEALTHY depends on. The verdict clears a host as
-# healthy only when both responded (passed as the booleans write_pool_collected / indexing_pressure_collected
-# the notebook sets from whether each endpoint returned data). This is deliberately keyed on endpoint
-# collection, NOT on whether a derived scalar (e.g. indexing-pressure pct) is None: a present-but-limitless
-# indexing-pressure reading, or a single-snapshot run whose rate deltas are legitimately None, still counts
-# as collected and must not be mistaken for a missing signal.
-_REQUIRED_COLLECTION_FLAGS = (
-    ("write_pool_collected", "write thread-pool (_cat/thread_pool/write)"),
-    ("indexing_pressure_collected", "indexing pressure (_nodes/stats/indexing_pressure)"),
+# The rate signals HEALTHY depends on having ACTUALLY MEASURED. Each is a window delta the reducers return
+# as None unless its counter endpoint was collected in BOTH samples over a real window (window_secs>0). A
+# None here therefore means the rate could not be measured - single snapshot, or a partial/total endpoint
+# failure in either sample - so a rejection burst cannot be ruled out and the verdict fails closed to
+# INCONCLUSIVE. Keying HEALTHY on the measured RATE (not on a point-in-time collection flag) is what closes
+# the partial-sample-failure fail-open: a sample-B failure yields a None delta here, never a spurious 0.
+# It also subsumes endpoint collection (a delta is non-None only if the endpoint answered in both samples),
+# while a present-but-limitless indexing-pressure reading still measures its rejection delta fine (finding
+# 2), because the delta comes from the rejection counters, not from the limit-derived pct.
+_REQUIRED_MEASURED_SIGNALS = (
+    ("write_rejected_delta", "write thread-pool rejection rate over the window"),
+    ("indexing_pressure_rejected_delta", "indexing-pressure rejection rate over the window"),
 )
 
 
@@ -279,13 +282,15 @@ def _tp_key(row):
 def total_rejected_delta(tp_before, tp_after):
     """Sum of (after - before) write-pool `rejected` across nodes, matched by node id.
 
-    Returns None if NEITHER sample carried a usable rejected count (signal not collected); otherwise an int
-    >= 0. A node present only in one sample contributes 0 (we can't diff it) rather than a spurious spike.
+    Returns None unless BOTH samples carried usable rejected counts: an empty side means the endpoint was
+    not collected in that sample, so no trustworthy window rate can be computed and the verdict must fail
+    closed (this is what stops a sample-B failure from reading as a spurious 0). Otherwise an int >= 0. When
+    both sides are populated, a node present in only one of them contributes 0 (it came/went, not a spike).
     Keyed on node_id so two nodes never collapse to one entry even if their display names are blank/equal.
     """
     before = {_tp_key(r): r["rejected"] for r in tp_before if r.get("rejected") is not None}
     after = {_tp_key(r): r["rejected"] for r in tp_after if r.get("rejected") is not None}
-    if not before and not after:
+    if not before or not after:
         return None
     delta = 0
     for node, aft in after.items():
@@ -323,8 +328,9 @@ def max_indexing_pressure_pct(ip_sample):
 
 
 def total_indexing_pressure_rejected_delta(ip_before, ip_after):
-    """Sum of (after - before) indexing-pressure rejections across nodes. None if not collected either sample."""
-    if not ip_before and not ip_after:
+    """Sum of (after - before) indexing-pressure rejections across nodes. None unless BOTH samples were
+    collected (an empty side => rate unmeasurable => fail closed, never a spurious 0)."""
+    if not ip_before or not ip_after:
         return None
     delta = 0
     for node, aft in ip_after.items():
@@ -339,8 +345,9 @@ def total_indexing_pressure_rejected_delta(ip_before, ip_after):
 
 
 def total_breaker_tripped_delta(br_before, br_after):
-    """Sum of (after - before) circuit-breaker `tripped` across nodes+breakers. None if not collected."""
-    if not br_before and not br_after:
+    """Sum of (after - before) circuit-breaker `tripped` across nodes+breakers. None unless BOTH samples
+    were collected (an empty side => rate unmeasurable => fail closed, never a spurious 0)."""
+    if not br_before or not br_after:
         return None
     delta = 0
     for node, breakers in br_after.items():
@@ -360,8 +367,9 @@ def max_heap_percent(jvm_sample):
 
 
 def total_gc_time_delta_ms(jvm_before, jvm_after):
-    """Sum of (after - before) GC collection time (ms) across nodes. None if not collected either sample."""
-    if not jvm_before and not jvm_after:
+    """Sum of (after - before) GC collection time (ms) across nodes. None unless BOTH samples were
+    collected (an empty side => rate unmeasurable => fail closed, never a spurious 0)."""
+    if not jvm_before or not jvm_after:
         return None
     delta = 0
     for node, aft in jvm_after.items():
@@ -380,19 +388,18 @@ def classify_verdict(signals, window_secs):
     """Classify the congestion signature from reduced scalar `signals` into (code, [reason lines]).
 
     `signals` is a flat dict the notebook assembles from the reducers above; any key may be None meaning
-    "not collected this run". Recognized keys:
+    "not measured this run". Recognized keys:
         write_rejected_delta, write_queue_max, write_queue_fill_max, indexing_pressure_pct_max,
-        indexing_pressure_rejected_delta, breaker_tripped_delta, heap_percent_max, gc_time_delta_ms,
-        write_pool_collected (bool), indexing_pressure_collected (bool)
+        indexing_pressure_rejected_delta, breaker_tripped_delta, heap_percent_max, gc_time_delta_ms
     `window_secs` is the wall-clock gap between the two samples (0 for a single snapshot), used only to
     scale the GC-pressure test.
 
-    FAIL CLOSED: HEALTHY is returned ONLY when the two direct backpressure ENDPOINTS (write pool + indexing
-    pressure) were both collected AND no acute signature fired. If either endpoint did not respond, the
-    verdict is INCONCLUSIVE naming which - an un-collected endpoint is never silently treated as "no
-    problem". The gate keys on endpoint collection, not on derived scalars: a present-but-limitless
-    indexing-pressure reading (pct None) or a single-snapshot run (rate deltas None) is still "collected".
-    The severity order (rejecting > saturated > pressured > heap/GC) reports the most acute signature first.
+    FAIL CLOSED: HEALTHY is returned ONLY when the two backpressure RATE signals (write-pool and
+    indexing-pressure rejection deltas) were actually measured over the window AND no acute signature
+    fired. A rejection delta is non-None only if its endpoint answered in BOTH samples over a real window,
+    so a single snapshot, or a partial/total endpoint failure, forces INCONCLUSIVE - a rate we could not
+    measure is never treated as "no rejections". The severity order (rejecting > saturated > pressured >
+    heap/GC) reports the most acute signature first; an acute signal visible in even one sample still fires.
     """
     def sig(key):
         return signals.get(key)
@@ -451,18 +458,20 @@ def classify_verdict(signals, window_secs):
             )
         return VERDICT_HEAP_GC, reasons
 
-    # 5. Nothing acute observed. Only call HEALTHY if BOTH direct backpressure endpoints responded;
-    #    otherwise we cannot clear the host - fail closed to INCONCLUSIVE naming the endpoint(s) missing.
-    missing = [label for key, label in _REQUIRED_COLLECTION_FLAGS if not sig(key)]
+    # 5. Nothing acute observed. Only call HEALTHY if BOTH backpressure rejection RATES were measured over
+    #    the window; a None means single-snapshot or a partial/total endpoint failure, so a rejection burst
+    #    can't be ruled out - fail closed to INCONCLUSIVE naming the rate(s) we could not measure.
+    missing = [label for key, label in _REQUIRED_MEASURED_SIGNALS if sig(key) is None]
     if missing:
         reasons.append(
-            "no acute congestion in the signals we DID read, but these backpressure endpoints were not "
-            f"collected: {'; '.join(missing)} => cannot clear the host as healthy (check the endpoint "
-            f"errors above)."
+            "no acute congestion in the signals we DID read, but these backpressure rates could not be "
+            f"measured: {'; '.join(missing)} => cannot clear the host as healthy (a single snapshot cannot "
+            f"measure a rate; otherwise check the endpoint errors above)."
         )
         return VERDICT_INCONCLUSIVE, reasons
 
-    reasons.append("write queue not building, no rejections, indexing pressure and heap/GC within limits.")
+    reasons.append("write queue not building, no rejections over the window, indexing pressure and heap/GC "
+                   "within limits.")
     return VERDICT_HEALTHY, reasons
 
 

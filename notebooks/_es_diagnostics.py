@@ -236,16 +236,10 @@ if WINDOW_SECS > 0:
 else:
     write_rejected_delta = ip_rejected_delta = breaker_tripped_delta = gc_time_delta_ms = None
 
-# Endpoint-collection flags gate the fail-closed HEALTHY verdict. We key on whether the parse produced
-# ACTUAL DATA (a non-empty structure), NOT merely on an HTTP 200: on an ES version that lacks the
-# indexing_pressure metric the _nodes/stats call still 200s but returns no IP section, and clearing a host
-# we never assessed for pressure would be a fail-OPEN hole. A healthy cluster always returns >= 1 write-pool
-# row and populated indexing_pressure, so this is False only when the data is genuinely absent (or the
-# endpoint failed - which is reported separately in ENDPOINTS_FAILED); INCONCLUSIVE is the correct outcome
-# in every such case.
-write_pool_collected = bool(SAMPLE_A["tp"]) or bool(SAMPLE_B["tp"])
-indexing_pressure_collected = bool(SAMPLE_A["ip"]) or bool(SAMPLE_B["ip"])
-
+# The verdict gates HEALTHY on the rejection RATE deltas being non-None (actually measured over the window
+# in BOTH samples), so we do not pass separate collection flags: a partial/total endpoint failure or a
+# single snapshot leaves the relevant delta None, which fails the verdict closed to INCONCLUSIVE. The
+# point-in-time gauges take the max over whichever samples produced a reading.
 SIGNALS = {
     "write_rejected_delta": write_rejected_delta,
     "write_queue_max": _max_opt(max_write_queue(SAMPLE_A["tp"]), max_write_queue(SAMPLE_B["tp"])),
@@ -256,8 +250,6 @@ SIGNALS = {
     "breaker_tripped_delta": breaker_tripped_delta,
     "heap_percent_max": _max_opt(max_heap_percent(SAMPLE_A["jvm"]), max_heap_percent(SAMPLE_B["jvm"])),
     "gc_time_delta_ms": gc_time_delta_ms,
-    "write_pool_collected": write_pool_collected,
-    "indexing_pressure_collected": indexing_pressure_collected,
 }
 
 VERDICT, VERDICT_REASONS = classify_verdict(SIGNALS, WINDOW_SECS)

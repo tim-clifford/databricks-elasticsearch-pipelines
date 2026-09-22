@@ -792,7 +792,9 @@ window rather than lifetime totals, then prints a one-line **verdict** classifyi
 
 Run parameters (all `--params`-overridable): `index_name` (blank => cluster/node level only),
 `verify_certs` (`false` for a self-signed endpoint; ignored when `ca_certs` is set), `sample_interval_secs`
-(`0` => single snapshot, no rate counters), and `request_timeout_secs`. The run FAILS only when it could
+(`0` => single snapshot: gauges only, no rejection rate, so it can surface `SATURATED`/`PRESSURED` but
+never clears a host as `HEALTHY` — use the default two-sample window for that), and `request_timeout_secs`.
+The run FAILS only when it could
 collect nothing at all (bad host / api_key / TLS / egress); a "found congestion" verdict is a successful
 run, since reporting congestion is the job's purpose. To point it at a host config other than
 `es_host_primary`, edit the `base_parameters` in `resources/_es_diagnostics.job.yml`.

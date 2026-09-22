@@ -149,6 +149,14 @@ def test_total_rejected_delta_none_when_not_collected():
     assert total_rejected_delta(before, after) is None
 
 
+def test_total_rejected_delta_none_when_one_sample_empty():
+    # THE partial-sample-failure regression: sample A collected, sample B's endpoint failed (empty). The
+    # rate is unmeasurable, so this MUST return None (not a spurious 0 that reads as "no rejections").
+    before = parse_cat_thread_pool([{"node_name": "n1", "rejected": "100"}])
+    assert total_rejected_delta(before, []) is None
+    assert total_rejected_delta([], before) is None
+
+
 def test_total_rejected_delta_counter_reset_contributes_zero():
     # If a node restarted mid-window (after < before), don't report a negative/huge spike; contribute 0.
     before = parse_cat_thread_pool([{"node_name": "n1", "rejected": "100"}])
@@ -226,7 +234,7 @@ def test_total_gc_time_delta_ms():
 
 # ============================================================ classify_verdict (the fail-closed core)
 def _clear_signals():
-    """A fully-collected, fully-clear signal set (baseline HEALTHY)."""
+    """A fully-measured, fully-clear signal set (baseline HEALTHY): both rejection rates measured at 0."""
     return {
         "write_rejected_delta": 0,
         "write_queue_max": 0,
@@ -236,8 +244,6 @@ def _clear_signals():
         "breaker_tripped_delta": 0,
         "heap_percent_max": 40,
         "gc_time_delta_ms": 50,
-        "write_pool_collected": True,
-        "indexing_pressure_collected": True,
     }
 
 
@@ -337,32 +343,33 @@ def test_verdict_gc_ignored_on_single_snapshot_window_zero():
     assert classify_verdict(s, window_secs=0)[0] == VERDICT_HEALTHY
 
 
-def test_verdict_inconclusive_when_a_backpressure_endpoint_missing():
-    # THE fail-closed regression: no acute problem in what we read, but the write-pool endpoint did not
-    # respond => must be INCONCLUSIVE, never HEALTHY, and the reason names the endpoint.
+def test_verdict_inconclusive_when_a_rejection_rate_unmeasured():
+    # THE fail-closed regression (partial-sample failure): the write-pool rate could not be measured (a
+    # sample failed => delta None) => must be INCONCLUSIVE, never HEALTHY, and the reason names the rate.
     s = _clear_signals()
-    s["write_pool_collected"] = False
+    s["write_rejected_delta"] = None
     code, reasons = classify_verdict(s, window_secs=5)
     assert code == VERDICT_INCONCLUSIVE
-    assert any("write thread-pool" in r for r in reasons)
+    assert any("write thread-pool rejection rate" in r for r in reasons)
 
 
-def test_verdict_healthy_when_ip_limit_absent_but_endpoint_collected():
-    # THE finding-2 regression: indexing pressure responded but a node reported no limit (pct None). That
-    # is a COLLECTED-but-limitless reading, not a missing endpoint, so a clear host must still be HEALTHY.
+def test_verdict_healthy_when_ip_limit_absent_but_rate_measured():
+    # THE finding-2 regression: indexing pressure responded but a node reported no limit (pct None). The
+    # rejection RATE still measures fine (it comes from the counters, not the limit), so a clear host is
+    # still HEALTHY - pct None must not force INCONCLUSIVE.
     s = _clear_signals()
     s["indexing_pressure_pct_max"] = None
     assert classify_verdict(s, window_secs=5)[0] == VERDICT_HEALTHY
 
 
-def test_verdict_healthy_on_single_snapshot_when_endpoints_collected():
-    # Single snapshot (window 0): rate deltas are legitimately None, but the endpoints were collected and
-    # the gauges are clear => HEALTHY, not falsely INCONCLUSIVE for the None deltas.
+def test_verdict_inconclusive_on_single_snapshot():
+    # Single snapshot (window 0): rate deltas are legitimately None, so a rejection burst cannot be ruled
+    # out => INCONCLUSIVE, never HEALTHY. A single snapshot cannot clear a host.
     s = _clear_signals()
     s["write_rejected_delta"] = None
     s["indexing_pressure_rejected_delta"] = None
     s["gc_time_delta_ms"] = None
-    assert classify_verdict(s, window_secs=0)[0] == VERDICT_HEALTHY
+    assert classify_verdict(s, window_secs=0)[0] == VERDICT_INCONCLUSIVE
 
 
 def test_verdict_inconclusive_when_all_signals_missing():
