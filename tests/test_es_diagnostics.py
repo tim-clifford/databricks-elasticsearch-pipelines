@@ -102,6 +102,17 @@ def test_parse_indexing_pressure_empty_nodes():
     assert parse_indexing_pressure({}) == {}
 
 
+def test_parse_indexing_pressure_skips_node_without_memory_section():
+    # THE fail-open regression: a node that reports jvm but NO indexing_pressure section must NOT become an
+    # entry with rejections defaulting to 0 (a fabricated "measured, clear" signal). It is skipped, so an
+    # all-absent parse is empty and the rejection-rate reducer returns None => the verdict fails closed.
+    stats = {"nodes": {"n": {"name": "n1", "jvm": {"mem": {"heap_used_percent": 40}}}}}  # no indexing_pressure
+    assert parse_indexing_pressure(stats) == {}
+    # And end-to-end: two such samples => reducer None => not treated as a clear 0.
+    assert total_indexing_pressure_rejected_delta(parse_indexing_pressure(stats),
+                                                  parse_indexing_pressure(stats)) is None
+
+
 # ============================================================ parse_jvm
 def test_parse_jvm_sums_collectors():
     stats = {"nodes": {"abc": {"name": "n1", "jvm": {

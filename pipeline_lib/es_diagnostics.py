@@ -175,7 +175,13 @@ def parse_indexing_pressure(nodes_stats):
     for node_id, node in _nodes_map(nodes_stats).items():
         if not isinstance(node, dict):
             continue
-        mem = _dig(node, "indexing_pressure", "memory", default={})
+        # Skip a node that has NO indexing_pressure.memory section (e.g. an ES version/config without the
+        # metric): emitting an entry with rejections defaulting to 0 would fabricate a "measured, clear"
+        # signal and let the verdict clear the host without ever collecting indexing pressure (fail OPEN).
+        # Absent => no entry => an empty parse => the rejection-rate reducer returns None => INCONCLUSIVE.
+        mem = _dig(node, "indexing_pressure", "memory")
+        if not isinstance(mem, dict) or not mem:
+            continue
         current = _to_int(_dig(mem, "current", "combined_coordinating_and_primary_in_bytes"))
         limit = _to_int(_dig(mem, "limit_in_bytes"))
         coord = _to_int(_dig(mem, "total", "coordinating_rejections"), 0)
