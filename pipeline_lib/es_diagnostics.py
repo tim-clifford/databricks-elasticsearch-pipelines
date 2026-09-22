@@ -309,14 +309,17 @@ def total_rejected_delta(tp_before, tp_after):
     and if a sample's keys DO collapse (e.g. rows missing node_id AND sharing a blank name), the pairing is
     unreliable, so this returns None (fail closed) rather than under-counting via last-write-wins.
     """
-    before_rows = [(_tp_key(r), r["rejected"]) for r in tp_before if r.get("rejected") is not None]
-    after_rows = [(_tp_key(r), r["rejected"]) for r in tp_after if r.get("rejected") is not None]
-    if not before_rows or not after_rows:
-        return None
-    before, after = dict(before_rows), dict(after_rows)
-    # Collision guard: a shorter dict than its row list means two rows shared a key (unkeyable rows) - we
-    # cannot reliably pair nodes across samples, so fail closed instead of silently under-counting.
-    if len(before) != len(before_rows) or len(after) != len(after_rows):
+    # Collision guard over ALL rows (independent of which carry a rejected count): if two rows in a sample
+    # share a match key, we cannot reliably pair nodes across samples, so fail closed. Checked before the
+    # rejected-None filter, so two distinct blank-keyed nodes that each report `rejected` in only one sample
+    # still trip the guard instead of being mispaired into a spurious delta.
+    for sample in (tp_before, tp_after):
+        keys = [_tp_key(r) for r in sample]
+        if len(keys) != len(set(keys)):
+            return None
+    before = {_tp_key(r): r["rejected"] for r in tp_before if r.get("rejected") is not None}
+    after = {_tp_key(r): r["rejected"] for r in tp_after if r.get("rejected") is not None}
+    if not before or not after:
         return None
     delta = 0
     for node, aft in after.items():

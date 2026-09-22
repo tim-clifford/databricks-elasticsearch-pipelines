@@ -207,6 +207,14 @@ def test_total_rejected_delta_none_when_keys_collide():
     assert total_rejected_delta(before, after) is None
 
 
+def test_total_rejected_delta_none_when_colliding_rows_partially_report_rejected():
+    # The collision guard runs over ALL rows, not just those with a rejected count: two distinct blank-keyed
+    # nodes where only ONE reports `rejected` per sample would slip a filtered-only guard and be mispaired.
+    before = parse_cat_thread_pool([{"rejected": "10"}, {"active": "1"}])  # two rows, both key ""
+    after = parse_cat_thread_pool([{"active": "1"}, {"rejected": "20"}])
+    assert total_rejected_delta(before, after) is None
+
+
 def test_max_write_queue():
     sample = parse_cat_thread_pool([{"node_name": "n1", "queue": "10"},
                                     {"node_name": "n2", "queue": "250"}])
