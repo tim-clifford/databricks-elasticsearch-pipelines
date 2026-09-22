@@ -21,7 +21,6 @@ from pipeline_lib.es_diagnostics import (
     max_heap_percent,
     max_indexing_pressure_pct,
     max_write_queue,
-    max_write_queue_fill,
     parse_breakers,
     parse_cat_nodes,
     parse_cat_thread_pool,
@@ -31,6 +30,7 @@ from pipeline_lib.es_diagnostics import (
     total_breaker_tripped_delta,
     total_indexing_pressure_rejected_delta,
     total_rejected_delta,
+    write_pool_saturated,
 )
 
 
@@ -206,16 +206,29 @@ def test_max_write_queue_none_when_absent():
     assert max_write_queue(parse_cat_thread_pool([{"node_name": "n1"}])) is None
 
 
-def test_max_write_queue_fill_is_fraction_of_queue_size():
-    sample = parse_cat_thread_pool([{"node_name": "n1", "queue": "1000", "queue_size": "10000"},
-                                    {"node_name": "n2", "queue": "50", "queue_size": "10000"}])
-    assert max_write_queue_fill(sample) == pytest.approx(0.1)
+def test_write_pool_saturated_on_bounded_fill_over_threshold():
+    # A bounded node at >= 10% of its queue_size saturates; a low-fill node alone does not.
+    assert write_pool_saturated(parse_cat_thread_pool([{"queue": "1000", "queue_size": "10000"}])) is True
+    assert write_pool_saturated(parse_cat_thread_pool([{"queue": "50", "queue_size": "10000"}])) is False
 
 
-def test_max_write_queue_fill_none_without_bounded_queue_size():
-    # An unbounded/resizable pool reports queue_size -1 (or omits it); no usable fill => None.
-    sample = parse_cat_thread_pool([{"node_name": "n1", "queue": "5", "queue_size": "-1"}])
-    assert max_write_queue_fill(sample) is None
+def test_write_pool_saturated_unbounded_node_judged_on_absolute_depth():
+    # An unbounded/resizable pool (queue_size -1) has no bound to fraction, so it saturates on depth >= 100.
+    assert write_pool_saturated(parse_cat_thread_pool([{"queue": "500", "queue_size": "-1"}])) is True
+    assert write_pool_saturated(parse_cat_thread_pool([{"queue": "30", "queue_size": "-1"}])) is False
+
+
+def test_write_pool_saturated_low_fill_node_does_not_mask_deep_unbounded_node():
+    # THE finding regression: a bounded node at low fill (5%) MUST NOT suppress an unbounded node with a
+    # deep backlog (500 >= 100). Per-node evaluation flags the pool saturated.
+    sample = parse_cat_thread_pool([{"node_id": "a", "queue": "500", "queue_size": "-1"},
+                                    {"node_id": "b", "queue": "500", "queue_size": "10000"}])  # b = 5%
+    assert write_pool_saturated(sample) is True
+
+
+def test_write_pool_saturated_none_when_no_queue_reported():
+    # No node reported a queue => endpoint not collected => None (so the verdict can fail closed).
+    assert write_pool_saturated(parse_cat_thread_pool([{"node_name": "n1"}])) is None
 
 
 def test_max_indexing_pressure_pct():
@@ -279,7 +292,7 @@ def _clear_signals():
     return {
         "write_rejected_delta": 0,
         "write_queue_max": 0,
-        "write_queue_fill_max": 0.0,
+        "write_saturated": False,
         "indexing_pressure_pct_max": 0.1,
         "indexing_pressure_rejected_delta": 0,
         "breaker_tripped_delta": 0,
@@ -314,35 +327,27 @@ def test_verdict_rejecting_on_breaker_trip():
 
 
 def test_verdict_rejecting_takes_precedence_over_saturation():
-    # Both a full queue AND rejections: the more acute REJECTING must win.
+    # Both a building queue AND rejections: the more acute REJECTING must win.
     s = _clear_signals()
     s["write_rejected_delta"] = 1
-    s["write_queue_fill_max"] = 0.5
+    s["write_saturated"] = True
     assert classify_verdict(s, window_secs=5)[0] == VERDICT_REJECTING
 
 
-def test_verdict_saturated_when_queue_fill_over_threshold():
+def test_verdict_saturated_when_write_pool_saturated():
+    # write_saturated True (a node building toward its bound, per the per-node reducer) => SATURATED.
     s = _clear_signals()
-    s["write_queue_fill_max"] = 0.10  # at the 10% bound => building
+    s["write_saturated"] = True
     s["write_queue_max"] = 1000
     assert classify_verdict(s, window_secs=5)[0] == VERDICT_SATURATED
 
 
-def test_verdict_not_saturated_on_transient_nonzero_queue_below_threshold():
-    # THE finding-1 regression: a small transient queue on a healthy, actively-writing cluster (well under
-    # 10% of the bound) must NOT be flagged SATURATED.
+def test_verdict_not_saturated_when_not_saturated():
+    # A transient queue below the per-node threshold leaves write_saturated False => not SATURATED.
     s = _clear_signals()
+    s["write_saturated"] = False
     s["write_queue_max"] = 30
-    s["write_queue_fill_max"] = 0.003  # 30 / 10000
     assert classify_verdict(s, window_secs=5)[0] == VERDICT_HEALTHY
-
-
-def test_verdict_saturated_absolute_backstop_when_queue_size_unknown():
-    # No bounded queue_size (fill None), but a large absolute depth => SATURATED via the backstop.
-    s = _clear_signals()
-    s["write_queue_fill_max"] = None
-    s["write_queue_max"] = 500
-    assert classify_verdict(s, window_secs=5)[0] == VERDICT_SATURATED
 
 
 def test_verdict_pressured_at_threshold():

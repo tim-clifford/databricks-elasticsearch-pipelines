@@ -326,19 +326,30 @@ def max_write_queue(tp_sample):
     return max(queues) if queues else None
 
 
-def max_write_queue_fill(tp_sample):
-    """Max write-pool queue FILL (queue / queue_size) across nodes with a positive bounded queue_size.
+def write_pool_saturated(tp_sample, warn_fraction=_QUEUE_WARN_FRACTION, warn_depth=_QUEUE_WARN_DEPTH):
+    """True if ANY node's write queue is building toward saturation, judged PER NODE.
 
-    Returns a fraction in [0, 1+] or None when no node reported a usable (queue, queue_size) pair (e.g. an
-    unbounded/resizable pool reports queue_size -1). Fill, not raw depth, is what says "near capacity": a
-    transient depth of a few is nothing against a 10000-deep bound, so the SATURATED verdict gates on this.
+    A bounded node (queue_size > 0) saturates at queue/queue_size >= warn_fraction (fill, not raw depth:
+    a transient handful is nothing against a 10000-deep bound). An unbounded/unknown node (queue_size
+    missing or <= 0, e.g. a resizable pool reporting -1) has no bound to take a fraction of, so it saturates
+    at an absolute queue >= warn_depth. Evaluated per node so one node's low fill cannot mask another
+    node's deep backlog, and an unbounded node's depth is judged on its own criterion.
+
+    Returns None when no node reported a queue at all (endpoint not collected); otherwise a bool.
     """
-    fills = []
+    any_queue = False
     for r in tp_sample:
-        q, qs = r.get("queue"), r.get("queue_size")
-        if q is not None and qs is not None and qs > 0:
-            fills.append(q / qs)
-    return max(fills) if fills else None
+        q = r.get("queue")
+        if q is None:
+            continue
+        any_queue = True
+        qs = r.get("queue_size")
+        if qs is not None and qs > 0:
+            if q / qs >= warn_fraction:
+                return True
+        elif q >= warn_depth:  # unbounded/unknown bound => judge on absolute depth
+            return True
+    return False if any_queue else None
 
 
 def max_indexing_pressure_pct(ip_sample):
@@ -415,7 +426,7 @@ def classify_verdict(signals, window_secs):
 
     `signals` is a flat dict the notebook assembles from the reducers above; any key may be None meaning
     "not measured this run". Recognized keys:
-        write_rejected_delta, write_queue_max, write_queue_fill_max, indexing_pressure_pct_max,
+        write_rejected_delta, write_queue_max, write_saturated (bool), indexing_pressure_pct_max,
         indexing_pressure_rejected_delta, breaker_tripped_delta, heap_percent_max, gc_time_delta_ms
     `window_secs` is the wall-clock gap between the two samples (0 for a single snapshot), used only to
     scale the GC-pressure test.
@@ -444,17 +455,15 @@ def classify_verdict(signals, window_secs):
         rej_reasons.append("=> ES is shedding load with 429s; reduce bulk size / write concurrency and back off on 429.")
         return VERDICT_REJECTING, rej_reasons
 
-    # 2. SATURATED - write queue building toward its bound but not yet rejecting. Gate on FILL (a fraction
-    #    of the pool's queue_size), so a transient depth of a few against a 10000-deep bound is not flagged;
-    #    fall back to an absolute depth only when queue_size is unknown (an unbounded/resizable pool).
-    fill = sig("write_queue_fill_max")
-    q = sig("write_queue_max")
-    if (fill is not None and fill >= _QUEUE_WARN_FRACTION) or \
-            (fill is None and q is not None and q >= _QUEUE_WARN_DEPTH):
-        depth = f"depth {q}" if q is not None else "depth n/a"
-        pct = f" ({fill*100:.0f}% of the queue bound)" if fill is not None else ""
-        reasons.append(f"write thread-pool queue {depth}{pct} building toward its bound (not yet rejecting) "
-                       f"=> near write capacity.")
+    # 2. SATURATED - write queue building toward its bound but not yet rejecting. write_saturated is a
+    #    PER-NODE decision (write_pool_saturated): a bounded node trips on fill >= _QUEUE_WARN_FRACTION, an
+    #    unbounded node on absolute depth >= _QUEUE_WARN_DEPTH, so one node's low fill can't mask another's
+    #    deep backlog. write_queue_max is carried only for the reason's depth context.
+    if sig("write_saturated"):
+        q = sig("write_queue_max")
+        depth = f" (max depth {q})" if q is not None else ""
+        reasons.append(f"write thread-pool queue building toward its bound on at least one node{depth} "
+                       f"(not yet rejecting) => near write capacity.")
         return VERDICT_SATURATED, reasons
 
     # 3. PRESSURED - indexing-pressure memory a high fraction of its limit (will reject soon).

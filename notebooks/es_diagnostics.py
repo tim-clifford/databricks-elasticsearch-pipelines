@@ -62,7 +62,6 @@ from pipeline_lib.es_diagnostics import (  # noqa: E402
     max_heap_percent,
     max_indexing_pressure_pct,
     max_write_queue,
-    max_write_queue_fill,
     parse_breakers,
     parse_cat_nodes,
     parse_cat_thread_pool,
@@ -72,6 +71,7 @@ from pipeline_lib.es_diagnostics import (  # noqa: E402
     total_breaker_tripped_delta,
     total_indexing_pressure_rejected_delta,
     total_rejected_delta,
+    write_pool_saturated,
 )
 
 dbutils.widgets.text("es_host_url", "", "Elasticsearch endpoint, e.g. https://<host>:9200")
@@ -259,10 +259,15 @@ else:
 # in BOTH samples), so we do not pass separate collection flags: a partial/total endpoint failure or a
 # single snapshot leaves the relevant delta None, which fails the verdict closed to INCONCLUSIVE. The
 # point-in-time gauges take the max over whichever samples produced a reading.
+# write_saturated is a per-node acute check: True if EITHER sample shows any node building toward its
+# bound; None only if neither sample reported a queue at all (endpoint not collected); else False.
+_sat_a, _sat_b = write_pool_saturated(SAMPLE_A["tp"]), write_pool_saturated(SAMPLE_B["tp"])
+_write_saturated = True if (_sat_a or _sat_b) else (None if (_sat_a is None and _sat_b is None) else False)
+
 SIGNALS = {
     "write_rejected_delta": write_rejected_delta,
     "write_queue_max": _max_opt(max_write_queue(SAMPLE_A["tp"]), max_write_queue(SAMPLE_B["tp"])),
-    "write_queue_fill_max": _max_opt(max_write_queue_fill(SAMPLE_A["tp"]), max_write_queue_fill(SAMPLE_B["tp"])),
+    "write_saturated": _write_saturated,
     "indexing_pressure_pct_max": _max_opt(max_indexing_pressure_pct(SAMPLE_A["ip"]),
                                           max_indexing_pressure_pct(SAMPLE_B["ip"])),
     "indexing_pressure_rejected_delta": ip_rejected_delta,
