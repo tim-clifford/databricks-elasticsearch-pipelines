@@ -17,6 +17,7 @@ from pipeline_lib.es_diagnostics import (
     VERDICT_SATURATED,
     classify_verdict,
     human_bytes,
+    max_gc_time_delta_ms,
     max_heap_percent,
     max_indexing_pressure_pct,
     max_write_queue,
@@ -28,7 +29,6 @@ from pipeline_lib.es_diagnostics import (
     parse_indexing_pressure,
     parse_jvm,
     total_breaker_tripped_delta,
-    total_gc_time_delta_ms,
     total_indexing_pressure_rejected_delta,
     total_rejected_delta,
 )
@@ -243,11 +243,32 @@ def test_max_heap_percent():
     assert max_heap_percent(parse_jvm(stats)) == 91
 
 
-def test_total_gc_time_delta_ms():
-    def jvm(ms):
-        return parse_jvm({"nodes": {"a": {"name": "n1", "jvm": {"gc": {"collectors": {
-            "young": {"collection_time_in_millis": ms}}}}}}})
-    assert total_gc_time_delta_ms(jvm(1000), jvm(4200)) == 3200
+def _jvm_gc(node_ms):
+    """Build a parsed jvm sample from {node_id: gc_time_ms}."""
+    nodes = {nid: {"name": nid, "jvm": {"gc": {"collectors": {
+        "young": {"collection_time_in_millis": ms}}}}} for nid, ms in node_ms.items()}
+    return parse_jvm({"nodes": nodes})
+
+
+def test_max_gc_time_delta_ms_is_per_node_not_summed():
+    # THE cross-node-sum regression: 3 nodes each +400ms in the window. A sum would be 1200ms; the per-node
+    # MAX must be 400ms, so an N-node cluster's background GC does not sum past a single window's threshold.
+    before = _jvm_gc({"a": 1000, "b": 1000, "c": 1000})
+    after = _jvm_gc({"a": 1400, "b": 1400, "c": 1400})
+    assert max_gc_time_delta_ms(before, after) == 400
+
+
+def test_max_gc_time_delta_ms_none_when_one_sample_empty():
+    assert max_gc_time_delta_ms(_jvm_gc({"a": 1000}), {}) is None
+
+
+def test_verdict_no_false_heap_gc_from_summed_background_gc():
+    # End-to-end: 3 nodes each doing 400ms GC in a 5s window (8% each) must NOT trip HEAP_GC (per-node max
+    # 400ms < 1500ms threshold). A summed 1200ms would have (wrongly) tripped it (>= 1500? no, but on more
+    # nodes it would); the per-node signal is what keeps ordinary multi-node GC clear.
+    s = _clear_signals()
+    s["gc_time_delta_ms"] = 400  # busiest node, per-node max
+    assert classify_verdict(s, window_secs=5)[0] == VERDICT_HEALTHY
 
 
 # ============================================================ classify_verdict (the fail-closed core)

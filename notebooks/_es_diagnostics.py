@@ -48,6 +48,7 @@ import urllib3
 from pipeline_lib.es_diagnostics import (
     classify_verdict,
     human_bytes,
+    max_gc_time_delta_ms,
     max_heap_percent,
     max_indexing_pressure_pct,
     max_write_queue,
@@ -59,7 +60,6 @@ from pipeline_lib.es_diagnostics import (
     parse_indexing_pressure,
     parse_jvm,
     total_breaker_tripped_delta,
-    total_gc_time_delta_ms,
     total_indexing_pressure_rejected_delta,
     total_rejected_delta,
 )
@@ -241,7 +241,7 @@ if WINDOW_SECS > 0:
     write_rejected_delta = total_rejected_delta(SAMPLE_A["tp"], SAMPLE_B["tp"])
     ip_rejected_delta = total_indexing_pressure_rejected_delta(SAMPLE_A["ip"], SAMPLE_B["ip"])
     breaker_tripped_delta = total_breaker_tripped_delta(SAMPLE_A["breakers"], SAMPLE_B["breakers"])
-    gc_time_delta_ms = total_gc_time_delta_ms(SAMPLE_A["jvm"], SAMPLE_B["jvm"])
+    gc_time_delta_ms = max_gc_time_delta_ms(SAMPLE_A["jvm"], SAMPLE_B["jvm"])  # per-node max, not summed
 else:
     write_rejected_delta = ip_rejected_delta = breaker_tripped_delta = gc_time_delta_ms = None
 
@@ -292,7 +292,7 @@ print(f"\n=== WINDOW DELTAS (over {WINDOW_SECS:.1f}s) ===")
 print(f"  write rejected delta        = {write_rejected_delta}")
 print(f"  indexing-pressure rej delta = {ip_rejected_delta}")
 print(f"  breaker tripped delta       = {breaker_tripped_delta}")
-print(f"  GC time delta               = {gc_time_delta_ms} ms")
+print(f"  GC time delta (busiest node)= {gc_time_delta_ms} ms")
 
 # COMMAND ----------
 # Cell 3 - CLUSTER / NODE STATE (single-shot, point-in-time). Node health, cluster health + pending
@@ -364,18 +364,18 @@ else:
         print(f"  translog: ops={idx_b['translog_operations']} size={human_bytes(idx_b['translog_size_bytes'])} "
               f"uncommitted_ops={idx_b['translog_uncommitted_operations']} "
               f"uncommitted_size={human_bytes(idx_b['translog_uncommitted_size_bytes'])}")
-        if WINDOW_SECS > 0 and idx_a and idx_b["index_total"] is not None and idx_a["index_total"] is not None:
-            # Clamp each cumulative delta to >= 0 and flag a reset, matching the reducers' reset handling:
-            # a shard restart resets index_total, so a raw idx_b - idx_a would print a misleading negative.
-            raw = {
-                "docs_indexed": idx_b["index_total"] - idx_a["index_total"],
-                "merges": (idx_b["merges_total"] or 0) - (idx_a["merges_total"] or 0),
-                "refreshes": (idx_b["refresh_total"] or 0) - (idx_a["refresh_total"] or 0),
-            }
-            shown = {k: max(0, v) for k, v in raw.items()}
-            reset_note = "  (counter reset mid-window; clamped to >=0)" if any(v < 0 for v in raw.values()) else ""
-            print(f"  window delta ({WINDOW_SECS:.1f}s): docs_indexed={shown['docs_indexed']} "
-                  f"merges={shown['merges']} refreshes={shown['refreshes']}{reset_note}")
+        if WINDOW_SECS > 0 and idx_a:
+            # Per-field window delta. Compute only when BOTH samples reported the field (else 'n/a', never
+            # treating a missing counter as 0); clamp to >= 0 and mark '(reset)' PER FIELD, since a shard
+            # restart resets one counter (misleading negative) while another stays a genuine positive.
+            def _idx_delta(field):
+                a, b = idx_a.get(field), idx_b.get(field)
+                if a is None or b is None:
+                    return "n/a"
+                d = b - a
+                return f"{d}" if d >= 0 else "0(reset)"
+            print(f"  window delta ({WINDOW_SECS:.1f}s): docs_indexed={_idx_delta('index_total')} "
+                  f"merges={_idx_delta('merges_total')} refreshes={_idx_delta('refresh_total')}")
     else:
         print("  (index _stats not collected)")
 

@@ -386,12 +386,18 @@ def max_heap_percent(jvm_sample):
     return max(heaps) if heaps else None
 
 
-def total_gc_time_delta_ms(jvm_before, jvm_after):
-    """Sum of (after - before) GC collection time (ms) across nodes. None unless BOTH samples were
-    collected (an empty side => rate unmeasurable => fail closed, never a spurious 0)."""
+def max_gc_time_delta_ms(jvm_before, jvm_after):
+    """Max PER-NODE (after - before) GC collection time (ms) over the window, across nodes matched by
+    node_id. None unless BOTH samples were collected (an empty side => rate unmeasurable => fail closed).
+
+    Per-node MAX, not a cross-node sum: the GC-pressure gate scales the threshold by ONE window's
+    wall-clock, so summing N nodes' ordinary background GC would exceed it even when no single node is
+    GC-bound (a spurious HEAP_GC on any multi-node cluster). Mirrors the per-node max_heap_percent gate.
+    Returns 0 when both samples are populated but no node matches (all came/went), never a spurious spike.
+    """
     if not jvm_before or not jvm_after:
         return None
-    delta = 0
+    best = 0
     for node, aft in jvm_after.items():
         bef = jvm_before.get(node)
         if bef is None:
@@ -399,8 +405,8 @@ def total_gc_time_delta_ms(jvm_before, jvm_after):
         a_ms = aft.get("gc_time_ms")
         b_ms = bef.get("gc_time_ms")
         if a_ms is not None and b_ms is not None and a_ms >= b_ms:
-            delta += a_ms - b_ms
-    return delta
+            best = max(best, a_ms - b_ms)
+    return best
 
 
 # --------------------------------------------------------------------------- the verdict
@@ -473,7 +479,7 @@ def classify_verdict(signals, window_secs):
             reasons.append(f"JVM heap at {heap}% (>= {_HEAP_WARN_PERCENT}%).")
         if gc_hot:
             reasons.append(
-                f"GC ran {gc_ms} ms of the {window_secs:g}s window "
+                f"the busiest node's GC ran {gc_ms} ms of the {window_secs:g}s window "
                 f"(>= {_GC_WARN_WINDOW_FRACTION*100:.0f}%) => slow processing, not a full queue."
             )
         return VERDICT_HEAP_GC, reasons
