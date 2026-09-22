@@ -194,12 +194,17 @@ def snapshot():
     (which the reducers read as 'not collected'), never to a crash."""
     ok_tp, tp_raw, _ = es_get("_cat/thread_pool/write?format=json"
                               "&h=node_id,node_name,active,queue,queue_size,rejected,completed")
+    # Stamp the clock immediately before the _nodes/stats read (which carries the GC + indexing-pressure
+    # counters). The GC-pressure window is the gap between the two samples' nodes/stats reads, so stamping
+    # at the SAME point in each snapshot brackets it symmetrically - independent of the tp GET's latency.
+    ns_read_at = time.monotonic()
     ns = _nodes_stats()
     snap = {
         "tp": parse_cat_thread_pool(tp_raw) if ok_tp else [],
         "ip": parse_indexing_pressure(ns),
         "jvm": parse_jvm(ns),
         "breakers": parse_breakers(ns),
+        "ns_read_at": ns_read_at,
     }
     if INDEX_NAME:
         ok_is, is_raw, _ = es_get(f"{INDEX_NAME}/_stats"
@@ -210,17 +215,15 @@ def snapshot():
 
 
 print(f"sampling counters (interval {SAMPLE_INTERVAL}s)...")
-# Measure the TRUE window with a monotonic clock around the two snapshots, not the configured interval:
-# each snapshot() issues several sequential GETs on top of the sleep, so the real read-to-read gap is
-# longer than SAMPLE_INTERVAL. classify_verdict scales the GC-pressure test by this window, so an
-# understated window would overstate the GC fraction and over-fire HEAP_GC.
-_t_a = time.monotonic()
+# Measure the TRUE window from the monotonic timestamps captured at each snapshot's _nodes/stats read
+# (see snapshot()), not the configured interval: the real read-to-read gap is the sleep plus GET latency,
+# and classify_verdict scales the GC-pressure test by this window, so an inaccurate window would mis-fire
+# HEAP_GC near the threshold.
 SAMPLE_A = snapshot()
 if SAMPLE_INTERVAL > 0:
     time.sleep(SAMPLE_INTERVAL)
-    _t_b = time.monotonic()
     SAMPLE_B = snapshot()
-    WINDOW_SECS = _t_b - _t_a  # start-of-A to start-of-B (sleep + A's GET durations)
+    WINDOW_SECS = SAMPLE_B["ns_read_at"] - SAMPLE_A["ns_read_at"]  # nodes/stats-read to nodes/stats-read
 else:
     SAMPLE_B = SAMPLE_A  # single snapshot: gauges only, no window => rate counters reported as absent
     WINDOW_SECS = 0
@@ -362,10 +365,17 @@ else:
               f"uncommitted_ops={idx_b['translog_uncommitted_operations']} "
               f"uncommitted_size={human_bytes(idx_b['translog_uncommitted_size_bytes'])}")
         if WINDOW_SECS > 0 and idx_a and idx_b["index_total"] is not None and idx_a["index_total"] is not None:
-            docs = idx_b["index_total"] - idx_a["index_total"]
-            merges = (idx_b["merges_total"] or 0) - (idx_a["merges_total"] or 0)
-            refreshes = (idx_b["refresh_total"] or 0) - (idx_a["refresh_total"] or 0)
-            print(f"  window delta ({WINDOW_SECS:.1f}s): docs_indexed={docs} merges={merges} refreshes={refreshes}")
+            # Clamp each cumulative delta to >= 0 and flag a reset, matching the reducers' reset handling:
+            # a shard restart resets index_total, so a raw idx_b - idx_a would print a misleading negative.
+            raw = {
+                "docs_indexed": idx_b["index_total"] - idx_a["index_total"],
+                "merges": (idx_b["merges_total"] or 0) - (idx_a["merges_total"] or 0),
+                "refreshes": (idx_b["refresh_total"] or 0) - (idx_a["refresh_total"] or 0),
+            }
+            shown = {k: max(0, v) for k, v in raw.items()}
+            reset_note = "  (counter reset mid-window; clamped to >=0)" if any(v < 0 for v in raw.values()) else ""
+            print(f"  window delta ({WINDOW_SECS:.1f}s): docs_indexed={shown['docs_indexed']} "
+                  f"merges={shown['merges']} refreshes={shown['refreshes']}{reset_note}")
     else:
         print("  (index _stats not collected)")
 
