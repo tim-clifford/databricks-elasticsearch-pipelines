@@ -11,8 +11,8 @@ resources:
         congestion verdict. It only issues GET requests and never writes to ES. Pick which host config to
         hit at run time with the es_host_config parameter (a name from databricks.yml, default
         es_host_primary); the job carries every configured host's url + secret scope/key so the notebook
-        resolves the chosen one by name. No cluster block => serverless notebook task (unless a cluster is
-        supplied via the diagnostics_existing_cluster_id / diagnostics_new_cluster vars below).
+        resolves the chosen one by name. Runs serverless by default; set the diagnostics_existing_cluster_id
+        or diagnostics_job_clusters+diagnostics_job_cluster_key vars to run on a specific cluster (deploy-time).
 
       # Run-time job parameters, all overridable with `--params <name>=<value>`:
       # - es_host_config: NAME of a host config in databricks.yml to hit (default es_host_primary). The
@@ -51,8 +51,15 @@ resources:
         no_alert_for_skipped_runs: true
         no_alert_for_canceled_runs: true
 
+      # OPTIONAL compute. All three vars default to empty, which DAB omits, leaving the task SERVERLESS.
+      # Set diagnostics_existing_cluster_id (an existing cluster) OR diagnostics_job_clusters +
+      # diagnostics_job_cluster_key (a new job cluster, reusing a _pipelines/job_cluster_configs spec) to
+      # run on a specific cluster. See the databricks.yml `es_diagnostics COMPUTE` block. Deploy-time only.
+      job_clusters: ${var.diagnostics_job_clusters}
       tasks:
         - task_key: es_diagnostics
+          existing_cluster_id: ${var.diagnostics_existing_cluster_id}
+          job_cluster_key: ${var.diagnostics_job_cluster_key}
           notebook_task:
             notebook_path: ../notebooks/es_diagnostics.py
             base_parameters:

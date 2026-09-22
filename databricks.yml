@@ -66,6 +66,30 @@ variables:
     description: "UC Volume path to the databricks-es-connector wheel every index job installs (version lives in the filename). Empty default; set per target below or override with --var. Required for index-job runs (fails closed if empty)."
     default: ""
 
+  # es_diagnostics COMPUTE. The `_es diagnostics` maintenance job (resources/es_diagnostics.job.yml) runs
+  # SERVERLESS by default (all three vars below empty). Set ONE of these to run it on a specific cluster
+  # instead - e.g. to match the client's DBR runtime or the network/egress path the pipeline writes over.
+  # This is a DEPLOY-time choice (re-deploy to change): Databricks has no run-time cluster swap. Empty
+  # values are omitted from the job (so the default is genuinely serverless). Set AT MOST ONE path; setting
+  # both an existing_cluster_id and a job_cluster_key makes the Jobs API reject the deploy.
+  #   - diagnostics_existing_cluster_id: run on an ALREADY-RUNNING cluster by its id (a simple string, so
+  #     it IS --var-settable: `--var="diagnostics_existing_cluster_id=<id>"`).
+  #   - diagnostics_job_clusters + diagnostics_job_cluster_key: run on a NEW job cluster. Put the whole
+  #     job_clusters list in diagnostics_job_clusters (one entry: job_cluster_key + a new_cluster spec -
+  #     copy a _pipelines/job_cluster_configs/<key>.yml spec in verbatim, adding apply_policy_default_values:
+  #     true if a cluster policy is enforced) and set diagnostics_job_cluster_key to that key. These are
+  #     complex/keyed values, so set them per target below or in variable-overrides.json (NOT via --var).
+  diagnostics_existing_cluster_id:
+    description: "es_diagnostics: run on this existing cluster id instead of serverless. Empty => serverless. Simple string, --var-settable."
+    default: ""
+  diagnostics_job_cluster_key:
+    description: "es_diagnostics: the job_cluster_key (in diagnostics_job_clusters) to run the task on. Empty => serverless (or use diagnostics_existing_cluster_id)."
+    default: ""
+  diagnostics_job_clusters:
+    type: complex
+    description: "es_diagnostics: the job's whole job_clusters list (job_cluster_key + new_cluster spec). Empty [] => serverless. Set per target / variable-overrides.json (complex; not --var-settable)."
+    default: []
+
   # Elasticsearch HOST CONFIGS. Each is a NAMED GROUP of the three connection settings the connector
   # needs: the endpoint, and the Databricks secret scope + key holding the ES api_key it authenticates
   # with. A pipeline selects ONE by name via `es_host_config: <name>` in its
