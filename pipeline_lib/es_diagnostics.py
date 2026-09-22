@@ -292,11 +292,18 @@ def total_rejected_delta(tp_before, tp_after):
     not collected in that sample, so no trustworthy window rate can be computed and the verdict must fail
     closed (this is what stops a sample-B failure from reading as a spurious 0). Otherwise an int >= 0. When
     both sides are populated, a node present in only one of them contributes 0 (it came/went, not a spike).
-    Keyed on node_id so two nodes never collapse to one entry even if their display names are blank/equal.
+    Keyed on node_id so two nodes never collapse to one entry even if their display names are blank/equal;
+    and if a sample's keys DO collapse (e.g. rows missing node_id AND sharing a blank name), the pairing is
+    unreliable, so this returns None (fail closed) rather than under-counting via last-write-wins.
     """
-    before = {_tp_key(r): r["rejected"] for r in tp_before if r.get("rejected") is not None}
-    after = {_tp_key(r): r["rejected"] for r in tp_after if r.get("rejected") is not None}
-    if not before or not after:
+    before_rows = [(_tp_key(r), r["rejected"]) for r in tp_before if r.get("rejected") is not None]
+    after_rows = [(_tp_key(r), r["rejected"]) for r in tp_after if r.get("rejected") is not None]
+    if not before_rows or not after_rows:
+        return None
+    before, after = dict(before_rows), dict(after_rows)
+    # Collision guard: a shorter dict than its row list means two rows shared a key (unkeyable rows) - we
+    # cannot reliably pair nodes across samples, so fail closed instead of silently under-counting.
+    if len(before) != len(before_rows) or len(after) != len(after_rows):
         return None
     delta = 0
     for node, aft in after.items():

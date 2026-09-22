@@ -188,6 +188,14 @@ def test_total_rejected_delta_distinct_ids_do_not_collapse_when_names_blank():
     assert total_rejected_delta(before, after) == 6
 
 
+def test_total_rejected_delta_none_when_keys_collide():
+    # Fail-closed collision guard: two rows with neither node_id nor a distinct name collapse to one key.
+    # Rather than under-count via last-write-wins, the reducer returns None so the verdict is INCONCLUSIVE.
+    before = parse_cat_thread_pool([{"rejected": "10"}, {"rejected": "20"}])  # both key -> ""
+    after = parse_cat_thread_pool([{"rejected": "13"}, {"rejected": "23"}])
+    assert total_rejected_delta(before, after) is None
+
+
 def test_max_write_queue():
     sample = parse_cat_thread_pool([{"node_name": "n1", "queue": "10"},
                                     {"node_name": "n2", "queue": "250"}])
