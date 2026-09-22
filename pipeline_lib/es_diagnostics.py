@@ -49,6 +49,13 @@ _REQUIRED_MEASURED_SIGNALS = (
     ("write_rejected_delta", "write thread-pool rejection rate over the window"),
     ("indexing_pressure_rejected_delta", "indexing-pressure rejection rate over the window"),
 )
+# Heap / GC are deliberately NOT required here. They are a SECONDARY signature (slow processing), not a
+# direct load-shedding signal, and heap_used_percent rides the SAME _nodes/stats call as the load-bearing
+# indexing-pressure rate (the notebook's filter_path requests nodes.*.jvm.mem alongside
+# nodes.*.indexing_pressure). So heap cannot be silently absent while the indexing-pressure rate is
+# measured: if that call fails, indexing_pressure_rejected_delta is already None and the verdict is
+# INCONCLUSIVE. Requiring heap too would be redundant and semantically wrong (heap is a point-in-time
+# gauge, present even on a single snapshot, not a windowed rate).
 
 
 # --------------------------------------------------------------------------- small parsing helpers

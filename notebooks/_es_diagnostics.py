@@ -210,11 +210,17 @@ def snapshot():
 
 
 print(f"sampling counters (interval {SAMPLE_INTERVAL}s)...")
+# Measure the TRUE window with a monotonic clock around the two snapshots, not the configured interval:
+# each snapshot() issues several sequential GETs on top of the sleep, so the real read-to-read gap is
+# longer than SAMPLE_INTERVAL. classify_verdict scales the GC-pressure test by this window, so an
+# understated window would overstate the GC fraction and over-fire HEAP_GC.
+_t_a = time.monotonic()
 SAMPLE_A = snapshot()
 if SAMPLE_INTERVAL > 0:
     time.sleep(SAMPLE_INTERVAL)
+    _t_b = time.monotonic()
     SAMPLE_B = snapshot()
-    WINDOW_SECS = SAMPLE_INTERVAL
+    WINDOW_SECS = _t_b - _t_a  # start-of-A to start-of-B (sleep + A's GET durations)
 else:
     SAMPLE_B = SAMPLE_A  # single snapshot: gauges only, no window => rate counters reported as absent
     WINDOW_SECS = 0
@@ -279,7 +285,7 @@ for node, breakers in SAMPLE_B["breakers"].items():
             print(f"  {node} breaker {bname}: tripped(lifetime)={b['tripped']} "
                   f"est={human_bytes(b['estimated_bytes'])}/{human_bytes(b['limit_bytes'])}")
 
-print(f"\n=== WINDOW DELTAS (over {WINDOW_SECS}s) ===")
+print(f"\n=== WINDOW DELTAS (over {WINDOW_SECS:.1f}s) ===")
 print(f"  write rejected delta        = {write_rejected_delta}")
 print(f"  indexing-pressure rej delta = {ip_rejected_delta}")
 print(f"  breaker tripped delta       = {breaker_tripped_delta}")
@@ -359,7 +365,7 @@ else:
             docs = idx_b["index_total"] - idx_a["index_total"]
             merges = (idx_b["merges_total"] or 0) - (idx_a["merges_total"] or 0)
             refreshes = (idx_b["refresh_total"] or 0) - (idx_a["refresh_total"] or 0)
-            print(f"  window delta ({WINDOW_SECS}s): docs_indexed={docs} merges={merges} refreshes={refreshes}")
+            print(f"  window delta ({WINDOW_SECS:.1f}s): docs_indexed={docs} merges={merges} refreshes={refreshes}")
     else:
         print("  (index _stats not collected)")
 
@@ -410,7 +416,7 @@ if ENDPOINTS_FAILED:
 _ip_pct = SIGNALS["indexing_pressure_pct_max"]
 SUMMARY = (
     f"es_diagnostics verdict={VERDICT} host={ES_HOST_URL!r} index={INDEX_NAME or '-'!r} "
-    f"window_secs={WINDOW_SECS} write_queue_max={SIGNALS['write_queue_max']} "
+    f"window_secs={WINDOW_SECS:.1f} write_queue_max={SIGNALS['write_queue_max']} "
     f"write_rejected_delta={SIGNALS['write_rejected_delta']} "
     f"indexing_pressure_pct_max={f'{_ip_pct:.2f}' if _ip_pct is not None else None} "
     f"indexing_pressure_rejected_delta={SIGNALS['indexing_pressure_rejected_delta']} "
