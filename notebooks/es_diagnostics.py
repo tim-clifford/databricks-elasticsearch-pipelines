@@ -30,7 +30,7 @@
 # MAGIC - `request_timeout_secs` (job parameter, default "15"): per-request client timeout.
 # MAGIC
 # MAGIC Invoke on demand, e.g.
-# MAGIC `databricks bundle run _es_diagnostics -t <target> -p <profile> --params index_name=<idx>`.
+# MAGIC `databricks bundle run es_diagnostics -t <target> -p <profile> --params index_name=<idx>`.
 
 # COMMAND ----------
 # Cell 1 - PARAMETERS + HELPERS. Read and validate parameters (fail closed on anything missing/unsafe),
@@ -47,7 +47,7 @@ import time
 import requests
 import urllib3
 
-# The bundle syncs this notebook to <files>/notebooks/_es_diagnostics.py and the shared package to
+# The bundle syncs this notebook to <files>/notebooks/es_diagnostics.py and the shared package to
 # <files>/pipeline_lib/; add the files root to sys.path so `pipeline_lib` imports on the cluster, exactly
 # as notebooks/run_index_pipeline.py does. (Must run before the pipeline_lib import below.)
 _nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()

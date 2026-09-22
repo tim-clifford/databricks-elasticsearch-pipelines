@@ -761,13 +761,13 @@ clear it.
 
 ### Diagnosing a congested Elasticsearch host
 
-When a host looks backed up (writes slowing down, requests timing out), run the read-only `_es_diagnostics`
-job (a serverless maintenance job, `resources/_es_diagnostics.job.yml`) to collect an outside view of what
+When a host looks backed up (writes slowing down, requests timing out), run the read-only `es_diagnostics`
+job (a serverless maintenance job, `resources/es_diagnostics.job.yml`) to collect an outside view of what
 the cluster is doing:
 
 ```bash
-databricks bundle run _es_diagnostics -t <target> -p <profile>                     # cluster/node level
-databricks bundle run _es_diagnostics -t <target> -p <profile> --params index_name=<index>   # + deep-dive one index
+databricks bundle run es_diagnostics -t <target> -p <profile>                     # cluster/node level
+databricks bundle run es_diagnostics -t <target> -p <profile> --params index_name=<index>   # + deep-dive one index
 ```
 
 It only issues `GET` requests (it never writes a document or reads the ES secret for anything but the
@@ -797,7 +797,7 @@ never clears a host as `HEALTHY` — use the default two-sample window for that)
 The run FAILS only when it could
 collect nothing at all (bad host / api_key / TLS / egress); a "found congestion" verdict is a successful
 run, since reporting congestion is the job's purpose. To point it at a host config other than
-`es_host_primary`, edit the `base_parameters` in `resources/_es_diagnostics.job.yml`.
+`es_host_primary`, edit the `base_parameters` in `resources/es_diagnostics.job.yml`.
 
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.

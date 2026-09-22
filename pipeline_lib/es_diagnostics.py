@@ -1,6 +1,6 @@
-"""Pure parsing, delta, and verdict logic for the _es_diagnostics maintenance notebook.
+"""Pure parsing, delta, and verdict logic for the es_diagnostics maintenance notebook.
 
-The notebook (notebooks/_es_diagnostics.py) collects read-only Elasticsearch diagnostics when a host or
+The notebook (notebooks/es_diagnostics.py) collects read-only Elasticsearch diagnostics when a host or
 index looks congested: it fetches a handful of `_cat` / `_nodes/stats` / `_cluster` endpoints TWICE a few
 seconds apart, then asks this module to (a) parse each raw response into a normalized shape, (b) diff the
 counter-bearing fields between the two samples (rejections, GC, completions are cumulative-since-boot, so a
@@ -10,7 +10,7 @@ single top-line verdict.
 Why a separate pure module: the HTTP fetch is impure and lives in the notebook, but the parse/delta/verdict
 logic is where the reasoning is - and a wrong verdict ("healthy" during an incident) is the failure this job
 exists to prevent. So that logic is pulled out here, dependency-free, and unit-tested off-cluster
-(tests/test_es_diagnostics.py) with fixture payloads.
+(tests/testes_diagnostics.py) with fixture payloads.
 
 The verdict is FAIL CLOSED (an allow-list, per the repo's classification convention): it names HEALTHY only
 when the load-bearing signals were positively collected AND positively clear. A missing signal (an endpoint

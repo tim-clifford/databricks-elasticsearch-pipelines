@@ -263,11 +263,13 @@ def test_max_gc_time_delta_ms_none_when_one_sample_empty():
 
 
 def test_verdict_no_false_heap_gc_from_summed_background_gc():
-    # End-to-end: 3 nodes each doing 400ms GC in a 5s window (8% each) must NOT trip HEAP_GC (per-node max
-    # 400ms < 1500ms threshold). A summed 1200ms would have (wrongly) tripped it (>= 1500? no, but on more
-    # nodes it would); the per-node signal is what keeps ordinary multi-node GC clear.
+    # End-to-end THROUGH the reducer: 4 nodes each +400ms GC in a 5s window. Per-node max = 400ms (< the
+    # 1500ms = 30%*5s threshold) => HEALTHY. A summed reducer would yield 1600ms (>= 1500) => a wrong
+    # HEAP_GC, so a max->sum mutation in the reducer flips this test (which a literal signal would not).
+    before = _jvm_gc({"a": 1000, "b": 1000, "c": 1000, "d": 1000})
+    after = _jvm_gc({"a": 1400, "b": 1400, "c": 1400, "d": 1400})
     s = _clear_signals()
-    s["gc_time_delta_ms"] = 400  # busiest node, per-node max
+    s["gc_time_delta_ms"] = max_gc_time_delta_ms(before, after)
     assert classify_verdict(s, window_secs=5)[0] == VERDICT_HEALTHY
 
 
