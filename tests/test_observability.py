@@ -11,7 +11,6 @@ import pytest
 from pipeline_lib.observability import (
     BULK_STATS_TAG,
     PROGRESS_TAG,
-    batch_job_description,
     bulk_stats_relay_line,
     format_bulk_stats,
     format_progress,
@@ -131,14 +130,6 @@ def test_multiple_sources_indexed():
     ]}
     line = format_progress(prog)
     assert "src0" in line and "src1" in line
-
-
-def test_batch_job_description_shape():
-    desc = batch_job_description("ecs_dns_activity_continuous", "ecs-dns-activity-continuous", 42)
-    assert PROGRESS_TAG in desc
-    assert "ecs_dns_activity_continuous" in desc
-    assert "ecs-dns-activity-continuous" in desc
-    assert "batch 42" in desc
 
 
 # --------------------------------------------------------------------------- format_bulk_stats
