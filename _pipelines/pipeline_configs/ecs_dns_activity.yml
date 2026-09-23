@@ -44,3 +44,5 @@ reference_tables:                 # OPTIONAL: extra tables the view joins
 
 schedule:                         # OPTIONAL: run this job on a Quartz cron (UTC); omit for on-demand
   quartz_cron_expression: "0 */10 * * * ?"   # every 10 minutes (paused under dev + stg; fires under prd)
+# pause_status: UNPAUSED          # OPTIONAL: override the target-wide schedule_pause_status for THIS
+#                                 # job's trigger (PAUSED|UNPAUSED). Omit to inherit the target default.

@@ -169,17 +169,17 @@ variables:
     default: ""
 
   # GLOBAL default for the connector's bulk_stats diagnostics (per-partition ES bulk-send stats -
-  # docs/send, round-trip ms, ES `took` ms - in the run log; requires connector >= 0.9.3). This is the
+  # docs/send, round-trip ms, ES `took` ms - in the run log). This is the
   # target-wide DEFAULT: scripts/gen_jobs.py bakes ${var.bulk_stats} as the bulk_stats job-parameter
   # default for every pipeline that OMITS bulk_stats, so you can turn diagnostics on for a whole target
   # (e.g. dev) and off for another (e.g. prd) WITHOUT editing each pipeline config. Precedence, highest
   # first: a per-run `--params bulk_stats=<v>` > a pipeline's own `bulk_stats:` in its config > this
   # global default > the connector's own default (OFF). Empty default so, out of the box, diagnostics are
-  # off everywhere and the connector default stands; set it "true" per target below (or --var) to turn
+  # off everywhere; set it "true" per target below (or --var) to turn
   # them on target-wide. A legal value is "" / true / false (validated at generation and at run). Like
   # the other simple string vars it accepts --var=bulk_stats=true at deploy.
   bulk_stats:
-    description: "Global default for connector bulk_stats diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off; connector default stands). A pipeline's own bulk_stats and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.9.3."
+    description: "Global default for connector bulk_stats diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off). A pipeline's own bulk_stats and a per-run --params override this. Set true per target/--var to turn on target-wide."
     default: ""
 
   # GLOBAL defaults for the connector's connection/reliability tuning, threaded exactly like bulk_stats:
@@ -189,18 +189,17 @@ variables:
   # levers for a batch write that fails at the transport layer ("The write operation timed out"): a large
   # or slow _bulk request that exceeds the socket timeout. Precedence, highest first: a per-run
   # `--params <knob>=<v>` > a pipeline's own `<knob>:` in its config > this global default > the
-  # connector's own default (request_timeout 60s, transport_max_retries 3). Empty defaults so, out of the
-  # box, the connector defaults stand everywhere; set them per target below (or --var) to raise them
+  # connector's own defaults. Empty defaults so, out of the
+  # box, the connector defaults apply everywhere; set them per target below (or --var) to raise them
   # target-wide. A legal request_timeout is "" or a positive integer of seconds; a legal
   # transport_max_retries is "" or a non-negative integer (0 disables transport retries). Both are
   # validated at generation and at run. Like the other simple string vars they accept
-  # --var=request_timeout=120 at deploy. request_timeout needs no minimum connector version (0.1.0+);
-  # transport_max_retries requires connector >= 0.6.0.
+  # --var=request_timeout=120 at deploy.
   request_timeout:
-    description: "Global default for EsWriteConfig request_timeout (per-request ES client timeout, seconds). Empty default (connector default 60 stands). A pipeline's own request_timeout and a per-run --params override this. Set per target/--var to raise it target-wide."
+    description: "Global default for EsWriteConfig request_timeout (per-request ES client timeout, seconds). Empty default (connector default applies). A pipeline's own request_timeout and a per-run --params override this. Set per target/--var to raise it target-wide."
     default: ""
   transport_max_retries:
-    description: "Global default for EsWriteConfig transport_max_retries (whole-request retries on a transport failure; 0 disables). Empty default (connector default 3 stands). A pipeline's own transport_max_retries and a per-run --params override this. Set per target/--var to raise it target-wide. Requires connector >= 0.6.0."
+    description: "Global default for EsWriteConfig transport_max_retries (whole-request retries on a transport failure; 0 disables). Empty default (connector default applies). A pipeline's own transport_max_retries and a per-run --params override this. Set per target/--var to raise it target-wide."
     default: ""
 
   # GLOBAL default for the connector's retry_transport_timeout, threaded exactly like bulk_stats (a bool
@@ -214,9 +213,9 @@ variables:
   # retry_transport_timeout=<v>` > a pipeline's own `retry_transport_timeout:` in its config > this global
   # default > the connector's own default (OFF). Empty default so it is off everywhere out of the box; set
   # it "true" per target below (or --var) to turn it on target-wide. A legal value is "" / true / false
-  # (validated at generation and at run). Requires connector >= 0.9.7 (older wheels drop it fail-soft).
+  # (validated at generation and at run).
   retry_transport_timeout:
-    description: "Global default for EsWriteConfig retry_transport_timeout (connector-owned whole-request timeout retry with backoff). Empty default (off; connector default stands). A pipeline's own retry_transport_timeout and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.9.7."
+    description: "Global default for EsWriteConfig retry_transport_timeout (connector-owned whole-request timeout retry with backoff). Empty default (off). A pipeline's own retry_transport_timeout and a per-run --params override this. Set true per target/--var to turn on target-wide."
     default: ""
 
   # GLOBAL default for the connector's bypass_fast_path, threaded exactly like bulk_stats (a bool flag).
@@ -228,10 +227,9 @@ variables:
   # per-run `--params bypass_fast_path=<v>` > a pipeline's own `bypass_fast_path:` in its config > this
   # global default > the connector's own default (OFF, fast path used). Empty default so the fast path is
   # used everywhere out of the box; set it "true" per target below (or --var) to turn it on target-wide. A
-  # legal value is "" / true / false (validated at generation and at run). Requires connector >= 0.10.0
-  # (older wheels drop it fail-soft).
+  # legal value is "" / true / false (validated at generation and at run).
   bypass_fast_path:
-    description: "Global default for EsWriteConfig bypass_fast_path (skip the errors-probe fast path; classify every chunk per-item for exact op_type=create counts, at the cost of fast-path throughput). Empty default (off; connector fast path used). A pipeline's own bypass_fast_path and a per-run --params override this. Set true per target/--var to turn on target-wide. Requires connector >= 0.10.0."
+    description: "Global default for EsWriteConfig bypass_fast_path (skip the errors-probe fast path; classify every chunk per-item for exact op_type=create counts, at the cost of fast-path throughput). Empty default (off; fast path used). A pipeline's own bypass_fast_path and a per-run --params override this. Set true per target/--var to turn on target-wide."
     default: ""
 
   # GLOBAL defaults for the REMAINING run-time knobs, so EVERY run-time job parameter follows ONE uniform
@@ -243,9 +241,8 @@ variables:
   # own config value, else the connector/Spark/built-in default, stands - EXCEPT pipeline_mode and
   # streaming_start, which have no meaningful empty value (their validators reject "") and so carry a
   # concrete default (batch / new). op_type stays EMPTY even though it is concrete-valued: its empty form
-  # defers to the connector's own default (index) AND, being version-gated (connector >= 0.10.0), a
-  # non-empty global would make an omitting config bake a value the runner's version-gate then drops with
-  # a spurious warning on an older wheel. All are validated at generation (require_runtime_knobs_declared)
+  # defers to the connector's own default write action, and a non-empty global would force that action on
+  # every omitting config. All are validated at generation (require_runtime_knobs_declared)
   # and at run, and like the other simple string vars accept a --var=<name>=<value> override at deploy.
   # (bulk_stats, request_timeout, transport_max_retries, retry_transport_timeout, and bypass_fast_path
   # above are the same pattern.)
@@ -263,19 +260,19 @@ variables:
     description: "Global default row filter (a Spark SQL predicate) for pipelines that omit filter_condition. Empty default (no filter). A pipeline's own filter_condition and a per-run --params override this."
     default: ""
   chunk_size:
-    description: "Global default EsWriteConfig chunk_size (docs per bulk request) for pipelines that omit it. Empty default (connector default stands). A pipeline's own value and a per-run --params override this."
+    description: "Global default EsWriteConfig chunk_size (docs per bulk request) for pipelines that omit it. Empty default (connector default applies). A pipeline's own value and a per-run --params override this."
     default: ""
   write_concurrency:
-    description: "Global default EsWriteConfig write_concurrency (parallel bulk streams per partition) for pipelines that omit it. Empty default (connector default 1). A pipeline's own value and a per-run --params override this."
+    description: "Global default EsWriteConfig write_concurrency (parallel bulk streams per partition) for pipelines that omit it. Empty default (connector default applies). A pipeline's own value and a per-run --params override this."
     default: ""
   op_type:
-    description: "Global default EsWriteConfig op_type (index|create) for pipelines that omit it. Empty default (the connector default, index, stands). A pipeline's own op_type and a per-run --params override this. create is append-only and needs a deterministic es_id_field to dedup a resend (without one, replays duplicate); requires connector >= 0.10.0. Empty (not a literal 'index') so an omitting config bakes '' and a pre-0.10.0 wheel's version-gate never spuriously drops it."
+    description: "Global default EsWriteConfig op_type (index|create) for pipelines that omit it. Empty default (the connector's default write action applies). A pipeline's own op_type and a per-run --params override this. create is append-only and needs a deterministic es_id_field to dedup a resend (without one, replays duplicate)."
     default: ""
   require_existing_index:
-    description: "Global default EsWriteConfig require_existing_index (true|false) for pipelines that omit it. Empty default (connector default stands). A pipeline's own value and a per-run --params override this."
+    description: "Global default EsWriteConfig require_existing_index (true|false) for pipelines that omit it. Empty default (connector default applies). A pipeline's own value and a per-run --params override this."
     default: ""
   verify_certs:
-    description: "Global default EsWriteConfig verify_certs (true|false) for pipelines that omit it. Empty default (connector default stands). A pipeline's own value and a per-run --params override this. Incompatible with a set ca_certs when false (the connector rejects that combination)."
+    description: "Global default EsWriteConfig verify_certs (true|false) for pipelines that omit it. Empty default (connector default applies). A pipeline's own value and a per-run --params override this. Incompatible with a set ca_certs when false (the connector rejects that combination)."
     default: ""
   streaming_start:
     description: "Global default first-run stream position (new|full) for pipelines that omit streaming_start. Default new (only new commits; full backfills the whole table). A pipeline's own value and a per-run --params override this. Streaming only; honored on a first run before a checkpoint exists."
@@ -293,15 +290,18 @@ variables:
     description: "Global default streaming read rate-limit: max bytes per micro-batch (e.g. 128m), for pipelines that omit it. Empty default (no cap). A pipeline's own value and a per-run --params override this. Streaming only."
     default: ""
 
-  # pause_status applied to EVERY generated job schedule (gen_jobs.py emits pause_status:
-  # ${var.schedule_pause_status}). Default PAUSED (fail-safe): schedules deploy but do NOT fire unless
-  # a target explicitly opts in, so dev and stg inherit PAUSED and never fire, and only prd binds
-  # UNPAUSED to actually run them. Default PAUSED (rather than relying on `mode: development` to pause
-  # dev) because an EXPLICIT pause_status is honored as-is - development mode does not override it
-  # (verified live), so the safe value has to be the default here. Only jobs that declare a schedule
-  # are affected; on-demand jobs have no schedule block.
+  # TARGET-WIDE default pause_status for EVERY generated job trigger (gen_jobs.py emits pause_status:
+  # ${var.schedule_pause_status} into each schedule/continuous block unless the pipeline overrides it).
+  # Default PAUSED (fail-safe): triggers deploy but do NOT fire unless a target explicitly opts in, so
+  # dev and stg inherit PAUSED and never fire, and only prd binds UNPAUSED to actually run them. Default
+  # PAUSED (rather than relying on `mode: development` to pause dev) because an EXPLICIT pause_status is
+  # honored as-is - development mode does not override it (verified live), so the safe value has to be
+  # the default here. Only jobs that declare a schedule or continuous trigger are affected; on-demand
+  # jobs have no trigger block. PER-PIPELINE OVERRIDE: a config may set its own top-level `pause_status:
+  # PAUSED|UNPAUSED` to override this target-wide default for that one job's trigger (two-layer pattern:
+  # this global default < the per-pipeline value); a pipeline that omits pause_status inherits this.
   schedule_pause_status:
-    description: "PAUSED or UNPAUSED for all job schedules (default PAUSED = fail-safe). Only prd binds UNPAUSED so schedules fire there; dev and stg stay paused."
+    description: "Target-wide default PAUSED or UNPAUSED for all job triggers (default PAUSED = fail-safe). Only prd binds UNPAUSED so triggers fire there; dev and stg stay paused. A pipeline config's own pause_status overrides this per job."
     default: "PAUSED"
 
   # Cluster policy id injected into EVERY generated job cluster: gen_jobs.py emits policy_id:
@@ -413,16 +413,16 @@ targets:
       # request_timeout: "120"     # raise the per-request ES timeout (seconds) for the whole dev target;
       # transport_max_retries: "5" # and the whole-request retry count. A pipeline's own value or a
                                    # --params override still wins. Empty defaults inherit the connector
-                                   # defaults (60s / 3) when omitted.
+                                   # defaults when omitted.
       # retry_transport_timeout: "true"  # let the connector OWN whole-request timeout retries (re-send with
                                    # backoff instead of failing the batch) for the whole dev target. A
                                    # pipeline's own value or a --params override still wins. Empty default
-                                   # (off) inherited when omitted. Requires connector >= 0.9.7.
+                                   # (off) inherited when omitted.
       # bypass_fast_path: "true"   # skip the errors-probe fast path and classify every chunk per-item for
                                    # the whole dev target (exact docs_deduped/written counts for
                                    # op_type=create, at the cost of fast-path throughput). A pipeline's own
                                    # value or a --params override still wins. Empty default (off, fast path
-                                   # used) inherited when omitted. Requires connector >= 0.10.0.
+                                   # used) inherited when omitted.
       # DEV Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-dev-es-host:9200

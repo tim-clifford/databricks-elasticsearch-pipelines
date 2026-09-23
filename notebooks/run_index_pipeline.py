@@ -192,14 +192,13 @@ from pipeline_lib.config import (  # noqa: E402
     write_config_overrides,
 )
 # Ephemeral per-batch streaming observability (pure Python, no Spark): the STREAM_PROGRESS log-line
-# formatter and the Jobs-UI batch label. Kept in pipeline_lib so it is unit-tested off-cluster.
+# formatter. Kept in pipeline_lib so it is unit-tested off-cluster.
 import json  # noqa: E402
 import time  # noqa: E402
 import uuid  # noqa: E402
 from pipeline_lib.observability import (  # noqa: E402
     BULK_STATS_TAG,
     PROGRESS_TAG,
-    batch_job_description,
     bulk_stats_relay_line,
     format_bulk_stats,
     format_progress,
@@ -615,67 +614,46 @@ if PIPELINE_MODE == "streaming":
         # shuffles), targeting ~2-3x worker cores, the same target as the batch path.
         if WRITE_REPARTITION > 0:
             transformed = transformed.repartition(WRITE_REPARTITION)
-        # Label this micro-batch's Spark jobs in the Jobs/Stages UI (batch id + target index) so an
-        # always-on run is legible there. Set on the batch session's context, BEFORE the write launches
-        # its jobs (it applies to jobs started on this micro-batch thread), and CLEAR it in the finally
-        # below so the 'batch N' label does not bleed onto later jobs on this thread or the idle window
-        # before the next batch. FAIL-SOFT: this is observability only, and sparkContext access can be
-        # restricted on some cluster access modes, so a set/clear failure must warn and continue.
-        try:
-            session.sparkContext.setJobDescription(
-                batch_job_description(CONFIG_NAME, es_write_config.index, batch_id)
-            )
-        except Exception as _e:
-            print(f"WARNING: {PROGRESS_TAG} could not set job description "
-                  f"({type(_e).__name__}: {_e}); continuing")
-        try:
-            # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
-            # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
-            # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
-            # micro-batch here: the checkpoint does not advance and Spark reprocesses the batch. That retry
-            # is an idempotent upsert ONLY when es_id_field is set (deterministic _id); with es_id_field
-            # OMITTED, ES assigns fresh random _ids, so the reprocessed rows land as NEW documents and the
-            # retry DUPLICATES them - streaming replays are routine, so omit es_id_field only for a stream
-            # where duplicates are acceptable. If it never recovers the run fails with no summary. So the
-            # record step below is only reached for a batch that wrote every row cleanly, and
-            # result['written'] is the true count.
-            result = bulk_write(transformed, es_write_config, raise_on_error=True)
-            # When bulk_stats is on, log a COMPACT one-line rollup of this micro-batch's ES bulk-send
-            # diagnostics (overall docs/send, rtt, took) so an always-on run has per-batch visibility
-            # without the full per-partition breakdown flooding the log. format_bulk_stats is fail-soft,
-            # so a diagnostic-formatting fault can never disturb the write. This print runs server-side
-            # (micro-batch), so its stdout lands in the driver LOG (surfacing as stderr), not the cell.
-            if "bulk_stats" in result:
-                print(format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}")
-                # ALSO relay the overall+tail line to the cell, via a small per-batch FILE the
-                # client-side listener reads (foreachBatch's own stdout can't reach the cell under Spark
-                # Connect - see relay_dir above). Written with the SAME nested Spark write used for the
-                # row count below, so it uses only a mechanism proven to work server-side here. Gated on
-                # _relay_readable: when the checkpoint path isn't FUSE-readable the listener can neither
-                # read NOR prune these files, so skip the write entirely (no leak; the operator was warned
-                # once at run start, and the oneline above still reaches the driver log). FAIL-SOFT: a
-                # relay/format fault must never disturb the write. Only data-carrying batches produce a
-                # line (bulk_stats_relay_line returns None otherwise), so empty batches write nothing.
-                try:
-                    _relay_line = bulk_stats_relay_line(result, batch_id) if _relay_readable else None
-                    if _relay_line is not None:
-                        session.createDataFrame([(_relay_line,)], "line string") \
-                            .coalesce(1).write.mode("overwrite").text(f"{relay_dir}/{int(batch_id)}")
-                except Exception as _e:
-                    print(f"WARNING: {BULK_STATS_TAG} could not relay batch {batch_id} to the cell "
-                          f"({type(_e).__name__}: {_e}); continuing")
-            # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
-            # the summary can dedup a retried batch (write mode append; each batch is its own small file).
-            session.createDataFrame(
-                [(int(batch_id), int(result.get("written", 0) or 0))], "batch_id bigint, written bigint"
-            ).coalesce(1).write.mode("append").json(metrics_dir)
-        finally:
-            # Clear the batch label so it does not persist onto later jobs on this thread/session or the
-            # idle window before the next batch (cosmetic only). Fail-soft.
+        # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
+        # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
+        # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
+        # micro-batch here: the checkpoint does not advance and Spark reprocesses the batch. That retry
+        # is an idempotent upsert ONLY when es_id_field is set (deterministic _id); with es_id_field
+        # OMITTED, ES assigns fresh random _ids, so the reprocessed rows land as NEW documents and the
+        # retry DUPLICATES them - streaming replays are routine, so omit es_id_field only for a stream
+        # where duplicates are acceptable. If it never recovers the run fails with no summary. So the
+        # record step below is only reached for a batch that wrote every row cleanly, and
+        # result['written'] is the true count.
+        result = bulk_write(transformed, es_write_config, raise_on_error=True)
+        # When bulk_stats is on, log a COMPACT one-line rollup of this micro-batch's ES bulk-send
+        # diagnostics (overall docs/send, rtt, took) so an always-on run has per-batch visibility
+        # without the full per-partition breakdown flooding the log. format_bulk_stats is fail-soft,
+        # so a diagnostic-formatting fault can never disturb the write. This print runs server-side
+        # (micro-batch), so its stdout lands in the driver LOG (surfacing as stderr), not the cell.
+        if "bulk_stats" in result:
+            print(format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}")
+            # ALSO relay the overall+tail line to the cell, via a small per-batch FILE the
+            # client-side listener reads (foreachBatch's own stdout can't reach the cell under Spark
+            # Connect - see relay_dir above). Written with the SAME nested Spark write used for the
+            # row count below, so it uses only a mechanism proven to work server-side here. Gated on
+            # _relay_readable: when the checkpoint path isn't FUSE-readable the listener can neither
+            # read NOR prune these files, so skip the write entirely (no leak; the operator was warned
+            # once at run start, and the oneline above still reaches the driver log). FAIL-SOFT: a
+            # relay/format fault must never disturb the write. Only data-carrying batches produce a
+            # line (bulk_stats_relay_line returns None otherwise), so empty batches write nothing.
             try:
-                session.sparkContext.setJobDescription(None)
-            except Exception:
-                pass
+                _relay_line = bulk_stats_relay_line(result, batch_id) if _relay_readable else None
+                if _relay_line is not None:
+                    session.createDataFrame([(_relay_line,)], "line string") \
+                        .coalesce(1).write.mode("overwrite").text(f"{relay_dir}/{int(batch_id)}")
+            except Exception as _e:
+                print(f"WARNING: {BULK_STATS_TAG} could not relay batch {batch_id} to the cell "
+                      f"({type(_e).__name__}: {_e}); continuing")
+        # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
+        # the summary can dedup a retried batch (write mode append; each batch is its own small file).
+        session.createDataFrame(
+            [(int(batch_id), int(result.get("written", 0) or 0))], "batch_id bigint, written bigint"
+        ).coalesce(1).write.mode("append").json(metrics_dir)
 
 # COMMAND ----------
 # STREAMING run - STEP 1 of 2: PREPARE the checkpoint (streaming mode only). Build the Delta stream

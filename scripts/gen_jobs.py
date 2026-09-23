@@ -342,9 +342,24 @@ def _compute_desc(cfg: dict) -> str:
     )
 
 
-def _continuous_block() -> dict:
-    """The job-level `continuous` trigger body (one perpetual, auto-restarting run). pause_status binds
-    schedule_pause_status (default PAUSED) so dev/stg deploy-but-paused and only prd runs the stream.
+# The target-wide pause_status global. A trigger inherits it (pause_status: ${var.schedule_pause_status})
+# unless the pipeline config sets its own pause_status, in which case that literal wins (two-layer
+# pattern: target-wide default < per-pipeline override). See _pause_status_ref.
+_SCHEDULE_PAUSE_STATUS_REF = "${var.schedule_pause_status}"
+
+
+def _pause_status_ref(pause_status: str) -> str:
+    """Resolve a trigger's pause_status field: the pipeline's own literal (PAUSED|UNPAUSED) if it set
+    one, else the target-wide ${var.schedule_pause_status} global. The config layer stores "" when a
+    pipeline omits pause_status, so `pause_status or <global>` reaches the global exactly like the
+    run-time knobs' `cfg[name] or ref` fallback."""
+    return pause_status or _SCHEDULE_PAUSE_STATUS_REF
+
+
+def _continuous_block(pause_status: str = "") -> dict:
+    """The job-level `continuous` trigger body (one perpetual, auto-restarting run). pause_status is the
+    pipeline's own PAUSED|UNPAUSED override when set, else binds schedule_pause_status (default PAUSED)
+    so dev/stg deploy-but-paused and only prd runs the stream.
 
     task_retry_mode is PINNED to ON_FAILURE, and this matters most for a multi-task continuous group.
     A continuous job's per-task recovery is governed ONLY by this field (per-task max_retries is not
@@ -357,22 +372,28 @@ def _continuous_block() -> dict:
     or the retry limit is reached, the whole run is cancelled and a fresh one started. That two-tier
     behavior - retry the task, else restart the job - is exactly what an always-on pipeline needs, so it
     is the framework default rather than an opt-in knob."""
-    return {"pause_status": "${var.schedule_pause_status}", "task_retry_mode": "ON_FAILURE"}
+    return {"pause_status": _pause_status_ref(pause_status), "task_retry_mode": "ON_FAILURE"}
 
 
-def _schedule_block(cron: str) -> dict:
-    """The job-level `schedule` body for a Quartz cron. Timezone always UTC; pause_status binds
-    schedule_pause_status (default PAUSED), the same fail-safe pause model as continuous."""
-    return {"quartz_cron_expression": cron, "timezone_id": "UTC", "pause_status": "${var.schedule_pause_status}"}
+def _schedule_block(cron: str, pause_status: str = "") -> dict:
+    """The job-level `schedule` body for a Quartz cron. Timezone always UTC; pause_status is the
+    pipeline's own PAUSED|UNPAUSED override when set, else binds schedule_pause_status (default PAUSED),
+    the same fail-safe pause model as continuous."""
+    return {
+        "quartz_cron_expression": cron,
+        "timezone_id": "UTC",
+        "pause_status": _pause_status_ref(pause_status),
+    }
 
 
-def _trigger_block(schedule: dict | None, continuous: dict | None) -> dict | None:
+def _trigger_block(schedule: dict | None, continuous: dict | None, pause_status: str = "") -> dict | None:
     """The single-key trigger dict for a standalone config: {"continuous": ...}, {"schedule": ...}, or
-    None (on-demand). Mirrors the config invariant that schedule and continuous are mutually exclusive."""
+    None (on-demand). Mirrors the config invariant that schedule and continuous are mutually exclusive.
+    pause_status is the config's per-pipeline override ("" => inherit the target-wide global)."""
     if continuous is not None:
-        return {"continuous": _continuous_block()}
+        return {"continuous": _continuous_block(pause_status)}
     if schedule is not None:
-        return {"schedule": _schedule_block(schedule["quartz_cron_expression"])}
+        return {"schedule": _schedule_block(schedule["quartz_cron_expression"], pause_status)}
     return None
 
 
@@ -555,7 +576,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
         _job_display_name(postfix),
         description,
         job_parameters(cfg, _RUNTIME_KNOB_GLOBAL_REFS),
-        _trigger_block(cfg["schedule"], cfg["continuous"]),
+        _trigger_block(cfg["schedule"], cfg["continuous"], cfg["pause_status"]),
         _job_clusters_for([(name, cfg, job_cluster_spec)]),
         [task],
     )
@@ -564,8 +585,13 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     return _GENERATED_HEADER.format(config=config_filename) + body
 
 
-def _resolve_group_trigger(group_name: str, members: list) -> tuple:
+def _resolve_group_trigger(group_name: str, members: list, pause_status: str = "") -> tuple:
     """Resolve a group's single job-level trigger from its members (define-once / conflict-fails).
+
+    pause_status is the group's already-resolved per-pipeline pause override (see
+    _resolve_group_pause_status), threaded into the emitted trigger block; "" => inherit the target-wide
+    global. A non-empty pause_status on an on-demand group (no member declares a trigger) is rejected
+    fail-closed, since there is no trigger for it to apply to.
 
     Returns (trigger_block_or_None, effective_streaming_interval). Each member contributes its declared
     trigger signature - ('continuous', interval), ('schedule', cron), or nothing (on-demand => inherits):
@@ -588,6 +614,12 @@ def _resolve_group_trigger(group_name: str, members: list) -> tuple:
         sigs.setdefault(sig, []).append(name)
 
     if not sigs:
+        if pause_status:
+            raise ValueError(
+                f"job_group '{group_name}' sets pause_status={pause_status!r} but has no trigger "
+                f"(no member declares a schedule or continuous block), so pause_status would have no "
+                f"effect. Add a schedule/continuous trigger to a member, or remove pause_status."
+            )
         return None, ""
     if len(sigs) > 1:
         detail = "; ".join(
@@ -609,8 +641,29 @@ def _resolve_group_trigger(group_name: str, members: list) -> tuple:
                     f"pipeline_mode={cfg['pipeline_mode']!r}, compute={cfg['compute']['type']!r}. Make it "
                     f"streaming on job_cluster/existing_cluster, or move it to its own job."
                 )
-        return {"continuous": _continuous_block()}, value
-    return {"schedule": _schedule_block(value)}, ""
+        return {"continuous": _continuous_block(pause_status)}, value
+    return {"schedule": _schedule_block(value, pause_status)}, ""
+
+
+def _resolve_group_pause_status(group_name: str, members: list) -> str:
+    """The group job's per-pipeline pause_status override (define-once / conflict-fails). Members that
+    omit pause_status ("") are ignored; if none set it, return "" (inherit the target-wide
+    ${var.schedule_pause_status} global); if members set the SAME value, adopt it; if members set
+    DIFFERENT values, fail closed (a group is one job with one trigger, so one pause state)."""
+    declared: dict = {}
+    for _, name, cfg, _ in members:
+        ps = cfg["pause_status"]
+        if ps:
+            declared.setdefault(ps, []).append(name)
+    if not declared:
+        return ""
+    if len(declared) > 1:
+        detail = "; ".join(f"{ps!r} (member(s): {', '.join(sorted(ns))})" for ps, ns in sorted(declared.items()))
+        raise ValueError(
+            f"job_group '{group_name}' has conflicting pause_status values: {detail}. Members must "
+            f"declare the same pause_status (others may omit it and inherit)."
+        )
+    return next(iter(declared))
 
 
 def _resolve_group_postfix(group_name: str, members: list) -> str:
@@ -655,7 +708,8 @@ def render_group_job_yaml(group_name: str, members: list) -> str:
     output; task keys stay index_pipeline_<member> (unique per member). The job resource key is
     index_pipeline_group_<group>.
     """
-    trigger, effective_interval = _resolve_group_trigger(group_name, members)
+    pause_status = _resolve_group_pause_status(group_name, members)
+    trigger, effective_interval = _resolve_group_trigger(group_name, members, pause_status)
     postfix = _resolve_group_postfix(group_name, members)
     ordered = sorted(members, key=lambda m: m[1])  # by config name
 

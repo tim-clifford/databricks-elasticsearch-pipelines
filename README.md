@@ -128,11 +128,13 @@ value fails closed wherever the value is required. The bundle variables are:
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Set per target (empty on `main`). Required for a streaming run (fails closed if empty); unused by batch and `deploy_views`. The `dev` target shows how to append `${workspace.current_user.short_name}` to isolate each developer's checkpoints (see [Streaming](#streaming)) |
 | `cluster_policy_id` | workspace-specific cluster policy id injected into every job cluster (see [Compute](#compute)). Set per target (empty on `main`); required only when a pipeline uses `job_cluster` compute |
 | `ca_certs` | UC Volume path to a CA bundle (PEM) the connector uses to verify the ES server's TLS certificate. One global bundle shared by every host config. Set per target (empty on `main`); empty means fall back to the system CA store. Incompatible with `verify_certs: false` (the connector rejects that combination at run). Per-endpoint CA pinning is not supported (would need `ca_certs` moved onto the `es_host_*` complex variables) |
-| `schedule_pause_status` | `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
-| `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log; connector **>= 0.9.3**). Empty default (off; the connector default stands). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
-| `retry_transport_timeout` | global default for the connector's `retry_transport_timeout` reliability toggle (connector **>= 0.9.7**): when on, the connector OWNS whole-request timeout retries (re-sends a timed-out bulk with backoff instead of letting the transport re-send it invisibly and then failing the batch). Empty default (off; the connector default stands). Threaded exactly like `bulk_stats`: the generator bakes `${var.retry_transport_timeout}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=retry_transport_timeout=true`) turns it on for a whole environment, and a pipeline's own `retry_transport_timeout:` or a per-run `--params retry_transport_timeout=<v>` override it (see [Configuration](#configuration)) |
-| `bypass_fast_path` | global default for the connector's `bypass_fast_path` write-path toggle (connector **>= 0.10.0**): when on, the connector skips its `filter_path="errors"` probe and classifies every chunk per-item, which makes the `docs_deduped` / `written` counts EXACT for `op_type=create` on chunks mixing new and existing `_id`s (and avoids the auto-id re-ship duplication), at the cost of the fast path's throughput on clean chunks. Empty default (off; the fast path is used). Threaded exactly like `bulk_stats`: the generator bakes `${var.bypass_fast_path}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bypass_fast_path=true`) turns it on for a whole environment, and a pipeline's own `bypass_fast_path:` or a per-run `--params bypass_fast_path=<v>` override it (see [Configuration](#configuration)) |
-| `pipeline_mode`, `filter_condition`, `chunk_size`, `write_concurrency`, `op_type`, `request_timeout`, `transport_max_retries`, `require_existing_index`, `verify_certs`, `streaming_start`, `write_repartition`, `max_partition_bytes`, `max_files_per_trigger`, `max_bytes_per_trigger` | the **remaining run-time knobs**, each threaded exactly like `bulk_stats`: the generator bakes `${var.<name>}` as that knob's job-parameter default for any pipeline that omits it, so **every** run-time knob follows one uniform pattern (this global default < a per-pipeline config value < a per-run `--params <name>=<value>`). All ship at a default that reproduces the prior behavior: `pipeline_mode` **`batch`** and `streaming_start` **`new`** (concrete, since their validators reject `""`), the rest empty (`""` = "the connector/Spark/built-in default stands" - `op_type` empty defers to the connector default `index`, and stays empty rather than a literal `index` so a pre-0.10.0 wheel's version-gate does not spuriously drop it). Leaving them unset changes nothing; set one per target (or `--var=<name>=<value>`) to move a whole environment. Note: setting a non-empty global for an empty-sentinel knob applies to every omitting pipeline with no per-config opt-out (watch `filter_condition`). Validated at generation and at run (see [Configuration](#configuration)) |
+| `default_es_host_config` | name of the ES **host config** a pipeline writes to when it omits `es_host_config` (out of the box `es_host_primary`); must name one of the `es_host_*` complex variables. Read at **generation** time, so it is a repo-level choice: per-target and `--var` overrides are not seen by the generator (its per-environment values live on the host config itself). See [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections) |
+| `schedule_pause_status` | target-wide default `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. A pipeline config's own top-level `pause_status` overrides this for that one job's trigger. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
+| `support_email` | email recipients (a **list**) notified on any job/task run **failure** in the target. Every job (generated index/group jobs plus the hand-authored `deploy_views`, `checkpoint_clear`, `build_wheel`) emits `email_notifications.on_failure: ${var.support_email}` with `notification_settings` that suppress SKIPPED and CANCELED runs, so the address is paged only on a genuine failure. A `type: complex` LIST var: the empty list `[]` turns notifications **off** (an unambiguous "no recipients", unlike a single empty string). Set per target (empty `[]` on `main`, `dev`, `stg`; set a real address, e.g. `["es-oncall@yourco.com"]`, only in `prd`). Because it is complex it **cannot** be set via `--var`; override `dev` through the git-ignored `.databricks/bundle/<target>/variable-overrides.json` |
+| `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
+| `retry_transport_timeout` | global default for the connector's `retry_transport_timeout` reliability toggle: when on, the connector OWNS whole-request timeout retries (re-sends a timed-out bulk with backoff instead of letting the transport re-send it invisibly and then failing the batch). Empty default (off). Threaded exactly like `bulk_stats`: the generator bakes `${var.retry_transport_timeout}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=retry_transport_timeout=true`) turns it on for a whole environment, and a pipeline's own `retry_transport_timeout:` or a per-run `--params retry_transport_timeout=<v>` override it (see [Configuration](#configuration)) |
+| `bypass_fast_path` | global default for the connector's `bypass_fast_path` write-path toggle: when on, the connector skips its `filter_path="errors"` probe and classifies every chunk per-item, which makes the `docs_deduped` / `written` counts EXACT for `op_type=create` on chunks mixing new and existing `_id`s (and avoids the auto-id re-ship duplication), at the cost of the fast path's throughput on clean chunks. Empty default (off; the fast path is used). Threaded exactly like `bulk_stats`: the generator bakes `${var.bypass_fast_path}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bypass_fast_path=true`) turns it on for a whole environment, and a pipeline's own `bypass_fast_path:` or a per-run `--params bypass_fast_path=<v>` override it (see [Configuration](#configuration)) |
+| `pipeline_mode`, `filter_condition`, `chunk_size`, `write_concurrency`, `op_type`, `request_timeout`, `transport_max_retries`, `require_existing_index`, `verify_certs`, `streaming_start`, `write_repartition`, `max_partition_bytes`, `max_files_per_trigger`, `max_bytes_per_trigger` | the **remaining run-time knobs**, each threaded exactly like `bulk_stats`: the generator bakes `${var.<name>}` as that knob's job-parameter default for any pipeline that omits it, so **every** run-time knob follows one uniform pattern (this global default < a per-pipeline config value < a per-run `--params <name>=<value>`). All ship at a default that reproduces the prior behavior: `pipeline_mode` **`batch`** and `streaming_start` **`new`** (concrete, since their validators reject `""`), the rest empty (`""` = defer to the connector/Spark/built-in default; `op_type` empty defers to the connector's default write action). Leaving them unset changes nothing; set one per target (or `--var=<name>=<value>`) to move a whole environment. Note: setting a non-empty global for an empty-sentinel knob applies to every omitting pipeline with no per-config opt-out (watch `filter_condition`). Validated at generation and at run (see [Configuration](#configuration)) |
 
 The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
 pipeline selects, with values that differ per environment. See
@@ -156,13 +158,13 @@ filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
 require_existing_index: true      # OPTIONAL EsWriteConfig tuning (require the index to exist); omit for connector default
 verify_certs: true                # OPTIONAL EsWriteConfig tuning (verify the ES TLS cert); omit for connector default
-write_concurrency: 4              # OPTIONAL EsWriteConfig tuning (parallel bulk streams per partition; connector >= 0.7.0); omit for connector default 1
-request_timeout: 120              # OPTIONAL EsWriteConfig tuning (per-request ES client timeout, seconds); omit for connector default 60. Raise it (with a smaller chunk_size) when a bulk send times out mid-write
-transport_max_retries: 5          # OPTIONAL EsWriteConfig tuning (whole-request retries on a transport failure: connection reset/timeout, 429/503 on the bulk call; connector >= 0.6.0); omit for connector default 3. 0 disables them
-bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log; connector >= 0.9.3). Behaves like verify_certs: omit to defer to the global ${var.bulk_stats} default (off), or set true|false here to override it for this pipeline
-retry_transport_timeout: true     # OPTIONAL EsWriteConfig reliability toggle: connector OWNS whole-request timeout retries (re-send a timed-out bulk with backoff instead of failing the batch; connector >= 0.9.7). Behaves like bulk_stats: omit to defer to the global ${var.retry_transport_timeout} default (off), or set true|false here to override it for this pipeline
-op_type: create                   # OPTIONAL EsWriteConfig write action: index (default, upsert by _id) | create (append-only; a resend of an existing _id is a benign 409 dedup, not overwritten or duplicated; connector >= 0.10.0). Behaves like bulk_stats: omit to defer to the global ${var.op_type} (empty default => connector default index), or set here to override it for this pipeline. create needs es_id_field to dedup a resend (else replays duplicate; the runner warns if create runs without one)
-bypass_fast_path: true            # OPTIONAL EsWriteConfig write-path toggle: skip the errors-probe fast path and classify every chunk per-item (connector >= 0.10.0). Makes docs_deduped/written counts EXACT for op_type=create at the cost of fast-path throughput. Behaves like bulk_stats: omit to defer to the global ${var.bypass_fast_path} default (off), or set true|false here to override it for this pipeline
+write_concurrency: 4              # OPTIONAL EsWriteConfig tuning (parallel bulk streams per partition); omit for connector default
+request_timeout: 120              # OPTIONAL EsWriteConfig tuning (per-request ES client timeout, seconds); omit for connector default. Raise it (with a smaller chunk_size) when a bulk send times out mid-write
+transport_max_retries: 5          # OPTIONAL EsWriteConfig tuning (whole-request retries on a transport failure: connection reset/timeout, 429/503 on the bulk call); omit for connector default. 0 disables them
+bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-partition ES bulk-send stats in the run log). Behaves like verify_certs: omit to defer to the global ${var.bulk_stats} default (off), or set true|false here to override it for this pipeline
+retry_transport_timeout: true     # OPTIONAL EsWriteConfig reliability toggle: connector OWNS whole-request timeout retries (re-send a timed-out bulk with backoff instead of failing the batch). Behaves like bulk_stats: omit to defer to the global ${var.retry_transport_timeout} default (off), or set true|false here to override it for this pipeline
+op_type: create                   # OPTIONAL EsWriteConfig write action: index (default, upsert by _id) | create (append-only; a resend of an existing _id is a benign 409 dedup, not overwritten or duplicated). Behaves like bulk_stats: omit to defer to the global ${var.op_type} (empty default defers to the connector's default write action), or set here to override it for this pipeline. create needs es_id_field to dedup a resend (else replays duplicate; the runner warns if create runs without one)
+bypass_fast_path: true            # OPTIONAL EsWriteConfig write-path toggle: skip the errors-probe fast path and classify every chunk per-item. Makes docs_deduped/written counts EXACT for op_type=create at the cost of fast-path throughput. Behaves like bulk_stats: omit to defer to the global ${var.bypass_fast_path} default (off), or set true|false here to override it for this pipeline
 streaming_start: new              # OPTIONAL first-run stream position: new (only new commits) | full (backfill whole table). Omit to defer to the global ${var.streaming_start} default (new), or set here; override per run. Streaming only; honored on a first run before a checkpoint exists
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit to defer to the global ${var.max_partition_bytes} (built-in default 2m)
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off); set > 0 only when the view shuffles; omit to defer to the global ${var.write_repartition} (built-in default 0)
@@ -191,6 +193,7 @@ reference_tables:                 # OPTIONAL: holds one alias entry per joined t
 #   quartz_cron_expression: "0 0 8 * * ?"   # 08:00 UTC daily
 # continuous:                      # OPTIONAL: run always-on instead of scheduled (see Continuous streaming).
 #   trigger_interval: 30 seconds   #   streaming + classic compute only; mutually exclusive with schedule
+# pause_status: UNPAUSED           # OPTIONAL: override the target-wide schedule_pause_status for THIS job's trigger (needs a schedule/continuous; see Scheduling)
 # job_group: ecs_streams           # OPTIONAL: merge every config sharing this name into ONE job, one task each (see Job groups)
 # job_name_postfix: "ECS streams"  # OPTIONAL: cosmetic display-name segment (default: config name, or group name in a group)
 ```
@@ -383,6 +386,22 @@ without touching configs: `dev` and `stg` inherit the paused default, so schedul
 **dormant** in both; only `prd` binds `UNPAUSED` and actually fires them. Unpause a single job in the
 UI/API for a one-off test, or set `--var=schedule_pause_status=UNPAUSED` at deploy to override.
 
+**Per-pipeline pause override.** A single pipeline can opt out of the target-wide default with its own
+top-level `pause_status: PAUSED | UNPAUSED` config key, which overrides `${var.schedule_pause_status}`
+for that one job's trigger (two-layer pattern: target-wide default `<` per-pipeline value). A pipeline
+that omits `pause_status` inherits the target-wide default, so this is fully backward-compatible. It
+applies to the job's `schedule` **or** `continuous` trigger, so it is only valid on a job that has one:
+an on-demand pipeline (no `schedule`, no `continuous`, and not in a `job_group`) that sets `pause_status`
+is rejected at config load, and a `job_group` with no trigger at all that sets it is rejected by
+`gen_jobs.py`. In a `job_group` (one job, one trigger), members follow define-once/conflict-fails: at
+most one distinct `pause_status` across members, others inherit.
+
+```yaml
+pause_status: UNPAUSED          # optional; overrides the target-wide schedule_pause_status default
+schedule:
+  quartz_cron_expression: "0 */10 * * * ?"
+```
+
 ### Continuous (always-on) streaming
 
 A scheduled `streaming` job drains the new commits and stops on each tick. For lower latency you can
@@ -413,8 +432,10 @@ matters only on the very first run.
 
 **Pausing.** Like a schedule, the continuous trigger's `pause_status` is bound to
 `schedule_pause_status` (default `PAUSED`), so `dev`/`stg` deploy the always-on job **dormant** and
-only `prd` (or an explicit `--var=schedule_pause_status=UNPAUSED`) actually runs it. One always-on run
-holds its job cluster for as long as it is unpaused, so treat it as a running-cost commitment.
+only `prd` (or an explicit `--var=schedule_pause_status=UNPAUSED`) actually runs it. A single pipeline
+can override this with its own top-level `pause_status` key (see **Per-pipeline pause override** above),
+which applies to the continuous trigger the same way. One always-on run holds its job cluster for as
+long as it is unpaused, so treat it as a running-cost commitment.
 
 **Failure recovery.** A continuous job's per-task recovery is governed by the continuous trigger's
 `task_retry_mode`, which the generator pins to **`ON_FAILURE`** for every continuous job. This is
@@ -547,19 +568,17 @@ Two different mechanisms carry values into a job, and they resolve at different 
     (highest) > the pipeline's own config value > the target-wide `${var.<name>}` global default in
     `databricks.yml` > the connector/Spark/built-in default. So a config that omits a knob (and a run that
     doesn't override it) inherits that target's global, and when the global is left at its shipped default
-    the connector's/Spark's own default stands, exactly as before. `pipeline_mode` and `streaming_start`
+    the connector's/Spark's own default applies, exactly as before. `pipeline_mode` and `streaming_start`
     ship concrete globals (`batch` / `new`, since their validators reject `""`); the rest ship empty
-    (`op_type` included, so its connector default `index` stands and a pre-0.10.0 wheel's version-gate
-    does not spuriously drop it). This is why a knob can be moved for a whole environment from
+    (`op_type` included, so its connector default applies). This is why a knob can be moved for a whole environment from
     `databricks.yml` alone, without editing any pipeline.
-  - `write_concurrency` (a positive integer, default the connector's `1`) runs that many bulk request
-    streams in parallel *within each write partition* (requires connector **>= 0.7.0**). Raise it when
+  - `write_concurrency` (a positive integer) runs that many bulk request
+    streams in parallel *within each write partition*. Raise it when
     the write is latency-bound on ES round-trips (executors idle, CPU and network both under-used)
     rather than CPU/bandwidth-bound; it multiplies with the partition count, so raise it gradually and
     watch for 429s. Applies to **both** modes.
-  - `request_timeout` (a positive integer, **seconds**; connector default `60`) and
-    `transport_max_retries` (a non-negative integer; connector default `3`, `0` disables; requires
-    connector **>= 0.6.0**) tune a write
+  - `request_timeout` (a positive integer, **seconds**) and
+    `transport_max_retries` (a non-negative integer; `0` disables) tune a write
     that fails at the transport layer: the classic symptom is `EsWriteError: ... ConnectionTimeout ...
     The write operation timed out`, where a whole bulk request exceeded the socket timeout. Because the
     request never returned per-document statuses, the connector fails those documents closed (counted as
@@ -568,7 +587,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
     `chunk_size` so each request is smaller; `transport_max_retries` is how many times the ES client
     re-sends the *whole* request on such a failure (it is **not** the per-document 429 retry, which is a
     separate connector knob not surfaced here). Both apply to **both** modes.
-  - `bulk_stats` (`true` | `false`; requires connector **>= 0.9.3**) collects
+  - `bulk_stats` (`true` | `false`) collects
     per-partition ES bulk-send diagnostics and logs them under the `BULK_STATS` tag. It behaves like the
     other bool knobs, with one extra layer: a **global** default. Precedence, highest first: a per-run
     `--params bulk_stats=<v>` > a pipeline's own `bulk_stats:` config value > the target-wide
@@ -594,10 +613,9 @@ Two different mechanisms carry values into a job, and they resolve at different 
     `docs/send` is the real docs-per-bulk, so this is the tool for diagnosing whether more
     `write_concurrency` or cores would help; `gil_wait_ms` (from the connector's GIL-acquisition probe,
     on connectors that emit it, else `n/a`) separates a slow round trip that is a genuine socket/ES wait
-    from one inflated by GIL starvation under a high `write_concurrency`. On a connector older than 0.9.3 the runner drops it with a
-    warning and the export proceeds without the diagnostic (it never fails the run). Applies to **both**
+    from one inflated by GIL starvation under a high `write_concurrency`. Applies to **both**
     modes.
-  - `retry_transport_timeout` (`true` | `false`; requires connector **>= 0.9.7**) moves whole-request
+  - `retry_transport_timeout` (`true` | `false`) moves whole-request
     **timeout** retries into the connector: a bulk send that exceeds the connector's `request_timeout`
     is re-sent with bounded exponential backoff instead of being re-sent invisibly by the ES transport
     and then failing the batch (which makes Spark re-run the whole task, so a latency-bound pipeline
@@ -609,10 +627,8 @@ Two different mechanisms carry values into a job, and they resolve at different 
     environment, and set/clear it in one pipeline's config to override that. When on, the connector does
     **not** shorten `request_timeout` and only retries `ConnectionTimeout` (connection resets and
     429/503 on the bulk call itself still retry at the transport as before); with `bulk_stats` also on,
-    the retry cost is visible as `timeout_sends` / `timeout_wait_ms` in the `BULK_STATS` output. On a
-    connector older than 0.9.7 the runner drops the knob with a warning and the export proceeds with the
-    connector's default timeout handling (it never fails the run). Applies to **both** modes.
-  - `op_type` (`index` | `create`, default `index`; requires connector **>= 0.10.0**) picks the `_bulk`
+    the retry cost is visible as `timeout_sends` / `timeout_wait_ms` in the `BULK_STATS` output. Applies to **both** modes.
+  - `op_type` (`index` | `create`, default `index`) picks the `_bulk`
     action. `index` upserts by `_id` (a resend overwrites). `create` is **append-only**: a resend of an
     existing `_id` returns a 409 the connector treats as a benign dedup (the doc is neither overwritten
     nor duplicated), which lets ES take its cheaper append path. Unlike `bulk_stats` /
@@ -624,9 +640,8 @@ Two different mechanisms carry values into a job, and they resolve at different 
     then the whole-chunk re-ship self-409s it, so it is tallied as `docs_deduped` rather than `written`
     (the data is still correct: one copy, no overwrite; only the attribution is off). All-new and
     all-existing chunks count exactly. Set `bypass_fast_path` (below) to make the counts exact, or accept
-    the possible miscount. On a connector older than 0.10.0 the runner drops the knob with a warning and
-    writes with the default `index` action. Applies to **both** modes.
-  - `bypass_fast_path` (`true` | `false`; requires connector **>= 0.10.0**) turns off the connector's
+    the possible miscount. Applies to **both** modes.
+  - `bypass_fast_path` (`true` | `false`) turns off the connector's
     `filter_path="errors"` fast path so every chunk is classified per-item on the first send (no
     whole-chunk re-ship). This makes the `docs_deduped` / `written` counts **exact** for `op_type=create`
     on chunks that mix new and already-indexed `_id`s (the miscount described above), and it also avoids
@@ -637,8 +652,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
     a pipeline's own `bypass_fast_path:` config value > the target-wide `${var.bypass_fast_path}`
     databricks.yml variable > the connector's own default (**off**; the fast path is used). So set
     `bypass_fast_path` in databricks.yml (per target, or `--var=bypass_fast_path=true`) to turn it on for
-    a whole environment. On a connector older than 0.10.0 the runner drops the knob with a warning and
-    writes with the fast path. Applies to **both** modes.
+    a whole environment. Applies to **both** modes.
   - `streaming_start` (`new` | `full`) sets where a **streaming** run begins on its
     first run: `new` streams only commits after the stream starts (batch mode owns the history);
     `full` backfills the whole existing table first. Now an optional config key on the same three-layer
