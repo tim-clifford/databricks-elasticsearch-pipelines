@@ -773,6 +773,58 @@ For a **continuous** (always-on) pipeline, pause the continuous trigger first (o
 job), run the clear, then resume, so the always-on stream is not re-establishing a checkpoint while you
 clear it.
 
+### Diagnosing a congested Elasticsearch host
+
+When a host looks backed up (writes slowing down, requests timing out), run the read-only `es_diagnostics`
+job (a serverless maintenance job, `resources/es_diagnostics.job.yml`) to collect an outside view of what
+the cluster is doing:
+
+```bash
+databricks bundle run es_diagnostics -t <target> -p <profile>                              # es_host_primary, cluster/node level
+databricks bundle run es_diagnostics -t <target> -p <profile> --params index_name=<index>  # + deep-dive one index
+databricks bundle run es_diagnostics -t <target> -p <profile> --params es_host_config=es_host_secondary  # hit a different host config
+```
+
+It only issues `GET` requests (it never writes a document or reads the ES secret for anything but the
+`Authorization` header) and connects to the host config named by the `es_host_config` parameter (default
+`es_host_primary`), the same endpoints and `api_key` secrets the pipelines use — so testing a different
+configured host is a `--params es_host_config=<name>`, not a YAML edit (the job carries every configured
+host's url + secret scope/key, and the notebook resolves the chosen name, failing closed on an unknown
+one). It gathers: write thread-pool saturation and rejections, indexing pressure,
+circuit breakers, node heap/GC, cluster health and pending tasks, in-flight bulk tasks, hot threads, and
+(when `index_name` is set) that index's `_stats`/`_settings`/`_count`/shard placement. It samples the
+counter endpoints **twice** (`sample_interval_secs` apart, default 5s) so rejection/GC rates reflect the
+window rather than lifetime totals, then prints a one-line **verdict** classifying the signature:
+
+- `REJECTING` — ES is actively shedding load with 429s (write-pool / indexing-pressure / breaker
+  rejections in the window). This is the idiomatic backpressure signal; reduce bulk size / write
+  concurrency and back off on 429.
+- `SATURATED` — the write queue is building but not yet rejecting (near capacity).
+- `PRESSURED` — indexing-pressure memory is a high fraction of its limit (rejections imminent).
+- `HEAP_GC_PRESSURE` — high heap and/or heavy GC in the window: the box is processing slowly rather than
+  queueing. A slow `_bulk` that times out client-side (rather than a fast 429) points here or at the
+  network, not at a full queue.
+- `HEALTHY` — every load-bearing signal was collected and is clear.
+- `INCONCLUSIVE` — a load-bearing signal (write rejections/queue, indexing pressure) could not be
+  collected, so the host cannot be cleared as healthy (fail closed). The failed endpoints are listed.
+
+Run parameters (all `--params`-overridable): `index_name` (blank => cluster/node level only),
+`verify_certs` (`false` for a self-signed endpoint; ignored when `ca_certs` is set), `sample_interval_secs`
+(`0` => single snapshot: gauges only, no rejection rate, so it can surface `SATURATED`/`PRESSURED` but
+never clears a host as `HEALTHY` — use the default two-sample window for that), and `request_timeout_secs`.
+The run FAILS only when it could
+collect nothing at all (bad host / api_key / TLS / egress); a "found congestion" verdict is a successful
+run, since reporting congestion is the job's purpose.
+
+By default the job runs **serverless**. To run it on a specific cluster instead (e.g. to match the
+client's DBR runtime or the network/egress path the real pipeline writes over), set one of the
+`es_diagnostics COMPUTE` variables in `databricks.yml` and re-deploy (compute is a deploy-time property;
+Databricks has no run-time cluster swap): `diagnostics_existing_cluster_id` to run on an already-running
+cluster by id (a plain string, so `--var="diagnostics_existing_cluster_id=<id>"` works), or
+`diagnostics_job_clusters` + `diagnostics_job_cluster_key` to run on a new job cluster — copy a
+`_pipelines/job_cluster_configs/<key>.yml` `new_cluster` spec into the `diagnostics_job_clusters` list
+(complex var; set per target or in `variable-overrides.json`). Set at most one path.
+
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
