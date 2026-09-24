@@ -45,6 +45,54 @@ variables:
     description: "Environment folded into ${environment} in config names. Empty default; set per target below or override with --var."
     default: ""
 
+  # GLOBAL job tags applied to EVERY job this bundle deploys: the 4 hand-authored maintenance jobs
+  # (build_wheel, deploy_views, checkpoint_clear, es_diagnostics) AND every gen_jobs-generated index/group
+  # job. A `type: complex` map of tag key -> tag value. Ships EMPTY ({}) on main: an empty complex var is
+  # OMITTED by DAB, so jobs deploy tagless until you configure this (the same "empty on main" convention as
+  # wheel_path and the host configs). Databricks allows at most 25 tags per job.
+  #
+  # HOW IT REACHES JOBS (two paths, one source):
+  #   - The 4 fixed jobs reference the WHOLE var: `tags: ${var.global_job_tags}`, resolved per target at
+  #     DEPLOY. A per-target override (below / variable-overrides.json) is honored for these.
+  #   - Generated jobs: scripts/gen_jobs.py reads THIS variable's `default:` at GENERATION time and bakes
+  #     {these tags + an es_index_list tag it computes} into each generated job's `tags:`. So the generated
+  #     jobs' tag KEY SET is the top-level default here, resolved at generation (exactly like
+  #     default_es_host_config). Per-target VALUE variation still works because a value that is a bundle
+  #     reference (e.g. environment: ${var.environment}) is baked in verbatim and resolves per target at
+  #     deploy. A per-target override that changes the KEY SET reaches only the fixed jobs, not generated
+  #     ones - so keep the key set here at the top level and vary values with ${var...} references.
+  #
+  # SYNTAX. The value is a MAPPING of tag key -> tag value under `default:`. `{}` is just YAML for the
+  # EMPTY map (no tags). To add tags, REPLACE `default: {}` with an indented block, one `key: value` per
+  # line. Both of these are equivalent (block form is preferred here for readability):
+  #     default:                                  |    default: {environment: "${var.environment}",
+  #       environment: "${var.environment}"       |              team: "search-platform",
+  #       team: "search-platform"                 |              cost_center: "CC-1234"}
+  #       cost_center: "CC-1234"                   |
+  # Keys and values are STRINGS. Quote a value that contains ${...}, a colon, or that YAML would otherwise
+  # read as a non-string (e.g. "true", "2026"); a bare word like search-platform is fine unquoted. A value
+  # may be a bundle reference such as "${var.environment}" (resolved per target) or a literal.
+  #
+  # ENVIRONMENT TAG: the common case is a per-target environment tag, environment: "${var.environment}"
+  # (the environment var is set per target below), mirroring how the job-cluster custom_tags already tag
+  # the cluster. es_index_list is added AUTOMATICALLY by the generator to generated jobs (and is a reserved
+  # key here - do NOT set it yourself).
+  #
+  # Job tags are FORWARDED to job clusters as cluster tags, so on a job_cluster pipeline these also land on
+  # the cluster (alongside the spec's custom_tags). Serverless jobs have no cluster, so job-level tags are
+  # the only tag lever there. A tag whose key/value conflicts with a FIXED cluster-policy rule fails closed
+  # at DEPLOY (like any policy conflict). Complex, so NOT settable via --var; override a target through
+  # .databricks/bundle/<target>/variable-overrides.json.
+  global_job_tags:
+    type: complex
+    description: "Global tags (map of key -> value string) applied to every job. Empty {} = no tags (omitted). To add tags replace {} with an indented block, e.g. environment: \"${var.environment}\". Fixed jobs resolve it per target at deploy; generated jobs bake the top-level default (+ an es_index_list tag) at generation. Job tags forward to job clusters. type: complex, so NOT --var-settable; override via variable-overrides.json."
+    # Populated example (uncomment and edit; delete the `{}` default below if you use this):
+    # default:
+    #   environment: "${var.environment}"   # per-target value (set under each target's variables block)
+    #   team: "search-platform"             # a literal
+    #   cost_center: "CC-1234"
+    default: {}
+
   # Branding PREFIX in every generated job's display name: `[<target>] <job_name_prefix>: <postfix>`.
   # scripts/gen_jobs.py emits ${var.job_name_prefix} into each job name, so the bundle resolves it per
   # target at deploy - rebrand every job (e.g. to a team/product name) without regenerating any files.

@@ -1038,3 +1038,197 @@ def test_group_distinct_es_index_names_ok():
 
 def test_group_generated_path_uses_group_prefix():
     assert gen_jobs.group_generated_path("g1").endswith("/resources/group_g1.job.yml")
+
+
+# --------------------------------------------------------------------------- global job tags + es_index_list
+
+def _render_job_tags(cfg, global_job_tags, spec=None, name="ecs_dns_activity"):
+    """Render a singleton job with the given global tags; return its parsed `tags` map (or None)."""
+    text = gen_jobs.render_job_yaml(f"{name}.yml", name, cfg, spec, global_job_tags)
+    job = yaml.safe_load(text)["resources"]["jobs"][f"index_pipeline_{name}"]
+    return job.get("tags")
+
+
+def _render_group_tags(group, members, global_job_tags):
+    """Render a group job with the given global tags; return its parsed `tags` map (or None)."""
+    text = gen_jobs.render_group_job_yaml(group, members, global_job_tags)
+    return yaml.safe_load(text)["resources"]["jobs"][f"index_pipeline_group_{group}"].get("tags")
+
+
+def test_generated_singleton_carries_es_index_list_of_its_one_index():
+    # A singleton job writes exactly one index; es_index_list is that name. With no global tags the job's
+    # tags map is JUST the generator-owned es_index_list (never empty - a job always writes an index).
+    tags = _render_job_tags(_cfg(), {})
+    assert tags == {"es_index_list": "ecs-dns-activity"}
+
+
+def test_generated_group_es_index_list_is_distinct_sorted_space_separated():
+    # A group's es_index_list is the DISTINCT es_index_name(s) of its members, sorted, SPACE-joined -
+    # deduped so two members writing the same index collapse to one entry, sorted for deterministic output.
+    # Space (not comma): the Jobs API tag-value regex rejects a comma (verified live at deploy).
+    members = [
+        _member("b.yml", "b", "idx-b", mode="batch"),
+        _member("a.yml", "a", "idx-a", mode="batch"),
+        _member("c.yml", "c", "idx-a", mode="batch"),  # duplicate index -> deduped
+    ]
+    tags = _render_group_tags("g1", members, {})
+    assert tags == {"es_index_list": "idx-a idx-b"}
+
+
+def test_es_index_list_value_has_no_comma_and_matches_jobs_api_regex():
+    # Guard the API constraint that made comma fail live: the es_index_list value must match the Jobs API
+    # tag-value regex ^[\d \w+\-=.:/@]*$ (no comma). Assert on a multi-index group value.
+    import re
+    tags = _render_group_tags("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch"),
+        _member("b.yml", "b", "idx-b", mode="batch"),
+    ], {})
+    value = tags["es_index_list"]
+    assert "," not in value
+    assert re.fullmatch(r"[\d \w+\-=.:/@]*", value)
+
+
+def test_global_tags_baked_before_es_index_list_in_order():
+    # Global tags are baked in FIRST (in declared order), es_index_list LAST, on both singleton and group.
+    gtags = {"environment": "${var.environment}", "team": "search-platform"}
+    stags = _render_job_tags(_cfg(), gtags)
+    assert stags == {"environment": "${var.environment}", "team": "search-platform",
+                     "es_index_list": "ecs-dns-activity"}
+    assert list(stags) == ["environment", "team", "es_index_list"]
+    gtags2 = _render_group_tags("g1", [_member("a.yml", "a", "idx-a", mode="batch")], gtags)
+    assert list(gtags2) == ["environment", "team", "es_index_list"]
+
+
+def test_global_tag_var_reference_value_preserved_verbatim():
+    # A tag VALUE that is a bundle reference is baked in verbatim (resolves per target at deploy), not
+    # touched by the generator - the whole point of per-target values on generated jobs.
+    tags = _render_job_tags(_cfg(), {"environment": "${var.environment}"})
+    assert tags["environment"] == "${var.environment}"
+
+
+def test_empty_global_tags_still_emits_es_index_list_only():
+    # Empty global tags => the job still carries es_index_list (generator-owned), nothing else.
+    assert _render_job_tags(_cfg(), {}) == {"es_index_list": "ecs-dns-activity"}
+
+
+def test_global_tags_baked_across_all_computes():
+    # Global tags reach every generated job regardless of compute (serverless / existing / job_cluster).
+    for compute, spec in (
+        (None, None),
+        ({"type": "existing_cluster", "cluster_config": "interactive_primary"}, None),
+        ({"type": "job_cluster", "job_cluster_config": "std"}, {"spark_version": "17.3.x-scala2.13", "num_workers": 1}),
+    ):
+        tags = _render_job_tags(_cfg(compute), {"environment": "${var.environment}"}, spec)
+        assert tags["environment"] == "${var.environment}"
+        assert tags["es_index_list"] == "ecs-dns-activity"
+
+
+def test_job_cluster_job_keeps_cluster_custom_tags_and_gets_job_tags():
+    # Job-level tags and the cluster spec's own custom_tags coexist: the generator does NOT push global
+    # tags into custom_tags, nor does it drop the spec's custom_tags. (Databricks forwards job tags onto
+    # the cluster at deploy; the generator leaves the spec untouched.)
+    spec = {"spark_version": "17.3.x-scala2.13", "num_workers": 1, "custom_tags": {"project": "elastic"}}
+    text = gen_jobs.render_job_yaml("x.yml", "x", _cfg({"type": "job_cluster", "job_cluster_config": "std"}),
+                                    spec, {"environment": "${var.environment}"})
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_x"]
+    assert job["tags"] == {"environment": "${var.environment}", "es_index_list": "ecs-dns-activity"}
+    assert job["job_clusters"][0]["new_cluster"]["custom_tags"] == {"project": "elastic"}
+
+
+def test_tags_emitted_after_notification_settings():
+    # Deterministic key order: tags sits right after notification_settings (keeps --check byte-stable).
+    text = gen_jobs.render_job_yaml("x.yml", "x", _cfg(), None, {"environment": "e"})
+    job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_x"]
+    keys = list(job)
+    assert keys.index("tags") == keys.index("notification_settings") + 1
+
+
+def test_es_index_list_over_cloud_limit_warns_but_emits(capsys):
+    # A very long es_index_list (past the conservative cloud tag-value bound) WARNS (does not fail) and is
+    # still emitted: the deploy is the authority on the actual per-cloud limit, and a valid large group
+    # must not be blocked at generation.
+    many = [_member(f"{i}.yml", f"m{i}", f"index-{i:03d}-longname", mode="batch") for i in range(30)]
+    tags = _render_group_tags("g1", many, {})
+    err = capsys.readouterr().err
+    assert "es_index_list" in err and "may be rejected at deploy" in err
+    assert len(tags["es_index_list"]) > gen_jobs._TAG_VALUE_WARN_LEN
+
+
+def test_es_index_list_within_limit_does_not_warn(capsys):
+    # A short es_index_list stays silent (the warning is not spurious).
+    _render_job_tags(_cfg(), {})
+    assert "es_index_list" not in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- load_global_job_tags / require
+
+def _write_tags_yml(tmp_path, body):
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(body)
+    return yml
+
+
+def test_load_global_job_tags_reads_map(tmp_path):
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n"
+                                    "      environment: '${var.environment}'\n      team: search\n")
+    assert gen_jobs.load_global_job_tags(str(yml)) == {"environment": "${var.environment}", "team": "search"}
+
+
+@pytest.mark.parametrize("body", [
+    "variables: {}\n",                                                  # var absent
+    "variables:\n  global_job_tags:\n    type: complex\n    default: {}\n",  # empty map
+    "variables:\n  global_job_tags:\n    type: complex\n",              # no default
+])
+def test_load_global_job_tags_absent_or_empty_is_empty(tmp_path, body):
+    assert gen_jobs.load_global_job_tags(str(_write_tags_yml(tmp_path, body))) == {}
+
+
+def test_load_global_job_tags_non_mapping_fails_closed(tmp_path):
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      - a\n      - b\n")
+    with pytest.raises(ValueError, match="must be a mapping"):
+        gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_load_global_job_tags_non_string_value_fails_closed(tmp_path):
+    # YAML reads a bare 2026 / true as int/bool; tags are string->string, so require the operator to quote.
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      year: 2026\n")
+    with pytest.raises(ValueError, match="must be a string"):
+        gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_load_global_job_tags_reserved_es_index_list_fails_closed(tmp_path):
+    # es_index_list is generator-owned; a user defining it in global_job_tags fails closed.
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      es_index_list: nope\n")
+    with pytest.raises(ValueError, match="reserved"):
+        gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_require_global_job_tags_declared_present_passes(tmp_path):
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default: {}\n")
+    gen_jobs.require_global_job_tags_declared(str(yml))  # no raise
+
+
+def test_require_global_job_tags_declared_missing_fails_closed(tmp_path):
+    yml = _write_tags_yml(tmp_path, "variables:\n  other: {default: x}\n")
+    with pytest.raises(ValueError, match="global_job_tags is not declared"):
+        gen_jobs.require_global_job_tags_declared(str(yml))
+
+
+def test_shipped_databricks_yml_declares_global_job_tags():
+    gen_jobs.require_global_job_tags_declared()  # the repo's databricks.yml declares it
+    assert gen_jobs.load_global_job_tags() == {}  # ships empty on main
+
+
+@pytest.mark.parametrize("filename,job_key", [
+    ("deploy_views.job.yml", "deploy_views"),
+    ("checkpoint_clear.job.yml", "checkpoint_clear"),
+    ("build_wheel.job.yml", "build_wheel"),
+    ("es_diagnostics.job.yml", "es_diagnostics"),
+])
+def test_shipped_fixed_jobs_reference_global_job_tags(filename, job_key):
+    # The 4 hand-authored jobs are NOT emitted by gen_jobs, so guard against drift: each must reference the
+    # whole global_job_tags var so it gets the same global tags every generated job carries.
+    path = os.path.join(_REPO_ROOT, "resources", filename)
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"][job_key]
+    assert job["tags"] == "${var.global_job_tags}"

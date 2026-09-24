@@ -36,6 +36,10 @@ resources:
         no_alert_for_skipped_runs: true
         no_alert_for_canceled_runs: true
 
+      # Global job tags from databricks.yml (empty {} => omitted). Applied to every job; serverless, so
+      # these are job-level tags (no cluster to forward onto). Matches every other job.
+      tags: ${var.global_job_tags}
+
       tasks:
         - task_key: checkpoint_clear
           notebook_task:

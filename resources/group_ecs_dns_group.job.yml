@@ -16,6 +16,8 @@ resources:
       notification_settings:
         no_alert_for_skipped_runs: true
         no_alert_for_canceled_runs: true
+      tags:
+        es_index_list: ecs-dns-group-a ecs-dns-group-b
       job_clusters:
       - job_cluster_key: standard_batch
         new_cluster:
