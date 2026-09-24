@@ -406,17 +406,24 @@ def load_global_job_tags(path: str = _DATABRICKS_YML, doc: dict | None = None) -
                 f"global_job_tags (databricks.yml): tag {key!r} value must be a string (got "
                 f"{type(value).__name__}); quote it, e.g. {key}: \"{value}\""
             )
-        # Validate the LITERAL part of each key/value against the Jobs API tag regex so a disallowed
-        # character (e.g. a comma) fails closed at generation, not at deploy. Strip ${...} bundle-reference
-        # spans first (their deploy-resolved form differs from the reference text), so a mixed value like
-        # "a,b${var.x}" still has its literal "a,b" checked and rejected.
-        for label, text in (("key", key), (f"tag {key!r} value", value)):
-            if _TAG_CHAR_RE.fullmatch(_BUNDLE_REF_RE.sub("", text)) is None:
-                raise ValueError(
-                    f"global_job_tags (databricks.yml): {label} {text!r} contains a character Databricks "
-                    f"rejects in a tag (allowed: ASCII letters, digits, space, and + - = . : / @ _); a "
-                    f"comma is NOT allowed. Fix the value."
-                )
+        # Validate against the Jobs API tag regex so a disallowed character (e.g. a comma) fails closed at
+        # generation, not at deploy. A KEY is a literal (references belong in values, per the databricks.yml
+        # docs), so it is checked whole - a ${...}-shaped key is rejected rather than reduced to '' and
+        # baked verbatim. A VALUE may embed a ${...} bundle reference (its deploy-resolved form differs from
+        # the reference text), so strip those spans first and check the literal remainder - a mixed value
+        # like "a,b${var.x}" still has its literal "a,b" caught.
+        if _TAG_CHAR_RE.fullmatch(key) is None:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag key {key!r} contains a character Databricks rejects "
+                f"in a tag (allowed: ASCII letters, digits, space, and + - = . : / @ _); a comma is NOT "
+                f"allowed, and a key must be a literal (put ${{var...}} references in the value, not the key)."
+            )
+        if _TAG_CHAR_RE.fullmatch(_BUNDLE_REF_RE.sub("", value)) is None:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag {key!r} value {value!r} contains a character "
+                f"Databricks rejects in a tag (allowed: ASCII letters, digits, space, and + - = . : / @ _); "
+                f"a comma is NOT allowed. Fix the value."
+            )
     # Every generated job also carries the generator-owned es_index_list tag, so the global set must leave
     # room for it under Databricks' 25-tag-per-job cap (fail closed here, not at deploy). NOTE: a
     # `mode: development` target ALSO adds its own `dev` tag at deploy, so in dev the effective headroom is

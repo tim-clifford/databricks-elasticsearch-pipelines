@@ -1304,3 +1304,11 @@ def test_load_global_job_tags_reserved_key_error_wins_over_count(tmp_path):
     yml = _write_tags_yml(tmp_path, "\n".join(body) + "\n")
     with pytest.raises(ValueError, match="reserved"):
         gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_load_global_job_tags_reference_shaped_key_fails_closed(tmp_path):
+    # A KEY is a literal (references belong in values); a ${...}-shaped key must fail closed at generation,
+    # not be reduced to '' by the ref-strip and baked verbatim. ($ { } are all outside the tag regex.)
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      '${var.foo}': x\n")
+    with pytest.raises(ValueError, match="key must be a literal"):
+        gen_jobs.load_global_job_tags(str(yml))
