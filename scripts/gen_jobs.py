@@ -67,12 +67,16 @@ _CLUSTER_CONFIG_FIELDS = frozenset({"cluster_id"})
 _ES_INDEX_LIST_TAG = "es_index_list"
 
 # Databricks forwards job tags to cluster tags, whose value length is bounded by the CLOUD PROVIDER
-# (AWS tag value 255, Azure 256, GCP labels only 63). There is no single Databricks number, so rather than
-# fail a valid large job_group closed at one threshold, WARN past a conservative bound (the AWS/Azure
-# practical limit) so a long es_index_list surfaces the risk; the deploy remains the authority on the
-# actual per-cloud limit. Only the generator-computed es_index_list value is checked (global tag values
-# may be ${var...} references whose deploy-time length differs from the reference string).
-_TAG_VALUE_WARN_LEN = 255
+# (AWS tag value 255, Azure 256, GCP labels only 63). To keep a large job_group DEPLOYABLE, the
+# generator-owned es_index_list is TRUNCATED to fit this conservative bound (the AWS/Azure practical
+# limit) rather than blocking the whole job's deploy on one oversized tag: whole index names are kept in
+# sorted order until the next would not fit, then a ` ...+N` marker names how many were dropped. The
+# GLOBAL tags are independent tag values and are never touched by this. (GCP's 63-char label limit is
+# tighter than this cap; a GCP deployment with many indices may still need fewer indices per group.)
+_TAG_VALUE_MAX_LEN = 255
+# Space for the ` ...+N` truncation marker, reserved out of _TAG_VALUE_MAX_LEN so the final value
+# (kept names + marker) never exceeds the cap. Generous: " ...+" is 5 chars plus the dropped count.
+_TRUNC_MARKER_BUDGET = 16
 
 # The Jobs API restricts a tag KEY/VALUE to this character set (verified live: a comma is rejected at
 # deploy with "must match the regular expression ^[\d \w+\-=.:/@]*$"). A LITERAL global tag key/value is
@@ -445,20 +449,44 @@ def _build_job_tags(global_job_tags: dict, index_names: list, label: str) -> dic
     mutated. es_index_list is always present (a job always writes at least one index), so a generated
     job's tags map is never empty even when global_job_tags is {}."""
     tags = dict(global_job_tags)
-    # SPACE-separated, not comma: the Jobs API restricts a tag VALUE to ^[\d \w+\-=.:/@]*$ (a comma is
-    # rejected at deploy - verified live). ES index names are lowercase and never contain a space or comma,
-    # so a space is an unambiguous, API-legal separator.
-    value = " ".join(sorted(set(index_names)))
-    if len(value) > _TAG_VALUE_WARN_LEN:
+    value, dropped = _es_index_list_value(index_names)
+    if dropped:
         print(
-            f"WARNING: job '{label}' {_ES_INDEX_LIST_TAG} tag value is {len(value)} chars (> "
-            f"{_TAG_VALUE_WARN_LEN}); Databricks forwards job tags to cluster tags whose value is capped "
-            f"by the cloud provider (AWS 255, Azure 256, GCP 63), so a very long list may be rejected at "
-            f"deploy. Consider fewer indices per job_group.",
+            f"WARNING: job '{label}' {_ES_INDEX_LIST_TAG} was truncated to fit the {_TAG_VALUE_MAX_LEN}-char "
+            f"tag-value cap: {dropped} of {len(set(index_names))} index name(s) dropped (a ' ...+N' marker "
+            f"records the count). The global tags are unaffected. Consider fewer indices per job_group if "
+            f"you need the full list in the tag.",
             file=sys.stderr,
         )
     tags[_ES_INDEX_LIST_TAG] = value
     return tags
+
+
+def _es_index_list_value(index_names: list) -> tuple:
+    """The es_index_list tag VALUE and how many names were dropped. Distinct + sorted + SPACE-joined
+    (space, not comma: the Jobs API tag-value regex rejects a comma - verified live; ES index names never
+    contain a space, so it is unambiguous). Truncated to _TAG_VALUE_MAX_LEN so a large job_group stays
+    deployable: whole names are kept in sorted order until the next would not fit within the budget left
+    after reserving room for a ` ...+N` marker, then the marker (N = names dropped) is appended. Returns
+    (value, dropped). A final hard slice guards the pathological case of a single name longer than the
+    budget; in normal use every name is short so truncation lands on a space boundary."""
+    names = sorted(set(index_names))
+    full = " ".join(names)
+    if len(full) <= _TAG_VALUE_MAX_LEN:
+        return full, 0
+    budget = _TAG_VALUE_MAX_LEN - _TRUNC_MARKER_BUDGET
+    kept: list = []
+    length = 0
+    for name in names:
+        add = len(name) + (1 if kept else 0)  # + the joining space once past the first
+        if length + add > budget:
+            break
+        kept.append(name)
+        length += add
+    dropped = len(names) - len(kept)
+    marker = f" ...+{dropped}"
+    value = (" ".join(kept) + marker) if kept else marker.lstrip()
+    return value[:_TAG_VALUE_MAX_LEN], dropped
 
 
 def _job_display_name(postfix: str) -> str:

@@ -396,9 +396,11 @@ attribution is a separate, account-level Serverless Usage Policy feature, outsid
 whose key or value conflicts with a value **fixed** by the workspace cluster policy fails closed at
 deploy, the same as any policy conflict, so keep the global tags in line with the policies you deploy
 under. Tag **value length** is bounded by the cloud provider (AWS 255, Azure 256, GCP labels 63) once a
-tag reaches a cluster; a very long `es_index_list` (a job group over many indices) is not blocked at
-generation but `gen_jobs.py` prints a warning that the deploy may reject it, so prefer fewer indices per
-group on tightly limited clouds.
+tag reaches a cluster; to keep a large job group deployable, `gen_jobs.py` **truncates** a long
+`es_index_list` to a conservative cap (255), keeping whole index names in sorted order and appending a
+` ...+N` marker for the count dropped (with a generation warning). The global tags are independent tag
+values and are never truncated. (GCP's 63-char label limit is tighter than the cap, so a GCP deployment
+with many indices per group may still need fewer.)
 
 The whole `compute` block is validated fail-closed: an unrecognized `type`, a missing required key,
 or a stray key for the chosen type is rejected at config load (and by `gen_jobs.py --check`).

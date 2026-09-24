@@ -1143,21 +1143,38 @@ def test_tags_emitted_after_notification_settings():
     assert keys.index("tags") == keys.index("notification_settings") + 1
 
 
-def test_es_index_list_over_cloud_limit_warns_but_emits(capsys):
-    # A very long es_index_list (past the conservative cloud tag-value bound) WARNS (does not fail) and is
-    # still emitted: the deploy is the authority on the actual per-cloud limit, and a valid large group
-    # must not be blocked at generation.
-    many = [_member(f"{i}.yml", f"m{i}", f"index-{i:03d}-longname", mode="batch") for i in range(30)]
+def test_es_index_list_over_cap_is_truncated_to_fit_and_warns(capsys):
+    # A very long es_index_list is TRUNCATED to the tag-value cap (so the job stays deployable) and warns.
+    # The value fits the cap, ends with a ` ...+N` marker, and keeps WHOLE names (truncation on a space
+    # boundary), so no partial index name is emitted.
+    many = [_member(f"{i}.yml", f"m{i}", f"index-{i:03d}-longname", mode="batch") for i in range(60)]
     tags = _render_group_tags("g1", many, {})
+    value = tags["es_index_list"]
     err = capsys.readouterr().err
-    assert "es_index_list" in err and "may be rejected at deploy" in err
-    assert len(tags["es_index_list"]) > gen_jobs._TAG_VALUE_WARN_LEN
+    assert "truncated" in err and "index name(s) dropped" in err
+    assert len(value) <= gen_jobs._TAG_VALUE_MAX_LEN
+    import re
+    m = re.search(r" \.\.\.\+(\d+)$", value)
+    assert m, f"expected a ' ...+N' marker, got {value!r}"
+    dropped = int(m.group(1))
+    kept = value[: m.start()].split()
+    assert len(kept) + dropped == 60           # every name accounted for
+    assert all(k.startswith("index-") and k.endswith("-longname") for k in kept)  # whole names only
 
 
-def test_es_index_list_within_limit_does_not_warn(capsys):
-    # A short es_index_list stays silent (the warning is not spurious).
-    _render_job_tags(_cfg(), {})
-    assert "es_index_list" not in capsys.readouterr().err
+def test_es_index_list_truncation_leaves_global_tags_intact(capsys):
+    # Truncation only affects es_index_list; the independent global tag values are emitted unchanged.
+    many = [_member(f"{i}.yml", f"m{i}", f"index-{i:03d}-longname", mode="batch") for i in range(60)]
+    tags = _render_group_tags("g1", many, {"environment": "${var.environment}", "team": "search-platform"})
+    assert tags["environment"] == "${var.environment}"
+    assert tags["team"] == "search-platform"
+
+
+def test_es_index_list_within_cap_not_truncated_and_silent(capsys):
+    # A short es_index_list is emitted whole, with no marker and no warning (truncation is not spurious).
+    tags = _render_job_tags(_cfg(), {})
+    assert tags["es_index_list"] == "ecs-dns-activity"
+    assert "truncated" not in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- load_global_job_tags / require
