@@ -74,9 +74,6 @@ _ES_INDEX_LIST_TAG = "es_index_list"
 # GLOBAL tags are independent tag values and are never touched by this. (GCP's 63-char label limit is
 # tighter than this cap; a GCP deployment with many indices may still need fewer indices per group.)
 _TAG_VALUE_MAX_LEN = 255
-# Space for the ` ...+N` truncation marker, reserved out of _TAG_VALUE_MAX_LEN so the final value
-# (kept names + marker) never exceeds the cap. Generous: " ...+" is 5 chars plus the dropped count.
-_TRUNC_MARKER_BUDGET = 16
 
 # The Jobs API restricts a tag KEY/VALUE to this character set (verified live: a comma is rejected at
 # deploy with "must match the regular expression ^[\d \w+\-=.:/@]*$"). A LITERAL global tag key/value is
@@ -468,13 +465,18 @@ def _es_index_list_value(index_names: list) -> tuple:
     contain a space, so it is unambiguous). Truncated to _TAG_VALUE_MAX_LEN so a large job_group stays
     deployable: whole names are kept in sorted order until the next would not fit within the budget left
     after reserving room for a ` ...+N` marker, then the marker (N = names dropped) is appended. Returns
-    (value, dropped). A final hard slice guards the pathological case of a single name longer than the
-    budget; in normal use every name is short so truncation lands on a space boundary."""
+    (value, dropped). The reserved marker width is derived from the MAX possible count (len(names)), so
+    the actual marker (dropped <= len(names)) always fits and the value is <= the cap BY CONSTRUCTION -
+    no blind final slice, and the count digits can never be cut. If a single name alone exceeds the
+    budget (pathological; an ES index name is short in practice) nothing is kept and the value is just
+    the marker."""
     names = sorted(set(index_names))
     full = " ".join(names)
     if len(full) <= _TAG_VALUE_MAX_LEN:
         return full, 0
-    budget = _TAG_VALUE_MAX_LEN - _TRUNC_MARKER_BUDGET
+    # Reserve exactly the marker's MAX possible width (the most that can be dropped is every name), so
+    # budget + actual marker <= cap holds with no slicing and the count digits are never cut.
+    budget = max(0, _TAG_VALUE_MAX_LEN - len(f" ...+{len(names)}"))
     kept: list = []
     length = 0
     for name in names:
@@ -484,9 +486,7 @@ def _es_index_list_value(index_names: list) -> tuple:
         kept.append(name)
         length += add
     dropped = len(names) - len(kept)
-    marker = f" ...+{dropped}"
-    value = (" ".join(kept) + marker) if kept else marker.lstrip()
-    return value[:_TAG_VALUE_MAX_LEN], dropped
+    return ((" ".join(kept) + f" ...+{dropped}") if kept else f"...+{dropped}"), dropped
 
 
 def _job_display_name(postfix: str) -> str:

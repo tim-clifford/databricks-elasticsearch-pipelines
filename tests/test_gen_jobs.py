@@ -1329,3 +1329,15 @@ def test_load_global_job_tags_reference_shaped_key_fails_closed(tmp_path):
     yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      '${var.foo}': x\n")
     with pytest.raises(ValueError, match="key must be a literal"):
         gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_es_index_list_multidigit_dropped_count_stays_within_cap():
+    # Marker width is derived from the max possible count, so even a 3-digit dropped count keeps the value
+    # within the cap and the count digits intact (guards the reserved-budget math without needing 10^11).
+    import re
+    names = [f"ix-{i:04d}" for i in range(200)]  # 200 short names -> dropped is 3 digits
+    value, dropped = gen_jobs._es_index_list_value(names)
+    assert len(value) <= gen_jobs._TAG_VALUE_MAX_LEN
+    m = re.search(r"\.\.\.\+(\d+)$", value)
+    assert m and int(m.group(1)) == dropped        # the full count survives (not sliced)
+    assert len(value.split()[:-1]) + dropped == 200  # every name kept-or-counted
