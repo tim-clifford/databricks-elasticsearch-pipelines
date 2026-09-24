@@ -74,6 +74,19 @@ _ES_INDEX_LIST_TAG = "es_index_list"
 # may be ${var...} references whose deploy-time length differs from the reference string).
 _TAG_VALUE_WARN_LEN = 255
 
+# The Jobs API restricts a tag KEY/VALUE to this character set (verified live: a comma is rejected at
+# deploy with "must match the regular expression ^[\d \w+\-=.:/@]*$"). A LITERAL global tag key/value is
+# validated against it at generation so a bad character fails closed HERE, not at deploy - the same
+# fail-closed-at-generation contract es_index_list follows. A value that is a ${...} bundle reference is
+# skipped (its deploy-resolved form differs from the reference text).
+_TAG_CHAR_RE = re.compile(r"[\d \w+\-=.:/@]*")
+
+# Databricks caps a job at 25 tags. The generator adds es_index_list to EVERY generated job, so at most
+# _JOB_TAG_LIMIT - 1 global tags leave room for it; a larger global_job_tags fails closed at generation
+# rather than at deploy. (Development mode adds its own `dev` tag at deploy on top of these, so keep the
+# global set well under the cap in dev - documented in the README.)
+_JOB_TAG_LIMIT = 25
+
 # Config files may use either extension; both are treated identically.
 _CONFIG_GLOBS = ("*.yml", "*.yaml")
 
@@ -372,6 +385,14 @@ def load_global_job_tags(path: str = _DATABRICKS_YML, doc: dict | None = None) -
             f"global_job_tags default (databricks.yml) must be a mapping of tag key -> value, got "
             f"{type(default).__name__}"
         )
+    # Every generated job also carries the generator-owned es_index_list tag, so the global set must leave
+    # room for it under Databricks' 25-tag-per-job cap (fail closed here, not at deploy).
+    if len(default) > _JOB_TAG_LIMIT - 1:
+        raise ValueError(
+            f"global_job_tags (databricks.yml) has {len(default)} tags; Databricks caps a job at "
+            f"{_JOB_TAG_LIMIT} tags and the generator adds {_ES_INDEX_LIST_TAG!r} to every generated job, "
+            f"so at most {_JOB_TAG_LIMIT - 1} global tags are allowed. Remove some."
+        )
     for key, value in default.items():
         if not isinstance(key, str) or not key:
             raise ValueError(
@@ -387,6 +408,16 @@ def load_global_job_tags(path: str = _DATABRICKS_YML, doc: dict | None = None) -
                 f"global_job_tags (databricks.yml): tag {key!r} value must be a string (got "
                 f"{type(value).__name__}); quote it, e.g. {key}: \"{value}\""
             )
+        # Validate LITERAL keys/values against the Jobs API tag regex so a disallowed character (e.g. a
+        # comma) fails closed at generation, not at deploy. Skip ${...} bundle references, whose resolved
+        # form differs from the reference text (a ref like ${var.x} contains { } which the regex forbids).
+        for label, text in (("key", key), (f"tag {key!r} value", value)):
+            if "${" not in text and _TAG_CHAR_RE.fullmatch(text) is None:
+                raise ValueError(
+                    f"global_job_tags (databricks.yml): {label} {text!r} contains a character Databricks "
+                    f"rejects in a tag (allowed: letters, digits, space, and + - = . : / @ _); a comma is "
+                    f"NOT allowed. Fix the value."
+                )
     return default
 
 

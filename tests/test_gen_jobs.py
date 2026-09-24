@@ -1232,3 +1232,43 @@ def test_shipped_fixed_jobs_reference_global_job_tags(filename, job_key):
     with open(path) as fh:
         job = yaml.safe_load(fh)["resources"]["jobs"][job_key]
     assert job["tags"] == "${var.global_job_tags}"
+
+
+def test_load_global_job_tags_comma_in_value_fails_closed(tmp_path):
+    # A literal tag VALUE with a comma is rejected by the Jobs API at deploy; catch it at generation
+    # (fail-closed-at-generation, same contract es_index_list follows) rather than letting it deploy-fail.
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      owners: 'a,b'\n")
+    with pytest.raises(ValueError, match="comma is NOT allowed"):
+        gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_load_global_job_tags_bad_char_in_key_fails_closed(tmp_path):
+    # A disallowed character in a tag KEY is caught at generation too.
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      'a,b': x\n")
+    with pytest.raises(ValueError, match="rejects in a tag"):
+        gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_load_global_job_tags_var_reference_value_allowed(tmp_path):
+    # A ${...} bundle reference is NOT validated against the tag regex (it contains { } which the regex
+    # forbids, but its DEPLOY-resolved form is what matters). So environment: ${var.environment} is fine.
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      environment: '${var.environment}'\n")
+    assert gen_jobs.load_global_job_tags(str(yml)) == {"environment": "${var.environment}"}
+
+
+def test_load_global_job_tags_over_tag_cap_fails_closed(tmp_path):
+    # 25 global tags + the generator-owned es_index_list = 26 > Databricks' 25-tag cap; fail closed at
+    # generation (leave room for es_index_list: at most 24 global tags).
+    body = ["variables:", "  global_job_tags:", "    type: complex", "    default:"]
+    body += [f"      k{i}: v{i}" for i in range(25)]
+    yml = _write_tags_yml(tmp_path, "\n".join(body) + "\n")
+    with pytest.raises(ValueError, match="at most 24 global tags"):
+        gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_load_global_job_tags_at_tag_cap_boundary_passes(tmp_path):
+    # 24 global tags is the boundary: 24 + es_index_list = 25 = the cap, so it is allowed.
+    body = ["variables:", "  global_job_tags:", "    type: complex", "    default:"]
+    body += [f"      k{i}: v{i}" for i in range(24)]
+    yml = _write_tags_yml(tmp_path, "\n".join(body) + "\n")
+    assert len(gen_jobs.load_global_job_tags(str(yml))) == 24
