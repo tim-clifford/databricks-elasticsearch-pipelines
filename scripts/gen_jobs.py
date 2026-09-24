@@ -77,9 +77,13 @@ _TAG_VALUE_WARN_LEN = 255
 # The Jobs API restricts a tag KEY/VALUE to this character set (verified live: a comma is rejected at
 # deploy with "must match the regular expression ^[\d \w+\-=.:/@]*$"). A LITERAL global tag key/value is
 # validated against it at generation so a bad character fails closed HERE, not at deploy - the same
-# fail-closed-at-generation contract es_index_list follows. A value that is a ${...} bundle reference is
-# skipped (its deploy-resolved form differs from the reference text).
-_TAG_CHAR_RE = re.compile(r"[\d \w+\-=.:/@]*")
+# fail-closed-at-generation contract es_index_list follows. re.ASCII so \w matches ONLY [A-Za-z0-9_]
+# (the server regex is ASCII; Python's default \w would let a non-ASCII letter pass generation and then
+# be rejected at deploy). Only the LITERAL text is checked: _BUNDLE_REF_RE strips ${...} spans first
+# (their deploy-resolved form differs from the reference text), so a value mixing a literal and a
+# reference (e.g. "a,b${var.x}") still has its literal part validated.
+_TAG_CHAR_RE = re.compile(r"[\d \w+\-=.:/@]*", re.ASCII)
+_BUNDLE_REF_RE = re.compile(r"\$\{[^}]*\}")
 
 # Databricks caps a job at 25 tags. The generator adds es_index_list to EVERY generated job, so at most
 # _JOB_TAG_LIMIT - 1 global tags leave room for it; a larger global_job_tags fails closed at generation
@@ -385,14 +389,8 @@ def load_global_job_tags(path: str = _DATABRICKS_YML, doc: dict | None = None) -
             f"global_job_tags default (databricks.yml) must be a mapping of tag key -> value, got "
             f"{type(default).__name__}"
         )
-    # Every generated job also carries the generator-owned es_index_list tag, so the global set must leave
-    # room for it under Databricks' 25-tag-per-job cap (fail closed here, not at deploy).
-    if len(default) > _JOB_TAG_LIMIT - 1:
-        raise ValueError(
-            f"global_job_tags (databricks.yml) has {len(default)} tags; Databricks caps a job at "
-            f"{_JOB_TAG_LIMIT} tags and the generator adds {_ES_INDEX_LIST_TAG!r} to every generated job, "
-            f"so at most {_JOB_TAG_LIMIT - 1} global tags are allowed. Remove some."
-        )
+    # Per-key checks run FIRST (before the total-count check below) so the specific reserved/type/char
+    # error wins over the generic count message when both apply (e.g. es_index_list among 25 keys).
     for key, value in default.items():
         if not isinstance(key, str) or not key:
             raise ValueError(
@@ -408,16 +406,28 @@ def load_global_job_tags(path: str = _DATABRICKS_YML, doc: dict | None = None) -
                 f"global_job_tags (databricks.yml): tag {key!r} value must be a string (got "
                 f"{type(value).__name__}); quote it, e.g. {key}: \"{value}\""
             )
-        # Validate LITERAL keys/values against the Jobs API tag regex so a disallowed character (e.g. a
-        # comma) fails closed at generation, not at deploy. Skip ${...} bundle references, whose resolved
-        # form differs from the reference text (a ref like ${var.x} contains { } which the regex forbids).
+        # Validate the LITERAL part of each key/value against the Jobs API tag regex so a disallowed
+        # character (e.g. a comma) fails closed at generation, not at deploy. Strip ${...} bundle-reference
+        # spans first (their deploy-resolved form differs from the reference text), so a mixed value like
+        # "a,b${var.x}" still has its literal "a,b" checked and rejected.
         for label, text in (("key", key), (f"tag {key!r} value", value)):
-            if "${" not in text and _TAG_CHAR_RE.fullmatch(text) is None:
+            if _TAG_CHAR_RE.fullmatch(_BUNDLE_REF_RE.sub("", text)) is None:
                 raise ValueError(
                     f"global_job_tags (databricks.yml): {label} {text!r} contains a character Databricks "
-                    f"rejects in a tag (allowed: letters, digits, space, and + - = . : / @ _); a comma is "
-                    f"NOT allowed. Fix the value."
+                    f"rejects in a tag (allowed: ASCII letters, digits, space, and + - = . : / @ _); a "
+                    f"comma is NOT allowed. Fix the value."
                 )
+    # Every generated job also carries the generator-owned es_index_list tag, so the global set must leave
+    # room for it under Databricks' 25-tag-per-job cap (fail closed here, not at deploy). NOTE: a
+    # `mode: development` target ALSO adds its own `dev` tag at deploy, so in dev the effective headroom is
+    # one lower; the generator is target-agnostic and cannot know the mode, so that stays a documented
+    # limitation (lowering the cap to 23 would wrongly reject a legitimate 24-tag prod config).
+    if len(default) > _JOB_TAG_LIMIT - 1:
+        raise ValueError(
+            f"global_job_tags (databricks.yml) has {len(default)} tags; Databricks caps a job at "
+            f"{_JOB_TAG_LIMIT} tags and the generator adds {_ES_INDEX_LIST_TAG!r} to every generated job, "
+            f"so at most {_JOB_TAG_LIMIT - 1} global tags are allowed. Remove some."
+        )
     return default
 
 

@@ -1272,3 +1272,35 @@ def test_load_global_job_tags_at_tag_cap_boundary_passes(tmp_path):
     body += [f"      k{i}: v{i}" for i in range(24)]
     yml = _write_tags_yml(tmp_path, "\n".join(body) + "\n")
     assert len(gen_jobs.load_global_job_tags(str(yml))) == 24
+
+
+def test_load_global_job_tags_comma_beside_reference_fails_closed(tmp_path):
+    # A value MIXING a literal bad char with a ${...} reference must still fail: only the ${...} span is
+    # stripped, the literal remainder ("a,b") is validated, so the comma is caught at generation.
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      owners: 'a,b${var.x}'\n")
+    with pytest.raises(ValueError, match="comma is NOT allowed"):
+        gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_load_global_job_tags_literal_around_reference_allowed(tmp_path):
+    # A clean literal around a reference passes: "prod-${var.environment}" -> literal "prod-" is legal.
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      environment: 'prod-${var.environment}'\n")
+    assert gen_jobs.load_global_job_tags(str(yml)) == {"environment": "prod-${var.environment}"}
+
+
+def test_load_global_job_tags_non_ascii_char_fails_closed(tmp_path):
+    # \w is matched ASCII-only, so a non-ASCII letter (which the server regex rejects) fails at generation
+    # rather than passing here and being rejected at deploy.
+    yml = _write_tags_yml(tmp_path, "variables:\n  global_job_tags:\n    type: complex\n    default:\n      team: café\n")
+    with pytest.raises(ValueError, match="rejects in a tag"):
+        gen_jobs.load_global_job_tags(str(yml))
+
+
+def test_load_global_job_tags_reserved_key_error_wins_over_count(tmp_path):
+    # With es_index_list plus 24 other keys (25 total), the per-key reserved check runs BEFORE the count
+    # check, so the operator sees the accurate 'reserved' message, not the generic 'at most 24' one.
+    body = ["variables:", "  global_job_tags:", "    type: complex", "    default:", "      es_index_list: x"]
+    body += [f"      k{i}: v{i}" for i in range(24)]
+    yml = _write_tags_yml(tmp_path, "\n".join(body) + "\n")
+    with pytest.raises(ValueError, match="reserved"):
+        gen_jobs.load_global_job_tags(str(yml))

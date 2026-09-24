@@ -370,7 +370,10 @@ global_job_tags:
 Keys and values are strings (quote anything with `${...}`, a colon, or that YAML would read as a
 non-string like `"2026"`). A value may be a bundle reference such as `${var.environment}`, so the
 `environment` tag carries the same per-target value the cluster `custom_tags` already use. Databricks
-allows at most 25 tags per job. The fixed jobs reference `tags: ${var.global_job_tags}` and resolve it
+allows at most 25 tags per job; because the generator adds `es_index_list` to every generated job, at
+most **24** global tags are allowed (`gen_jobs.py` fails closed on more). A `dev` (`mode: development`)
+target also adds its own `dev` tag at deploy, so keep the global set one lower there, the generator is
+target-agnostic and cannot reserve for a tag only some targets add. The fixed jobs reference `tags: ${var.global_job_tags}` and resolve it
 per target at deploy; the generated jobs have `gen_jobs.py` bake this variable's default into their
 `tags:` at generation time, so the tag **key set** for generated jobs is the top-level default (a
 per-target override that changes the *keys* reaches only the fixed jobs, exactly like
