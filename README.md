@@ -644,9 +644,9 @@ Two different mechanisms carry values into a job, and they resolve at different 
     document, only this knob retries it (elasticsearch-py exponential backoff). Reach for
     `max_retries_per_doc` when a feed sees 429s under load, not `transport_max_retries`. Raising it a lot
     multiplies backoff sleep inside the partition, and the ceiling is the ES cluster's write capacity, not
-    the client. The connector default is 3. Note the connector rejects `max_retries_per_doc: 0` together
-    with `transport_max_retries` above 3 (it would leave 429'd rows with no retry at either layer), which
-    fails closed at write. Applies to **both** modes.
+    the client. The connector default is 3. Note the connector emits a warning (it does not fail) if you
+    set `max_retries_per_doc: 0` together with `transport_max_retries` above 3, since that leaves a 429'd
+    row with no retry at either layer, almost always a misconfiguration. Applies to **both** modes.
   - `bulk_stats` (`true` | `false`) collects
     per-partition ES bulk-send diagnostics and logs them under the `BULK_STATS` tag. It behaves like the
     other bool knobs, with one extra layer: a **global** default. Precedence, highest first: a per-run
