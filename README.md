@@ -353,6 +353,55 @@ Hardcoded `custom_tags` in a job-cluster spec pass straight through onto the clu
 `project: elastic`). Serverless and `existing_cluster` pipelines have no job cluster and are unaffected
 by either.
 
+**Global job tags.** The `global_job_tags` bundle variable (a `type: complex` map, empty `{}` on `main`)
+is applied to **every** job the bundle deploys, the generated index/group jobs and the four hand-authored
+maintenance jobs (`build_wheel`, `deploy_views`, `checkpoint_clear`, `es_diagnostics`). Set it in
+`databricks.yml` by replacing `default: {}` with a `key: value` mapping, for example:
+
+```yaml
+global_job_tags:
+  type: complex
+  default:
+    environment: "${var.environment}"   # per-target value (resolves at deploy)
+    team: "search-platform"
+    cost_center: "CC-1234"
+```
+
+Keys and values are strings (quote anything with `${...}`, a colon, or that YAML would read as a
+non-string like `"2026"`). A value may be a bundle reference such as `${var.environment}`, so the
+`environment` tag carries the same per-target value the cluster `custom_tags` already use. Databricks
+allows at most 25 tags per job; because the generator adds `es_index_list` to every generated job, at
+most **24** global tags are allowed (`gen_jobs.py` fails closed on more). A `dev` (`mode: development`)
+target also adds its own `dev` tag at deploy, so keep the global set one lower there, the generator is
+target-agnostic and cannot reserve for a tag only some targets add. The fixed jobs reference `tags: ${var.global_job_tags}` and resolve it
+per target at deploy; the generated jobs have `gen_jobs.py` bake this variable's default into their
+`tags:` at generation time, so the tag **key set** for generated jobs is the top-level default (a
+per-target override that changes the *keys* reaches only the fixed jobs, exactly like
+`default_es_host_config`) while per-target **values** still work through `${var...}` references. Because
+it is `type: complex` it is not `--var`-settable; override a target through
+`.databricks/bundle/<target>/variable-overrides.json`.
+
+**`es_index_list` tag.** In addition to the global tags, `gen_jobs.py` adds one generated tag to each
+generated job: `es_index_list`, a distinct, sorted, **space-separated** list of the `es_index_name`(s) that
+job writes (one index for a singleton, the distinct set for a job group). It is reserved, `global_job_tags`
+must not define it. This is the one case where a generated job's `tags:` is never empty even when
+`global_job_tags` is `{}`. (The separator is a space, not a comma: the Jobs API restricts a tag value to
+`^[\d \w+\-=.:/@]*$`, which excludes commas; ES index names never contain spaces, so a space is
+unambiguous.)
+
+**Tags on clusters and serverless.** Databricks **forwards job tags to the job cluster** as cluster tags,
+so on a `job_cluster` pipeline the global tags also land on the cluster alongside the spec's `custom_tags`.
+Serverless jobs have no cluster, so job-level tags are the only tag lever there (serverless *billing*
+attribution is a separate, account-level Serverless Usage Policy feature, outside this bundle). A tag
+whose key or value conflicts with a value **fixed** by the workspace cluster policy fails closed at
+deploy, the same as any policy conflict, so keep the global tags in line with the policies you deploy
+under. Tag **value length** is bounded by the cloud provider (AWS 255, Azure 256, GCP labels 63) once a
+tag reaches a cluster; to keep a large job group deployable, `gen_jobs.py` **truncates** a long
+`es_index_list` to a conservative cap (255), keeping whole index names in sorted order and appending a
+` ...+N` marker for the count dropped (with a generation warning). The global tags are independent tag
+values and are never truncated. (GCP's 63-char label limit is tighter than the cap, so a GCP deployment
+with many indices per group may still need fewer.)
+
 The whole `compute` block is validated fail-closed: an unrecognized `type`, a missing required key,
 or a stray key for the chosen type is rejected at config load (and by `gen_jobs.py --check`).
 

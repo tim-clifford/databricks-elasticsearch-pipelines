@@ -61,6 +61,37 @@ _ES_HOST_CONFIG_FIELDS = frozenset({"es_host_url", "secret_scope_name", "secret_
 # compute.cluster_config, and the generator emits existing_cluster_id: ${var.<name>.cluster_id}.
 _CLUSTER_CONFIG_FIELDS = frozenset({"cluster_id"})
 
+# The tag key the generator computes and adds to every generated job (a distinct, sorted, SPACE-separated
+# list of the es_index_name(s) the job writes). Reserved: global_job_tags must not define it (the
+# generator owns it). Space-separated because the Jobs API tag-value regex rejects a comma (see _build_job_tags).
+_ES_INDEX_LIST_TAG = "es_index_list"
+
+# Databricks forwards job tags to cluster tags, whose value length is bounded by the CLOUD PROVIDER
+# (AWS tag value 255, Azure 256, GCP labels only 63). To keep a large job_group DEPLOYABLE, the
+# generator-owned es_index_list is TRUNCATED to fit this conservative bound (the AWS/Azure practical
+# limit) rather than blocking the whole job's deploy on one oversized tag: whole index names are kept in
+# sorted order until the next would not fit, then a ` ...+N` marker names how many were dropped. The
+# GLOBAL tags are independent tag values and are never touched by this. (GCP's 63-char label limit is
+# tighter than this cap; a GCP deployment with many indices may still need fewer indices per group.)
+_TAG_VALUE_MAX_LEN = 255
+
+# The Jobs API restricts a tag KEY/VALUE to this character set (verified live: a comma is rejected at
+# deploy with "must match the regular expression ^[\d \w+\-=.:/@]*$"). A LITERAL global tag key/value is
+# validated against it at generation so a bad character fails closed HERE, not at deploy - the same
+# fail-closed-at-generation contract es_index_list follows. re.ASCII so \w matches ONLY [A-Za-z0-9_]
+# (the server regex is ASCII; Python's default \w would let a non-ASCII letter pass generation and then
+# be rejected at deploy). Only the LITERAL text is checked: _BUNDLE_REF_RE strips ${...} spans first
+# (their deploy-resolved form differs from the reference text), so a value mixing a literal and a
+# reference (e.g. "a,b${var.x}") still has its literal part validated.
+_TAG_CHAR_RE = re.compile(r"[\d \w+\-=.:/@]*", re.ASCII)
+_BUNDLE_REF_RE = re.compile(r"\$\{[^}]*\}")
+
+# Databricks caps a job at 25 tags. The generator adds es_index_list to EVERY generated job, so at most
+# _JOB_TAG_LIMIT - 1 global tags leave room for it; a larger global_job_tags fails closed at generation
+# rather than at deploy. (Development mode adds its own `dev` tag at deploy on top of these, so keep the
+# global set well under the cap in dev - documented in the README.)
+_JOB_TAG_LIMIT = 25
+
 # Config files may use either extension; both are treated identically.
 _CONFIG_GLOBS = ("*.yml", "*.yaml")
 
@@ -316,6 +347,148 @@ def require_support_email_declared(path: str = _DATABRICKS_YML, doc: dict | None
         )
 
 
+def require_global_job_tags_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION if databricks.yml declares no `global_job_tags` variable.
+
+    Every job carries the global tags: the hand-authored fixed jobs reference ${var.global_job_tags} (so
+    an undeclared variable fails their deploy), and generated jobs bake this variable's default. Require
+    the DECLARATION here (mirrors require_support_email_declared); the value is a deploy-time choice and an
+    empty map is valid (= no tags), so there is nothing to validate about the contents at this point. The
+    shape of a NON-empty default is validated by load_global_job_tags."""
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
+    if "global_job_tags" not in variables:
+        raise ValueError(
+            "global_job_tags is not declared in databricks.yml; add it under `variables:` as a `type: "
+            "complex` variable with an empty-map default (global_job_tags: {type: complex, default: {}}). "
+            "Every job carries these tags: the fixed jobs reference ${var.global_job_tags} and generated "
+            "jobs bake its default, so the bundle needs the variable to resolve it (empty {} = no tags)."
+        )
+
+
+def load_global_job_tags(path: str = _DATABRICKS_YML, doc: dict | None = None) -> dict:
+    """The global job tags map, read from databricks.yml `variables.global_job_tags.default`. Fail closed.
+
+    Returns {} when the variable is absent or its default is empty/None (= no tags). A NON-empty default
+    must be a flat MAPPING of string key -> string value (Databricks tags are string->string): a non-dict
+    default, a non-string key, a non-string value (YAML would read `true`/`2026` as bool/int, so require
+    the operator to quote them), or the reserved `es_index_list` key (the generator owns it) each abort
+    generation with a clear message rather than emitting a malformed or surprising tag. Read at GENERATION
+    time from the static default (like default_es_host_config): per-target/--var overrides are deploy-time
+    and deliberately not seen here, so the generated jobs' tag KEY SET is this top-level default. Values
+    may be bundle references (e.g. "${var.environment}"), baked in verbatim to resolve per target at deploy.
+    """
+    if doc is None:
+        doc = _read_bundle_doc(path)
+    spec = (doc.get("variables") or {}).get("global_job_tags")
+    if not isinstance(spec, dict):
+        return {}
+    default = spec.get("default")
+    if default is None or default == {}:
+        return {}
+    if not isinstance(default, dict):
+        raise ValueError(
+            f"global_job_tags default (databricks.yml) must be a mapping of tag key -> value, got "
+            f"{type(default).__name__}"
+        )
+    # Per-key checks run FIRST (before the total-count check below) so the specific reserved/type/char
+    # error wins over the generic count message when both apply (e.g. es_index_list among 25 keys).
+    for key, value in default.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag key {key!r} must be a non-empty string"
+            )
+        if key == _ES_INDEX_LIST_TAG:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): {_ES_INDEX_LIST_TAG!r} is reserved (the generator adds "
+                f"it to every generated job); remove it from global_job_tags"
+            )
+        if not isinstance(value, str):
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag {key!r} value must be a string (got "
+                f"{type(value).__name__}); quote it, e.g. {key}: \"{value}\""
+            )
+        # Validate against the Jobs API tag regex so a disallowed character (e.g. a comma) fails closed at
+        # generation, not at deploy. A KEY is a literal (references belong in values, per the databricks.yml
+        # docs), so it is checked whole - a ${...}-shaped key is rejected rather than reduced to '' and
+        # baked verbatim. A VALUE may embed a ${...} bundle reference (its deploy-resolved form differs from
+        # the reference text), so strip those spans first and check the literal remainder - a mixed value
+        # like "a,b${var.x}" still has its literal "a,b" caught.
+        if _TAG_CHAR_RE.fullmatch(key) is None:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag key {key!r} contains a character Databricks rejects "
+                f"in a tag (allowed: ASCII letters, digits, space, and + - = . : / @ _); a comma is NOT "
+                f"allowed, and a key must be a literal (put ${{var...}} references in the value, not the key)."
+            )
+        if _TAG_CHAR_RE.fullmatch(_BUNDLE_REF_RE.sub("", value)) is None:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag {key!r} value {value!r} contains a character "
+                f"Databricks rejects in a tag (allowed: ASCII letters, digits, space, and + - = . : / @ _); "
+                f"a comma is NOT allowed. Fix the value."
+            )
+    # Every generated job also carries the generator-owned es_index_list tag, so the global set must leave
+    # room for it under Databricks' 25-tag-per-job cap (fail closed here, not at deploy). NOTE: a
+    # `mode: development` target ALSO adds its own `dev` tag at deploy, so in dev the effective headroom is
+    # one lower; the generator is target-agnostic and cannot know the mode, so that stays a documented
+    # limitation (lowering the cap to 23 would wrongly reject a legitimate 24-tag prod config).
+    if len(default) > _JOB_TAG_LIMIT - 1:
+        raise ValueError(
+            f"global_job_tags (databricks.yml) has {len(default)} tags; Databricks caps a job at "
+            f"{_JOB_TAG_LIMIT} tags and the generator adds {_ES_INDEX_LIST_TAG!r} to every generated job, "
+            f"so at most {_JOB_TAG_LIMIT - 1} global tags are allowed. Remove some."
+        )
+    return default
+
+
+def _build_job_tags(global_job_tags: dict, index_names: list, label: str) -> dict:
+    """The `tags:` map for a generated job: the global tags (in declared order) plus the generator-owned
+    es_index_list (a distinct, sorted, space-separated list of the job's es_index_name(s)), emitted last. `label` names the
+    job/group only for the length warning. Built as a copy so the caller's loaded global tags are never
+    mutated. es_index_list is always present (a job always writes at least one index), so a generated
+    job's tags map is never empty even when global_job_tags is {}."""
+    tags = dict(global_job_tags)
+    value, dropped = _es_index_list_value(index_names)
+    if dropped:
+        print(
+            f"WARNING: job '{label}' {_ES_INDEX_LIST_TAG} was truncated to fit the {_TAG_VALUE_MAX_LEN}-char "
+            f"tag-value cap: {dropped} of {len(set(index_names))} index name(s) dropped (a ' ...+N' marker "
+            f"records the count). The global tags are unaffected. Consider fewer indices per job_group if "
+            f"you need the full list in the tag.",
+            file=sys.stderr,
+        )
+    tags[_ES_INDEX_LIST_TAG] = value
+    return tags
+
+
+def _es_index_list_value(index_names: list) -> tuple:
+    """The es_index_list tag VALUE and how many names were dropped. Distinct + sorted + SPACE-joined
+    (space, not comma: the Jobs API tag-value regex rejects a comma - verified live; ES index names never
+    contain a space, so it is unambiguous). Truncated to _TAG_VALUE_MAX_LEN so a large job_group stays
+    deployable: whole names are kept in sorted order until the next would not fit within the budget left
+    after reserving room for a ` ...+N` marker, then the marker (N = names dropped) is appended. Returns
+    (value, dropped). The reserved marker width is derived from the MAX possible count (len(names)), so
+    the actual marker (dropped <= len(names)) always fits and the value is <= the cap BY CONSTRUCTION -
+    no blind final slice, and the count digits can never be cut. If a single name alone exceeds the
+    budget (pathological; an ES index name is short in practice) nothing is kept and the value is just
+    the marker."""
+    names = sorted(set(index_names))
+    full = " ".join(names)
+    if len(full) <= _TAG_VALUE_MAX_LEN:
+        return full, 0
+    # Reserve exactly the marker's MAX possible width (the most that can be dropped is every name), so
+    # budget + actual marker <= cap holds with no slicing and the count digits are never cut.
+    budget = max(0, _TAG_VALUE_MAX_LEN - len(f" ...+{len(names)}"))
+    kept: list = []
+    length = 0
+    for name in names:
+        add = len(name) + (1 if kept else 0)  # + the joining space once past the first
+        if length + add > budget:
+            break
+        kept.append(name)
+        length += add
+    dropped = len(names) - len(kept)
+    return ((" ".join(kept) + f" ...+{dropped}") if kept else f"...+{dropped}"), dropped
+
+
 def _job_display_name(postfix: str) -> str:
     """The job display name: `[<target>] <prefix>: <postfix>`.
 
@@ -498,10 +671,14 @@ def _job_clusters_for(members: list) -> list | None:
 
 
 def _assemble_job(display_name: str, description: str, job_params: list | None,
-                  trigger: dict | None, job_clusters: list | None, tasks: list) -> dict:
+                  trigger: dict | None, job_clusters: list | None, tasks: list,
+                  tags: dict | None = None) -> dict:
     """Assemble one job dict with deterministic key order: name, description, max_concurrent_runs,
-    queue, email_notifications, notification_settings, [parameters], [schedule|continuous],
+    queue, email_notifications, notification_settings, [tags], [parameters], [schedule|continuous],
     [job_clusters], tasks, permissions.
+
+    tags: the job-level `tags:` map (global tags + es_index_list, see _build_job_tags), or None/empty to
+    omit the block. Emitted right after notification_settings so --check stays byte-stable.
 
     job_params: the job-level `parameters:` list (singleton) or None to omit it (a grouped job carries
     the run-time knobs in each task's base_parameters instead - job parameters can't hold per-member
@@ -535,6 +712,8 @@ def _assemble_job(display_name: str, description: str, job_params: list | None,
             "no_alert_for_canceled_runs": True,
         },
     }
+    if tags:
+        job_def["tags"] = tags
     if job_params is not None:
         job_def["parameters"] = job_params
     if trigger:
@@ -546,7 +725,8 @@ def _assemble_job(display_name: str, description: str, job_params: list | None,
     return job_def
 
 
-def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec: dict | None = None) -> str:
+def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec: dict | None = None,
+                    global_job_tags: dict | None = None) -> str:
     """Render the resources/<name>.job.yml content for one STANDALONE (ungrouped) index config.
 
     Built as a dict and serialized with yaml.safe_dump (the writer escapes special characters, so a
@@ -579,6 +759,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
         _trigger_block(cfg["schedule"], cfg["continuous"], cfg["pause_status"]),
         _job_clusters_for([(name, cfg, job_cluster_spec)]),
         [task],
+        _build_job_tags(global_job_tags or {}, [cfg["es_index_name"]], name),
     )
     job = {"resources": {"jobs": {f"index_pipeline_{name}": job_def}}}
     body = yaml.safe_dump(job, sort_keys=False, default_flow_style=False, width=100, allow_unicode=True)
@@ -698,7 +879,7 @@ def _group_description(group_name: str, members: list, effective_interval: str) 
     return desc
 
 
-def render_group_job_yaml(group_name: str, members: list) -> str:
+def render_group_job_yaml(group_name: str, members: list, global_job_tags: dict | None = None) -> str:
     """Render resources/group_<group>.job.yml for one job_group: ONE job, one independent task per member.
 
     members: list of (config_filename, name, cfg, job_cluster_spec) sharing this job_group. Option A
@@ -747,6 +928,7 @@ def render_group_job_yaml(group_name: str, members: list) -> str:
         trigger,
         job_clusters,
         tasks,
+        _build_job_tags(global_job_tags or {}, [cfg["es_index_name"] for _, _, cfg, _ in ordered], group_name),
     )
     job = {"resources": {"jobs": {f"index_pipeline_group_{group_name}": job_def}}}
     body = yaml.safe_dump(job, sort_keys=False, default_flow_style=False, width=100, allow_unicode=True)
@@ -828,10 +1010,12 @@ def main(argv: list[str] | None = None) -> int:
     bundle_doc = _read_bundle_doc()
     require_job_name_prefix_declared(doc=bundle_doc)
     require_support_email_declared(doc=bundle_doc)
+    require_global_job_tags_declared(doc=bundle_doc)
     require_runtime_knobs_declared(doc=bundle_doc)
     es_host_configs = load_es_host_configs(doc=bundle_doc)
     default_es_host_config = load_default_es_host_config(doc=bundle_doc)
     cluster_configs = load_cluster_configs(doc=bundle_doc)
+    global_job_tags = load_global_job_tags(doc=bundle_doc)
 
     # Validate every config and partition into standalone (singleton) jobs and job groups, all BEFORE
     # touching disk so generation is all-or-nothing: an invalid config, a bad host/cluster reference, or
@@ -895,13 +1079,13 @@ def main(argv: list[str] | None = None) -> int:
         if os.path.exists(out_path) and not is_generated(out_path):
             collisions.append(os.path.relpath(out_path, _REPO_ROOT))
             continue
-        rendered[out_path] = render_job_yaml(config_filename, name, cfg, spec)
+        rendered[out_path] = render_job_yaml(config_filename, name, cfg, spec, global_job_tags)
     for group_name, gmembers in groups.items():
         out_path = group_generated_path(group_name)
         if os.path.exists(out_path) and not is_generated(out_path):
             collisions.append(os.path.relpath(out_path, _REPO_ROOT))
             continue
-        rendered[out_path] = render_group_job_yaml(group_name, gmembers)
+        rendered[out_path] = render_group_job_yaml(group_name, gmembers, global_job_tags)
     if collisions:
         for rel in collisions:
             print(

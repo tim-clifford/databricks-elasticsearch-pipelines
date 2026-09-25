@@ -51,6 +51,11 @@ resources:
         no_alert_for_skipped_runs: true
         no_alert_for_canceled_runs: true
 
+      # Global job tags from databricks.yml (empty {} => omitted). Applied to every job; on the optional
+      # job-cluster compute below they also forward onto the cluster as cluster tags. Generated jobs add an
+      # es_index_list tag too; this fixed job writes no index, so it carries only the globals.
+      tags: ${var.global_job_tags}
+
       # OPTIONAL compute. All three vars default to empty, which DAB omits, leaving the task SERVERLESS.
       # Set diagnostics_existing_cluster_id (an existing cluster) OR diagnostics_job_clusters +
       # diagnostics_job_cluster_key (a new job cluster, reusing a _pipelines/job_cluster_configs spec) to
