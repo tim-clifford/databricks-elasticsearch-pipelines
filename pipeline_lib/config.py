@@ -28,6 +28,11 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
     transport_max_retries: <non-neg int> # OPTIONAL EsWriteConfig tuning: whole-request retries on a
                                          #   transport failure (connection reset/timeout, 429/503 on the
                                          #   bulk call), connector default 3. 0 disables them.
+    max_retries_per_doc: <non-neg int>   # OPTIONAL EsWriteConfig tuning: PER-DOCUMENT retries for rows ES
+                                         #   rejects with a 429 (es_rejected_execution_exception, write
+                                         #   queue full), connector default 3. Distinct from
+                                         #   transport_max_retries (whole request): a 429'd document is
+                                         #   only ever retried by this knob. 0 disables per-doc retries.
     require_existing_index: true | false # OPTIONAL EsWriteConfig tuning: require the index to exist.
     verify_certs: true | false           # OPTIONAL EsWriteConfig tuning: verify the ES TLS certificate.
                                          #   All six: config DEFAULT, also a job parameter overridable
@@ -433,8 +438,8 @@ def require_transport_max_retries(value: object, where: str = "transport_max_ret
 
     This is the transport layer, NOT per-document retries: the _bulk API returns HTTP 200 even when
     individual documents are rejected, so a raised transport_max_retries re-sends the whole request on a
-    connection-level failure (the timeout case) but never sees a 429'd document (that is
-    max_retries_per_doc, a separate connector knob not exposed here)."""
+    connection-level failure (the timeout case) but never sees a 429'd document (that is the separate
+    max_retries_per_doc knob; see require_max_retries_per_doc)."""
     if isinstance(value, str):
         value = value.strip()
     if value is None or value == "":
@@ -453,6 +458,20 @@ def require_transport_max_retries(value: object, where: str = "transport_max_ret
     if parsed < 0:
         raise PipelineConfigError(f"{where} must be a non-negative integer, got {value!r}")
     return str(parsed)
+
+
+def require_max_retries_per_doc(value: object, where: str = "max_retries_per_doc") -> str:
+    """OPTIONAL EsWriteConfig max_retries_per_doc (PER-DOCUMENT retries for rows Elasticsearch rejects
+    with a 429 - es_rejected_execution_exception, the ES write queue is full): a NON-NEGATIVE integer,
+    or "" for unset (leave the connector default of 3). 0 is a MEANINGFUL value (disable per-document
+    retries), distinct from "" (unset).
+
+    This is the PER-DOCUMENT layer, NOT transport_max_retries (whole request): the _bulk API returns
+    HTTP 200 even when individual documents are rejected, so a transport retry never sees a 429'd
+    document - only this knob re-sends it (elasticsearch-py exponential backoff, retry_on_doc_status
+    defaults to (429,)). Same non-negative-int-with-meaningful-zero rule as require_transport_max_retries,
+    so it delegates there and the rule never forks."""
+    return require_transport_max_retries(value, where)
 
 
 def require_es_flag(value: object, where: str) -> str:
@@ -507,6 +526,7 @@ def require_op_type(value: object, where: str = "op_type") -> str:
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
                            write_concurrency: object = "", bulk_stats: object = "",
                            request_timeout: object = "", transport_max_retries: object = "",
+                           max_retries_per_doc: object = "",
                            retry_transport_timeout: object = "", op_type: object = "",
                            bypass_fast_path: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
@@ -547,7 +567,13 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     transport retries) are connection/reliability knobs inherited from EsConnection. Both are unset by
     default (omitted => the connector's own defaults, 60s / 3 retries, stand). Unlike bulk_stats they
     need no version guard: request_timeout has existed since the connector's first release and
-    transport_max_retries since 0.6.0, so every wheel this framework installs has both fields."""
+    transport_max_retries since 0.6.0, so every wheel this framework installs has both fields.
+
+    max_retries_per_doc (non-negative int; 0 disables per-document retries) is the PER-DOCUMENT 429
+    retry count (a 429'd document is retried only by this knob, never by transport_max_retries). Unset
+    by default (omitted => the connector's own default of 3 stands). Like transport_max_retries it needs
+    no version guard: it has existed since connector 0.6.0, so every wheel this framework installs has
+    the field."""
     overrides: dict = {}
 
     canonical_chunk_size = require_chunk_size(chunk_size)
@@ -568,6 +594,13 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     canonical_transport_max_retries = require_transport_max_retries(transport_max_retries)
     if canonical_transport_max_retries:
         overrides["transport_max_retries"] = int(canonical_transport_max_retries)
+
+    # max_retries_per_doc=0 (disable per-document 429 retries) is a MEANINGFUL override, so include it:
+    # same rule as transport_max_retries above (canonical "0" is truthy and included; unset "" is falsy
+    # and omitted so the connector default of 3 stands).
+    canonical_max_retries_per_doc = require_max_retries_per_doc(max_retries_per_doc)
+    if canonical_max_retries_per_doc:
+        overrides["max_retries_per_doc"] = int(canonical_max_retries_per_doc)
 
     for name, value in (("require_existing_index", require_existing_index),
                         ("verify_certs", verify_certs), ("bulk_stats", bulk_stats),
@@ -760,6 +793,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     allowed_top = {
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
         "chunk_size", "write_concurrency", "request_timeout", "transport_max_retries",
+        "max_retries_per_doc",
         "require_existing_index", "verify_certs", "bulk_stats", "retry_transport_timeout",
         "op_type", "bypass_fast_path",
         "streaming_start",
@@ -824,6 +858,10 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # (a string job-parameter default), like the other tuning knobs.
     request_timeout = require_request_timeout(raw.get("request_timeout", ""), f"{source}: request_timeout")
     transport_max_retries = require_transport_max_retries(raw.get("transport_max_retries", ""), f"{source}: transport_max_retries")
+    # max_retries_per_doc (non-negative int; 0 = disable per-document retries) is the PER-DOCUMENT 429
+    # retry count, distinct from transport_max_retries (whole request). OPTIONAL: absent -> "" (leave the
+    # connector default of 3). Stored canonical string form, like the other tuning knobs.
+    max_retries_per_doc = require_max_retries_per_doc(raw.get("max_retries_per_doc", ""), f"{source}: max_retries_per_doc")
     require_existing_index = require_es_flag(raw.get("require_existing_index", ""), f"{source}: require_existing_index")
     verify_certs = require_es_flag(raw.get("verify_certs", ""), f"{source}: verify_certs")
     # bulk_stats is the diagnostics knob. It now behaves EXACTLY like verify_certs: an absent value is ""
@@ -1008,6 +1046,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "write_concurrency": write_concurrency,
         "request_timeout": request_timeout,
         "transport_max_retries": transport_max_retries,
+        "max_retries_per_doc": max_retries_per_doc,
         "require_existing_index": require_existing_index,
         "verify_certs": verify_certs,
         "bulk_stats": bulk_stats,
@@ -1280,10 +1319,12 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # verbatim (canonical string form), like filter_condition.
         "chunk_size": cfg["chunk_size"],
         "write_concurrency": cfg["write_concurrency"],
-        # request_timeout / transport_max_retries (connection/reliability tuning) are connector settings,
-        # not object names: passed through verbatim (canonical string form), like the tuning knobs.
+        # request_timeout / transport_max_retries / max_retries_per_doc (connection/reliability tuning)
+        # are connector settings, not object names: passed through verbatim (canonical string form),
+        # like the tuning knobs.
         "request_timeout": cfg["request_timeout"],
         "transport_max_retries": cfg["transport_max_retries"],
+        "max_retries_per_doc": cfg["max_retries_per_doc"],
         "require_existing_index": cfg["require_existing_index"],
         "verify_certs": cfg["verify_certs"],
         # bulk_stats (diagnostics toggle) is a connector setting, not an object name: passed through
@@ -1566,6 +1607,7 @@ _RUNTIME_KNOBS = (
     _RuntimeKnob("op_type", require_op_type),
     _RuntimeKnob("request_timeout", require_request_timeout),
     _RuntimeKnob("transport_max_retries", require_transport_max_retries),
+    _RuntimeKnob("max_retries_per_doc", require_max_retries_per_doc),
     _RuntimeKnob("require_existing_index", require_es_flag),
     _RuntimeKnob("verify_certs", require_es_flag),
     _RuntimeKnob("bulk_stats", require_es_flag),

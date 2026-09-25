@@ -631,7 +631,7 @@ def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
 @pytest.mark.parametrize("name,bad", [
     ("bulk_stats", "on"), ("retry_transport_timeout", "yes"), ("bypass_fast_path", "1"),
     ("verify_certs", "maybe"), ("require_existing_index", "nope"),
-    ("request_timeout", "abc"), ("transport_max_retries", "-1"),
+    ("request_timeout", "abc"), ("transport_max_retries", "-1"), ("max_retries_per_doc", "-1"),
     ("pipeline_mode", "turbo"), ("op_type", "has space"), ("streaming_start", "sideways"),
     ("write_repartition", "-5"), ("max_partition_bytes", "32x"), ("chunk_size", "0"),
 ])
