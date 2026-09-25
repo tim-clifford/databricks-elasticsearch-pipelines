@@ -22,6 +22,7 @@ from pipeline_lib.config import (
     require_max_bytes_per_trigger,
     require_max_files_per_trigger,
     require_max_partition_bytes,
+    require_max_retries_per_doc,
     require_pause_status,
     require_pipeline_mode,
     require_request_timeout,
@@ -657,7 +658,8 @@ def test_job_base_parameters_excludes_run_time_params():
     # per-run override.
     params = _job_base_parameters("x")
     for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "write_concurrency",
-                     "request_timeout", "transport_max_retries", "require_existing_index",
+                     "request_timeout", "transport_max_retries", "max_retries_per_doc",
+                     "require_existing_index",
                      "verify_certs", "bulk_stats", "streaming_start", "write_repartition", "max_partition_bytes"):
         assert run_time not in params
 
@@ -690,6 +692,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "op_type", "default": ""},
         {"name": "request_timeout", "default": ""},
         {"name": "transport_max_retries", "default": ""},
+        {"name": "max_retries_per_doc", "default": ""},
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
         {"name": "bulk_stats", "default": ""},
@@ -743,11 +746,28 @@ def test_job_parameters_bulk_stats_config_value_overrides_ref(value, expected):
 
 
 def test_job_parameters_reliability_knobs_default_empty_without_ref():
-    # With no refs supplied (the pure/unit-test call), omitted request_timeout / transport_max_retries
-    # stay "" - the connector's own defaults stand.
+    # With no refs supplied (the pure/unit-test call), omitted request_timeout / transport_max_retries /
+    # max_retries_per_doc stay "" - the connector's own defaults stand.
     params = job_parameters(validate_config(_base()))
     assert {"name": "request_timeout", "default": ""} in params
     assert {"name": "transport_max_retries", "default": ""} in params
+    assert {"name": "max_retries_per_doc", "default": ""} in params
+
+
+def test_job_parameters_max_retries_per_doc_omitted_uses_global_ref():
+    # When the config OMITS max_retries_per_doc, the generator's ref (runtime_knob_global_refs) becomes
+    # the job-parameter default, so an omitted pipeline defers to the target-wide ${var.max_retries_per_doc}.
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
+    assert {"name": "max_retries_per_doc", "default": "${var.max_retries_per_doc}"} in params
+
+
+def test_job_parameters_max_retries_per_doc_config_value_overrides_ref():
+    # A config that SETS max_retries_per_doc bakes its literal canonical value, overriding the global ref
+    # (per-pipeline wins over the target-wide default). 0 is meaningful and kept as "0".
+    cfg = _base()
+    cfg["max_retries_per_doc"] = 0
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
+    assert {"name": "max_retries_per_doc", "default": "0"} in params
 
 
 def test_job_parameters_retry_transport_timeout_defaults_empty_without_ref():
@@ -976,7 +996,8 @@ def test_runtime_knob_registry_shape():
     # asserts the canonical set/order in one place.
     assert RUNTIME_KNOB_NAMES == (
         "pipeline_mode", "filter_condition", "chunk_size", "write_concurrency", "op_type",
-        "request_timeout", "transport_max_retries", "require_existing_index", "verify_certs",
+        "request_timeout", "transport_max_retries", "max_retries_per_doc", "require_existing_index",
+        "verify_certs",
         "bulk_stats", "retry_transport_timeout", "bypass_fast_path", "streaming_start",
         "write_repartition", "max_partition_bytes", "max_files_per_trigger", "max_bytes_per_trigger",
     )
@@ -1144,6 +1165,41 @@ def test_write_config_overrides_bad_transport_max_retries_fails_closed(bad):
         write_config_overrides("", "", "", transport_max_retries=bad)
 
 
+def test_write_config_overrides_max_retries_per_doc_parsed():
+    # max_retries_per_doc is a keyword-only override (a non-negative int), the PER-DOCUMENT 429 retry
+    # count. Distinct from transport_max_retries; setting one must not touch the other.
+    assert write_config_overrides("", "", "", max_retries_per_doc="5") == {"max_retries_per_doc": 5}
+    assert write_config_overrides("", "", "", max_retries_per_doc=" 8 ") == {"max_retries_per_doc": 8}
+
+
+def test_write_config_overrides_max_retries_per_doc_zero_included():
+    # 0 is a MEANINGFUL value (disable per-document 429 retries), so it must be passed through, not
+    # dropped as if unset - the distinction between "0 retries" and "leave the connector default (3)".
+    assert write_config_overrides("", "", "", max_retries_per_doc="0") == {"max_retries_per_doc": 0}
+    assert write_config_overrides("", "", "", max_retries_per_doc=0) == {"max_retries_per_doc": 0}
+
+
+def test_write_config_overrides_max_retries_per_doc_empty_omitted():
+    # Unset (empty) omits the knob, so the connector's own default (3) stands.
+    assert write_config_overrides("", "", "", max_retries_per_doc="") == {}
+
+
+@pytest.mark.parametrize("bad", ["abc", "2.5", "-1", "1e2"])
+def test_write_config_overrides_bad_max_retries_per_doc_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="max_retries_per_doc"):
+        write_config_overrides("", "", "", max_retries_per_doc=bad)
+
+
+def test_write_config_overrides_transport_and_per_doc_independent():
+    # The two retry knobs are separate layers: both set at once are carried independently (neither
+    # coerces the other), which is exactly why a feed can raise per-doc 429 retries without touching the
+    # whole-request retry count.
+    assert write_config_overrides("", "", "", transport_max_retries="2", max_retries_per_doc="7") == {
+        "transport_max_retries": 2,
+        "max_retries_per_doc": 7,
+    }
+
+
 def test_write_config_overrides_combined_with_reliability_knobs():
     # All knobs together, including the two new reliability knobs (transport_max_retries=0 kept). The
     # positional args are (chunk_size, require_existing_index, verify_certs, write_concurrency,
@@ -1229,6 +1285,25 @@ def test_require_transport_max_retries_fails_closed(bad):
         require_transport_max_retries(bad)
 
 
+@pytest.mark.parametrize("value,expected", [
+    ("", ""), (None, ""), ("  ", ""),                # unset -> canonical "" (defer to connector default 3)
+    (0, "0"), ("0", "0"),                            # 0 is valid (disable per-document 429 retries)
+    (3, "3"), ("5", "5"), (" 8 ", "8"),              # YAML int OR string -> canonical string
+])
+def test_require_max_retries_per_doc_canonical(value, expected):
+    # max_retries_per_doc is a NON-negative int with the same shape as transport_max_retries: 0 is
+    # accepted (disable per-doc retries), and unset stays "" (defer to the connector default).
+    assert require_max_retries_per_doc(value) == expected
+
+
+@pytest.mark.parametrize("bad", ["abc", "2.5", "-1", "1e2", -5, 2.5, True, False])
+def test_require_max_retries_per_doc_fails_closed(bad):
+    # A negative int, a float, a non-numeric string, or a bool (int subclass) must fail closed. The
+    # error message names max_retries_per_doc (the caller-supplied `where`), not the delegate.
+    with pytest.raises(PipelineConfigError, match="max_retries_per_doc"):
+        require_max_retries_per_doc(bad)
+
+
 # ------------------------------------------------- tuning knobs as config keys
 
 
@@ -1258,6 +1333,7 @@ def test_tuning_knobs_from_yaml_string_values():
     ("chunk_size", "abc"), ("chunk_size", 0), ("chunk_size", -5), ("chunk_size", 12.5),
     ("request_timeout", "abc"), ("request_timeout", 0), ("request_timeout", -5), ("request_timeout", 12.5),
     ("transport_max_retries", "abc"), ("transport_max_retries", -1), ("transport_max_retries", 2.5),
+    ("max_retries_per_doc", "abc"), ("max_retries_per_doc", -1), ("max_retries_per_doc", 2.5),
     ("require_existing_index", "maybe"), ("require_existing_index", 1),
     ("verify_certs", "yes"),
 ])
@@ -1269,14 +1345,17 @@ def test_tuning_knobs_bad_config_value_fails_closed(key, bad):
 
 
 def test_reliability_knobs_from_config_canonicalized():
-    # request_timeout / transport_max_retries accept YAML int or string; stored as canonical strings.
-    # transport_max_retries=0 is a valid config value (disable transport retries), kept as "0".
+    # request_timeout / transport_max_retries / max_retries_per_doc accept YAML int or string; stored as
+    # canonical strings. transport_max_retries=0 (disable transport retries) and max_retries_per_doc=0
+    # (disable per-doc retries) are valid config values, kept as "0".
     cfg = _base()
     cfg["request_timeout"] = 120
     cfg["transport_max_retries"] = 0
+    cfg["max_retries_per_doc"] = 0
     out = validate_config(cfg)
     assert out["request_timeout"] == "120"
     assert out["transport_max_retries"] == "0"
+    assert out["max_retries_per_doc"] == "0"
 
 
 def test_tuning_knobs_carried_through_resolve():
@@ -1286,12 +1365,14 @@ def test_tuning_knobs_carried_through_resolve():
     cfg["verify_certs"] = False
     cfg["request_timeout"] = 90
     cfg["transport_max_retries"] = 5
+    cfg["max_retries_per_doc"] = 7
     out = resolve_config(validate_config(cfg), environment="prod")
     assert out["chunk_size"] == "800"
     assert out["verify_certs"] == "false"
     assert out["require_existing_index"] == ""  # omitted -> unset
     assert out["request_timeout"] == "90"
     assert out["transport_max_retries"] == "5"
+    assert out["max_retries_per_doc"] == "7"
 
 
 def test_reliability_knobs_omitted_carry_through_resolve_as_unset():
@@ -1299,6 +1380,7 @@ def test_reliability_knobs_omitted_carry_through_resolve_as_unset():
     out = resolve_config(validate_config(_with_env()), environment="prod")
     assert out["request_timeout"] == ""
     assert out["transport_max_retries"] == ""
+    assert out["max_retries_per_doc"] == ""
 
 
 def test_job_parameters_tuning_defaults_from_config():
