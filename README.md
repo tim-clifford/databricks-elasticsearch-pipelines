@@ -30,6 +30,11 @@ The bundle deploys:
   files (see [Adding a new pipeline for an ES index](#adding-a-new-pipeline-for-an-es-index)).
   Configs can instead be merged into a single multi-task job via [Job groups](#job-groups) (e.g. to
   share one cluster).
+- **Optional durable monitoring**: every run logs its `STREAM_PROGRESS` / `BULK_STATS` metrics to the
+  run log; turning on `monitoring_log_enabled` **also** appends them (plus a per-run summary) as rows in
+  a shared Delta table for querying across jobs. The table is created once by the hand-authored
+  `_log table create` job. Off by default, fail-soft (a sink fault never fails an export). See
+  [Durable monitoring](#durable-monitoring).
 
 ## Adding a new pipeline for an ES index
 
@@ -134,6 +139,8 @@ value fails closed wherever the value is required. The bundle variables are:
 | `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
 | `retry_transport_timeout` | global default for the connector's `retry_transport_timeout` reliability toggle: when on, the connector OWNS whole-request timeout retries (re-sends a timed-out bulk with backoff instead of letting the transport re-send it invisibly and then failing the batch). Empty default (off). Threaded exactly like `bulk_stats`: the generator bakes `${var.retry_transport_timeout}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=retry_transport_timeout=true`) turns it on for a whole environment, and a pipeline's own `retry_transport_timeout:` or a per-run `--params retry_transport_timeout=<v>` override it (see [Configuration](#configuration)) |
 | `bypass_fast_path` | global default for the connector's `bypass_fast_path` write-path toggle: when on, the connector skips its `filter_path="errors"` probe and classifies every chunk per-item, which makes the `docs_deduped` / `written` counts EXACT for `op_type=create` on chunks mixing new and existing `_id`s (and avoids the auto-id re-ship duplication), at the cost of the fast path's throughput on clean chunks. Empty default (off; the fast path is used). Threaded exactly like `bulk_stats`: the generator bakes `${var.bypass_fast_path}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bypass_fast_path=true`) turns it on for a whole environment, and a pipeline's own `bypass_fast_path:` or a per-run `--params bypass_fast_path=<v>` override it (see [Configuration](#configuration)) |
+| `monitoring_log_enabled` | global default for the **durable monitoring sink**: when on, a run **also** appends its metrics (STREAM_PROGRESS / per-partition bulk_stats / a per-run summary) to `monitoring_log_table`, in addition to the run log. Empty default (off). Threaded exactly like `bulk_stats`: the generator bakes `${var.monitoring_log_enabled}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=monitoring_log_enabled=true`) turns the sink on for a whole environment, and a pipeline's own `monitoring_log_enabled:` or a per-run `--params monitoring_log_enabled=<v>` override it. Fail-soft: with the sink on but the table unset/missing, the run warns and skips it (see [Durable monitoring](#durable-monitoring)) |
+| `monitoring_log_table` | fully-qualified `catalog.schema.table` of the shared monitoring Delta table the sink appends to. **Deploy-time**, threaded like `checkpoint_base_path` / `ca_certs` (a notebook base_parameter, not a per-run job parameter, since the table is a per-environment choice). Empty default (no table => the sink is skipped even when `monitoring_log_enabled` is on). Set per target (or `--var`). Created out-of-band by the `_log table create` job; **export jobs only append**, so their run identity needs only `MODIFY` on the table, not `CREATE` (see [Durable monitoring](#durable-monitoring)) |
 | `pipeline_mode`, `filter_condition`, `chunk_size`, `write_concurrency`, `op_type`, `request_timeout`, `transport_max_retries`, `max_retries_per_doc`, `require_existing_index`, `verify_certs`, `streaming_start`, `write_repartition`, `max_partition_bytes`, `max_files_per_trigger`, `max_bytes_per_trigger` | the **remaining run-time knobs**, each threaded exactly like `bulk_stats`: the generator bakes `${var.<name>}` as that knob's job-parameter default for any pipeline that omits it, so **every** run-time knob follows one uniform pattern (this global default < a per-pipeline config value < a per-run `--params <name>=<value>`). All ship at a default that reproduces the prior behavior: `pipeline_mode` **`batch`** and `streaming_start` **`new`** (concrete, since their validators reject `""`), the rest empty (`""` = defer to the connector/Spark/built-in default; `op_type` empty defers to the connector's default write action). Leaving them unset changes nothing; set one per target (or `--var=<name>=<value>`) to move a whole environment. Note: setting a non-empty global for an empty-sentinel knob applies to every omitting pipeline with no per-config opt-out (watch `filter_condition`). Validated at generation and at run (see [Configuration](#configuration)) |
 
 The **Elasticsearch connection** is not a single global setting: it is a named **host config** that each
@@ -166,6 +173,7 @@ bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-part
 retry_transport_timeout: true     # OPTIONAL EsWriteConfig reliability toggle: connector OWNS whole-request timeout retries (re-send a timed-out bulk with backoff instead of failing the batch). Behaves like bulk_stats: omit to defer to the global ${var.retry_transport_timeout} default (off), or set true|false here to override it for this pipeline
 op_type: create                   # OPTIONAL EsWriteConfig write action: index (default, upsert by _id) | create (append-only; a resend of an existing _id is a benign 409 dedup, not overwritten or duplicated). Behaves like bulk_stats: omit to defer to the global ${var.op_type} (empty default defers to the connector's default write action), or set here to override it for this pipeline. create needs es_id_field to dedup a resend (else replays duplicate; the runner warns if create runs without one)
 bypass_fast_path: true            # OPTIONAL EsWriteConfig write-path toggle: skip the errors-probe fast path and classify every chunk per-item. Makes docs_deduped/written counts EXACT for op_type=create at the cost of fast-path throughput. Behaves like bulk_stats: omit to defer to the global ${var.bypass_fast_path} default (off), or set true|false here to override it for this pipeline
+monitoring_log_enabled: true      # OPTIONAL observability toggle (NOT a connector setting): also append this run's metrics (STREAM_PROGRESS / per-partition bulk_stats / run summary) to the shared monitoring Delta table (${var.monitoring_log_table}). Behaves like bulk_stats: omit to defer to the global ${var.monitoring_log_enabled} default (off), or set true|false here. Fail-soft: table unset/missing => warn and skip. Create the table once with the `_log table create` job
 streaming_start: new              # OPTIONAL first-run stream position: new (only new commits) | full (backfill whole table). Omit to defer to the global ${var.streaming_start} default (new), or set here; override per run. Streaming only; honored on a first run before a checkpoint exists
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit to defer to the global ${var.max_partition_bytes} (built-in default 2m)
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off); set > 0 only when the view shuffles; omit to defer to the global ${var.write_repartition} (built-in default 0)
@@ -885,6 +893,65 @@ cluster by id (a plain string, so `--var="diagnostics_existing_cluster_id=<id>"`
 `_pipelines/job_cluster_configs/<key>.yml` `new_cluster` spec into the `diagnostics_job_clusters` list
 (complex var; set per target or in `variable-overrides.json`). Set at most one path.
 
+### Durable monitoring
+
+Every run logs its `STREAM_PROGRESS` and `BULK_STATS` metrics to the run log (see [Streaming](#streaming)
+and the `bulk_stats` knob). That is ephemeral. To keep those metrics for querying **across jobs and over
+time** (dashboards, alerting, capacity trends), turn on the durable monitoring sink: the run then **also**
+appends the same metrics as rows in a shared Delta table. It is off by default and strictly
+observability — a sink fault (missing table, permission, transient error) only **warns** and skips, never
+failing an export.
+
+**One-time setup — create the table.** Table creation is a separate, deliberate step, not something the
+export path does (so export jobs never need `CREATE`). Point `monitoring_log_table` at a
+`catalog.schema.table` (per target, or `--var`), then run the hand-authored `_log table create` job once:
+
+```bash
+databricks bundle run log_table_create -t <target> -p <profile>
+```
+
+It runs `CREATE TABLE IF NOT EXISTS` with the sink's schema (from
+`pipeline_lib/monitoring_sink.py`, the single source of truth shared with the writer) and is idempotent
+(safe to re-run). The identity that runs **this** job needs `CREATE TABLE` (and `USE CATALOG`/`USE
+SCHEMA`) on the target schema; the export jobs only ever **append**, so their run identity needs only
+`MODIFY` on the table. If a name is blank or not a three-part identifier it fails closed.
+
+**Turn the sink on.** Set `monitoring_log_enabled` (global `${var.monitoring_log_enabled}` per target, a
+pipeline's own `monitoring_log_enabled:`, or a per-run `--params monitoring_log_enabled=true` — the same
+three-layer precedence as every knob). With the sink on but `monitoring_log_table` unset or the table not
+yet created, the run warns and skips the sink (the export is unaffected).
+
+**What lands in the table.** One append-only table, distinguished by a `record_type` column, with common
+columns `config_name`, `job_run_id`, `record_type`, `batch_id`, `event_ts`, a `VARIANT` `payload`, and a
+write-time `ingest_ts`. Rows are atomic (aggregation is left to SQL/views), so nothing the run log shows
+is lost:
+
+- `stream_progress` — one per streaming micro-batch; `payload` is the whole `StreamingQueryProgress`
+  (durationMs breakdown, per-source backlog, offsets).
+- `bulk_stats_partition` — one per DataFrame partition; `payload` is that partition's raw bulk-send stats
+  (sends, docs, rtt/http/took percentiles, timeouts, 429/409 rejections, retries, dedup, GIL wait).
+  **Requires `bulk_stats` on as well** (they come from the connector's per-partition stats).
+- `bulk_stats_batch` — the driver-side facts not in any partition (`collect_ms`, `merge_ms`, `written`,
+  `num_partitions`).
+- `run_summary` — one per run (mode, es_index, connector version, and the batch/row totals).
+
+Example — the per-run 429 pressure and throughput across all pipelines:
+
+```sql
+SELECT config_name, job_run_id,
+       sum(payload:rejected_429::bigint)  AS docs_429,
+       sum(payload:docs_retried::bigint)  AS docs_retried,
+       sum(payload:docs_sent::bigint)     AS docs_sent
+FROM <catalog>.<schema>.<table>
+WHERE record_type = 'bulk_stats_partition'
+GROUP BY config_name, job_run_id
+ORDER BY docs_429 DESC;
+```
+
+The sink appends one small file per micro-batch per record type; the `_log table create` job sets
+`delta.autoOptimize.optimizeWrite`/`autoCompact` so the table stays compact. `VARIANT` requires DBR
+15.3+ / recent serverless (every target here qualifies).
+
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
@@ -918,19 +985,25 @@ Shared notebooks (run by the jobs, not edited per pipeline):
                                 the import), loads its config by name, resolves the environment, and
                                 exports to Elasticsearch via the connector - batch (bulk_write over the
                                 deployed view) or streaming (view SELECT over each source micro-batch)
+    log_table_create.py         Run by the _log table create job: creates the shared monitoring Delta
+                                table (CREATE TABLE IF NOT EXISTS, idempotent; see Durable monitoring)
 
 Shared library + tests (the config schema, used by the generator and both notebooks):
   pipeline_lib/
     config.py                   Loads/validates a pipeline definition; resolves ${environment} and
                                 derives view substitutions + job parameters (single source of truth)
+    monitoring_sink.py          Pure schema + row builders for the durable monitoring sink (single
+                                source of truth for the table columns, shared by the writer + creator)
   tests/
     test_config.py              Offline unit tests for pipeline_lib.config (plain pytest)
+    test_monitoring_sink.py     Offline unit tests for pipeline_lib.monitoring_sink
 
 Generated / tooling (do not hand-edit the generated jobs):
   scripts/
     gen_jobs.py                 Generates resources/<config_name>.job.yml from the configs (--check guards drift)
   resources/
     deploy_views.job.yml        The deploy_views job (hand-authored)
+    log_table_create.job.yml    The _log table create job (hand-authored)
     <config_name>.job.yml       GENERATED per-index job (one per pipeline_configs config)
 ```
 
