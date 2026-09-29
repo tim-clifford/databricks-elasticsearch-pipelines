@@ -61,6 +61,15 @@ resources:
             # and wheel_version arrive as job parameters (above), not here.
             base_parameters:
               wheel_path: ${var.wheel_path}
+          # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
+          # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
+          # plus alert_on_last_attempt: false so every failed attempt pages. See scripts/gen_jobs.py _build_task.
+          email_notifications:
+            on_failure: ${var.support_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: false
 
       # On-demand: invoke via
       #   databricks bundle run build_wheel --params repo_workspace_path=/Workspace/Users/...,wheel_version=x.x.x

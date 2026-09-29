@@ -185,6 +185,50 @@ def test_render_group_job_notifies_support_email_on_failure():
     }
 
 
+# Task-level notification_settings: the JOB block plus alert_on_last_attempt: False (explicit). A
+# continuous job retries a failed task ON_FAILURE with no bounded "last attempt", so alert_on_last_attempt
+# True would suppress the alert forever - False pages on every failed attempt/restart.
+_EXPECTED_TASK_NOTIFICATION_SETTINGS = {
+    "no_alert_for_skipped_runs": True,
+    "no_alert_for_canceled_runs": True,
+    "alert_on_last_attempt": False,
+}
+
+
+def test_render_task_notifies_support_email_on_failure():
+    # The JOB-level on_failure fires only when the whole run reaches terminal FAILED. A task that fails
+    # and is retried - including a continuous job's ON_FAILURE restart, where the job stays RUNNING and
+    # never reaches FAILED - never trips it, so EVERY task also carries its own
+    # email_notifications.on_failure: ${var.support_email}. Holds for every compute.
+    for compute, spec in (
+        (None, None),
+        ({"type": "existing_cluster", "cluster_config": "interactive_primary"}, None),
+        ({"type": "job_cluster", "job_cluster_config": "std"}, {"spark_version": "15.4.x-scala2.12", "num_workers": 1}),
+    ):
+        task = _render_job(_cfg(compute), spec)["tasks"][0]
+        assert task["email_notifications"] == {"on_failure": "${var.support_email}"}
+
+
+def test_render_task_notification_settings_alert_on_every_attempt():
+    # Task notification_settings mirror the job block PLUS alert_on_last_attempt: False, so every failed
+    # attempt/restart pages (see _EXPECTED_TASK_NOTIFICATION_SETTINGS).
+    task = _render_job(_cfg())["tasks"][0]
+    assert task["notification_settings"] == _EXPECTED_TASK_NOTIFICATION_SETTINGS
+
+
+def test_render_group_tasks_notify_support_email_on_failure():
+    # The reported gap: the client runs pipelines as tasks in a group, so a single task's crash/restart
+    # must page even while sibling tasks keep the job RUNNING. Each member task carries its own block.
+    job = _render_group("g1", [
+        _member("a.yml", "a", "idx-a", mode="batch"),
+        _member("b.yml", "b", "idx-b", mode="batch"),
+    ])
+    assert len(job["tasks"]) == 2
+    for task in job["tasks"]:
+        assert task["email_notifications"] == {"on_failure": "${var.support_email}"}
+        assert task["notification_settings"] == _EXPECTED_TASK_NOTIFICATION_SETTINGS
+
+
 # --------------------------------------------------------------------------- render: existing_cluster
 
 
@@ -196,8 +240,12 @@ def test_render_existing_cluster():
     assert task["existing_cluster_id"] == "${var.interactive_primary.cluster_id}"
     assert "job_clusters" not in job
     assert "job_cluster_key" not in task
-    # the cluster ref precedes notebook_task in the task (deterministic key order)
-    assert list(task) == ["task_key", "existing_cluster_id", "notebook_task"]
+    # the cluster ref precedes notebook_task in the task, and the task-level notification blocks follow
+    # it (deterministic key order, keeps --check byte-stable)
+    assert list(task) == [
+        "task_key", "existing_cluster_id", "notebook_task",
+        "email_notifications", "notification_settings",
+    ]
 
 
 # --------------------------------------------------------------------------- render: job_cluster
@@ -742,13 +790,15 @@ def test_shipped_deploy_views_job_disables_queue():
     ("deploy_views.job.yml", "deploy_views"),
     ("checkpoint_clear.job.yml", "checkpoint_clear"),
     ("build_wheel.job.yml", "build_wheel"),
+    ("es_diagnostics.job.yml", "es_diagnostics"),
     ("log_table_create.job.yml", "log_table_create"),
 ])
 def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
     # The hand-authored jobs are NOT emitted by gen_jobs, so guard their failure-email block against drift:
     # each must carry the same email_notifications.on_failure: [${var.support_email}] and the skipped/
-    # canceled suppression that every generated job gets. Without this a hand-authored job could silently
-    # go un-monitored while the generated ones page prd on failure.
+    # canceled suppression that every generated job gets - at BOTH the job level and on every task (a
+    # task retry that never fails the whole run would otherwise go un-monitored). Without this a
+    # hand-authored job could silently go un-monitored while the generated ones page prd on failure.
     path = os.path.join(_REPO_ROOT, "resources", filename)
     with open(path) as fh:
         job = yaml.safe_load(fh)["resources"]["jobs"][job_key]
@@ -757,6 +807,10 @@ def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
         "no_alert_for_skipped_runs": True,
         "no_alert_for_canceled_runs": True,
     }
+    assert job["tasks"], f"{filename} has no tasks to monitor"
+    for task in job["tasks"]:
+        assert task["email_notifications"] == {"on_failure": "${var.support_email}"}
+        assert task["notification_settings"] == _EXPECTED_TASK_NOTIFICATION_SETTINGS
 
 
 def test_shipped_build_wheel_job_shape():
