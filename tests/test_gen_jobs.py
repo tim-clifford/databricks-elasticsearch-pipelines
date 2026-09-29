@@ -114,6 +114,8 @@ def test_render_wires_global_deploy_vars():
     assert bp["wheel_path"] == "${var.wheel_path}"
     assert bp["checkpoint_base_path"] == "${var.checkpoint_base_path}"
     assert bp["ca_certs"] == "${var.ca_certs}"
+    # monitoring_log_table is threaded the same way (deploy-time global, not a per-run job parameter).
+    assert bp["monitoring_log_table"] == "${var.monitoring_log_table}"
 
 
 def test_render_all_jobs_max_concurrent_runs_1():
@@ -618,7 +620,7 @@ def test_require_runtime_knobs_declared_full_legal_passes(tmp_path):
     gen_jobs.require_runtime_knobs_declared(str(_write_runtime_knob_yml(tmp_path)))  # no raise
 
 
-@pytest.mark.parametrize("missing", ["pipeline_mode", "bulk_stats", "streaming_start", "max_bytes_per_trigger"])
+@pytest.mark.parametrize("missing", ["pipeline_mode", "bulk_stats", "streaming_start", "max_bytes_per_trigger", "monitoring_log_enabled"])
 def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
     # An omitted-knob config bakes ${var.<name>}; if the variable is not declared, fail closed at
     # generation rather than let the reference break confusingly at deploy. Checked for every knob (the
@@ -634,6 +636,7 @@ def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
     ("request_timeout", "abc"), ("transport_max_retries", "-1"), ("max_retries_per_doc", "-1"),
     ("pipeline_mode", "turbo"), ("op_type", "has space"), ("streaming_start", "sideways"),
     ("write_repartition", "-5"), ("max_partition_bytes", "32x"), ("chunk_size", "0"),
+    ("monitoring_log_enabled", "maybe"),
 ])
 def test_require_runtime_knobs_declared_bad_default_fails_closed(tmp_path, name, bad):
     # The registry wires each knob's OWN validator (the same require_* helper the runner applies to the

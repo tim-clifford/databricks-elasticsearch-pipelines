@@ -43,6 +43,7 @@ resources:
             secret_key_name: ${var.es_host_primary.secret_key_name}
             checkpoint_base_path: ${var.checkpoint_base_path}
             ca_certs: ${var.ca_certs}
+            monitoring_log_table: ${var.monitoring_log_table}
             streaming_trigger_interval: ''
             pipeline_mode: batch
             filter_condition: ${var.filter_condition}
@@ -62,6 +63,7 @@ resources:
             max_partition_bytes: ${var.max_partition_bytes}
             max_files_per_trigger: ${var.max_files_per_trigger}
             max_bytes_per_trigger: ${var.max_bytes_per_trigger}
+            monitoring_log_enabled: ${var.monitoring_log_enabled}
       - task_key: index_pipeline_ecs_dns_group_b
         job_cluster_key: standard_batch
         notebook_task:
@@ -75,6 +77,7 @@ resources:
             secret_key_name: ${var.es_host_primary.secret_key_name}
             checkpoint_base_path: ${var.checkpoint_base_path}
             ca_certs: ${var.ca_certs}
+            monitoring_log_table: ${var.monitoring_log_table}
             streaming_trigger_interval: ''
             pipeline_mode: batch
             filter_condition: ${var.filter_condition}
@@ -94,6 +97,7 @@ resources:
             max_partition_bytes: ${var.max_partition_bytes}
             max_files_per_trigger: ${var.max_files_per_trigger}
             max_bytes_per_trigger: ${var.max_bytes_per_trigger}
+            monitoring_log_enabled: ${var.monitoring_log_enabled}
       permissions:
       - level: CAN_MANAGE_RUN
         group_name: users

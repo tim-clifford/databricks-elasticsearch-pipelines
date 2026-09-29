@@ -55,6 +55,8 @@ resources:
         default: ${var.max_files_per_trigger}
       - name: max_bytes_per_trigger
         default: ${var.max_bytes_per_trigger}
+      - name: monitoring_log_enabled
+        default: ${var.monitoring_log_enabled}
       continuous:
         pause_status: ${var.schedule_pause_status}
         task_retry_mode: ON_FAILURE
@@ -83,6 +85,7 @@ resources:
             secret_key_name: ${var.es_host_primary.secret_key_name}
             checkpoint_base_path: ${var.checkpoint_base_path}
             ca_certs: ${var.ca_certs}
+            monitoring_log_table: ${var.monitoring_log_table}
             streaming_trigger_interval: 30 seconds
       permissions:
       - level: CAN_MANAGE_RUN

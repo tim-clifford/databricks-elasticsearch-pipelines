@@ -629,6 +629,7 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
         f"${{var.{hc}.secret_key_name}}",
         "${var.checkpoint_base_path}",
         "${var.ca_certs}",
+        "${var.monitoring_log_table}",
         streaming_trigger_interval,
     )
     if include_run_time_knobs:
