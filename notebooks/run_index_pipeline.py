@@ -29,6 +29,9 @@
 # MAGIC   `/<config_name>` (required for a streaming run; unused by batch).
 # MAGIC - `streaming_trigger_interval`: the continuous ProcessingTime cadence (e.g. `30 seconds`) from the
 # MAGIC   config's `continuous` block, or empty for availableNow (drain-and-stop). Deploy-time, not per-run.
+# MAGIC - `monitoring_log_table`: the shared monitoring Delta table (`catalog.schema.table`) for the durable
+# MAGIC   sink, from `${var.monitoring_log_table}`. Empty => the sink is skipped. Deploy-time, not per-run;
+# MAGIC   create it once with the `_log table create` job. Only used when `monitoring_log_enabled` is true.
 # MAGIC
 # MAGIC Run-time parameters (job parameters; overridable per run with `--params <name>=<value>`):
 # MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config). Clearing a stale streaming
@@ -45,6 +48,11 @@
 # MAGIC   snapshot without exporting to ES), so history is skipped without stalling on a large source.
 # MAGIC - `max_files_per_trigger`, `max_bytes_per_trigger`: streaming read rate-limits that bound each
 # MAGIC   micro-batch (default from config; empty => Spark defaults). Streaming only; useful for a backfill.
+# MAGIC - `monitoring_log_enabled`: `true` | `false` (default from `${var.monitoring_log_enabled}`/config;
+# MAGIC   empty => off). When true, the run ALSO appends its STREAM_PROGRESS / per-partition bulk_stats /
+# MAGIC   run-summary rows to `monitoring_log_table` (in addition to the log lines). Fail-soft: an
+# MAGIC   unset/missing/malformed table warns and skips the sink, never failing the export. Per-partition
+# MAGIC   bulk_stats rows require `bulk_stats` on as well; STREAM_PROGRESS and run-summary rows do not.
 
 # COMMAND ----------
 # FIRST, install the connector wheel and restart Python. This cell handles ONLY the wheel, because
@@ -138,6 +146,13 @@ dbutils.widgets.text("streaming_start", "", "Streaming start: new (only new comm
 dbutils.widgets.text("streaming_trigger_interval", "", "Continuous ProcessingTime cadence, e.g. '30 seconds' (empty => availableNow drain-and-stop)")
 dbutils.widgets.text("max_files_per_trigger", "", "Streaming: max Delta files per micro-batch (empty => Spark default 1000)")
 dbutils.widgets.text("max_bytes_per_trigger", "", "Streaming: max bytes per micro-batch, e.g. 128m (empty => no cap)")
+# Durable monitoring sink. monitoring_log_enabled is a run-time job parameter (true|false; default from
+# ${var.monitoring_log_enabled}/config); monitoring_log_table is a deploy-time base_parameter (the
+# ${var.monitoring_log_table} bundle variable, the shared catalog.schema.table). When enabled and the
+# table is set, the run also APPENDS its metrics to that table (in addition to the log lines). Fail-soft:
+# an unset/missing table warns and skips the sink, never failing the export.
+dbutils.widgets.text("monitoring_log_enabled", "", "Durable monitoring sink: true|false; also append run metrics to ${var.monitoring_log_table} (empty => off)")
+dbutils.widgets.text("monitoring_log_table", "", "Fully-qualified catalog.schema.table for the monitoring sink (deploy-time; empty => sink skipped). Created by the `_log table create` job.")
 CONFIG_NAME = dbutils.widgets.get("config_name").strip()
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
 ES_HOST_URL = dbutils.widgets.get("es_host_url").strip()
@@ -164,6 +179,8 @@ STREAMING_START = dbutils.widgets.get("streaming_start").strip()
 STREAMING_TRIGGER_INTERVAL = dbutils.widgets.get("streaming_trigger_interval").strip()
 MAX_FILES_PER_TRIGGER = dbutils.widgets.get("max_files_per_trigger").strip()
 MAX_BYTES_PER_TRIGGER = dbutils.widgets.get("max_bytes_per_trigger").strip()
+MONITORING_LOG_ENABLED = dbutils.widgets.get("monitoring_log_enabled").strip()
+MONITORING_LOG_TABLE = dbutils.widgets.get("monitoring_log_table").strip()
 if not CONFIG_NAME:
     raise ValueError("missing required parameter: config_name")
 
@@ -181,6 +198,7 @@ if FILES_ROOT not in sys.path:
 from pipeline_lib.config import (  # noqa: E402
     load_config,
     render_view_sql,
+    require_es_flag,
     require_filter_condition,
     require_max_bytes_per_trigger,
     require_max_files_per_trigger,
@@ -193,6 +211,17 @@ from pipeline_lib.config import (  # noqa: E402
     view_select_body,
     view_substitutions,
     write_config_overrides,
+)
+# Durable monitoring sink (optional): pure row builders + the table schema/name validator, shared with
+# the `_log table create` job. Kept in pipeline_lib so it is unit-tested off-cluster; this notebook owns
+# only the Spark append (build_monitoring_writer below).
+from pipeline_lib.monitoring_sink import (  # noqa: E402
+    ROW_FIELDS,
+    bulk_stats_batch_row,
+    bulk_stats_partition_rows,
+    progress_row,
+    run_summary_row,
+    validate_table_name,
 )
 # Ephemeral per-batch streaming observability (pure Python, no Spark): the STREAM_PROGRESS log-line
 # formatter. Kept in pipeline_lib so it is unit-tested off-cluster.
@@ -288,6 +317,71 @@ MAX_PARTITION_BYTES = require_max_partition_bytes(MAX_PARTITION_BYTES, "max_part
 #   below. Empty widget -> "" (leave Spark's default), so an unset knob is simply omitted from the read.
 MAX_FILES_PER_TRIGGER = require_max_files_per_trigger(MAX_FILES_PER_TRIGGER, "max_files_per_trigger job parameter")
 MAX_BYTES_PER_TRIGGER = require_max_bytes_per_trigger(MAX_BYTES_PER_TRIGGER, "max_bytes_per_trigger job parameter")
+
+# Durable monitoring sink setup (OPTIONAL, strictly observability, FAIL-SOFT). Canonicalize the enable
+# flag with the SAME validator the config/registry use (a bad --params value fails closed here). The sink
+# is ACTIVE only when it resolves true AND a valid table name is configured: with the sink on but the
+# table unset OR malformed, we WARN and disable it rather than fail - a monitoring misconfiguration must
+# never break an export. The append itself (append_monitoring_rows) is independently fail-soft too.
+MONITORING_LOG_ENABLED = require_es_flag(MONITORING_LOG_ENABLED, "monitoring_log_enabled job parameter")
+_MONITORING_TABLE = ""
+if MONITORING_LOG_ENABLED == "true":
+    if not MONITORING_LOG_TABLE:
+        print("WARNING: monitoring_log_enabled=true but monitoring_log_table is unset "
+              "(${var.monitoring_log_table}); skipping the monitoring sink. Set the bundle variable and "
+              "run the `_log table create` job to enable durable monitoring.")
+    else:
+        try:
+            _MONITORING_TABLE = validate_table_name(MONITORING_LOG_TABLE, "monitoring_log_table")
+        except ValueError as _e:
+            print(f"WARNING: monitoring_log_table is invalid ({_e}); skipping the monitoring sink.")
+MONITORING_ACTIVE = bool(_MONITORING_TABLE)
+
+
+def _resolve_job_run_id():
+    """Best-effort Databricks job run id, used to group a run's monitoring rows. FAIL-SOFT: any failure
+    falls back to a per-process uuid so a run's rows still share an id (just not the platform run id)."""
+    try:
+        _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        _tags = json.loads(_ctx.toJson()).get("tags", {}) or {}
+        for _k in ("jobRunId", "multitaskParentRunId", "rootRunId", "runId"):
+            if _tags.get(_k):
+                return str(_tags[_k])
+    except Exception:
+        pass
+    return f"local-{uuid.uuid4().hex[:12]}"
+
+
+JOB_RUN_ID = _resolve_job_run_id() if MONITORING_ACTIVE else ""
+
+
+def append_monitoring_rows(rows, session=None):
+    """Append monitoring rows (dicts keyed by ROW_FIELDS, from pipeline_lib.monitoring_sink builders) to
+    the shared Delta table. No-op when the sink is inactive or rows is empty. FAIL-SOFT: any error is
+    caught and warned so a monitoring append can never disturb the export. Builds a DataFrame with the
+    payload + event_ts as strings, then parse_json -> VARIANT and cast -> TIMESTAMP, stamps
+    ingest_ts = current_timestamp() (the write time), and appends BY NAME via writeTo().append(). A
+    `session` is passed from foreachBatch (its micro-batch session); elsewhere the global spark is used."""
+    if not MONITORING_ACTIVE or not rows:
+        return
+    sess = session if session is not None else spark
+    try:
+        from pyspark.sql import functions as _F  # noqa: E402
+        _schema = ("config_name string, job_run_id string, record_type string, "
+                   "batch_id bigint, event_ts string, payload string")
+        _df = sess.createDataFrame([tuple(r[f] for f in ROW_FIELDS) for r in rows], _schema)
+        _df = (_df
+               .withColumn("event_ts", _F.col("event_ts").cast("timestamp"))
+               .withColumn("payload", _F.expr("parse_json(payload)"))
+               .withColumn("ingest_ts", _F.current_timestamp()))
+        _df.writeTo(_MONITORING_TABLE).append()
+    except Exception as _e:  # noqa: BLE001 - observability sink must never break the export
+        print(f"WARNING: monitoring sink append to {_MONITORING_TABLE!r} failed "
+              f"({type(_e).__name__}: {_e}); {len(rows)} row(s) not persisted. The export is unaffected.")
+
+
+if MONITORING_ACTIVE:
+    print(f"monitoring sink ACTIVE -> {_MONITORING_TABLE} (job_run_id={JOB_RUN_ID})")
 
 # The ES connection settings are required for any run that WRITES to ES: fail closed on an empty one
 # rather than constructing a broken EsWriteConfig. These come from this pipeline's es_host_config (a
@@ -479,12 +573,26 @@ if PIPELINE_MODE == "batch":
         # the full per-partition breakdown. Both fail-soft.
         print(format_tail_summary(result))
         print(format_bulk_stats(result["bulk_stats"]))
+    # Durable monitoring (optional, fail-soft): persist this batch's per-partition bulk_stats + the
+    # driver-side batch facts BEFORE reconcile, so a run that later fails reconciliation still leaves its
+    # diagnostics in the table. Per-partition rows land only when bulk_stats is on (otherwise result has
+    # no 'bulk_stats' and the builder yields none); the batch row (collect_ms/merge_ms/written) always does.
+    append_monitoring_rows(
+        bulk_stats_partition_rows(result, CONFIG_NAME, JOB_RUN_ID, batch_id=None)
+        + [r for r in (bulk_stats_batch_row(result, CONFIG_NAME, JOB_RUN_ID, batch_id=None),) if r]
+    )
     reconcile_or_raise(result, index=es_write_config.index)
     RUN_SUMMARY = (
         f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
         f"ignored={result['ignored']} total_input={result['total_input']}"
     )
     print(f"BATCH EXPORT COMPLETE: {RUN_SUMMARY}")
+    # A run_summary row on success (the counts + identity for this run).
+    append_monitoring_rows([r for r in (run_summary_row({
+        "mode": "batch", "es_index": es_write_config.index, "connector_version": _connector_version,
+        "written": result["written"], "deleted": result["deleted"], "errors": result["errors"],
+        "ignored": result["ignored"], "total_input": result["total_input"],
+    }, CONFIG_NAME, JOB_RUN_ID),) if r])
 
 # COMMAND ----------
 # STREAMING setup (streaming mode only). Prepare everything the stream needs BEFORE starting it, so a
@@ -658,6 +766,16 @@ if PIPELINE_MODE == "streaming":
         session.createDataFrame(
             [(int(batch_id), int(result.get("written", 0) or 0))], "batch_id bigint, written bigint"
         ).coalesce(1).write.mode("append").json(metrics_dir)
+        # Durable monitoring (optional, fail-soft): append this micro-batch's per-partition bulk_stats +
+        # driver-side batch facts to the shared table, from the micro-batch's OWN session (this runs
+        # server-side). Per-partition rows land only when bulk_stats is on; the batch row always does.
+        # STREAM_PROGRESS rows are appended separately by the client-side listener (the progress event
+        # lives only there). Fail-soft inside append_monitoring_rows, so a sink fault never fails the batch.
+        append_monitoring_rows(
+            bulk_stats_partition_rows(result, CONFIG_NAME, JOB_RUN_ID, batch_id=batch_id)
+            + [r for r in (bulk_stats_batch_row(result, CONFIG_NAME, JOB_RUN_ID, batch_id=batch_id),) if r],
+            session=session,
+        )
 
 # COMMAND ----------
 # STREAMING run - STEP 1 of 2: PREPARE the checkpoint (streaming mode only). Build the Delta stream
@@ -864,6 +982,15 @@ if PIPELINE_MODE == "streaming":
                 if progress.get("name") != _QUERY_NAME:
                     return
                 print(format_progress(progress))
+                # Durable monitoring (optional, fail-soft): append this batch's STREAM_PROGRESS row to the
+                # shared table. The progress event exists ONLY here (client-side), so this is the sole place
+                # a stream_progress row can be produced; the per-partition bulk_stats rows are appended
+                # server-side in foreach_batch. Own try so a sink fault cannot suppress the line just
+                # printed (append_monitoring_rows is itself fail-soft; this is belt-and-suspenders).
+                try:
+                    append_monitoring_rows([r for r in (progress_row(progress, CONFIG_NAME, JOB_RUN_ID),) if r])
+                except Exception as _me:
+                    print(f"WARNING: monitoring progress append failed ({type(_me).__name__}: {_me})")
                 # Surface this batch's bulk/tail diagnostics in the CELL, if foreachBatch wrote them for
                 # this batch (bulk_stats on, non-empty batch). Read the per-batch relay file written
                 # server-side; this runs on the driver so a plain file read reaches it. Own try so a
@@ -940,6 +1067,14 @@ if PIPELINE_MODE == "streaming":
                 f"checkpoint={checkpoint_location}"
             )
             print(f"CONTINUOUS STREAM STOPPED: {RUN_SUMMARY}")
+            # Durable monitoring (optional, fail-soft): a run_summary row on a GRACEFUL continuous stop
+            # (a failure re-raises from awaitTermination above and never reaches here). Per-batch rows
+            # were already appended by foreach_batch / the listener while the stream ran.
+            append_monitoring_rows([r for r in (run_summary_row({
+                "mode": "streaming", "trigger": f"continuous({STREAMING_TRIGGER_INTERVAL})",
+                "es_index": es_write_config.index, "connector_version": _connector_version,
+                "checkpoint": checkpoint_location, "stopped": True,
+            }, CONFIG_NAME, JOB_RUN_ID),) if r])
         else:
             # availableNow (drain-and-stop): start, drain to completion, then summarize THIS run.
             query = writer.trigger(availableNow=True).start()
@@ -991,6 +1126,13 @@ if PIPELINE_MODE == "streaming":
             if rows_pushed == 0:
                 print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
             print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
+            # Durable monitoring (optional, fail-soft): a run_summary row for this drain-and-stop run.
+            # Per-batch stream_progress / bulk_stats rows were appended as the batches ran.
+            append_monitoring_rows([r for r in (run_summary_row({
+                "mode": "streaming", "trigger": "availableNow", "streaming_start": STREAMING_START,
+                "es_index": es_write_config.index, "connector_version": _connector_version,
+                "batches": num_batches, "rows_pushed": rows_pushed, "checkpoint": checkpoint_location,
+            }, CONFIG_NAME, JOB_RUN_ID),) if r])
     finally:
         # Remove our listener when the run ends (availableNow drain-and-stop, graceful continuous
         # stop, OR failure) so it does not survive on a reused SparkSession and keep logging unrelated
