@@ -742,6 +742,7 @@ def test_shipped_deploy_views_job_disables_queue():
     ("deploy_views.job.yml", "deploy_views"),
     ("checkpoint_clear.job.yml", "checkpoint_clear"),
     ("build_wheel.job.yml", "build_wheel"),
+    ("log_table_create.job.yml", "log_table_create"),
 ])
 def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
     # The hand-authored jobs are NOT emitted by gen_jobs, so guard their failure-email block against drift:
@@ -775,6 +776,23 @@ def test_shipped_build_wheel_job_shape():
     assert task["notebook_task"]["notebook_path"] == "../notebooks/build_wheel.py"
     # wheel_path is wired from the bundle variable; the notebook takes its parent dir as the upload target.
     assert task["notebook_task"]["base_parameters"] == {"wheel_path": "${var.wheel_path}"}
+
+
+def test_shipped_log_table_create_job_shape():
+    # log_table_create is hand-authored (not generated), so guard its shape against drift: single-flight +
+    # skip-not-queue like every other job, the serverless notebook task, and the monitoring_log_table
+    # base_parameter wired from the bundle variable (the notebook validates it and runs CREATE TABLE IF NOT
+    # EXISTS). The notebook's create behavior is proven by a live run, not here.
+    path = os.path.join(_REPO_ROOT, "resources", "log_table_create.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["log_table_create"]
+    assert job["max_concurrent_runs"] == 1
+    assert job["queue"] == {"enabled": False}
+    (task,) = job["tasks"]
+    assert task["notebook_task"]["notebook_path"] == "../notebooks/log_table_create.py"
+    assert task["notebook_task"]["base_parameters"] == {"monitoring_log_table": "${var.monitoring_log_table}"}
+    # No run-time job parameters: the table name is a deploy-time base_parameter, not overridable per run.
+    assert "parameters" not in job
 
 
 # --------------------------------------------------------------------------- job groups
@@ -1244,9 +1262,10 @@ def test_shipped_databricks_yml_declares_global_job_tags():
     ("checkpoint_clear.job.yml", "checkpoint_clear"),
     ("build_wheel.job.yml", "build_wheel"),
     ("es_diagnostics.job.yml", "es_diagnostics"),
+    ("log_table_create.job.yml", "log_table_create"),
 ])
 def test_shipped_fixed_jobs_reference_global_job_tags(filename, job_key):
-    # The 4 hand-authored jobs are NOT emitted by gen_jobs, so guard against drift: each must reference the
+    # The 5 hand-authored jobs are NOT emitted by gen_jobs, so guard against drift: each must reference the
     # whole global_job_tags var so it gets the same global tags every generated job carries.
     path = os.path.join(_REPO_ROOT, "resources", filename)
     with open(path) as fh:
