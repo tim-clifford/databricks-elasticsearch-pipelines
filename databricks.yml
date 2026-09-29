@@ -231,23 +231,30 @@ variables:
     default: ""
 
   # GLOBAL defaults for the connector's connection/reliability tuning, threaded exactly like bulk_stats:
-  # scripts/gen_jobs.py bakes ${var.request_timeout} / ${var.transport_max_retries} as the job-parameter
-  # default for every pipeline that OMITS the knob, so you can raise the per-request ES timeout and the
-  # whole-request retry count for a WHOLE target without editing each pipeline config. These are the
-  # levers for a batch write that fails at the transport layer ("The write operation timed out"): a large
-  # or slow _bulk request that exceeds the socket timeout. Precedence, highest first: a per-run
+  # scripts/gen_jobs.py bakes ${var.request_timeout} / ${var.transport_max_retries} /
+  # ${var.max_retries_per_doc} as the job-parameter default for every pipeline that OMITS the knob, so you
+  # can raise the per-request ES timeout, the whole-request retry count, and the per-document 429 retry
+  # count for a WHOLE target without editing each pipeline config. request_timeout / transport_max_retries
+  # are the levers for a batch write that fails at the transport layer ("The write operation timed out"): a
+  # large or slow _bulk request that exceeds the socket timeout. max_retries_per_doc is a DIFFERENT layer:
+  # it re-sends an individual document that ES rejects with a 429 (es_rejected_execution_exception, the
+  # write queue is full); the _bulk call returns HTTP 200 with the row rejected inside it, so
+  # transport_max_retries never sees it and only this knob retries it. Precedence, highest first: a per-run
   # `--params <knob>=<v>` > a pipeline's own `<knob>:` in its config > this global default > the
   # connector's own defaults. Empty defaults so, out of the
   # box, the connector defaults apply everywhere; set them per target below (or --var) to raise them
   # target-wide. A legal request_timeout is "" or a positive integer of seconds; a legal
-  # transport_max_retries is "" or a non-negative integer (0 disables transport retries). Both are
-  # validated at generation and at run. Like the other simple string vars they accept
+  # transport_max_retries / max_retries_per_doc is "" or a non-negative integer (0 disables that layer's
+  # retries). All are validated at generation and at run. Like the other simple string vars they accept
   # --var=request_timeout=120 at deploy.
   request_timeout:
     description: "Global default for EsWriteConfig request_timeout (per-request ES client timeout, seconds). Empty default (connector default applies). A pipeline's own request_timeout and a per-run --params override this. Set per target/--var to raise it target-wide."
     default: ""
   transport_max_retries:
     description: "Global default for EsWriteConfig transport_max_retries (whole-request retries on a transport failure; 0 disables). Empty default (connector default applies). A pipeline's own transport_max_retries and a per-run --params override this. Set per target/--var to raise it target-wide."
+    default: ""
+  max_retries_per_doc:
+    description: "Global default for EsWriteConfig max_retries_per_doc (per-document retries for rows ES rejects with a 429, write queue full; distinct from transport_max_retries; 0 disables). Empty default (connector default 3 applies). A pipeline's own max_retries_per_doc and a per-run --params override this. Set per target/--var to raise it target-wide."
     default: ""
 
   # GLOBAL default for the connector's retry_transport_timeout, threaded exactly like bulk_stats (a bool
@@ -292,8 +299,8 @@ variables:
   # defers to the connector's own default write action, and a non-empty global would force that action on
   # every omitting config. All are validated at generation (require_runtime_knobs_declared)
   # and at run, and like the other simple string vars accept a --var=<name>=<value> override at deploy.
-  # (bulk_stats, request_timeout, transport_max_retries, retry_transport_timeout, and bypass_fast_path
-  # above are the same pattern.)
+  # (bulk_stats, request_timeout, transport_max_retries, max_retries_per_doc, retry_transport_timeout,
+  # and bypass_fast_path above are the same pattern.)
   #
   # CAVEAT (empty-sentinel knobs): setting a NON-empty global for a knob whose unset form is "" (every knob
   # here except pipeline_mode / streaming_start) applies to EVERY pipeline that omits that knob, with no
@@ -462,6 +469,10 @@ targets:
       # transport_max_retries: "5" # and the whole-request retry count. A pipeline's own value or a
                                    # --params override still wins. Empty defaults inherit the connector
                                    # defaults when omitted.
+      # max_retries_per_doc: "5"   # raise the PER-DOCUMENT 429 retry count (rows ES rejects because its
+                                   # write queue is full) for the whole dev target; distinct from
+                                   # transport_max_retries. A pipeline's own value or a --params override
+                                   # still wins. Empty default (connector default 3) inherited when omitted.
       # retry_transport_timeout: "true"  # let the connector OWN whole-request timeout retries (re-send with
                                    # backoff instead of failing the batch) for the whole dev target. A
                                    # pipeline's own value or a --params override still wins. Empty default

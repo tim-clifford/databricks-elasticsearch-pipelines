@@ -51,6 +51,7 @@ resources:
             op_type: ${var.op_type}
             request_timeout: ${var.request_timeout}
             transport_max_retries: ${var.transport_max_retries}
+            max_retries_per_doc: ${var.max_retries_per_doc}
             require_existing_index: ${var.require_existing_index}
             verify_certs: ${var.verify_certs}
             bulk_stats: ${var.bulk_stats}
@@ -82,6 +83,7 @@ resources:
             op_type: ${var.op_type}
             request_timeout: ${var.request_timeout}
             transport_max_retries: ${var.transport_max_retries}
+            max_retries_per_doc: ${var.max_retries_per_doc}
             require_existing_index: ${var.require_existing_index}
             verify_certs: ${var.verify_certs}
             bulk_stats: ${var.bulk_stats}

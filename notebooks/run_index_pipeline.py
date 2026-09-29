@@ -34,10 +34,11 @@
 # MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config). Clearing a stale streaming
 # MAGIC   checkpoint is handled by the dedicated `_checkpoint clear` job, not a pipeline_mode.
 # MAGIC - `filter_condition`: optional Spark SQL predicate applied before the write (default from config).
-# MAGIC - `chunk_size`, `write_concurrency`, `request_timeout`, `transport_max_retries`, `require_existing_index`,
-# MAGIC   `verify_certs`: EsWriteConfig tuning (default from config; omitted there and unset per run => connector
-# MAGIC   default). `request_timeout` (seconds) and `transport_max_retries` (0 disables) tune a write that
-# MAGIC   times out mid-send.
+# MAGIC - `chunk_size`, `write_concurrency`, `request_timeout`, `transport_max_retries`, `max_retries_per_doc`,
+# MAGIC   `require_existing_index`, `verify_certs`: EsWriteConfig tuning (default from config; omitted there and
+# MAGIC   unset per run => connector default). `request_timeout` (seconds) and `transport_max_retries` (0 disables)
+# MAGIC   tune a write that times out mid-send; `max_retries_per_doc` (0 disables) is the PER-DOCUMENT retry count
+# MAGIC   for rows ES rejects with a 429 (write queue full), distinct from the whole-request `transport_max_retries`.
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
 # MAGIC   streaming only, honored on the first run before a checkpoint exists. `new` establishes the
 # MAGIC   checkpoint at the current source position via a no-op availableNow seed (drains the initial
@@ -117,6 +118,7 @@ dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty
 dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
 dbutils.widgets.text("request_timeout", "", "EsWriteConfig request_timeout: per-request ES client timeout in seconds (empty => connector default 60)")
 dbutils.widgets.text("transport_max_retries", "", "EsWriteConfig transport_max_retries: whole-request retries on a transport failure; 0 disables (empty => connector default 3)")
+dbutils.widgets.text("max_retries_per_doc", "", "EsWriteConfig max_retries_per_doc: PER-DOCUMENT retries for rows ES rejects with a 429 (write queue full); 0 disables (empty => connector default 3)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
 dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default from ${var.bulk_stats}/config; empty => connector default off; needs connector 0.9.3+)")
@@ -148,6 +150,7 @@ CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
 WRITE_CONCURRENCY = dbutils.widgets.get("write_concurrency").strip()
 REQUEST_TIMEOUT = dbutils.widgets.get("request_timeout").strip()
 TRANSPORT_MAX_RETRIES = dbutils.widgets.get("transport_max_retries").strip()
+MAX_RETRIES_PER_DOC = dbutils.widgets.get("max_retries_per_doc").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
 BULK_STATS = dbutils.widgets.get("bulk_stats").strip()
@@ -250,6 +253,7 @@ if STREAMING_TRIGGER_INTERVAL:
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS,
                                          request_timeout=REQUEST_TIMEOUT, transport_max_retries=TRANSPORT_MAX_RETRIES,
+                                         max_retries_per_doc=MAX_RETRIES_PER_DOC,
                                          retry_transport_timeout=RETRY_TRANSPORT_TIMEOUT, op_type=OP_TYPE,
                                          bypass_fast_path=BYPASS_FAST_PATH)
 # Four knobs were added to EsWriteConfig in specific connector releases: bulk_stats (0.9.3+),
