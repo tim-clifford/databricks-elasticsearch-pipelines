@@ -48,6 +48,15 @@ resources:
             # notebook appends /<config_name>. config_name arrives as a job parameter (above), not here.
             base_parameters:
               checkpoint_base_path: ${var.checkpoint_base_path}
+          # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
+          # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
+          # plus alert_on_last_attempt: false so every failed attempt pages. See scripts/gen_jobs.py _build_task.
+          email_notifications:
+            on_failure: ${var.support_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: false
 
       # On-demand: invoke via `databricks bundle run checkpoint_clear --params config_name=<name>`.
       # CAN_MANAGE_RUN so any teammate in `users` can trigger it, matching deploy_views.

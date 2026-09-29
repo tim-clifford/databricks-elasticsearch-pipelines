@@ -638,6 +638,21 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
         "notebook_path": "../notebooks/run_index_pipeline.py",
         "base_parameters": base_parameters,
     }
+    # Per-TASK failure notifications. The job-level email_notifications (see _assemble_job) fires only
+    # when the whole run reaches terminal FAILED, so it MISSES a task that fails and is retried: a task
+    # that fails-then-succeeds leaves the run SUCCESSFUL, and in a continuous group a crashed task is
+    # retried in place (task_retry_mode ON_FAILURE, see _continuous_block) while siblings keep the job
+    # RUNNING - the run never reaches FAILED. Most client pipelines run as tasks in a group, so without
+    # this the critical per-task crash/restart goes unmonitored. Mirrors the job-level ${var.support_email}
+    # reference (whole complex LIST var, empty => [] = off). notification_settings mirror the job block
+    # PLUS alert_on_last_attempt: False - a continuous ON_FAILURE retry has no bounded "last attempt", so
+    # True would suppress the alert forever; False pages on every failed attempt/restart.
+    task["email_notifications"] = {"on_failure": "${var.support_email}"}
+    task["notification_settings"] = {
+        "no_alert_for_skipped_runs": True,
+        "no_alert_for_canceled_runs": True,
+        "alert_on_last_attempt": False,
+    }
     return task
 
 
