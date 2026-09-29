@@ -80,6 +80,12 @@ resources:
             checkpoint_base_path: ${var.checkpoint_base_path}
             ca_certs: ${var.ca_certs}
             streaming_trigger_interval: ''
+        email_notifications:
+          on_failure: ${var.support_email}
+        notification_settings:
+          no_alert_for_skipped_runs: true
+          no_alert_for_canceled_runs: true
+          alert_on_last_attempt: false
       permissions:
       - level: CAN_MANAGE_RUN
         group_name: users

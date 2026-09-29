@@ -81,6 +81,15 @@ resources:
               #  {"es_host_primary": {"es_host_url": "${var.es_host_primary.es_host_url}", "secret_scope_name": "${var.es_host_primary.secret_scope_name}", "secret_key_name": "${var.es_host_primary.secret_key_name}"},
               #   "es_host_secondary": {"es_host_url": "${var.es_host_secondary.es_host_url}", "secret_scope_name": "${var.es_host_secondary.secret_scope_name}", "secret_key_name": "${var.es_host_secondary.secret_key_name}"}}
               ca_certs: ${var.ca_certs}
+          # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
+          # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
+          # plus alert_on_last_attempt: false so every failed attempt pages. See scripts/gen_jobs.py _build_task.
+          email_notifications:
+            on_failure: ${var.support_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: false
 
       # On-demand: invoke via `databricks bundle run es_diagnostics -t <target> -p <profile>
       # [--params index_name=<idx>]`. CAN_MANAGE_RUN so any teammate in `users` can trigger it, matching
