@@ -1,0 +1,70 @@
+resources:
+  jobs:
+    log_table_prune:
+      name: "[${bundle.target}] ${var.job_name_prefix}: _log table prune"
+      description: >-
+        A serverless maintenance job that bounds the growth of the shared monitoring Delta table (the one
+        pipelines append to when monitoring_log_enabled is on). It DELETEs rows older than
+        monitoring_log_retention_days (${var.monitoring_log_retention_days}; 0 disables the delete), then
+        OPTIMIZEs (reclusters/compacts) and VACUUMs the table (${var.monitoring_log_table}). Runs on a daily
+        schedule that is PAUSED by default (${var.schedule_pause_status}); unpause it per target once the
+        table exists and the sink is on, or run on demand with `databricks bundle run log_table_prune`. This
+        job needs MODIFY on the table (DELETE/OPTIMIZE/VACUUM), not CREATE. No cluster block => serverless
+        notebook task.
+
+      # Never run two copies at once, consistent with every index job, deploy_views, checkpoint_clear and
+      # log_table_create.
+      max_concurrent_runs: 1
+
+      # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
+      # rather than queued, matching every generated job and the other maintenance jobs.
+      queue:
+        enabled: false
+
+      # Daily at 03:00 UTC, PAUSED by default (${var.schedule_pause_status}): dev/stg deploy the schedule
+      # but never fire it; prd (schedule_pause_status=UNPAUSED) runs retention nightly. On-demand runs work
+      # regardless of pause_status.
+      schedule:
+        quartz_cron_expression: 0 0 3 * * ?
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
+
+      # Notify the target's support recipients on a run failure. ${var.support_email} is a complex LIST
+      # var: an empty list in dev/stg (no recipients = off) and a real address in prd. on_failure
+      # references the whole var so the empty case is [] (not [""]). notification_settings suppress
+      # SKIPPED (queue disabled => an overlapping trigger is skipped, not failed) and CANCELED runs, so
+      # recipients are paged only on a genuine failure. Matches every other job (see scripts/gen_jobs.py).
+      email_notifications:
+        on_failure: ${var.support_email}
+      notification_settings:
+        no_alert_for_skipped_runs: true
+        no_alert_for_canceled_runs: true
+
+      # Global job tags from databricks.yml (empty {} => omitted). Applied to every job; serverless, so
+      # these are job-level tags (no cluster to forward onto). Matches every other job.
+      tags: ${var.global_job_tags}
+
+      tasks:
+        - task_key: log_table_prune
+          notebook_task:
+            notebook_path: ../notebooks/log_table_prune.py
+            # Both deploy-time bundle variables: the fully-qualified catalog.schema.table and the retention
+            # window. The notebook validates them and runs DELETE (if retention > 0) + OPTIMIZE + VACUUM.
+            base_parameters:
+              monitoring_log_table: ${var.monitoring_log_table}
+              monitoring_log_retention_days: ${var.monitoring_log_retention_days}
+          # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
+          # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
+          # plus alert_on_last_attempt: false so every failed attempt pages. See scripts/gen_jobs.py _build_task.
+          email_notifications:
+            on_failure: ${var.support_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: false
+
+      # On-demand: invoke via `databricks bundle run log_table_prune`. CAN_MANAGE_RUN so any teammate in
+      # `users` can trigger it, matching checkpoint_clear / deploy_views / log_table_create.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          group_name: users

@@ -792,6 +792,7 @@ def test_shipped_deploy_views_job_disables_queue():
     ("build_wheel.job.yml", "build_wheel"),
     ("es_diagnostics.job.yml", "es_diagnostics"),
     ("log_table_create.job.yml", "log_table_create"),
+    ("log_table_prune.job.yml", "log_table_prune"),
 ])
 def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
     # The hand-authored jobs are NOT emitted by gen_jobs, so guard their failure-email block against drift:
@@ -846,6 +847,30 @@ def test_shipped_log_table_create_job_shape():
     assert task["notebook_task"]["notebook_path"] == "../notebooks/log_table_create.py"
     assert task["notebook_task"]["base_parameters"] == {"monitoring_log_table": "${var.monitoring_log_table}"}
     # No run-time job parameters: the table name is a deploy-time base_parameter, not overridable per run.
+    assert "parameters" not in job
+
+
+def test_shipped_log_table_prune_job_shape():
+    # log_table_prune is hand-authored (not generated), so guard its shape against drift: single-flight +
+    # skip-not-queue like every other job, the serverless notebook task, both deploy-time base_parameters
+    # (table + retention), and a daily schedule PAUSED by default via ${var.schedule_pause_status}. The
+    # notebook's prune/optimize/vacuum behavior is proven by a live run, not here.
+    path = os.path.join(_REPO_ROOT, "resources", "log_table_prune.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["log_table_prune"]
+    assert job["max_concurrent_runs"] == 1
+    assert job["queue"] == {"enabled": False}
+    assert job["tags"] == "${var.global_job_tags}"
+    # Daily schedule, paused by default (dev/stg deploy but never fire; prd unpauses).
+    assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
+    assert job["schedule"]["quartz_cron_expression"]
+    (task,) = job["tasks"]
+    assert task["notebook_task"]["notebook_path"] == "../notebooks/log_table_prune.py"
+    assert task["notebook_task"]["base_parameters"] == {
+        "monitoring_log_table": "${var.monitoring_log_table}",
+        "monitoring_log_retention_days": "${var.monitoring_log_retention_days}",
+    }
+    # No run-time job parameters: both values are deploy-time base_parameters, not overridable per run.
     assert "parameters" not in job
 
 

@@ -230,6 +230,17 @@ variables:
     description: "Fully-qualified catalog.schema.table of the shared monitoring Delta table jobs append to when monitoring_log_enabled is on. Empty default (no table => sink skipped, fail-soft). Set per target below or override with --var. Created out-of-band by the `_log table create` job; export jobs only append (need MODIFY, not CREATE)."
     default: ""
 
+  # Retention (in days) the `_log table prune` maintenance job enforces on the monitoring table: it DELETEs
+  # rows older than this, then OPTIMIZEs (reclusters/compacts) and VACUUMs. The monitoring table grows
+  # unbounded otherwise (one bulk_stats_partition row per partition per micro-batch on a continuous stream),
+  # so retention keeps it bounded and query-fast. 0 disables retention (keep ALL rows; the prune job then
+  # only OPTIMIZEs/VACUUMs). Default 90. Threaded like monitoring_log_table: a deploy-time base_parameter on
+  # the hand-authored prune job, so it is a per-target choice, not a per-run flag. e.g.
+  #   --var="monitoring_log_retention_days=30"
+  monitoring_log_retention_days:
+    description: "Days of history the `_log table prune` job keeps in the monitoring table (DELETE older rows, then OPTIMIZE + VACUUM). 0 disables retention (keep all). Default 90. Deploy-time; set per target or --var."
+    default: "90"
+
   # GLOBAL default for the connector's bulk_stats diagnostics (per-partition ES bulk-send stats -
   # docs/send, round-trip ms, ES `took` ms - in the run log). This is the
   # target-wide DEFAULT: scripts/gen_jobs.py bakes ${var.bulk_stats} as the bulk_stats job-parameter
