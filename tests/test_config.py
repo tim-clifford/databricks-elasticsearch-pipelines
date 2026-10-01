@@ -52,6 +52,7 @@ def _job_base_parameters(config_name):
         secret_key_name_ref="${var.es_host_primary.secret_key_name}",
         checkpoint_base_path_ref="${var.checkpoint_base_path}",
         ca_certs_ref="${var.ca_certs}",
+        monitoring_log_table_ref="${var.monitoring_log_table}",
     )
 
 
@@ -155,6 +156,44 @@ def test_bulk_stats_carried_through_resolve():
     cfg = _base()
     cfg["bulk_stats"] = False
     assert resolve_config(validate_config(cfg), "")["bulk_stats"] == "false"
+
+
+# --- monitoring_log_enabled (durable monitoring-sink toggle, mirrors bulk_stats but pipeline-side) ---
+
+
+def test_monitoring_log_enabled_defaults_unset_when_omitted():
+    # Like bulk_stats: an omitted value is "" (unset), deferring to the ${var.monitoring_log_enabled}
+    # global (baked by the generator), which is empty (off) out of the box.
+    assert validate_config(_base())["monitoring_log_enabled"] == ""
+
+
+@pytest.mark.parametrize("blank", ["", "  ", None])
+def test_monitoring_log_enabled_explicit_blank_is_unset(blank):
+    cfg = _base()
+    cfg["monitoring_log_enabled"] = blank
+    assert validate_config(cfg)["monitoring_log_enabled"] == ""
+
+
+@pytest.mark.parametrize("value,expected", [(True, "true"), (False, "false"), ("true", "true"), ("FALSE", "false")])
+def test_monitoring_log_enabled_explicit_value_canonicalized(value, expected):
+    cfg = _base()
+    cfg["monitoring_log_enabled"] = value
+    assert validate_config(cfg)["monitoring_log_enabled"] == expected
+
+
+@pytest.mark.parametrize("bad", ["maybe", "1", 0, "yes"])
+def test_monitoring_log_enabled_invalid_rejected(bad):
+    cfg = _base()
+    cfg["monitoring_log_enabled"] = bad
+    with pytest.raises(PipelineConfigError, match="monitoring_log_enabled"):
+        validate_config(cfg)
+
+
+def test_monitoring_log_enabled_carried_through_resolve():
+    # A pipeline-side run behavior (not an object name): resolve_config passes it through verbatim.
+    cfg = _base()
+    cfg["monitoring_log_enabled"] = True
+    assert resolve_config(validate_config(cfg), "")["monitoring_log_enabled"] == "true"
 
 
 def test_environment_token_accepted_as_template():
@@ -636,6 +675,7 @@ def test_job_base_parameters():
         "secret_key_name": "${var.es_host_primary.secret_key_name}",
         "checkpoint_base_path": "${var.checkpoint_base_path}",
         "ca_certs": "${var.ca_certs}",
+        "monitoring_log_table": "${var.monitoring_log_table}",
         "streaming_trigger_interval": "",
     }
 
@@ -647,7 +687,7 @@ def test_job_base_parameters_streaming_trigger_interval():
     params = job_base_parameters(
         "x", "${var.environment}", "${var.wheel_path}", "${var.es_host_primary.es_host_url}",
         "${var.es_host_primary.secret_scope_name}", "${var.es_host_primary.secret_key_name}",
-        "${var.checkpoint_base_path}", "${var.ca_certs}", "30 seconds",
+        "${var.checkpoint_base_path}", "${var.ca_certs}", "${var.monitoring_log_table}", "30 seconds",
     )
     assert params["streaming_trigger_interval"] == "30 seconds"
 
@@ -703,6 +743,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "max_partition_bytes", "default": ""},
         {"name": "max_files_per_trigger", "default": ""},
         {"name": "max_bytes_per_trigger", "default": ""},
+        {"name": "monitoring_log_enabled", "default": ""},
     ]
 
 
@@ -743,6 +784,33 @@ def test_job_parameters_bulk_stats_config_value_overrides_ref(value, expected):
     cfg["bulk_stats"] = value
     params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
     assert {"name": "bulk_stats", "default": expected} in params
+
+
+def test_job_parameters_monitoring_log_enabled_defaults_empty_without_ref():
+    params = job_parameters(validate_config(_base()))
+    assert {"name": "monitoring_log_enabled", "default": ""} in params
+
+
+def test_job_parameters_monitoring_log_enabled_omitted_uses_global_ref():
+    # An omitted config defers to the target-wide ${var.monitoring_log_enabled} global.
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
+    assert {"name": "monitoring_log_enabled", "default": "${var.monitoring_log_enabled}"} in params
+
+
+@pytest.mark.parametrize("value,expected", [(True, "true"), (False, "false")])
+def test_job_parameters_monitoring_log_enabled_config_value_overrides_ref(value, expected):
+    cfg = _base()
+    cfg["monitoring_log_enabled"] = value
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
+    assert {"name": "monitoring_log_enabled", "default": expected} in params
+
+
+def test_monitoring_log_table_is_a_base_parameter_not_a_job_parameter():
+    # monitoring_log_table is threaded like checkpoint_base_path/ca_certs: a deploy-time base_parameter
+    # (the ${var.monitoring_log_table} ref), NOT a run-time job parameter (never overridable per run).
+    base = _job_base_parameters("x")
+    assert base["monitoring_log_table"] == "${var.monitoring_log_table}"
+    assert "monitoring_log_table" not in {p["name"] for p in job_parameters(validate_config(_base()))}
 
 
 def test_job_parameters_reliability_knobs_default_empty_without_ref():
@@ -1000,6 +1068,7 @@ def test_runtime_knob_registry_shape():
         "verify_certs",
         "bulk_stats", "retry_transport_timeout", "bypass_fast_path", "streaming_start",
         "write_repartition", "max_partition_bytes", "max_files_per_trigger", "max_bytes_per_trigger",
+        "monitoring_log_enabled",
     )
     # Every knob carries a callable validator (the same require_* helper used at parse + run time).
     for knob in _RUNTIME_KNOBS:

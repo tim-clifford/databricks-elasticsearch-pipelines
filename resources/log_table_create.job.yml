@@ -1,0 +1,59 @@
+resources:
+  jobs:
+    log_table_create:
+      name: "[${bundle.target}] ${var.job_name_prefix}: _log table create"
+      description: >-
+        A serverless maintenance job that CREATES the shared monitoring Delta table the pipelines append
+        to when monitoring_log_enabled is on. Takes the target's monitoring_log_table
+        (${var.monitoring_log_table}) as a deploy-time base parameter and runs CREATE TABLE IF NOT EXISTS
+        with the schema from pipeline_lib.monitoring_sink (the single source of truth shared with the
+        writer). Run it ONCE per target before turning the sink on; it is idempotent, so re-running is a
+        safe no-op. This job needs CREATE TABLE on the target schema; the export jobs only append, so
+        they need only MODIFY. No cluster block => serverless notebook task.
+
+      # Never run two copies at once, consistent with every index job, deploy_views and checkpoint_clear.
+      max_concurrent_runs: 1
+
+      # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
+      # rather than queued, matching every generated job, deploy_views and checkpoint_clear.
+      queue:
+        enabled: false
+
+      # Notify the target's support recipients on a run failure. ${var.support_email} is a complex LIST
+      # var: an empty list in dev/stg (no recipients = off) and a real address in prd. on_failure
+      # references the whole var so the empty case is [] (not [""]). notification_settings suppress
+      # SKIPPED (queue disabled => an overlapping trigger is skipped, not failed) and CANCELED runs, so
+      # recipients are paged only on a genuine failure. Matches every other job (see scripts/gen_jobs.py).
+      email_notifications:
+        on_failure: ${var.support_email}
+      notification_settings:
+        no_alert_for_skipped_runs: true
+        no_alert_for_canceled_runs: true
+
+      # Global job tags from databricks.yml (empty {} => omitted). Applied to every job; serverless, so
+      # these are job-level tags (no cluster to forward onto). Matches every other job.
+      tags: ${var.global_job_tags}
+
+      tasks:
+        - task_key: log_table_create
+          notebook_task:
+            notebook_path: ../notebooks/log_table_create.py
+            # monitoring_log_table is the deploy-time bundle variable (the fully-qualified
+            # catalog.schema.table); the notebook validates it and runs CREATE TABLE IF NOT EXISTS.
+            base_parameters:
+              monitoring_log_table: ${var.monitoring_log_table}
+          # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
+          # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
+          # plus alert_on_last_attempt: false so every failed attempt pages. See scripts/gen_jobs.py _build_task.
+          email_notifications:
+            on_failure: ${var.support_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: false
+
+      # On-demand: invoke via `databricks bundle run log_table_create`. CAN_MANAGE_RUN so any teammate in
+      # `users` can trigger it, matching checkpoint_clear / deploy_views.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          group_name: users

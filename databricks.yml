@@ -216,6 +216,20 @@ variables:
     description: "UC Volume path to a CA bundle (PEM) the connector uses to verify the ES TLS cert. Empty default (system CAs); set per target below or override with --var. One global bundle for all host configs; incompatible with verify_certs=false."
     default: ""
 
+  # GLOBAL fully-qualified name (catalog.schema.table) of the shared monitoring Delta table every job
+  # appends its metrics to when monitoring_log_enabled is on. Threaded exactly like checkpoint_base_path /
+  # ca_certs: scripts/gen_jobs.py bakes ${var.monitoring_log_table} as a notebook base_parameter (a
+  # deploy-time value, NOT a per-run job parameter, because the table is a per-target/environment choice
+  # not something you flip per run). Empty default so, out of the box, no table is configured and the
+  # runner skips the sink even when monitoring_log_enabled is true (fail-soft, never fails an export). Set
+  # it PER TARGET below (or --var). The table itself is created out-of-band by the `_log table create`
+  # job (which validates this same name and runs CREATE TABLE IF NOT EXISTS); export jobs only append, so
+  # their run identity needs only MODIFY on the table, not CREATE. e.g.
+  #   --var="monitoring_log_table=<catalog>.<schema>.pipeline_monitoring"
+  monitoring_log_table:
+    description: "Fully-qualified catalog.schema.table of the shared monitoring Delta table jobs append to when monitoring_log_enabled is on. Empty default (no table => sink skipped, fail-soft). Set per target below or override with --var. Created out-of-band by the `_log table create` job; export jobs only append (need MODIFY, not CREATE)."
+    default: ""
+
   # GLOBAL default for the connector's bulk_stats diagnostics (per-partition ES bulk-send stats -
   # docs/send, round-trip ms, ES `took` ms - in the run log). This is the
   # target-wide DEFAULT: scripts/gen_jobs.py bakes ${var.bulk_stats} as the bulk_stats job-parameter
@@ -228,6 +242,19 @@ variables:
   # the other simple string vars it accepts --var=bulk_stats=true at deploy.
   bulk_stats:
     description: "Global default for connector bulk_stats diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off). A pipeline's own bulk_stats and a per-run --params override this. Set true per target/--var to turn on target-wide."
+    default: ""
+
+  # GLOBAL default for the durable monitoring sink (a run-time knob, so scripts/gen_jobs.py bakes
+  # ${var.monitoring_log_enabled} as the job-parameter default for every pipeline that OMITS it). When
+  # true the run also APPENDS its STREAM_PROGRESS / per-partition bulk_stats / run-summary rows to the
+  # ${var.monitoring_log_table} Delta table (in addition to logging them). Precedence, highest first: a
+  # per-run `--params monitoring_log_enabled=<v>` > a pipeline's own `monitoring_log_enabled:` in its
+  # config > this global default > OFF. Empty default so the sink is off everywhere out of the box; set
+  # it "true" per target below (or --var) to turn it on target-wide. Fail-soft: with the sink on but
+  # monitoring_log_table unset or the table missing, the run WARNS and skips it (monitoring never fails an
+  # export). A legal value is "" / true / false (validated at generation and at run).
+  monitoring_log_enabled:
+    description: "Global default for the durable monitoring sink. Empty default (off). When true a run also appends its metrics to ${var.monitoring_log_table}. A pipeline's own monitoring_log_enabled and a per-run --params override this. Fail-soft: table unset/missing => warn and skip."
     default: ""
 
   # GLOBAL defaults for the connector's connection/reliability tuning, threaded exactly like bulk_stats:
@@ -462,6 +489,12 @@ targets:
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""           # e.g. 0123-456789-abcde
       ca_certs: ""                 # e.g. /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
+      # monitoring_log_table: "<catalog>.<schema>.pipeline_monitoring"  # shared monitoring Delta table for
+                                   # this target; empty => no sink. Create it once via the `_log table
+                                   # create` job before enabling the sink.
+      # monitoring_log_enabled: "true"  # turn the durable monitoring sink ON for the whole dev target (a
+                                   # pipeline's own monitoring_log_enabled or a --params override still
+                                   # wins). Empty default (off). Fail-soft if the table is unset/missing.
       # bulk_stats: "true"         # turn connector bulk-send diagnostics ON for the whole dev target (a
                                    # pipeline's own bulk_stats or a --params override still wins). Empty
                                    # default (off) inherited when omitted.

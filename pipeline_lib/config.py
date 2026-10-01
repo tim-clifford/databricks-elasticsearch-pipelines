@@ -76,6 +76,16 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   global (databricks.yml, default new). A job parameter,
                                          #   overridable per run. Streaming mode only; honored only on a
                                          #   first run before a checkpoint exists.
+    monitoring_log_enabled: true | false # OPTIONAL observability toggle (NOT a connector setting): when
+                                         #   true, the run also APPENDS its STREAM_PROGRESS / per-partition
+                                         #   bulk_stats / run-summary rows to the shared monitoring Delta
+                                         #   table (${var.monitoring_log_table}) as well as the log. Behaves
+                                         #   like bulk_stats: omitted => the ${var.monitoring_log_enabled}
+                                         #   global (per target) stands, empty global => OFF; a config value
+                                         #   overrides the global, and --params overrides per run. Fail-soft:
+                                         #   if enabled but the table is unset/missing, the run WARNS and
+                                         #   skips the sink (monitoring never fails an export). The table is
+                                         #   created out-of-band by the `_log table create` job.
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -799,6 +809,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "streaming_start",
         "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
+        "monitoring_log_enabled",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
         "pause_status", "job_group", "job_name_postfix",
     }
@@ -900,6 +911,13 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # an older wheel the runner drops it fail-soft (see runner).
     bypass_fast_path = require_es_flag(raw.get("bypass_fast_path", ""),
                                        f"{source}: bypass_fast_path")
+    # monitoring_log_enabled is the durable-monitoring-sink toggle. It is NOT a connector setting (never
+    # goes into write_config_overrides); it is a pipeline-side behavior read by run_index_pipeline.py.
+    # Behaves EXACTLY like bulk_stats: absent -> "" so job_parameters' `cfg[name] or ref` inherits the
+    # target-wide ${var.monitoring_log_enabled} global (empty => OFF); a config value here overrides the
+    # global for this pipeline; --params overrides per run. Canonical "true"/"false"/"".
+    monitoring_log_enabled = require_es_flag(raw.get("monitoring_log_enabled", ""),
+                                             f"{source}: monitoring_log_enabled")
     # streaming_start selects where a FIRST streaming run positions: "new" (start at the source's current
     # version, only new commits exported) or "full" (backfill the whole existing table). OPTIONAL: absent
     # -> "" (inherit the target-wide ${var.streaming_start} global, which databricks.yml sets to "new"). A
@@ -1058,6 +1076,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "max_partition_bytes": max_partition_bytes,
         "max_files_per_trigger": max_files_per_trigger,
         "max_bytes_per_trigger": max_bytes_per_trigger,
+        "monitoring_log_enabled": monitoring_log_enabled,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
@@ -1354,6 +1373,11 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # (canonical string form), like max_partition_bytes.
         "max_files_per_trigger": cfg["max_files_per_trigger"],
         "max_bytes_per_trigger": cfg["max_bytes_per_trigger"],
+        # monitoring_log_enabled (durable monitoring-sink toggle) is a pipeline-side run behavior, not an
+        # object name and not a connector setting: passed through verbatim (canonical string form). The
+        # runner reads it from the job-parameter widget, not from here; carried for consistency with its
+        # sibling run-time knobs.
+        "monitoring_log_enabled": cfg["monitoring_log_enabled"],
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
@@ -1524,6 +1548,7 @@ def job_base_parameters(
     secret_key_name_ref: str,
     checkpoint_base_path_ref: str,
     ca_certs_ref: str,
+    monitoring_log_table_ref: str = "",
     streaming_trigger_interval: str = "",
 ) -> dict:
     """The DEPLOY-TIME values the generated per-index job passes to run_index_pipeline.py as widgets.
@@ -1545,6 +1570,11 @@ def job_base_parameters(
     - `ca_certs_ref` (e.g. "${var.ca_certs}"): the global path to a CA bundle (PEM) the connector uses
       to verify the ES TLS cert. One global bundle for every host config; empty => the runner omits it
       and the connector falls back to the system CAs.
+    - `monitoring_log_table_ref` (e.g. "${var.monitoring_log_table}"): the fully-qualified
+      catalog.schema.table of the shared monitoring Delta table. One global table for every job (per
+      target), threaded like checkpoint_base_path/ca_certs; empty => no table configured, so the runner
+      skips the sink even when monitoring_log_enabled is on (fail-soft). Deploy-time, not overridable per
+      run (the table is an environment-level choice), so it is a base_parameter, not a job parameter.
     - `streaming_trigger_interval` (e.g. "30 seconds", or "" for none): a LITERAL from the config's
       `continuous` block (NOT a bundle variable), the single signal that couples the job's shape to the
       notebook's trigger. Non-empty => this is a continuous (always-on) pipeline, so the notebook drives
@@ -1568,6 +1598,7 @@ def job_base_parameters(
         "secret_key_name": secret_key_name_ref,
         "checkpoint_base_path": checkpoint_base_path_ref,
         "ca_certs": ca_certs_ref,
+        "monitoring_log_table": monitoring_log_table_ref,
         "streaming_trigger_interval": streaming_trigger_interval,
     }
 
@@ -1618,6 +1649,10 @@ _RUNTIME_KNOBS = (
     _RuntimeKnob("max_partition_bytes", require_max_partition_bytes),
     _RuntimeKnob("max_files_per_trigger", require_max_files_per_trigger),
     _RuntimeKnob("max_bytes_per_trigger", require_max_bytes_per_trigger),
+    # Pipeline-side observability toggle (NOT an EsWriteConfig field): when true the runner also appends
+    # the run's metrics to the shared monitoring Delta table. On the same three-layer pattern as every
+    # knob (global ${var.monitoring_log_enabled} < config key < --params); require_es_flag like bulk_stats.
+    _RuntimeKnob("monitoring_log_enabled", require_es_flag),
 )
 
 # The knob names in registry order (stable public list for callers/tests that need the set of run-time
