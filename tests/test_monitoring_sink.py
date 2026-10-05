@@ -14,19 +14,29 @@ import json
 import pytest
 
 from pipeline_lib.monitoring_sink import (
+    CLUSTER_BY_COLUMNS,
     MONITORING_TABLE_COLUMNS,
     RECORD_TYPES,
     ROW_FIELDS,
+    alter_add_columns_sql,
+    alter_cluster_by_sql,
     assert_columns_consistent,
     bulk_stats_batch_row,
     bulk_stats_partition_rows,
     create_table_sql,
+    missing_columns,
+    optimize_sql,
     progress_row,
+    prune_sql,
+    run_error_row,
     run_summary_row,
     validate_table_name,
+    vacuum_sql,
 )
 
 FIXED = datetime(2026, 9, 29, 21, 18, 32, 458000, tzinfo=timezone.utc)
+START = datetime(2026, 9, 29, 21, 18, 30, 0, tzinfo=timezone.utc)
+END = datetime(2026, 9, 29, 21, 18, 35, 500000, tzinfo=timezone.utc)
 
 
 # --- schema invariants -------------------------------------------------------------------------
@@ -52,7 +62,19 @@ def test_record_types_are_the_closed_set():
         "bulk_stats_partition",
         "bulk_stats_batch",
         "run_summary",
+        "run_error",
     )
+
+
+def test_timing_columns_present_and_between_event_ts_and_payload():
+    col_names = [name for name, _t in MONITORING_TABLE_COLUMNS]
+    cols = dict(MONITORING_TABLE_COLUMNS)
+    assert cols["batch_start_ts"] == "TIMESTAMP"
+    assert cols["batch_end_ts"] == "TIMESTAMP"
+    # Order: event_ts, batch_start_ts, batch_end_ts, payload (ingest_ts stays last).
+    assert col_names.index("event_ts") < col_names.index("batch_start_ts")
+    assert col_names.index("batch_start_ts") < col_names.index("batch_end_ts")
+    assert col_names.index("batch_end_ts") < col_names.index("payload")
 
 
 # --- progress_row ------------------------------------------------------------------------------
@@ -236,3 +258,127 @@ def test_create_table_sql_is_idempotent_and_has_every_column():
 def test_create_table_sql_validates_name():
     with pytest.raises(ValueError):
         create_table_sql("bad name")
+
+
+# --- batch_start_ts / batch_end_ts timing columns ---------------------------------------------
+
+def test_optional_timing_defaults_to_null():
+    # A builder with no start/end stores NULL (NOT 'now') for the timing columns, unlike event_ts.
+    row = run_summary_row({"a": 1}, "c", "r", now=FIXED)
+    assert row["event_ts"] == "2026-09-29T21:18:32.458000"
+    assert row["batch_start_ts"] is None
+    assert row["batch_end_ts"] is None
+
+
+def test_bulk_stats_batch_row_carries_passed_start_end():
+    row = bulk_stats_batch_row({"written": 5}, "cfg", "run-1", batch_id=3,
+                               now=FIXED, batch_start=START, batch_end=END)
+    assert row["batch_start_ts"] == "2026-09-29T21:18:30.000000"
+    assert row["batch_end_ts"] == "2026-09-29T21:18:35.500000"
+
+
+def test_progress_row_derives_start_end_from_timestamp_and_duration():
+    progress = {"name": "x", "batchId": 2, "timestamp": "2026-09-29T21:18:30.000Z", "batchDuration": 5500}
+    row = progress_row(progress, "x", "r", now=FIXED)
+    # start = the progress timestamp (UTC); end = start + batchDuration ms.
+    assert row["batch_start_ts"] == "2026-09-29T21:18:30.000000"
+    assert row["batch_end_ts"] == "2026-09-29T21:18:35.500000"
+
+
+def test_progress_row_bad_timestamp_leaves_timing_null():
+    assert progress_row({"timestamp": "not-a-date"}, "x", "r", now=FIXED)["batch_start_ts"] is None
+    # Missing timestamp => both NULL (but the row still exists with its payload).
+    row = progress_row({"batchId": 1}, "x", "r", now=FIXED)
+    assert row["batch_start_ts"] is None and row["batch_end_ts"] is None
+
+
+def test_progress_row_missing_duration_end_equals_start():
+    progress = {"timestamp": "2026-09-29T21:18:30.000Z"}
+    row = progress_row(progress, "x", "r", now=FIXED)
+    assert row["batch_start_ts"] == row["batch_end_ts"] == "2026-09-29T21:18:30.000000"
+
+
+# --- run_error_row -----------------------------------------------------------------------------
+
+def test_run_error_row_records_exception_facts_and_timing():
+    err = {"exception_type": "ConnectionTimeout", "message": "timed out", "mode": "batch", "elapsed_ms": 60000}
+    row = run_error_row(err, "cfg", "run-7", now=FIXED, batch_start=START, batch_end=END)
+    assert row["record_type"] == "run_error"
+    assert row["batch_id"] is None
+    assert json.loads(row["payload"]) == err
+    assert row["batch_start_ts"] == "2026-09-29T21:18:30.000000"
+    assert row["batch_end_ts"] == "2026-09-29T21:18:35.500000"
+    assert set(row) == set(ROW_FIELDS)
+
+
+def test_run_error_row_non_dict_is_none():
+    assert run_error_row(None, "c", "r") is None
+    assert run_error_row("boom", "c", "r") is None
+
+
+# --- liquid clustering in CREATE ---------------------------------------------------------------
+
+def test_create_table_sql_has_cluster_by_before_tblproperties():
+    sql = create_table_sql("cat.sch.monitoring")
+    assert f"CLUSTER BY ({', '.join(CLUSTER_BY_COLUMNS)})" in sql
+    assert sql.index("CLUSTER BY") < sql.index("TBLPROPERTIES")
+    assert sql.index("USING DELTA") < sql.index("CLUSTER BY")
+
+
+# --- additive migration: missing_columns / alter_add_columns_sql / alter_cluster_by_sql --------
+
+def test_missing_columns_additive_only():
+    all_names = [name for name, _t in MONITORING_TABLE_COLUMNS]
+    # Nothing missing when every column is present (order-insensitive).
+    assert missing_columns(list(reversed(all_names))) == []
+    # An old table lacking the two timing columns => exactly those two are reported, with types.
+    old = [n for n in all_names if n not in ("batch_start_ts", "batch_end_ts")]
+    assert missing_columns(old) == [("batch_start_ts", "TIMESTAMP"), ("batch_end_ts", "TIMESTAMP")]
+    # Extra columns in the table are NEVER reported for dropping (additive allow-list).
+    assert missing_columns(all_names + ["some_future_col"]) == []
+
+
+def test_alter_add_columns_sql_additive_and_none_when_empty():
+    sql = alter_add_columns_sql("cat.sch.t", [("batch_start_ts", "TIMESTAMP"), ("batch_end_ts", "TIMESTAMP")])
+    assert sql == "ALTER TABLE cat.sch.t ADD COLUMNS (batch_start_ts TIMESTAMP, batch_end_ts TIMESTAMP)"
+    assert alter_add_columns_sql("cat.sch.t", []) is None
+
+
+def test_alter_cluster_by_sql():
+    assert alter_cluster_by_sql("cat.sch.t") == f"ALTER TABLE cat.sch.t CLUSTER BY ({', '.join(CLUSTER_BY_COLUMNS)})"
+
+
+@pytest.mark.parametrize("fn", [alter_cluster_by_sql, optimize_sql, vacuum_sql])
+def test_maintenance_sql_fail_closed_on_bad_name(fn):
+    with pytest.raises(ValueError):
+        fn("bad name")
+
+
+def test_alter_add_columns_sql_fail_closed_on_bad_name():
+    with pytest.raises(ValueError):
+        alter_add_columns_sql("bad name", [("x", "STRING")])
+
+
+# --- retention / maintenance: prune_sql / optimize_sql / vacuum_sql ----------------------------
+
+def test_prune_sql_builds_delete_with_interval():
+    assert prune_sql("cat.sch.t", 90) == (
+        "DELETE FROM cat.sch.t WHERE ingest_ts < current_timestamp() - INTERVAL 90 DAYS"
+    )
+
+
+def test_prune_sql_disabled_when_retention_non_positive():
+    assert prune_sql("cat.sch.t", 0) is None
+    assert prune_sql("cat.sch.t", -5) is None
+
+
+def test_prune_sql_fail_closed_on_bad_name_and_bad_days():
+    with pytest.raises(ValueError):
+        prune_sql("bad name", 90)
+    with pytest.raises(ValueError):
+        prune_sql("cat.sch.t", "ninety")
+
+
+def test_optimize_and_vacuum_sql():
+    assert optimize_sql("cat.sch.t") == "OPTIMIZE cat.sch.t"
+    assert vacuum_sql("cat.sch.t") == "VACUUM cat.sch.t"

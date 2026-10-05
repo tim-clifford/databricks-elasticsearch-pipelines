@@ -53,6 +53,9 @@
 # MAGIC   run-summary rows to `monitoring_log_table` (in addition to the log lines). Fail-soft: an
 # MAGIC   unset/missing/malformed table warns and skips the sink, never failing the export. Per-partition
 # MAGIC   bulk_stats rows require `bulk_stats` on as well; STREAM_PROGRESS and run-summary rows do not.
+# MAGIC   The `bulk_stats_batch` and `stream_progress` rows carry `batch_start_ts`/`batch_end_ts` (the
+# MAGIC   beginning-to-end wall clock of each batch), and a FAILED run (a timeout included) appends a
+# MAGIC   `run_error` row recording the exception, so a failure is visible in the table, not only the log.
 
 # COMMAND ----------
 # FIRST, install the connector wheel and restart Python. This cell handles ONLY the wheel, because
@@ -220,6 +223,7 @@ from pipeline_lib.monitoring_sink import (  # noqa: E402
     bulk_stats_batch_row,
     bulk_stats_partition_rows,
     progress_row,
+    run_error_row,
     run_summary_row,
     validate_table_name,
 )
@@ -228,6 +232,7 @@ from pipeline_lib.monitoring_sink import (  # noqa: E402
 import json  # noqa: E402
 import time  # noqa: E402
 import uuid  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
 from pipeline_lib.observability import (  # noqa: E402
     BULK_STATS_TAG,
     PROGRESS_TAG,
@@ -368,10 +373,13 @@ def append_monitoring_rows(rows, session=None):
     try:
         from pyspark.sql import functions as _F  # noqa: E402
         _schema = ("config_name string, job_run_id string, record_type string, "
-                   "batch_id bigint, event_ts string, payload string")
+                   "batch_id bigint, event_ts string, batch_start_ts string, batch_end_ts string, "
+                   "payload string")
         _df = sess.createDataFrame([tuple(r[f] for f in ROW_FIELDS) for r in rows], _schema)
         _df = (_df
                .withColumn("event_ts", _F.col("event_ts").cast("timestamp"))
+               .withColumn("batch_start_ts", _F.col("batch_start_ts").cast("timestamp"))
+               .withColumn("batch_end_ts", _F.col("batch_end_ts").cast("timestamp"))
                .withColumn("payload", _F.expr("parse_json(payload)"))
                .withColumn("ingest_ts", _F.current_timestamp()))
         _df.writeTo(_MONITORING_TABLE).append()
@@ -552,47 +560,67 @@ if PIPELINE_MODE == "batch":
     # Repartition AFTER the filter so the surviving rows spread evenly.
     if WRITE_REPARTITION > 0:
         export_df = export_df.repartition(WRITE_REPARTITION)
-    # Driver wall clock around the write, to LOCATE a tail that persists after the Spark UI shows every
-    # write task complete. bulk_write's own collect_ms (under bulk_stats) is the time INSIDE Spark's
-    # collect (the write job PLUS Spark's result finalization), so if this driver-measured wall is
-    # ~collect_ms the tail is inside the write itself - typically a straggler partition, which the
-    # BULK_STATS tail line below then names - whereas wall well above collect_ms would be work between
-    # the collect and this return. Two time.time() calls on the driver; nothing touches the write path.
-    _bw_t0 = time.time()
-    result = bulk_write(export_df, es_write_config)
-    _bw_wall_ms = (time.time() - _bw_t0) * 1000.0
-    # Print the core count dict on one line; when bulk_stats is on, result also carries a per-partition
-    # 'bulk_stats' list, which we render SEPARATELY (below) as readable BULK_STATS lines rather than
-    # dumping the raw list into the result line. reconcile_or_raise reads only the counts, so the extra
-    # key is ignored there.
-    _core_result = {k: v for k, v in result.items() if k != "bulk_stats"}
-    print(f"batch bulk_write result: {_core_result}")
-    print(f"{BULK_STATS_TAG} driver: bulk_write_wall_ms={_bw_wall_ms:.1f}")
-    if "bulk_stats" in result:
-        # The tail/straggler summary FIRST (the one-line answer to "where did the wall time go"), then
-        # the full per-partition breakdown. Both fail-soft.
-        print(format_tail_summary(result))
-        print(format_bulk_stats(result["bulk_stats"]))
-    # Durable monitoring (optional, fail-soft): persist this batch's per-partition bulk_stats + the
-    # driver-side batch facts BEFORE reconcile, so a run that later fails reconciliation still leaves its
-    # diagnostics in the table. Per-partition rows land only when bulk_stats is on (otherwise result has
-    # no 'bulk_stats' and the builder yields none); the batch row (collect_ms/merge_ms/written) always does.
-    append_monitoring_rows(
-        bulk_stats_partition_rows(result, CONFIG_NAME, JOB_RUN_ID, batch_id=None)
-        + [r for r in (bulk_stats_batch_row(result, CONFIG_NAME, JOB_RUN_ID, batch_id=None),) if r]
-    )
-    reconcile_or_raise(result, index=es_write_config.index)
-    RUN_SUMMARY = (
-        f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
-        f"ignored={result['ignored']} total_input={result['total_input']}"
-    )
-    print(f"BATCH EXPORT COMPLETE: {RUN_SUMMARY}")
-    # A run_summary row on success (the counts + identity for this run).
-    append_monitoring_rows([r for r in (run_summary_row({
-        "mode": "batch", "es_index": es_write_config.index, "connector_version": _connector_version,
-        "written": result["written"], "deleted": result["deleted"], "errors": result["errors"],
-        "ignored": result["ignored"], "total_input": result["total_input"],
-    }, CONFIG_NAME, JOB_RUN_ID),) if r])
+    # Beginning-of-batch wall clock (UTC), persisted as bulk_stats_batch.batch_start_ts and used for a
+    # run_error elapsed on failure. In batch mode the whole export IS the batch, so this is its start.
+    _export_start_dt = datetime.now(timezone.utc)
+    # Wrap the write + reconcile so a FAILURE (a timeout that exhausts retries RAISES from bulk_write, or a
+    # reconcile mismatch) leaves a durable run_error row before it propagates. Without this a timed-out run
+    # persists NOTHING to the monitoring table (every append below runs only after bulk_write returns), so
+    # "what happened" is invisible there. The append is fail-soft and we re-raise, so failure semantics are
+    # unchanged (the job still fails).
+    try:
+        # Driver wall clock around the write, to LOCATE a tail that persists after the Spark UI shows every
+        # write task complete. bulk_write's own collect_ms (under bulk_stats) is the time INSIDE Spark's
+        # collect (the write job PLUS Spark's result finalization), so if this driver-measured wall is
+        # ~collect_ms the tail is inside the write itself - typically a straggler partition, which the
+        # BULK_STATS tail line below then names - whereas wall well above collect_ms would be work between
+        # the collect and this return. Two time.time() calls on the driver; nothing touches the write path.
+        _bw_t0 = time.time()
+        result = bulk_write(export_df, es_write_config)
+        _bw_wall_ms = (time.time() - _bw_t0) * 1000.0
+        _bw_end_dt = datetime.now(timezone.utc)  # end-of-batch wall clock, persisted as batch_end_ts
+        # Print the core count dict on one line; when bulk_stats is on, result also carries a per-partition
+        # 'bulk_stats' list, which we render SEPARATELY (below) as readable BULK_STATS lines rather than
+        # dumping the raw list into the result line. reconcile_or_raise reads only the counts, so the extra
+        # key is ignored there.
+        _core_result = {k: v for k, v in result.items() if k != "bulk_stats"}
+        print(f"batch bulk_write result: {_core_result}")
+        print(f"{BULK_STATS_TAG} driver: bulk_write_wall_ms={_bw_wall_ms:.1f}")
+        if "bulk_stats" in result:
+            # The tail/straggler summary FIRST (the one-line answer to "where did the wall time go"), then
+            # the full per-partition breakdown. Both fail-soft.
+            print(format_tail_summary(result))
+            print(format_bulk_stats(result["bulk_stats"]))
+        # Durable monitoring (optional, fail-soft): persist this batch's per-partition bulk_stats + the
+        # driver-side batch facts BEFORE reconcile, so a run that later fails reconciliation still leaves its
+        # diagnostics in the table. Per-partition rows land only when bulk_stats is on (otherwise result has
+        # no 'bulk_stats' and the builder yields none); the batch row (collect_ms/merge_ms/written, now with
+        # batch_start_ts/batch_end_ts for beginning-to-end duration) always does.
+        append_monitoring_rows(
+            bulk_stats_partition_rows(result, CONFIG_NAME, JOB_RUN_ID, batch_id=None)
+            + [r for r in (bulk_stats_batch_row(result, CONFIG_NAME, JOB_RUN_ID, batch_id=None,
+                                                batch_start=_export_start_dt, batch_end=_bw_end_dt),) if r]
+        )
+        reconcile_or_raise(result, index=es_write_config.index)
+        RUN_SUMMARY = (
+            f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
+            f"ignored={result['ignored']} total_input={result['total_input']}"
+        )
+        print(f"BATCH EXPORT COMPLETE: {RUN_SUMMARY}")
+        # A run_summary row on success (the counts + identity for this run).
+        append_monitoring_rows([r for r in (run_summary_row({
+            "mode": "batch", "es_index": es_write_config.index, "connector_version": _connector_version,
+            "written": result["written"], "deleted": result["deleted"], "errors": result["errors"],
+            "ignored": result["ignored"], "total_input": result["total_input"],
+        }, CONFIG_NAME, JOB_RUN_ID),) if r])
+    except Exception as _exc:
+        _fail_dt = datetime.now(timezone.utc)
+        append_monitoring_rows([r for r in (run_error_row({
+            "mode": "batch", "es_index": es_write_config.index, "connector_version": _connector_version,
+            "exception_type": type(_exc).__name__, "message": str(_exc),
+            "elapsed_ms": (_fail_dt - _export_start_dt).total_seconds() * 1000.0,
+        }, CONFIG_NAME, JOB_RUN_ID, batch_start=_export_start_dt, batch_end=_fail_dt),) if r])
+        raise
 
 # COMMAND ----------
 # STREAMING setup (streaming mode only). Prepare everything the stream needs BEFORE starting it, so a
@@ -736,7 +764,9 @@ if PIPELINE_MODE == "streaming":
         # where duplicates are acceptable. If it never recovers the run fails with no summary. So the
         # record step below is only reached for a batch that wrote every row cleanly, and
         # result['written'] is the true count.
+        _fb_start_dt = datetime.now(timezone.utc)  # beginning-of-batch wall clock (persisted as batch_start_ts)
         result = bulk_write(transformed, es_write_config, raise_on_error=True)
+        _fb_end_dt = datetime.now(timezone.utc)    # end-of-batch wall clock (persisted as batch_end_ts)
         # When bulk_stats is on, log a COMPACT one-line rollup of this micro-batch's ES bulk-send
         # diagnostics (overall docs/send, rtt, took) so an always-on run has per-batch visibility
         # without the full per-partition breakdown flooding the log. format_bulk_stats is fail-soft,
@@ -773,7 +803,8 @@ if PIPELINE_MODE == "streaming":
         # lives only there). Fail-soft inside append_monitoring_rows, so a sink fault never fails the batch.
         append_monitoring_rows(
             bulk_stats_partition_rows(result, CONFIG_NAME, JOB_RUN_ID, batch_id=batch_id)
-            + [r for r in (bulk_stats_batch_row(result, CONFIG_NAME, JOB_RUN_ID, batch_id=batch_id),) if r],
+            + [r for r in (bulk_stats_batch_row(result, CONFIG_NAME, JOB_RUN_ID, batch_id=batch_id,
+                                                batch_start=_fb_start_dt, batch_end=_fb_end_dt),) if r],
             session=session,
         )
 
@@ -1041,6 +1072,7 @@ if PIPELINE_MODE == "streaming":
     #   (serverless rejects ProcessingTime). The generated job carries a Databricks Jobs `continuous`
     #   trigger that keeps this run perpetually alive (auto-restarting on failure); each restart resumes
     #   from the checkpoint (the startingVersion seed above is skipped once an offset exists).
+    _stream_start_dt = datetime.now(timezone.utc)  # run start, for a run_error elapsed on failure
     try:
         writer = (
             stream_df.writeStream
@@ -1133,6 +1165,20 @@ if PIPELINE_MODE == "streaming":
                 "es_index": es_write_config.index, "connector_version": _connector_version,
                 "batches": num_batches, "rows_pushed": rows_pushed, "checkpoint": checkpoint_location,
             }, CONFIG_NAME, JOB_RUN_ID),) if r])
+    except Exception as _exc:
+        # Durable failure breadcrumb (optional, fail-soft): a stream failure re-raises from .start()/
+        # awaitTermination and would otherwise leave only the per-batch rows (none, if it failed before any
+        # batch committed) plus the driver log. Record the terminal exception, then re-raise so the run
+        # still fails and a continuous Jobs trigger auto-restarts it exactly as before.
+        _fail_dt = datetime.now(timezone.utc)
+        _trigger = f"continuous({STREAMING_TRIGGER_INTERVAL})" if STREAMING_TRIGGER_INTERVAL else "availableNow"
+        append_monitoring_rows([r for r in (run_error_row({
+            "mode": "streaming", "trigger": _trigger, "es_index": es_write_config.index,
+            "connector_version": _connector_version, "checkpoint": checkpoint_location,
+            "exception_type": type(_exc).__name__, "message": str(_exc),
+            "elapsed_ms": (_fail_dt - _stream_start_dt).total_seconds() * 1000.0,
+        }, CONFIG_NAME, JOB_RUN_ID, batch_start=_stream_start_dt, batch_end=_fail_dt),) if r])
+        raise
     finally:
         # Remove our listener when the run ends (availableNow drain-and-stop, graceful continuous
         # stop, OR failure) so it does not survive on a reused SparkSession and keep logging unrelated
