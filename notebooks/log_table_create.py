@@ -96,10 +96,12 @@ if not EXISTS_AFTER:
 
 MIGRATED_COLS = []
 if EXISTED_BEFORE:
-    # Introspect the existing columns and additively reconcile to the expected schema. The ADD COLUMNS /
-    # CLUSTER BY statements themselves must succeed (a failed migration is a real failure, so NOT swallowed);
-    # only the schema READ is guarded, so a transient introspection fault does not turn a present table into
-    # a false failure before we have anything to migrate.
+    # Introspect the existing columns and additively reconcile to the expected schema. Everything here
+    # FAILS CLOSED: the schema READ and the ADD COLUMNS / CLUSTER BY statements must all succeed. A
+    # transient fault fails the job (and a re-run retries) rather than being swallowed - correct for an
+    # on-demand maintenance job, since silently skipping migration would leave the table unmigrated and
+    # later appends failing. The table itself is already verified-present above, so this only governs the
+    # additive migration, never whether the create succeeded.
     existing_cols = [c.name for c in spark.table(CANONICAL_TABLE).schema]
     expected_cols = [name for name, _type in MONITORING_TABLE_COLUMNS]
     to_add = missing_columns(existing_cols)

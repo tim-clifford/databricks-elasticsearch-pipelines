@@ -313,7 +313,15 @@ def prune_sql(table_name, retention_days):
     on the monitoring table (it grows unbounded otherwise - one bulk_stats_partition row per partition per
     micro-batch). Validates the name fail-closed. Returns None when retention_days <= 0 (retention
     DISABLED => keep all rows; the caller skips the DELETE). retention_days is coerced to a non-negative
-    int; a non-numeric value raises (fail-closed, since it is interpolated into SQL)."""
+    int; a non-numeric value raises (fail-closed, since it is interpolated into SQL).
+
+    Retention is on ingest_ts (write time), deliberately NOT the clustered event_ts. ingest_ts is ALWAYS
+    set (the writer stamps current_timestamp() at append), whereas event_ts can be NULL from a fail-soft
+    builder - and a NULL-event_ts row would then never age out, leaking forever; "age since written" is
+    also the correct retention semantic. The cost is that this DELETE predicate is not a clustering key, so
+    it does not get event_ts clustered-file skipping; that is acceptable for a once-a-day prune of a
+    retention-bounded table (ingest_ts and event_ts are near-identical for rows this sink writes, since
+    builders stamp event_ts at write time, so any skipping would be approximate anyway)."""
     canonical = validate_table_name(table_name)
     days = int(retention_days)
     if days <= 0:
