@@ -537,3 +537,9 @@ def test_run_state_sql():
         run_state_sql("c.s.log", 0)
     with pytest.raises(ValueError):
         run_state_sql("bad", 7)
+
+
+def test_streaming_offset_ahead_boundary():
+    # newest version 3: sent-below 4 means fully caught up; sent-below 5 points past the table.
+    assert s(ckpt(4), hist((3, 1, "WRITE")))["status"] == CAUGHT_UP
+    assert s(ckpt(5), hist((3, 1, "WRITE")))["status_reason"] == "offset_ahead_of_table"
