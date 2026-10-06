@@ -59,7 +59,7 @@ REASONS = {
     BEHIND: ("unsent_over_threshold", "send_over_threshold", "run_over_threshold", "last_run_failed",
              "missed_schedule"),
     UNKNOWN: ("no_checkpoint", "no_committed_batch", "bad_checkpoint", "source_unreadable",
-              "history_window_exceeded", "offset_ahead_of_table", "no_runs_logged", "unknown_run_status",
+              "history_window_exceeded", "history_retention_exceeded", "offset_ahead_of_table", "no_runs_logged", "unknown_run_status",
               "unsupported_cron", "no_job_for_config", "unsupported_trigger", "evaluation_error"),
 }
 
@@ -314,15 +314,20 @@ def carries_rows(operation):
 
 
 def history_covers(history, limit, from_version):
-    """Does a `DESCRIBE HISTORY ... LIMIT limit` result include every version >= from_version? True when
-    the result is the whole history (fewer rows than the limit) or reaches down to from_version. LIMIT
-    returns the newest rows, contiguous by version, so reaching from_version means nothing above it is
-    missing, however many commits landed between reads."""
+    """Does a `DESCRIBE HISTORY ... LIMIT limit` result include every version >= from_version? Only when
+    it reaches down to from_version: LIMIT returns the newest rows, contiguous by version, so reaching
+    from_version means nothing above it is missing, however many commits landed between reads. A result
+    shorter than the limit is the whole RETAINED history, which still does not cover versions that Delta
+    log cleanup has already dropped (see history_exhausted)."""
     if not history:
         return False
-    if len(history) < limit:
-        return True
     return min(h["version"] for h in history) <= from_version
+
+
+def history_exhausted(history, limit):
+    """Is this the source's entire retained history (fewer rows than asked for)? Widening the window
+    cannot then reveal anything older."""
+    return len(history) < limit
 
 
 def next_history_limit(limit, cap=DEFAULT_HISTORY_LIMIT_CAP):
@@ -383,6 +388,10 @@ def classify_streaming(checkpoint, history, history_limit, run, now,
     if waiting and now - waiting[0]["timestamp"] >= threshold:
         return _result(BEHIND, "unsent_over_threshold", **common)
     if not history_covers(history, history_limit, sent_below):
+        if history_exhausted(history, history_limit):
+            return unknown_result("history_retention_exceeded", **common,
+                                  detail=f"sent position {sent_below} predates the oldest retained commit "
+                                         f"{min(h['version'] for h in history)}")
         return None
     if not unsent:
         return _result(CAUGHT_UP, "no_unsent_data", **common)

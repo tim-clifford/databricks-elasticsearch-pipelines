@@ -105,6 +105,11 @@ for path in sorted(glob.glob(os.path.join(FILES_ROOT, "resources", "*.yml"))):
         job_docs.append(yaml.safe_load(fh))
 TRIGGERS = fs.feed_triggers(job_docs, SCHEDULE_PAUSE_STATUS)
 
+# No configs means a wrong path or an empty deployment, never "no feeds": fail before the MERGE, whose
+# NOT MATCHED BY SOURCE DELETE would otherwise empty the status table while the run reports success.
+if not FEEDS:
+    raise RuntimeError(f"no pipeline configs found under {CONFIG_DIR}; refusing to MERGE an empty status set")
+
 STREAMING = sorted(n for n, c in FEEDS.items() if c["pipeline_mode"] == "streaming")
 BATCH = sorted(n for n, c in FEEDS.items() if c["pipeline_mode"] == "batch")
 if STREAMING and not CHECKPOINT_BASE_PATH:

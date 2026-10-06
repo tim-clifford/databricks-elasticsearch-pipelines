@@ -231,7 +231,9 @@ def test_history_covers():
     assert history_covers(h, limit=3, from_version=10)
     assert history_covers(h, limit=3, from_version=11)
     assert not history_covers(h, limit=3, from_version=9)   # version 9 may exist below the window
-    assert history_covers(h, limit=20, from_version=0)       # fewer rows than the limit: whole history
+    # fewer rows than the limit is the whole RETAINED history: covers only if it reaches the version
+    assert history_covers(h, limit=20, from_version=10)
+    assert not history_covers(h, limit=20, from_version=0)
     assert not history_covers([], limit=20, from_version=0)
 
 
@@ -510,6 +512,7 @@ def test_to_row_shapes_and_formats_timestamps():
     assert tuple(row) == RESULT_FIELDS
     assert row["config_name"] == "cfg" and row["trigger"] == "schedule" and row["trigger_paused"] is False
     assert row["oldest_unsent_ts"] == "2026-10-05 11:50:00.000000"
+    assert row["source_table"] == "c.s.t"
     assert row["evaluated_at"] == "2026-10-05 12:00:00.000000"
     assert to_row("b", "batch", None, b(None), NOW, source_table="c.s.t")["source_table"] is None
 
@@ -551,3 +554,17 @@ def test_streaming_rows_carry_the_latest_run():
     assert out["last_run_id"] == "r8" and out["last_run_status"] == "error"
     assert out["last_run_start_ts"] == ENDED["started_at"] and out["last_run_end_ts"] == ENDED["run_ended_at"]
     assert s(ckpt(9), hist((8, 10, "WRITE")))["last_run_id"] is None
+
+
+def test_streaming_sent_position_before_retained_history_is_unknown_not_caught_up():
+    # Delta log cleanup kept only versions 40-41 (2 rows < limit 20); the stream is at 10. Versions 10-39
+    # are invisible and may hold unsent rows, so this must not read as CAUGHT_UP (and widening cannot help).
+    out = s(ckpt(10), hist((41, 1, "OPTIMIZE"), (40, 2, "OPTIMIZE")), run=ENDED)
+    assert (out["status"], out["status_reason"]) == (UNKNOWN, "history_retention_exceeded")
+    # ...but an old unsent commit still visible is decisive.
+    assert s(ckpt(10), hist((41, 90, "WRITE")), run=ENDED)["status"] == BEHIND
+
+
+def test_new_table_whole_history_still_covers():
+    # A young table: history back to version 0 is whole and reaches any sent position.
+    assert s(ckpt(0), hist((1, 2, "WRITE"), (0, 3, "CREATE TABLE")), run=ENDED)["status"] == PENDING
