@@ -543,3 +543,11 @@ def test_streaming_offset_ahead_boundary():
     # newest version 3: sent-below 4 means fully caught up; sent-below 5 points past the table.
     assert s(ckpt(4), hist((3, 1, "WRITE")))["status"] == CAUGHT_UP
     assert s(ckpt(5), hist((3, 1, "WRITE")))["status_reason"] == "offset_ahead_of_table"
+
+
+def test_streaming_rows_carry_the_latest_run():
+    out = s(ckpt(9, in_flight=(10, -1), since=NOW - timedelta(minutes=5)), hist((9, 10, "WRITE")),
+            run={**ENDED, "run_end_status": "error"})
+    assert out["last_run_id"] == "r8" and out["last_run_status"] == "error"
+    assert out["last_run_start_ts"] == ENDED["started_at"] and out["last_run_end_ts"] == ENDED["run_ended_at"]
+    assert s(ckpt(9), hist((8, 10, "WRITE")))["last_run_id"] is None

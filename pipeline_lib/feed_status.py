@@ -358,7 +358,7 @@ def classify_streaming(checkpoint, history, history_limit, run, now,
     committed = checkpoint["committed"]
     sent_below = committed["reservoir_version"]  # every version < this is fully sent
     newest = max(h["version"] for h in history)
-    common = {"source_version": newest, "sent_through_version": sent_below - 1}
+    common = {"source_version": newest, "sent_through_version": sent_below - 1, **_run_fields(run)}
     if sent_below > newest + 1:
         return unknown_result("offset_ahead_of_table", **common,
                               detail=f"checkpoint at version {sent_below} but the source's newest is {newest}")
