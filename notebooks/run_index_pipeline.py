@@ -850,8 +850,7 @@ if PIPELINE_MODE == "streaming":
             try:
                 _names = [f.name for f in dbutils.fs.ls(relay_dir)]
             except Exception as _e:
-                if "FileNotFound" in str(_e) or "No such file" in str(_e) or "does not exist" in str(_e):
-                    return
+                # relay_dir is created at setup, so a failed listing is a real failure, never "absent".
                 if final and MONITORING_ACTIVE:
                     raise MonitoringLogError(f"could not list {relay_dir} to summarize unrecorded batches "
                                              f"({type(_e).__name__}: {_e})") from _e
