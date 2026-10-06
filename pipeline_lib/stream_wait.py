@@ -38,7 +38,9 @@ def await_stream(query, poll_seconds, record=None, log=print):
       slice get their summaries; a failure there never masks the query's own error (it is attached as a
       note when the runtime supports exception notes).
 
-    An `isActive` check that itself errors is treated as "cannot tell this slice": the loop keeps waiting
+    Between slices the loop checks two independent signals: `query.isActive` and `query.exception()` (a
+    failure the server has recorded). Either one ending the wait is enough. An `isActive` check that itself
+    errors is treated as "cannot tell this slice": the loop keeps waiting
     and the next wait call (which raises on a broken connection or failed query) decides. After
     MAX_ISACTIVE_ERRORS consecutive failed checks it raises instead, so a query whose state can never be
     read fails the task rather than hanging it. If the query is found ended AND has failed, its own error
@@ -74,6 +76,20 @@ def await_stream(query, poll_seconds, record=None, log=print):
                 isactive_errors = 0
                 if ended:
                     log("query is no longer active although the wait call had not returned; "
+                        "treating it as ended")
+        if not ended:
+            # A second, independent liveness signal: a failure the server has RECORDED for the query. Guards
+            # the case where both the wait call and isActive keep reporting "running" for a failed query (each
+            # is a fresh request to the server, which knew the query FAILED in the reproduced hang, but this
+            # does not depend on isActive alone). A failed check only warns; the next slice asks again.
+            try:
+                ended = query.exception() is not None
+            except Exception as exc_check:
+                log(f"WARNING: could not read the query's recorded failure ({type(exc_check).__name__}: "
+                    f"{exc_check}); checking again on the next poll")
+            else:
+                if ended:
+                    log("query has a recorded failure although the wait call had not returned; "
                         "treating it as ended")
         if record is not None:
             try:

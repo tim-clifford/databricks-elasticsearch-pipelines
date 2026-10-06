@@ -81,7 +81,13 @@ def test_failed_query_raises_its_exception_from_the_wait_call():
 
 def test_hung_wait_call_is_caught_by_isactive_and_the_failure_is_raised():
     # The reproduced hang: the wait call keeps saying "still running" although the query has FAILED.
-    q = FakeQuery([False], active=[True, True, False], failure=QueryFailed("DELTA_SCHEMA_CHANGED_WITH_VERSION"))
+    # The failure becomes visible only once isActive reports False, so this exercises the isActive path.
+    class FailsOnceInactive(FakeQuery):
+        def exception(self):
+            return self.failure if self.active_calls >= 3 else None
+
+    q = FailsOnceInactive([False], active=[True, True, False],
+                          failure=QueryFailed("DELTA_SCHEMA_CHANGED_WITH_VERSION"))
     with pytest.raises(QueryFailed, match="DELTA_SCHEMA_CHANGED_WITH_VERSION"):
         _run(q)
     assert q.wait_calls == 3
@@ -186,3 +192,25 @@ def test_isactive_error_streak_resets_on_a_good_check():
     q = FakeQuery([False] * 60 + [True], active=errs + [True] + errs + [True])
     _run(q)
     assert q.wait_calls == 61
+
+
+def test_failure_recorded_while_isactive_stays_stale_true_is_still_raised():
+    # Isaac finding: if both the wait call AND isActive kept reporting "running" for a failed query, the
+    # loop would spin forever. query.exception() is checked every slice as an independent signal.
+    q = FakeQuery([False], active=[True], failure=QueryFailed("failed but isActive is stale"))
+    with pytest.raises(QueryFailed, match="isActive is stale"):
+        _run(q)
+    assert q.wait_calls == 1
+
+
+def test_exception_check_error_is_not_fatal():
+    class FlakyException(FakeQuery):
+        def exception(self):
+            self.exc_calls = getattr(self, "exc_calls", 0) + 1
+            if self.exc_calls == 1:
+                raise RuntimeError("rpc blip")
+            return None
+
+    q = FlakyException([False, False, True], active=[True])
+    _run(q)
+    assert q.wait_calls == 3

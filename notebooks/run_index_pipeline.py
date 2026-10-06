@@ -1311,8 +1311,8 @@ if PIPELINE_MODE == "streaming":
             # in testing: recentProgress right after the end missed a batch that moved rows). Poll briefly for
             # the stragglers; any batch whose progress never arrives still gets its summary from the relayed ES
             # diagnostics alone, so the record is complete either way.
-            if MONITORING_ACTIVE and _batch_ids:
-                for _attempt in range(5):
+            if MONITORING_ACTIVE:
+                for _attempt in range(5 if _batch_ids else 0):
                     if _progress_mark["last"] is not None and _progress_mark["last"] >= _batch_ids[-1]:
                         break
                     time.sleep(2)
