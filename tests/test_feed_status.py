@@ -579,3 +579,13 @@ def test_batch_run_longer_than_interval_is_not_missed_schedule():
     # At 12:01 the latest fire >= grace ago is 11:50, after the run ended, and no run is logged for it.
     out = classify_batch(r, SCHED, utc(2026, 10, 5, 12, 1))
     assert (out["status"], out["status_reason"]) == (BEHIND, "missed_schedule")
+
+
+def test_batch_run_without_any_start_time_is_no_runs_logged():
+    r = {"job_run_id": "j", "started_at": None, "run_ended_at": None, "run_end_status": None}
+    assert classify_batch(r, SCHED, NOW)["status_reason"] == "no_runs_logged"
+
+
+def test_to_row_formats_naive_timestamps_unchanged():
+    res = _result(PENDING, "unsent_within_threshold", oldest_unsent_ts=datetime(2026, 10, 5, 11, 50, 7))
+    assert to_row("cfg", "streaming", None, res, NOW)["oldest_unsent_ts"] == "2026-10-05 11:50:07.000000"
