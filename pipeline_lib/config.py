@@ -158,7 +158,7 @@ _ES_INDEX_MAX_BYTES = 255
 # - batch / streaming: the two EXPORT modes, valid both as a config's pipeline_mode DEFAULT (a per-index
 #   config choice, baked as the job-parameter default by the generator) and as a run-time override.
 # Clearing a stale streaming checkpoint is NOT a pipeline_mode: it is handled by the dedicated
-# `_checkpoint clear` job (resources/checkpoint_clear.job.yml + notebooks/checkpoint_clear.py), invoked
+# `_checkpoint clear` job (resources/_checkpoint_clear.job.yml + notebooks/checkpoint_clear.py), invoked
 # with `databricks bundle run checkpoint_clear --params config_name=<name>`.
 _VALID_PIPELINE_MODES = ("batch", "streaming")
 
@@ -1281,11 +1281,16 @@ def _require_job_group(value: object, where: str) -> str:
 
     It becomes part of a generated resource key and filename (index_pipeline_group_<g> /
     resources/group_<g>.job.yml), so it is charset-restricted exactly like a config stem and a
-    job_cluster_config key - no dots/slashes/spaces that would break the key or enable path issues."""
+    job_cluster_config key - no dots/slashes/spaces that would break the key or enable path issues.
+    Names starting with '_' are reserved for hand-authored resource files."""
     if not isinstance(value, str) or not _VALID_JOB_GROUP.match(value):
         raise PipelineConfigError(
             f"{where} must be an identifier (letters, digits, '_' and '-' only, no dots or spaces), "
             f"got {value!r}"
+        )
+    if value.startswith("_"):
+        raise PipelineConfigError(
+            f"{where} must not start with '_' (reserved for hand-authored resources), got {value!r}"
         )
     return value
 

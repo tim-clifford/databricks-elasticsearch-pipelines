@@ -2183,6 +2183,13 @@ def test_job_group_bad_identifier_fails_closed(bad):
         validate_config(cfg)
 
 
+def test_job_group_underscore_prefix_rejected():
+    cfg = _base()
+    cfg["job_group"] = "_reserved"
+    with pytest.raises(PipelineConfigError, match="job_group"):
+        validate_config(cfg)
+
+
 def test_job_name_postfix_string_accepted_and_stripped():
     cfg = _base()
     cfg["job_name_postfix"] = "  ECS DNS + Auth  "

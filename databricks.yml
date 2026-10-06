@@ -114,7 +114,7 @@ variables:
     description: "UC Volume path to the databricks-es-connector wheel every index job installs (version lives in the filename). Empty default; set per target below or override with --var. Required for index-job runs (fails closed if empty)."
     default: ""
 
-  # es_diagnostics COMPUTE. The `_es diagnostics` maintenance job (resources/es_diagnostics.job.yml) runs
+  # es_diagnostics COMPUTE. The `_es diagnostics` maintenance job (resources/_es_diagnostics.job.yml) runs
   # SERVERLESS by default (all three vars below empty). Set ONE of these to run it on a specific cluster
   # instead - e.g. to match the client's DBR runtime or the network/egress path the pipeline writes over.
   # This is a DEPLOY-time choice (re-deploy to change): Databricks has no run-time cluster swap. Empty

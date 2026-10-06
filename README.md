@@ -826,7 +826,7 @@ Key behaviors:
 
 When a stream's checkpoint is stale (say the index was wiped, or you want to re-stream from a fresh
 `streaming_start`), clear it with the dedicated `_checkpoint clear` job (a serverless maintenance job,
-`resources/checkpoint_clear.job.yml`):
+`resources/_checkpoint_clear.job.yml`):
 
 ```bash
 databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>
@@ -847,7 +847,7 @@ clear it.
 ### Diagnosing a congested Elasticsearch host
 
 When a host looks backed up (writes slowing down, requests timing out), run the read-only `es_diagnostics`
-job (a serverless maintenance job, `resources/es_diagnostics.job.yml`) to collect an outside view of what
+job (a serverless maintenance job, `resources/_es_diagnostics.job.yml`) to collect an outside view of what
 the cluster is doing:
 
 ```bash
@@ -1053,10 +1053,16 @@ Generated / tooling (do not hand-edit the generated jobs):
   scripts/
     gen_jobs.py                 Generates resources/<config_name>.job.yml from the configs (--check guards drift)
   resources/
-    deploy_views.job.yml        The deploy_views job (hand-authored)
-    log_table_create.job.yml    The _log table create job (hand-authored)
-    log_table_prune.job.yml     The _log table prune job (hand-authored; daily, paused by default)
+    _build_wheel.job.yml        The build_wheel job (hand-authored)
+    _checkpoint_clear.job.yml   The _checkpoint clear job (hand-authored)
+    _deploy_views.job.yml       The deploy_views job (hand-authored)
+    _es_diagnostics.job.yml     The _es diagnostics job (hand-authored)
+    _log_table_create.job.yml   The _log table create job (hand-authored)
+    _log_table_prune.job.yml    The _log table prune job (hand-authored; daily, paused by default)
     <config_name>.job.yml       GENERATED per-index job (one per pipeline_configs config)
+
+Hand-authored resource files (starting with `_`) are visually separate from generated ones. Config names
+and job_group names may not start with `_` (checked at generation) to prevent conflicts.
 ```
 
 ## License & Attribution

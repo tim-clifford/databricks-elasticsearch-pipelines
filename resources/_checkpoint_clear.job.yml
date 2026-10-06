@@ -17,8 +17,13 @@ resources:
         - name: config_name
           default: ""
 
-      # Never run two copies at once, consistent with every index job and deploy_views. Fixed at 1.
-      max_concurrent_runs: 1
+      # Allow concurrent runs: each run targets one config's checkpoint via its config_name param. Two runs
+      # on the same config are harmless (the second finds nothing and reports NOT_PRESENT). Clearing a
+      # checkpoint while that config's stream is running is unsafe regardless of concurrency, so stop the
+      # stream first, as before. Unlike other jobs, this job differs in allowing multiple concurrent runs
+      # since they are isolated by config_name and never compete for the same checkpoint. Set to 20 to allow
+      # concurrent clears of different pipelines' checkpoints.
+      max_concurrent_runs: 20
 
       # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
       # rather than queued, matching every generated job and deploy_views (see scripts/gen_jobs.py).
