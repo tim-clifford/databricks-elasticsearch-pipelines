@@ -37,7 +37,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
-from pipeline_lib.monitoring_sink import validate_table_name
+from pipeline_lib.monitoring_sink import RECORD_TYPES, STATUSES as LOG_STATUSES, validate_table_name
 
 # ---------------------------------------------------------------------------------------------------
 # Vocabulary
@@ -76,15 +76,20 @@ DEFAULT_LOG_LOOKBACK_DAYS = 35
 DEFAULT_HISTORY_LIMIT = 20
 DEFAULT_HISTORY_LIMIT_CAP = 1000
 
-# monitoring log record_type / status values this job reads. These mirror the run/batch row model in
-# pipeline_lib/monitoring_sink.py (run_start / run_end / batch_start; run_end status success | error |
-# stopped). Keep them in step with that module's RECORD_TYPES and _ALLOWED_STATUS.
+# The monitoring log record_type / status values this job reads, from the run/batch row model in
+# pipeline_lib/monitoring_sink.py. Named here for readable SQL, and checked against that module's
+# RECORD_TYPES / STATUSES at import, so a rename there fails loudly here instead of silently matching
+# no rows.
 LOG_RUN_START = "run_start"
 LOG_RUN_END = "run_end"
 LOG_BATCH_START = "batch_start"
 RUN_SUCCESS = "success"
 RUN_ERROR = "error"
 RUN_STOPPED = "stopped"
+_missing = ({LOG_RUN_START, LOG_RUN_END, LOG_BATCH_START} - set(RECORD_TYPES)) | \
+    ({RUN_SUCCESS, RUN_ERROR, RUN_STOPPED} - set(LOG_STATUSES))
+if _missing:
+    raise ImportError(f"feed_status reads log values monitoring_sink no longer defines: {sorted(_missing)}")
 
 # DESCRIBE HISTORY `operation` values that can NOT carry new rows for a skipChangeCommits Delta stream, so
 # a commit with one of these is never "unsent data". An ALLOW-LIST of the safe-to-ignore set: any
@@ -168,37 +173,48 @@ def merge_status_sql(table_name, source_view):
 
 
 def run_state_sql(log_table, lookback_days=DEFAULT_LOG_LOOKBACK_DAYS):
-    """One row per config_name: its LATEST logged run within the lookback window, as columns job_run_id,
-    run_started_at, run_ended_at, run_end_status, last_batch_started_at.
+    """One row per config_name with its LATEST run ATTEMPT in the lookback window (job_run_id,
+    run_started_at, run_ended_at, run_end_status) and its newest batch_start (last_batch_started_at).
 
-    A run is ordered by its run_start time, falling back to its newest batch_start, then its run_end: a
-    long-lived continuous run whose run_start has aged out of the window is still found (and still reads
-    as running) through its recent batch_start rows, and one that just ended through its run_end. The event_ts predicate lets the clustered (config_name, event_ts)
+    An attempt is keyed by (config_name, job_run_id, batch_start_ts): run_start and run_end both carry the
+    attempt's own start wall clock in batch_start_ts. job_run_id alone is NOT enough: it is {{job.run_id}},
+    shared by every task retry inside one job run (ON_FAILURE retries, a continuous stream's restarts), so
+    grouping by it would pair a failed attempt's run_end with the retry that is running now.
+
+    last_batch_started_at (outer-joined) keeps a long-lived continuous attempt visible after its run_start
+    has aged out of the window. The event_ts predicates let the clustered (config_name, event_ts)
     monitoring table skip old files."""
     canonical = validate_table_name(log_table, "monitoring_log_table")
     days = int(lookback_days)
     if days <= 0:
         raise ValueError(f"lookback_days must be positive, got {lookback_days!r}")
+    window = f"event_ts >= current_timestamp() - INTERVAL {days} DAYS"
     return f"""
-WITH runs AS (
-  SELECT config_name, job_run_id,
-    min(CASE WHEN record_type = '{LOG_RUN_START}' THEN coalesce(batch_start_ts, event_ts) END) AS run_started_at,
+WITH attempts AS (
+  SELECT config_name, job_run_id, batch_start_ts AS run_started_at,
     max(CASE WHEN record_type = '{LOG_RUN_END}' THEN coalesce(batch_end_ts, event_ts) END) AS run_ended_at,
-    max(CASE WHEN record_type = '{LOG_RUN_END}' THEN status END) AS run_end_status,
-    max(CASE WHEN record_type = '{LOG_BATCH_START}' THEN coalesce(batch_start_ts, event_ts) END) AS last_batch_started_at
+    max(CASE WHEN record_type = '{LOG_RUN_END}' THEN status END) AS run_end_status
   FROM {canonical}
-  WHERE event_ts >= current_timestamp() - INTERVAL {days} DAYS
-    AND record_type IN ('{LOG_RUN_START}', '{LOG_RUN_END}', '{LOG_BATCH_START}')
-  GROUP BY config_name, job_run_id
-)
-SELECT config_name, latest.* FROM (
+  WHERE {window} AND record_type IN ('{LOG_RUN_START}', '{LOG_RUN_END}') AND batch_start_ts IS NOT NULL
+  GROUP BY config_name, job_run_id, batch_start_ts
+),
+latest AS (
   SELECT config_name,
     max_by(named_struct('job_run_id', job_run_id, 'run_started_at', run_started_at,
-                        'run_ended_at', run_ended_at, 'run_end_status', run_end_status,
-                        'last_batch_started_at', last_batch_started_at),
-           coalesce(run_started_at, last_batch_started_at, run_ended_at)) AS latest
-  FROM runs GROUP BY config_name
-)""".strip()
+                        'run_ended_at', run_ended_at, 'run_end_status', run_end_status),
+           run_started_at) AS a
+  FROM attempts GROUP BY config_name
+),
+batches AS (
+  SELECT config_name, max(coalesce(batch_start_ts, event_ts)) AS last_batch_started_at
+  FROM {canonical}
+  WHERE {window} AND record_type = '{LOG_BATCH_START}'
+  GROUP BY config_name
+)
+SELECT coalesce(l.config_name, b.config_name) AS config_name,
+  l.a.job_run_id AS job_run_id, l.a.run_started_at AS run_started_at, l.a.run_ended_at AS run_ended_at,
+  l.a.run_end_status AS run_end_status, b.last_batch_started_at AS last_batch_started_at
+FROM latest l FULL OUTER JOIN batches b ON l.config_name = b.config_name""".strip()
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -409,17 +425,19 @@ def classify_streaming(checkpoint, history, history_limit, run, now,
 
 def latest_run(row):
     """Normalize one run_state_sql row (a dict) into {job_run_id, started_at, run_ended_at,
-    run_end_status}, or None for a feed with no logged run. started_at falls back to the run's newest
-    batch_start (see run_state_sql)."""
+    run_end_status}, or None for a feed with no logged run.
+
+    A batch_start newer than the latest attempt's end (or with no attempt in the window at all) means an
+    attempt is running whose run_start is not visible (a long-lived continuous run that started before the
+    lookback window): it is reported as an OPEN run starting at that batch, never as the older ended one."""
     if not row:
         return None
-    started = row.get("run_started_at") or row.get("last_batch_started_at") or row.get("run_ended_at")
-    return {
-        "job_run_id": row.get("job_run_id"),
-        "started_at": started,
-        "run_ended_at": row.get("run_ended_at"),
-        "run_end_status": row.get("run_end_status"),
-    }
+    started, ended = row.get("run_started_at"), row.get("run_ended_at")
+    last_batch = row.get("last_batch_started_at")
+    if last_batch is not None and (started is None or (ended is not None and last_batch > ended)):
+        return {"job_run_id": None, "started_at": last_batch, "run_ended_at": None, "run_end_status": None}
+    return {"job_run_id": row.get("job_run_id"), "started_at": started, "run_ended_at": ended,
+            "run_end_status": row.get("run_end_status")}
 
 
 def _run_fields(run):

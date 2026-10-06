@@ -443,9 +443,23 @@ def test_batch_unsupported_cron_is_unknown():
 def test_latest_run_normalizes_and_falls_back_to_batch_start():
     t = NOW - timedelta(minutes=3)
     assert latest_run(None) is None
-    r = latest_run({"job_run_id": "j", "run_started_at": None, "last_batch_started_at": t,
+    r = latest_run({"job_run_id": None, "run_started_at": None, "last_batch_started_at": t,
                     "run_ended_at": None, "run_end_status": None})
     assert r["started_at"] == t and r["run_ended_at"] is None
+
+
+def test_latest_run_newer_batch_than_the_ended_attempt_is_an_open_run():
+    # The visible attempt ended at -30; a batch started at -2 belongs to a newer attempt whose run_start is
+    # outside the window: report that one, open.
+    r = latest_run({"job_run_id": "j", "run_started_at": NOW - timedelta(minutes=40),
+                    "run_ended_at": NOW - timedelta(minutes=30), "run_end_status": "error",
+                    "last_batch_started_at": NOW - timedelta(minutes=2)})
+    assert r["run_ended_at"] is None and r["started_at"] == NOW - timedelta(minutes=2)
+    # A batch from INSIDE the ended attempt changes nothing.
+    r = latest_run({"job_run_id": "j", "run_started_at": NOW - timedelta(minutes=40),
+                    "run_ended_at": NOW - timedelta(minutes=30), "run_end_status": "error",
+                    "last_batch_started_at": NOW - timedelta(minutes=35)})
+    assert r["run_end_status"] == "error" and r["started_at"] == NOW - timedelta(minutes=40)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -608,15 +622,20 @@ def test_lag_minutes_never_negative_for_a_commit_newer_than_now():
     assert out["status"] == PENDING and out["lag_minutes"] == 0.0
 
 
-def test_latest_run_falls_back_to_run_end():
-    t = NOW - timedelta(minutes=1)
-    r = latest_run({"job_run_id": "j", "run_started_at": None, "last_batch_started_at": None,
-                    "run_ended_at": t, "run_end_status": "success"})
-    assert r["started_at"] == t
-    assert "coalesce(run_started_at, last_batch_started_at, run_ended_at)" in run_state_sql("c.s.log", 7)
+def test_run_state_sql_pairs_by_attempt_not_job_run():
+    q = run_state_sql("c.s.log", 7)
+    assert "GROUP BY config_name, job_run_id, batch_start_ts" in q
+    assert "FULL OUTER JOIN batches" in q
 
 
 def test_feed_triggers_config_in_two_jobs_is_unsupported():
     docs = [_job({"schedule": {"quartz_cron_expression": "0 */10 * * * ?", "pause_status": "UNPAUSED"}}, ("dup",)),
             _job(None, ("dup",))]
     assert feed_triggers(docs, "PAUSED")["dup"]["kind"] == "unsupported"
+
+
+def test_log_vocabulary_comes_from_monitoring_sink():
+    from pipeline_lib import feed_status as fs
+    from pipeline_lib.monitoring_sink import RECORD_TYPES as RT, STATUSES as ST
+    assert {fs.LOG_RUN_START, fs.LOG_RUN_END, fs.LOG_BATCH_START} <= set(RT)
+    assert {fs.RUN_SUCCESS, fs.RUN_ERROR, fs.RUN_STOPPED} <= set(ST)
