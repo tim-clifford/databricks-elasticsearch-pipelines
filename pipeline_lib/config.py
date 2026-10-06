@@ -77,15 +77,15 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   overridable per run. Streaming mode only; honored only on a
                                          #   first run before a checkpoint exists.
     monitoring_log_enabled: true | false # OPTIONAL observability toggle (NOT a connector setting): when
-                                         #   true, the run also APPENDS its STREAM_PROGRESS / per-partition
-                                         #   bulk_stats / run-summary rows to the shared monitoring Delta
-                                         #   table (${var.monitoring_log_table}) as well as the log. Behaves
+                                         #   true, the run also APPENDS its run and per-batch rows to the
+                                         #   shared monitoring Delta table
+                                         #   (${var.monitoring_log_table}) as well as the log. Behaves
                                          #   like bulk_stats: omitted => the ${var.monitoring_log_enabled}
                                          #   global (per target) stands, empty global => OFF; a config value
-                                         #   overrides the global, and --params overrides per run. Fail-soft:
-                                         #   if enabled but the table is unset/missing, the run WARNS and
-                                         #   skips the sink (monitoring never fails an export). The table is
-                                         #   created out-of-band by the `_log table create` job.
+                                         #   overrides the global, and --params overrides per run.
+                                         #   FAIL-CLOSED when on: a table that is unset/missing, or any
+                                         #   failed append, fails the task. The table is created
+                                         #   out-of-band by the `_log table create` job.
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -1577,8 +1577,8 @@ def job_base_parameters(
       and the connector falls back to the system CAs.
     - `monitoring_log_table_ref` (e.g. "${var.monitoring_log_table}"): the fully-qualified
       catalog.schema.table of the shared monitoring Delta table. One global table for every job (per
-      target), threaded like checkpoint_base_path/ca_certs; empty => no table configured, so the runner
-      skips the sink even when monitoring_log_enabled is on (fail-soft). Deploy-time, not overridable per
+      target), threaded like checkpoint_base_path/ca_certs; empty => no table configured, which fails a
+      run that has monitoring_log_enabled on (fail-closed). Deploy-time, not overridable per
       run (the table is an environment-level choice), so it is a base_parameter, not a job parameter.
     - `streaming_trigger_interval` (e.g. "30 seconds", or "" for none): a LITERAL from the config's
       `continuous` block (NOT a bundle variable), the single signal that couples the job's shape to the

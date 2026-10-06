@@ -247,19 +247,20 @@ variables:
   # appends its metrics to when monitoring_log_enabled is on. Threaded exactly like checkpoint_base_path /
   # ca_certs: scripts/gen_jobs.py bakes ${var.monitoring_log_table} as a notebook base_parameter (a
   # deploy-time value, NOT a per-run job parameter, because the table is a per-target/environment choice
-  # not something you flip per run). Empty default so, out of the box, no table is configured and the
-  # runner skips the sink even when monitoring_log_enabled is true (fail-soft, never fails an export). Set
-  # it PER TARGET below (or --var). The table itself is created out-of-band by the `_log table create`
+  # not something you flip per run). Empty default: out of the box no table is configured (and the log is
+  # off). With monitoring_log_enabled true the table is REQUIRED: unset, missing, or unwritable fails the
+  # run, since when the log is on it is part of the contract, not best-effort. Set it PER TARGET below
+  # (or --var). The table itself is created out-of-band by the `_log table create`
   # job (which validates this same name and runs CREATE TABLE IF NOT EXISTS); export jobs only append, so
   # their run identity needs only MODIFY on the table, not CREATE. e.g.
   #   --var="monitoring_log_table=<catalog>.<schema>.pipeline_monitoring"
   monitoring_log_table:
-    description: "Fully-qualified catalog.schema.table of the shared monitoring Delta table jobs append to when monitoring_log_enabled is on. Empty default (no table => sink skipped, fail-soft). Set per target below or override with --var. Created out-of-band by the `_log table create` job; export jobs only append (need MODIFY, not CREATE)."
+    description: "Fully-qualified catalog.schema.table of the shared monitoring Delta table jobs append to when monitoring_log_enabled is on. Empty default (no table). Required when monitoring_log_enabled is true (unset/missing/unwritable fails the run). Set per target below or override with --var. Created out-of-band by the `_log table create` job; export jobs only append (need MODIFY, not CREATE)."
     default: ""
 
   # Retention (in days) the `_log table prune` maintenance job enforces on the monitoring table: it DELETEs
   # rows older than this, then OPTIMIZEs (reclusters/compacts) and VACUUMs. The monitoring table grows
-  # unbounded otherwise (one bulk_stats_partition row per partition per micro-batch on a continuous stream),
+  # unbounded otherwise (several rows per batch, and a continuous stream runs a batch every trigger),
   # so retention keeps it bounded and query-fast. 0 disables retention (keep ALL rows; the prune job then
   # only OPTIMIZEs/VACUUMs). Default 90. Threaded like monitoring_log_table: a deploy-time base_parameter on
   # the hand-authored prune job, so it is a per-target choice, not a per-run flag. e.g.
@@ -282,17 +283,17 @@ variables:
     description: "Global default for connector bulk_stats diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off). A pipeline's own bulk_stats and a per-run --params override this. Set true per target/--var to turn on target-wide."
     default: ""
 
-  # GLOBAL default for the durable monitoring sink (a run-time knob, so scripts/gen_jobs.py bakes
+  # GLOBAL default for the durable monitoring log (a run-time knob, so scripts/gen_jobs.py bakes
   # ${var.monitoring_log_enabled} as the job-parameter default for every pipeline that OMITS it). When
-  # true the run also APPENDS its STREAM_PROGRESS / per-partition bulk_stats / run-summary rows to the
-  # ${var.monitoring_log_table} Delta table (in addition to logging them). Precedence, highest first: a
+  # true the run also APPENDS run_start / run_end and, per batch, batch_start / batch_end / batch_summary
+  # rows to the ${var.monitoring_log_table} Delta table (in addition to logging them). Precedence, highest first: a
   # per-run `--params monitoring_log_enabled=<v>` > a pipeline's own `monitoring_log_enabled:` in its
   # config > this global default > OFF. Empty default so the sink is off everywhere out of the box; set
-  # it "true" per target below (or --var) to turn it on target-wide. Fail-soft: with the sink on but
-  # monitoring_log_table unset or the table missing, the run WARNS and skips it (monitoring never fails an
-  # export). A legal value is "" / true / false (validated at generation and at run).
+  # it "true" per target below (or --var) to turn it on target-wide. FAIL-CLOSED when on: an unset or
+  # missing table, or ANY failed append, fails the task, so support is notified and no further data is
+  # sent unlogged. A legal value is "" / true / false (validated at generation and at run).
   monitoring_log_enabled:
-    description: "Global default for the durable monitoring sink. Empty default (off). When true a run also appends its metrics to ${var.monitoring_log_table}. A pipeline's own monitoring_log_enabled and a per-run --params override this. Fail-soft: table unset/missing => warn and skip."
+    description: "Global default for the durable monitoring sink. Empty default (off). When true a run also appends its metrics to ${var.monitoring_log_table}. A pipeline's own monitoring_log_enabled and a per-run --params override this. Fail-closed when on: table unset/missing or a failed append fails the task."
     default: ""
 
   # GLOBAL defaults for the connector's connection/reliability tuning, threaded exactly like bulk_stats:
@@ -532,7 +533,7 @@ targets:
                                    # create` job before enabling the sink.
       # monitoring_log_enabled: "true"  # turn the durable monitoring sink ON for the whole dev target (a
                                    # pipeline's own monitoring_log_enabled or a --params override still
-                                   # wins). Empty default (off). Fail-soft if the table is unset/missing.
+                                   # wins). Empty default (off). When on, a missing table fails the run.
       # cluster_log_conf: {}       # job cluster log delivery disabled (empty default). To enable, uncomment
                                    # and set to {volumes: {destination: "/Volumes/<catalog>/<schema>/<volume>/logs"}}.
                                    # Logs accumulate; manually prune them or set up a cleanup job.
