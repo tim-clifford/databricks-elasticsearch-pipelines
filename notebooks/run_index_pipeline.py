@@ -828,7 +828,7 @@ if PIPELINE_MODE == "streaming":
             Consulted before every swept summary: a leftover outside this run's recorded range may be a batch a
             previous process summarized just before its best-effort relay delete failed (the in-process range
             starts empty after a restart). Leftovers are rare, so the extra read is cheap. Raises on a read
-            failure (fail-closed)."""
+            failure; the caller decides whether that is fatal (only on the end-of-run sweep)."""
             return spark.sql(
                 f"SELECT 1 FROM {_MONITORING_TABLE} WHERE record_type = 'batch_summary' "
                 f"AND config_name = :c AND job_run_id = :r AND batch_id = :b LIMIT 1",
@@ -881,7 +881,17 @@ if PIPELINE_MODE == "streaming":
                     # batch_end rows to complete, so there is nothing to summarize. Just clear it.
                     drop_relay(_bid)
                     continue
-                if _summary_already_written(_owner, _bid):
+                try:
+                    _already = _summary_already_written(_owner, _bid)
+                except Exception as _re:
+                    # A failed READ says nothing about whether data went unlogged, so it does not fail a healthy
+                    # stream: leave the relay for the next sweep (the end-of-run sweep does fail on it).
+                    if final:
+                        raise
+                    print(f"WARNING: could not check whether batch {_bid} is already summarized "
+                          f"({type(_re).__name__}: {_re}); retrying on the next sweep")
+                    continue
+                if _already:
                     drop_relay(_bid)  # summarized before a restart; only its cleanup was lost
                     continue
                 print(f"WARNING: {PROGRESS_TAG} no progress report seen for batch {_bid}; writing its "
