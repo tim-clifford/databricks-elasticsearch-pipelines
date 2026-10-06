@@ -113,3 +113,9 @@ def test_max_climb_is_bounded():
     # rather than climbing further.
     ls = make_ls({BASE_PARENT: ["other_config"]})  # would be EMPTY if allowed to climb to the parent
     assert checkpoint_offsets_state(CP, ls, max_climb=1) == UNKNOWN
+
+
+def test_checkpoint_location_appends_config_name():
+    from pipeline_lib.checkpoint import checkpoint_location
+    assert checkpoint_location("/Volumes/c/s/v/checkpoints", "ecs_dns") == "/Volumes/c/s/v/checkpoints/ecs_dns"
+    assert checkpoint_location("/Volumes/c/s/v/checkpoints/", "ecs_dns") == "/Volumes/c/s/v/checkpoints/ecs_dns"

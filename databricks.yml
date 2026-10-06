@@ -241,6 +241,22 @@ variables:
     description: "Days of history the `_log table prune` job keeps in the monitoring table (DELETE older rows, then OPTIMIZE + VACUUM). 0 disables retention (keep all). Default 90. Deploy-time; set per target or --var."
     default: "90"
 
+  # GLOBAL fully-qualified name (catalog.schema.table) of the feed status table the `_feed status` job
+  # MERGEs into every 5 minutes: one row per pipeline config, CAUGHT_UP / IN_PROGRESS / PENDING / BEHIND /
+  # UNKNOWN, for a caught-up dashboard. The job creates it IF NOT EXISTS on its first run and reads the
+  # monitoring log table (${var.monitoring_log_table}), so set both per target. Empty default => the job
+  # fails closed until configured. e.g.
+  #   --var="feed_status_table=<catalog>.<schema>.feed_status"
+  feed_status_table:
+    description: "Fully-qualified catalog.schema.table the `_feed status` job MERGEs one status row per pipeline config into. Created IF NOT EXISTS by that job. Empty default (the job fails closed until set). Deploy-time; set per target or --var."
+    default: ""
+
+  # Minutes after which waiting source data, a running stream send, or a running batch run counts as
+  # BEHIND in the feed status table. Deploy-time base_parameter of the `_feed status` job. Default 60.
+  feed_status_behind_threshold_minutes:
+    description: "Minutes after which waiting data or a running send/run is BEHIND in the feed status table. Default 60. Deploy-time; set per target or --var."
+    default: "60"
+
   # GLOBAL default for the connector's bulk_stats diagnostics (per-partition ES bulk-send stats -
   # docs/send, round-trip ms, ES `took` ms - in the run log). This is the
   # target-wide DEFAULT: scripts/gen_jobs.py bakes ${var.bulk_stats} as the bulk_stats job-parameter
