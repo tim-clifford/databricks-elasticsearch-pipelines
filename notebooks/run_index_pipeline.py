@@ -788,43 +788,46 @@ if PIPELINE_MODE == "streaming":
         # Spark write it uses for the row count - the one file mechanism proven to work server-side here):
         # one JSON line with the ES write summary (for the batch_summary row) and the BULK_STATS overall+tail
         # text (to print into the cell). The wait loop reads it once Spark has published that batch's progress
-        # and joins the two into the batch's batch_summary. Cleared at run start so it only holds this run.
+        # and joins the two into the batch's batch_summary. A relay is deleted only AFTER its batch_summary is
+        # written, and the directory is NOT cleared at run start: an attempt that died after a batch committed
+        # but before its summary was written leaves that relay behind, and the sweep at the end of this cell
+        # summarizes it first (with the relay off, leftovers are simply deleted).
         relay_dir = f"{checkpoint_location}/_batch_relay"
-        dbutils.fs.rm(relay_dir, recurse=True)
         # The relay is needed only when something consumes it: the monitoring log (batch_summary.es) or the
         # bulk_stats relay-to-cell print.
         _RELAY_ON = MONITORING_ACTIVE or BULK_STATS.strip().lower() == "true"
 
         def read_relay(batch_id):
             """Read the relay foreachBatch wrote for `batch_id` (a Spark `.text()` output directory holding one
-            `part-*` file with one JSON line) and return it as a dict, or None when there is none (the relay
-            is off, or the write failed and was warned). Then delete that batch's relay directory: it is
-            spent once read, so an always-on stream does not accumulate one directory per batch. Runs in the
-            notebook process via dbutils.fs, so any checkpoint URI works (no FUSE mount needed). FAIL-SOFT: a
-            read or delete problem yields None / is ignored; the batch_summary is then written from Spark's
-            progress alone."""
-            content = None
-            d = f"{relay_dir}/{int(batch_id)}"
+            `part-*` file with one JSON line) and return it as a dict, or None when it is absent or unreadable.
+            Does NOT delete it: the caller drops it (drop_relay) only once the batch's summary is safely
+            written, so a failed read or a failed summary append leaves it for a later sweep instead of losing
+            the batch's diagnostics. Runs in the notebook process via dbutils.fs, so any checkpoint URI works
+            (no FUSE mount needed). FAIL-SOFT: returns None on any problem."""
             try:
-                for f in dbutils.fs.ls(d):
+                for f in dbutils.fs.ls(f"{relay_dir}/{int(batch_id)}"):
                     if f.name.startswith("part-"):
-                        content = json.loads(dbutils.fs.head(f.path, 1024 * 1024))
-                        break
-            except Exception:
-                content = None
-            try:
-                dbutils.fs.rm(d, recurse=True)
+                        return json.loads(dbutils.fs.head(f.path, 1024 * 1024))
             except Exception:
                 pass
-            return content
+            return None
+
+        def drop_relay(batch_id):
+            """Delete `batch_id`'s spent relay directory (best-effort), so an always-on stream does not
+            accumulate one directory per batch."""
+            try:
+                dbutils.fs.rm(f"{relay_dir}/{int(batch_id)}", recurse=True)
+            except Exception:
+                pass
 
         def summarize_leftover_relays(below=None):
             """Write a batch_summary for every batch that ended successfully (it left a relay directory) but
             whose progress report was never recorded, for ids below `below` (None = all): its report was
-            evicted from query.recentProgress's bounded buffer before a poll saw it, or reads kept failing.
-            The summary carries the relayed ES diagnostics alone, with a warning, so no batch is silently
-            skipped (pipeline_lib.monitoring_sink.leftover_relay_ids). With the log off the leftovers are
-            just deleted. A listing failure only warns (the next call retries)."""
+            evicted from query.recentProgress's bounded buffer before a poll saw it, reads kept failing, or an
+            earlier attempt died before summarizing it. The summary carries the relayed ES diagnostics alone,
+            with a warning, so no batch is silently skipped (pipeline_lib.monitoring_sink.leftover_relay_ids).
+            A relay is dropped only after its summary is written; an unreadable one is left (and warned) for
+            the next sweep. With the log off, leftovers are just dropped. A listing failure only warns."""
             if not _RELAY_ON:
                 return
             try:
@@ -835,15 +838,18 @@ if PIPELINE_MODE == "streaming":
                 print(f"WARNING: could not list {relay_dir} for unrecorded batches ({type(_e).__name__}: {_e})")
                 return
             for _bid in leftover_relay_ids(_names, below):
+                if not MONITORING_ACTIVE:
+                    drop_relay(_bid)
+                    continue
                 _relay = read_relay(_bid)
-                if MONITORING_ACTIVE:
-                    print(f"WARNING: {PROGRESS_TAG} no progress report seen for batch {_bid}; writing its "
-                          f"batch_summary from the relayed ES diagnostics only")
-                    if _relay and _relay.get("es"):
-                        append_monitoring_rows([batch_summary_row(CONFIG_NAME, JOB_RUN_ID, _bid, es=_relay["es"])])
-                    else:
-                        print(f"WARNING: batch {_bid} left no readable diagnostics either; it has batch_start/"
-                              f"batch_end rows but no batch_summary")
+                if not (_relay and _relay.get("es")):
+                    print(f"WARNING: could not read the relayed diagnostics for unrecorded batch {_bid}; "
+                          f"retrying on the next sweep")
+                    continue
+                print(f"WARNING: {PROGRESS_TAG} no progress report seen for batch {_bid}; writing its "
+                      f"batch_summary from the relayed ES diagnostics only")
+                append_monitoring_rows([batch_summary_row(CONFIG_NAME, JOB_RUN_ID, _bid, es=_relay["es"])])
+                drop_relay(_bid)
 
         def foreach_batch(batch_df, batch_id: int):
             # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so
@@ -955,6 +961,8 @@ if PIPELINE_MODE == "streaming":
                 if MONITORING_ACTIVE:
                     append_monitoring_rows([batch_summary_row(CONFIG_NAME, JOB_RUN_ID, _bid,
                                                               es=(_relay or {}).get("es"), progress=_p)])
+                if _RELAY_ON:
+                    drop_relay(_bid)  # only once its summary is written (a failed append raised above)
                 _progress_mark["last"] = _bid
 
         def await_stream(query, record=True):
@@ -965,6 +973,15 @@ if PIPELINE_MODE == "streaming":
             (after stopping the query)."""
             _await_stream(query, _POLL_SECONDS, record=record_progress if record else None,
                           log=lambda m: print(f"{PROGRESS_TAG} {m}"))
+
+        # Settle what a previous attempt left behind (see relay_dir above): summarize committed batches it
+        # never summarized, or, with the relay off, just clear the leftovers.
+        if _RELAY_ON:
+            summarize_leftover_relays()
+        else:
+            dbutils.fs.rm(relay_dir, recurse=True)
+        # The previous runner's relay directory name; nothing reads it any more, so remove it if present.
+        dbutils.fs.rm(f"{checkpoint_location}/_bulk_stats_relay", recurse=True)
 
 # COMMAND ----------
 # STREAMING run - STEP 1 of 2: PREPARE the checkpoint (streaming mode only). Build the Delta stream
@@ -1171,6 +1188,10 @@ if PIPELINE_MODE == "streaming":
             # failure notifications). So set a summary noting the stop and do NOT run the availableNow summary
             # below (this branch owns its own RUN_SUMMARY).
             await_stream(query)
+            # Batches that committed just before the stop may not have had their report polled yet: record
+            # them, then summarize any whose report never arrived, as the availableNow branch does.
+            record_progress(query)
+            summarize_leftover_relays()
             RUN_SUMMARY = (
                 f"streaming_trigger=continuous({STREAMING_TRIGGER_INTERVAL}) stopped; "
                 f"checkpoint={checkpoint_location}"
