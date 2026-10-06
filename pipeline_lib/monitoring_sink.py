@@ -1,29 +1,36 @@
-"""Pure logic for the OPTIONAL durable monitoring sink: turn the metrics run_index_pipeline.py already
-computes (StreamingQueryProgress + the connector's per-partition bulk_stats + per-run summary facts)
-into rows for one shared UC Delta table, and own that table's schema and its CREATE statement.
+"""Pure logic for the OPTIONAL durable monitoring log: turn what run_index_pipeline.py knows about a run
+and its batches into rows for one shared UC Delta table, and own that table's schema and its SQL.
 
 Why this module exists, and what it deliberately is NOT:
-- It is the SINGLE SOURCE OF TRUTH for the monitoring table's columns (MONITORING_TABLE_COLUMNS). Both
-  the `_log table create` job (notebooks/log_table_create.py, which runs the CREATE) and the writer
-  (notebooks/run_index_pipeline.py, which appends) import that one definition, so the DDL and the rows
-  can never drift apart.
+- It is the SINGLE SOURCE OF TRUTH for the monitoring table's columns (MONITORING_TABLE_COLUMNS) and its
+  closed row vocabulary (RECORD_TYPES x STATUSES). Both the `_log table create` job (which runs the
+  CREATE / additive migration) and the writer (run_index_pipeline.py, which appends) import that one
+  definition, so the DDL and the rows can never drift apart.
 - It is PURE: no Spark, no dbutils, no Databricks. Every function here is unit-testable off-cluster
   (plain pytest), exactly like pipeline_lib/observability.py. The notebooks own all Spark I/O.
-- It stores ATOMIC rows, not the console rollups. observability.format_bulk_stats computes an `overall`
-  line (weighted-mean rtt, cluster totals) and format_tail_summary computes a straggler line; those are
-  aggregations OVER the per-partition dicts. Re-computing them here would re-type values from their
-  source (the per-partition dicts), so instead each partition dict is stored raw as its own row and the
-  overall/tail views are derived in SQL. Nothing is lost: the rollups are exactly recoverable from the
-  bulk_stats_partition rows.
 
-DESIGN INVARIANT - the sink is OBSERVABILITY ONLY, like observability.py. The row builders are called
-from the export path, so they are FAIL-SOFT: an unusable (non-dict) input yields None (the caller skips
-it) rather than raising, and payload serialization never raises (default=str). A monitoring fault must
-never disturb a write.
+THE ROW MODEL. Two levels, each with a start and an end, plus one diagnostics row per batch:
+- run_start / run_end: one pair per job run (run_end is absent only when the run was killed outright,
+  which is itself the signal: a run_start with no run_end is a run that died).
+- batch_start / batch_end / batch_summary: one set per batch. A batch-mode run is exactly ONE batch
+  (batch_id BATCH_MODE_BATCH_ID); a streaming run has one per micro-batch (the micro-batch id). A
+  batch_start with no batch_end is a batch that never finished.
+- batch_end is the OUTCOME (status success|error, end time, ES counts or the error); batch_summary is the
+  DIAGNOSTICS (the ES write rollup and, for streaming, Spark's progress report for that batch). They are
+  separate because in streaming Spark only publishes a batch's progress AFTER the batch has committed,
+  later than batch_end is written.
+
+DESIGN INVARIANT - when the log is ON it is part of the contract, not best-effort. The builders RAISE on
+unusable input (a builder that silently produced no row would be exactly the missing log entry this
+model exists to prevent), and the notebook's writer raises on a failed append, so a log fault fails the
+task. Only the CONTENT of diagnostics is fail-soft (observability's rollups yield None for a figure they
+cannot compute), and payload serialization never raises (default=str).
 """
 import json
 import re
 from datetime import datetime, timedelta, timezone
+
+from pipeline_lib.observability import bulk_stats_overall, bulk_stats_tail
 
 # The monitoring table's columns, in order, as (name, sql_type). This ONE tuple drives both the CREATE
 # TABLE statement (create_table_sql) and the row shape (ROW_FIELDS), so the schema is defined exactly
@@ -35,7 +42,8 @@ MONITORING_TABLE_COLUMNS = (
     ("config_name", "STRING"),     # which pipeline config emitted the row
     ("job_run_id", "STRING"),      # the Databricks job run id, to group rows of one run across batches
     ("record_type", "STRING"),     # discriminator; one of RECORD_TYPES
-    ("batch_id", "BIGINT"),        # streaming micro-batch id; NULL for batch runs and run_summary rows
+    ("status", "STRING"),          # one of STATUSES (started | success | error | stopped); see _ALLOWED_STATUS
+    ("batch_id", "BIGINT"),        # batch id (micro-batch id; BATCH_MODE_BATCH_ID in batch mode); NULL on run rows
     ("event_ts", "TIMESTAMP"),     # UTC wall-clock the row is ABOUT (batch/emit time)
     ("batch_start_ts", "TIMESTAMP"),  # UTC wall-clock the batch/run STARTED; NULL where not applicable
     ("batch_end_ts", "TIMESTAMP"),    # UTC wall-clock the batch/run ENDED; NULL where not applicable
@@ -43,21 +51,43 @@ MONITORING_TABLE_COLUMNS = (
     ("ingest_ts", "TIMESTAMP"),    # UTC wall-clock the row was WRITTEN (writer supplies via current_timestamp())
 )
 
-# The allow-list of record_type values. A row builder only ever emits one of these; the writer and any
-# reader can trust the set is closed. (Adding a type is a deliberate change here, never an accident.)
+# The allow-list of record_type values (see THE ROW MODEL above). A row builder only ever emits one of
+# these; the writer and any reader can trust the set is closed. (Adding a type is a deliberate change.)
 RECORD_TYPES = (
-    "stream_progress",       # one StreamingQueryProgress (streaming only), payload = the progress dict
-    "bulk_stats_partition",  # one per DataFrame partition, payload = that partition's raw bulk_stats dict
-    "bulk_stats_batch",      # driver-side facts not in any partition (collect_ms/merge_ms/written)
-    "run_summary",           # one per run: streaming_start, es_index, versions, totals
-    "run_error",             # one per FAILED run: the exception that ended it (timeouts included)
+    "run_start",      # one per run, first row written: identity + effective settings
+    "run_end",        # one per run that ended in-process: success | error | stopped, totals or the error
+    "batch_start",    # one per batch, written immediately BEFORE the batch's data is sent to ES
+    "batch_end",      # one per batch that ended: success (ES counts) | error (the exception)
+    "batch_summary",  # one per batch with diagnostics: ES write rollup (+ Spark progress for streaming)
 )
+
+# The allow-list of status values, and which statuses each record_type may carry. `stopped` is a
+# continuous stream whose query ended WITHOUT an error while the notebook kept running, which is
+# neither a success nor a failure of the export.
+STATUSES = ("started", "success", "error", "stopped")
+_ALLOWED_STATUS = {
+    "run_start": ("started",),
+    "run_end": ("success", "error", "stopped"),
+    "batch_start": ("started",),
+    "batch_end": ("success", "error"),
+    "batch_summary": ("success", "error"),
+}
+
+# A batch-mode run is exactly ONE batch; its batch rows carry this id so batch and streaming rows join
+# and pair the same way (streaming micro-batch ids start at 0 too, but config_name + job_run_id keep the
+# two apart: one run is one mode).
+BATCH_MODE_BATCH_ID = 0
+
+# An exception message is stored on error rows, capped so a pathological message (a Delta schema-change
+# error embeds both full schemas, tens of KB) cannot bloat the table. The cap is generous: the head of
+# the message names the error class and the cause.
+MAX_ERROR_MESSAGE_CHARS = 16000
 
 # The fields a row builder emits, in order. This is MONITORING_TABLE_COLUMNS MINUS the writer-supplied
 # ingest_ts (the writer stamps ingest_ts with the Spark current_timestamp() at append time, so a pure
 # builder never invents it). assert_columns_consistent() enforces the relationship so the two lists
 # cannot drift.
-ROW_FIELDS = ("config_name", "job_run_id", "record_type", "batch_id", "event_ts",
+ROW_FIELDS = ("config_name", "job_run_id", "record_type", "status", "batch_id", "event_ts",
               "batch_start_ts", "batch_end_ts", "payload")
 
 # Liquid-clustering columns for the monitoring table. Every monitoring query filters by WHICH pipeline
@@ -114,26 +144,34 @@ def _json(payload):
     return json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
 
 
-def _row(config_name, job_run_id, record_type, batch_id, payload, now=None,
-         batch_start=None, batch_end=None):
-    """Assemble one row dict keyed by ROW_FIELDS. record_type is asserted to be in the allow-list (a
-    programming error if not, so it raises here in tests, but callers only ever pass a literal). batch_id
-    is coerced to int or None. payload is JSON-serialized. batch_start/batch_end are OPTIONAL datetimes
-    (None => NULL) for the batch/run start and end wall clocks."""
+def _row(config_name, job_run_id, record_type, status, batch_id, payload, now=None,
+         start=None, end=None):
+    """Assemble one row dict keyed by ROW_FIELDS. FAIL-CLOSED: record_type must be in RECORD_TYPES, status
+    must be one _ALLOWED_STATUS permits for it, payload must be a dict, and a batch row needs an integer
+    batch_id (a run row must have none). Any violation raises ValueError: a malformed row is a bug, and a
+    silently dropped row is the missing log entry this module exists to prevent. start/end are OPTIONAL
+    datetimes (None => NULL) stored as batch_start_ts / batch_end_ts (the run's or batch's wall clock)."""
     if record_type not in RECORD_TYPES:
         raise ValueError(f"unknown record_type {record_type!r}; allowed: {', '.join(RECORD_TYPES)}")
-    try:
-        bid = int(batch_id) if batch_id is not None else None
-    except (TypeError, ValueError):
-        bid = None
+    if status not in _ALLOWED_STATUS[record_type]:
+        raise ValueError(f"status {status!r} not allowed for {record_type}; allowed: "
+                         f"{', '.join(_ALLOWED_STATUS[record_type])}")
+    if not isinstance(payload, dict):
+        raise ValueError(f"{record_type} payload must be a dict, got {type(payload).__name__}")
+    if record_type.startswith("batch_"):
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 0:
+            raise ValueError(f"{record_type} needs a non-negative integer batch_id, got {batch_id!r}")
+    elif batch_id is not None:
+        raise ValueError(f"{record_type} is a run row and carries no batch_id, got {batch_id!r}")
     return {
         "config_name": config_name,
         "job_run_id": job_run_id,
         "record_type": record_type,
-        "batch_id": bid,
+        "status": status,
+        "batch_id": batch_id,
         "event_ts": _event_ts(now),
-        "batch_start_ts": _opt_ts(batch_start),
-        "batch_end_ts": _opt_ts(batch_end),
+        "batch_start_ts": _opt_ts(start),
+        "batch_end_ts": _opt_ts(end),
         "payload": _json(payload),
     }
 
@@ -159,81 +197,146 @@ def _progress_bounds(progress):
     return start, end
 
 
-def progress_row(progress, config_name, job_run_id, now=None):
-    """One `stream_progress` row from a StreamingQueryProgress dict (as parsed in the listener). payload
-    is the WHOLE progress dict (full fidelity - durationMs breakdown, per-source backlog, offsets), so
-    nothing the runtime emits is dropped. batch_id is taken from progress['batchId']; batch_start_ts/
-    batch_end_ts are derived from the progress timestamp + batchDuration. Returns None for a non-dict input
-    (fail-soft; the caller skips it)."""
-    if not isinstance(progress, dict):
-        return None
-    start, end = _progress_bounds(progress)
-    return _row(config_name, job_run_id, "stream_progress", progress.get("batchId"), progress, now,
-                batch_start=start, batch_end=end)
+def error_facts(exc):
+    """The payload fields describing an exception: its type name and its message, capped at
+    MAX_ERROR_MESSAGE_CHARS (with message_truncated set when it was cut). Shared by every error row so they
+    all describe a failure the same way."""
+    message = str(exc)
+    facts = {"exception_type": type(exc).__name__, "message": message[:MAX_ERROR_MESSAGE_CHARS]}
+    if len(message) > MAX_ERROR_MESSAGE_CHARS:
+        facts["message_truncated"] = True
+    return facts
 
 
-def bulk_stats_partition_rows(result, config_name, job_run_id, batch_id, now=None):
-    """One `bulk_stats_partition` row PER partition, payload = that partition's raw bulk_stats dict with
-    a `partition` index added. `result` is the connector's bulk_write return dict (carries
-    result['bulk_stats'], a list of per-partition dicts, when EsWriteConfig bulk_stats is on). Stores the
-    per-partition dicts verbatim so every field the connector emits is preserved without re-typing;
-    overall/tail rollups are derived from these rows in SQL. Returns [] when no bulk_stats are present
-    (diagnostics off, or an empty batch) or the input is unusable (fail-soft)."""
+def run_start_row(config_name, job_run_id, facts, start, now=None):
+    """The `run_start` row: the run's identity and effective settings (`facts`: mode, es_index, view,
+    source, trigger, connector version, ...), stored verbatim. `start` is the run's start wall clock."""
+    return _row(config_name, job_run_id, "run_start", "started", None, facts, now, start=start)
+
+
+def run_end_row(config_name, job_run_id, status, facts, start, end, now=None):
+    """The `run_end` row: how the run ended (status success | error | stopped) plus `facts` (totals on
+    success, error_facts on error), with the run's start and end wall clocks so its duration is direct."""
+    return _row(config_name, job_run_id, "run_end", status, None, facts, now, start=start, end=end)
+
+
+def batch_start_row(config_name, job_run_id, batch_id, facts, start, now=None):
+    """The `batch_start` row, written immediately BEFORE the batch's data is sent to ES. `facts` carries
+    whatever is known up front (at least the mode). With the log on, failing to write this row fails the
+    batch before any data is sent."""
+    return _row(config_name, job_run_id, "batch_start", "started", batch_id, facts, now, start=start)
+
+
+def batch_end_row(config_name, job_run_id, batch_id, status, facts, start, end, now=None):
+    """The `batch_end` row: the batch's OUTCOME. status success (facts = es_counts) or error (facts =
+    error_facts), with the batch's start and end wall clocks."""
+    return _row(config_name, job_run_id, "batch_end", status, batch_id, facts, now, start=start, end=end)
+
+
+def batch_summary_row(config_name, job_run_id, batch_id, es=None, progress=None, status="success", now=None):
+    """The `batch_summary` row: the batch's DIAGNOSTICS. `es` is es_write_summary(...) (the ES write
+    rollup); `progress` is Spark's StreamingQueryProgress dict for the batch (streaming only; stored
+    whole, so nothing the runtime reports is dropped). At least one must be present. status mirrors the
+    batch's outcome: a streaming summary is only ever written for a committed batch (success), while a
+    batch-mode write that returned diagnostics but then failed reconciliation is summarized as error.
+    batch_start_ts /
+    batch_end_ts come from the progress (Spark's trigger timestamp + batchDuration) when there is one, and
+    are NULL otherwise (an es-only summary: batch mode, or a streaming batch whose progress report was never
+    seen); the batch's own wall clock is always on its batch_start / batch_end rows."""
+    if es is None and progress is None:
+        raise ValueError("batch_summary needs an es summary, a progress report, or both")
+    if es is not None and not isinstance(es, dict):
+        raise ValueError(f"batch_summary es must be a dict, got {type(es).__name__}")
+    if progress is not None and not isinstance(progress, dict):
+        raise ValueError(f"batch_summary progress must be a dict, got {type(progress).__name__}")
+    payload = {}
+    start = end = None
+    if es is not None:
+        payload["es"] = es
+    if progress is not None:
+        payload["progress"] = progress
+        start, end = _progress_bounds(progress)
+    return _row(config_name, job_run_id, "batch_summary", status, batch_id, payload, now,
+                start=start, end=end)
+
+
+def es_counts(result):
+    """The ES write COUNTS from a bulk_write result (what batch_end carries on success): written, deleted,
+    errors, ignored, total_input. Raises ValueError on a non-dict result (a bulk_write that returned
+    nothing usable is not a success to record)."""
     if not isinstance(result, dict):
-        return []
-    parts = result.get("bulk_stats")
-    if not isinstance(parts, list):
-        return []
-    rows = []
-    for i, part in enumerate(parts):
-        payload = dict(part) if isinstance(part, dict) else {"unparseable": type(part).__name__}
-        payload["partition"] = i
-        rows.append(_row(config_name, job_run_id, "bulk_stats_partition", batch_id, payload, now))
-    return rows
+        raise ValueError(f"bulk_write result must be a dict, got {type(result).__name__}")
+    return {k: result.get(k) for k in ("written", "deleted", "errors", "ignored", "total_input")}
 
 
-def bulk_stats_batch_row(result, config_name, job_run_id, batch_id, now=None,
-                         batch_start=None, batch_end=None):
-    """One `bulk_stats_batch` row carrying the DRIVER-side facts that are NOT in any partition:
-    collect_ms and merge_ms (Spark result finalization / driver rollup), written (rows the batch shipped)
-    and num_partitions. These are read verbatim from the top level of the bulk_write result, not
-    re-aggregated from the partition dicts. batch_start/batch_end are the driver wall-clock around the
-    batch's bulk_write (so beginning-to-end duration per batch is directly queryable). Returns None for a
-    non-dict input (fail-soft)."""
+def es_write_summary(result, wall_ms=None):
+    """The ES write DIAGNOSTICS for batch_summary, from a bulk_write result: the driver-side facts
+    (collect_ms, merge_ms, num_partitions, and the driver-measured bulk_write wall time when given) plus,
+    when bulk_stats is on, the cluster-wide `overall` rollup and the straggler `tail` facts. The rollups
+    come from observability's bulk_stats_overall / bulk_stats_tail, the SAME computation behind the
+    BULK_STATS log lines, so the table and the console agree. Per-partition detail is deliberately NOT
+    stored (too granular for this log; it still prints when bulk_stats is on). Raises ValueError on a
+    non-dict result."""
     if not isinstance(result, dict):
-        return None
+        raise ValueError(f"bulk_write result must be a dict, got {type(result).__name__}")
     parts = result.get("bulk_stats")
-    payload = {
+    out = {
         "collect_ms": result.get("collect_ms"),
         "merge_ms": result.get("merge_ms"),
-        "written": result.get("written"),
         "num_partitions": len(parts) if isinstance(parts, list) else None,
+        "bulk_write_wall_ms": wall_ms,
     }
-    return _row(config_name, job_run_id, "bulk_stats_batch", batch_id, payload, now,
-                batch_start=batch_start, batch_end=batch_end)
+    if isinstance(parts, list) and parts:
+        out["overall"] = bulk_stats_overall(parts)
+        tail = bulk_stats_tail(result)
+        # collect_ms / merge_ms are already top-level above; keep only the partition facts in `tail`.
+        out["tail"] = {k: v for k, v in tail.items() if k not in ("collect_ms", "merge_ms")}
+    return out
 
 
-def run_summary_row(summary, config_name, job_run_id, now=None):
-    """One `run_summary` row (batch_id NULL) from a plain dict of run-level facts the notebook assembles
-    at the end of a run (e.g. streaming_start, es_index, connector_version, wheel_path, environment,
-    batches, rows_pushed, mode). Stored verbatim as the payload. Returns None for a non-dict input
-    (fail-soft)."""
-    if not isinstance(summary, dict):
-        return None
-    return _row(config_name, job_run_id, "run_summary", None, summary, now)
+def progress_batch_ids(progresses, last_batch_id):
+    """The progress reports from `progresses` (StreamingQueryProgress dicts, as polled from
+    query.recentProgress) that describe a batch which actually EXECUTED and is newer than
+    `last_batch_id` (the highest batch id already recorded; None = none yet), returned in ascending batch
+    order with one report per batch id.
+
+    A high-water mark rather than a set of seen ids: within one query, Spark's batch ids only increase, and
+    a mark stays constant-size on a stream that runs for months. A report counts only when it has an
+    integer batchId above the mark and its durationMs carries addBatch: Spark also posts progress for idle
+    triggers (no new data, so no batch ran), and those carry no addBatch. If one batch id appears twice,
+    the first executed report wins. Non-dict entries are skipped."""
+    by_id = {}
+    for p in progresses or []:
+        if not isinstance(p, dict):
+            continue
+        bid = p.get("batchId")
+        if isinstance(bid, bool) or not isinstance(bid, int) or bid in by_id:
+            continue
+        if last_batch_id is not None and bid <= last_batch_id:
+            continue
+        duration = p.get("durationMs")
+        if not isinstance(duration, dict) or "addBatch" not in duration:
+            continue
+        by_id[bid] = p
+    return [by_id[b] for b in sorted(by_id)]
 
 
-def run_error_row(error, config_name, job_run_id, now=None, batch_start=None, batch_end=None):
-    """One `run_error` row (batch_id NULL) recording the exception that ENDED a run. `error` is a dict of
-    failure facts the notebook assembles in its except handler (e.g. exception_type, message, mode,
-    es_index, elapsed_ms); stored verbatim as the payload. batch_start/batch_end carry the run's start and
-    the failure time so a timed-out run shows HOW LONG it ran before failing. This is the durable
-    breadcrumb a hard failure (a timeout that exhausts retries and raises) otherwise never leaves in the
-    table. Returns None for a non-dict input (fail-soft)."""
-    if not isinstance(error, dict):
-        return None
-    return _row(config_name, job_run_id, "run_error", None, error, now,
-                batch_start=batch_start, batch_end=batch_end)
+def leftover_relay_ids(names, below=None):
+    """The batch ids among relay directory entry `names` (as listed; a trailing "/" is ignored) that are
+    below `below` (None = all), ascending. Non-numeric names are skipped. The streaming runner writes one
+    relay directory per batch that ended successfully and deletes it once that batch's batch_summary is
+    written, so whatever is left below the batch being recorded is a batch whose progress report was never
+    seen (evicted from query.recentProgress's bounded buffer, or a read that kept failing). Those still owe
+    a batch_summary, written from the relayed ES diagnostics alone, so no batch is silently skipped."""
+    out = []
+    for name in names or []:
+        n = str(name).rstrip("/")
+        if not n.isdigit():
+            continue
+        bid = int(n)
+        if below is None or bid < below:
+            out.append(bid)
+    return sorted(out)
 
 
 def validate_table_name(name, where="monitoring_log_table"):
@@ -310,8 +413,8 @@ def alter_cluster_by_sql(table_name):
 
 def prune_sql(table_name, retention_days):
     """`DELETE FROM <name> WHERE ingest_ts < current_timestamp() - INTERVAL <n> DAYS` to enforce retention
-    on the monitoring table (it grows unbounded otherwise - one bulk_stats_partition row per partition per
-    micro-batch). Validates the name fail-closed. Returns None when retention_days <= 0 (retention
+    on the monitoring table (it grows unbounded otherwise: several rows per batch, and an always-on stream
+    runs a batch every trigger). Validates the name fail-closed. Returns None when retention_days <= 0 (retention
     DISABLED => keep all rows; the caller skips the DELETE). retention_days is coerced to a non-negative
     int; a non-numeric value raises (fail-closed, since it is interpolated into SQL).
 

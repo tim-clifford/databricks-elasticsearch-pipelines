@@ -677,6 +677,9 @@ def test_job_base_parameters():
         "ca_certs": "${var.ca_certs}",
         "monitoring_log_table": "${var.monitoring_log_table}",
         "streaming_trigger_interval": "",
+        # Jobs dynamic value references, resolved per run by the Jobs service (monitoring log run id).
+        "job_run_id": "{{job.run_id}}",
+        "task_run_id": "{{task.run_id}}",
     }
 
 
@@ -2179,6 +2182,13 @@ def test_job_group_valid_identifier_accepted():
 def test_job_group_bad_identifier_fails_closed(bad):
     cfg = _base()
     cfg["job_group"] = bad
+    with pytest.raises(PipelineConfigError, match="job_group"):
+        validate_config(cfg)
+
+
+def test_job_group_underscore_prefix_rejected():
+    cfg = _base()
+    cfg["job_group"] = "_reserved"
     with pytest.raises(PipelineConfigError, match="job_group"):
         validate_config(cfg)
 

@@ -30,13 +30,14 @@ The bundle deploys:
   files (see [Adding a new pipeline for an ES index](#adding-a-new-pipeline-for-an-es-index)).
   Configs can instead be merged into a single multi-task job via [Job groups](#job-groups) (e.g. to
   share one cluster).
-- **Optional durable monitoring**: every run logs its `STREAM_PROGRESS` / `BULK_STATS` metrics to the
-  run log; turning on `monitoring_log_enabled` **also** appends them (plus a per-run summary, per-batch
-  start/end timestamps, and a `run_error` row on failure) as rows in a shared, liquid-clustered Delta
-  table for querying across jobs. The table is created once by the hand-authored `_log table create` job
-  (re-run it to additively migrate the schema); a `_log table prune` job bounds its growth with retention.
-  Off by default, fail-soft (a sink fault never fails an export). See
-  [Durable monitoring](#durable-monitoring).
+- **Optional durable monitoring log**: every run logs its `STREAM_PROGRESS` / `BULK_STATS` metrics to the
+  run log; turning on `monitoring_log_enabled` **also** records every run and every batch in a shared,
+  liquid-clustered Delta table: `run_start` / `run_end` per run and `batch_start` / `batch_end` /
+  `batch_summary` per batch (one batch in batch mode, one per micro-batch in streaming), with status,
+  timing, ES counts and diagnostics. The table is created once by the hand-authored `_log table create`
+  job (re-run it to additively migrate the schema); a `_log table prune` job bounds its growth with
+  retention. Off by default; when ON it is **fail-closed** (a failed log write fails the task, so no data
+  is sent unlogged). See [Durable monitoring](#durable-monitoring).
 
 ## Adding a new pipeline for an ES index
 
@@ -141,8 +142,8 @@ value fails closed wherever the value is required. The bundle variables are:
 | `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
 | `retry_transport_timeout` | global default for the connector's `retry_transport_timeout` reliability toggle: when on, the connector OWNS whole-request timeout retries (re-sends a timed-out bulk with backoff instead of letting the transport re-send it invisibly and then failing the batch). Empty default (off). Threaded exactly like `bulk_stats`: the generator bakes `${var.retry_transport_timeout}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=retry_transport_timeout=true`) turns it on for a whole environment, and a pipeline's own `retry_transport_timeout:` or a per-run `--params retry_transport_timeout=<v>` override it (see [Configuration](#configuration)) |
 | `bypass_fast_path` | global default for the connector's `bypass_fast_path` write-path toggle: when on, the connector skips its `filter_path="errors"` probe and classifies every chunk per-item, which makes the `docs_deduped` / `written` counts EXACT for `op_type=create` on chunks mixing new and existing `_id`s (and avoids the auto-id re-ship duplication), at the cost of the fast path's throughput on clean chunks. Empty default (off; the fast path is used). Threaded exactly like `bulk_stats`: the generator bakes `${var.bypass_fast_path}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bypass_fast_path=true`) turns it on for a whole environment, and a pipeline's own `bypass_fast_path:` or a per-run `--params bypass_fast_path=<v>` override it (see [Configuration](#configuration)) |
-| `monitoring_log_enabled` | global default for the **durable monitoring sink**: when on, a run **also** appends its metrics (STREAM_PROGRESS / per-partition bulk_stats / a per-run summary) to `monitoring_log_table`, in addition to the run log. Empty default (off). Threaded exactly like `bulk_stats`: the generator bakes `${var.monitoring_log_enabled}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=monitoring_log_enabled=true`) turns the sink on for a whole environment, and a pipeline's own `monitoring_log_enabled:` or a per-run `--params monitoring_log_enabled=<v>` override it. Fail-soft: with the sink on but the table unset/missing, the run warns and skips it (see [Durable monitoring](#durable-monitoring)) |
-| `monitoring_log_table` | fully-qualified `catalog.schema.table` of the shared monitoring Delta table the sink appends to. **Deploy-time**, threaded like `checkpoint_base_path` / `ca_certs` (a notebook base_parameter, not a per-run job parameter, since the table is a per-environment choice). Empty default (no table => the sink is skipped even when `monitoring_log_enabled` is on). Set per target (or `--var`). Created out-of-band by the `_log table create` job; **export jobs only append**, so their run identity needs only `MODIFY` on the table, not `CREATE` (see [Durable monitoring](#durable-monitoring)) |
+| `monitoring_log_enabled` | global default for the **durable monitoring log**: when on, a run **also** records its run and batch rows (`run_start`/`run_end`, `batch_start`/`batch_end`/`batch_summary`) in `monitoring_log_table`, in addition to the run log. Empty default (off). Threaded exactly like `bulk_stats`: the generator bakes `${var.monitoring_log_enabled}` as the job-parameter default for any pipeline that omits it, so setting this per target (or `--var=monitoring_log_enabled=true`) turns the sink on for a whole environment, and a pipeline's own `monitoring_log_enabled:` or a per-run `--params monitoring_log_enabled=<v>` override it. **Fail-closed** when on: the table unset/missing, or any failed append, fails the task (see [Durable monitoring](#durable-monitoring)) |
+| `monitoring_log_table` | fully-qualified `catalog.schema.table` of the shared monitoring Delta table the sink appends to. **Deploy-time**, threaded like `checkpoint_base_path` / `ca_certs` (a notebook base_parameter, not a per-run job parameter, since the table is a per-environment choice). Empty default (no table); **required** when `monitoring_log_enabled` is on (unset fails the run). Set per target (or `--var`). Created out-of-band by the `_log table create` job; **export jobs only append**, so their run identity needs only `MODIFY` on the table, not `CREATE` (see [Durable monitoring](#durable-monitoring)) |
 | `monitoring_log_retention_days` | days of history the `_log table prune` job keeps in `monitoring_log_table` (it DELETEs older rows, then OPTIMIZEs + VACUUMs). **Deploy-time** base_parameter on the prune job. Default `90`; `0` disables the delete (keep all). Set per target (or `--var`) (see [Durable monitoring](#durable-monitoring)) |
 | `pipeline_mode`, `filter_condition`, `chunk_size`, `write_concurrency`, `op_type`, `request_timeout`, `transport_max_retries`, `max_retries_per_doc`, `require_existing_index`, `verify_certs`, `streaming_start`, `write_repartition`, `max_partition_bytes`, `max_files_per_trigger`, `max_bytes_per_trigger` | the **remaining run-time knobs**, each threaded exactly like `bulk_stats`: the generator bakes `${var.<name>}` as that knob's job-parameter default for any pipeline that omits it, so **every** run-time knob follows one uniform pattern (this global default < a per-pipeline config value < a per-run `--params <name>=<value>`). All ship at a default that reproduces the prior behavior: `pipeline_mode` **`batch`** and `streaming_start` **`new`** (concrete, since their validators reject `""`), the rest empty (`""` = defer to the connector/Spark/built-in default; `op_type` empty defers to the connector's default write action). Leaving them unset changes nothing; set one per target (or `--var=<name>=<value>`) to move a whole environment. Note: setting a non-empty global for an empty-sentinel knob applies to every omitting pipeline with no per-config opt-out (watch `filter_condition`). Validated at generation and at run (see [Configuration](#configuration)) |
 
@@ -176,7 +177,7 @@ bulk_stats: true                  # OPTIONAL EsWriteConfig diagnostics (per-part
 retry_transport_timeout: true     # OPTIONAL EsWriteConfig reliability toggle: connector OWNS whole-request timeout retries (re-send a timed-out bulk with backoff instead of failing the batch). Behaves like bulk_stats: omit to defer to the global ${var.retry_transport_timeout} default (off), or set true|false here to override it for this pipeline
 op_type: create                   # OPTIONAL EsWriteConfig write action: index (default, upsert by _id) | create (append-only; a resend of an existing _id is a benign 409 dedup, not overwritten or duplicated). Behaves like bulk_stats: omit to defer to the global ${var.op_type} (empty default defers to the connector's default write action), or set here to override it for this pipeline. create needs es_id_field to dedup a resend (else replays duplicate; the runner warns if create runs without one)
 bypass_fast_path: true            # OPTIONAL EsWriteConfig write-path toggle: skip the errors-probe fast path and classify every chunk per-item. Makes docs_deduped/written counts EXACT for op_type=create at the cost of fast-path throughput. Behaves like bulk_stats: omit to defer to the global ${var.bypass_fast_path} default (off), or set true|false here to override it for this pipeline
-monitoring_log_enabled: true      # OPTIONAL observability toggle (NOT a connector setting): also append this run's metrics (STREAM_PROGRESS / per-partition bulk_stats / run summary) to the shared monitoring Delta table (${var.monitoring_log_table}). Behaves like bulk_stats: omit to defer to the global ${var.monitoring_log_enabled} default (off), or set true|false here. Fail-soft: table unset/missing => warn and skip. Create the table once with the `_log table create` job
+monitoring_log_enabled: true      # OPTIONAL observability toggle (NOT a connector setting): also record this run's run and batch rows in the shared monitoring Delta table (${var.monitoring_log_table}). Behaves like bulk_stats: omit to defer to the global ${var.monitoring_log_enabled} default (off), or set true|false here. Fail-closed when on: table unset/missing or a failed append fails the task. Create the table once with the `_log table create` job
 streaming_start: new              # OPTIONAL first-run stream position: new (only new commits) | full (backfill whole table). Omit to defer to the global ${var.streaming_start} default (new), or set here; override per run. Streaming only; honored on a first run before a checkpoint exists
 max_partition_bytes: 2m           # OPTIONAL: spark.sql.files.maxPartitionBytes for the source read (read parallelism); 0 leaves it unset; omit to defer to the global ${var.max_partition_bytes} (built-in default 2m)
 write_repartition: 0              # OPTIONAL: repartition the write input to N partitions before bulk_write (0 = off); set > 0 only when the view shuffles; omit to defer to the global ${var.write_repartition} (built-in default 0)
@@ -433,7 +434,8 @@ clear message rather than failing at deploy. Omitting `schedule` leaves the job 
 
 The schedule pairs naturally with either export mode: a `batch` job re-exports the view on each tick,
 and a `streaming` job drains new source commits since its last run on each tick (it uses
-`Trigger.availableNow`, so a scheduled run processes the delta and stops). Every job sets
+`Trigger.availableNow`, so a scheduled run processes the delta and stops). Every job (except
+`_checkpoint clear`, see [Resetting a checkpoint](#resetting-a-checkpoint)) sets
 `max_concurrent_runs: 1` **and** `queue: {enabled: false}`, so a scheduled tick that fires while the
 previous run is still going is **skipped** (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or
 piling up. The `queue` disable is load-bearing: the Jobs API defaults `queue.enabled` to `true`, which
@@ -518,9 +520,30 @@ single-task continuous job recovers under either value (its failure ends the run
 restarts), but it is pinned the same way for consistency. Continuous jobs deployed before this change
 carry the `NEVER` default until redeployed.
 
+**A failed stream always fails its task.** All of the above depends on the task actually FAILING when its
+stream fails. That is not automatic: a blocking `awaitTermination()` was reproduced (FEVM, DBR 17.3 classic
+STANDARD, a two-task continuous group) **never returning** after its query failed. The Spark UI showed the
+query FAILED, yet the task sat `RUNNING` with no work for over an hour, so the job never saw a failure and
+never retried it, while the sibling task ran on. The runner therefore waits on a stream in short slices
+(`pipeline_lib/stream_wait.py`) and, between them, asks the query directly whether it is still active; a
+stream that has ended is noticed within about 10 seconds even if the wait call misses it, and its error
+fails the task, so the retry above applies.
+
+**Schema changes in the source.** An **added** source column fails the stream once with
+`DELTA_SCHEMA_CHANGED_WITH_VERSION` ("Please try restarting the query"); the task retry restarts it with
+the new schema and it continues (verified live: the new rows reach ES). The views list their columns
+explicitly, so a new column does not reach ES until the view is changed to include it. A **renamed or
+dropped** column fails on every attempt with `DELTA_STREAMING_INCOMPATIBLE_SCHEMA_CHANGE_USE_SCHEMA_LOG`
+and needs an operator (deliberately: no `schemaTrackingLocation` is set). Note the task retry limit is
+**per run and cumulative**: a long-lived run's earlier failures (added columns, transient ES errors) count
+toward it. A single-task continuous job that hits the limit is cancelled and restarted by the trigger
+("The continuous job run was cancelled because a task reached its retry limit"); in a group, tasks were
+seen retried past that limit while siblings ran.
+
 **Observability.** An always-on run never reaches the end-of-run summary (it never terminates), so
 health comes from the Databricks Jobs continuous-run state (RUNNING / restart count / failure
-notifications) plus the per-batch metrics the runner writes as each batch commits. Bound a first-run
+notifications) plus, with the [monitoring log](#durable-monitoring) on, the per-batch rows the runner
+writes as each batch runs. Bound a first-run
 backfill or a large post-restart catch-up with `max_files_per_trigger` / `max_bytes_per_trigger` so one
 micro-batch does not try to read the whole table.
 
@@ -676,7 +699,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
     line plus that `tail:` summary per micro-batch. Every line carries a `ts=<UTC>` wall-clock token so a
     batch can be placed in real time; this matters because a micro-batch's write runs server-side (its
     log output does not reach the notebook cell), so each batch's line is written to a small per-batch
-    file and re-emitted by the progress listener, appearing alongside the `STREAM_PROGRESS` line (in the
+    file and re-emitted by the notebook's wait loop, appearing alongside the `STREAM_PROGRESS` line (in the
     notebook cell for an interactive run, in the driver log for a job run) LATER than the batch actually
     ran, so the ambient log timestamp is the relay time and the embedded `ts=` is the true batch time.
     `rtt_ms - took_ms`
@@ -826,7 +849,7 @@ Key behaviors:
 
 When a stream's checkpoint is stale (say the index was wiped, or you want to re-stream from a fresh
 `streaming_start`), clear it with the dedicated `_checkpoint clear` job (a serverless maintenance job,
-`resources/checkpoint_clear.job.yml`):
+`resources/_checkpoint_clear.job.yml`):
 
 ```bash
 databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>
@@ -844,10 +867,15 @@ For a **continuous** (always-on) pipeline, pause the continuous trigger first (o
 job), run the clear, then resume, so the always-on stream is not re-establishing a checkpoint while you
 clear it.
 
+Unlike every other job, `_checkpoint clear` allows up to 20 **concurrent** runs, so you can reset several
+pipelines' checkpoints at once (one run per `config_name`). Two runs for the same config are harmless
+(the second finds nothing to delete). Concurrency does not make it safe to clear a checkpoint while that
+pipeline's stream is running: stop the stream first, as above.
+
 ### Diagnosing a congested Elasticsearch host
 
 When a host looks backed up (writes slowing down, requests timing out), run the read-only `es_diagnostics`
-job (a serverless maintenance job, `resources/es_diagnostics.job.yml`) to collect an outside view of what
+job (a serverless maintenance job, `resources/_es_diagnostics.job.yml`) to collect an outside view of what
 the cluster is doing:
 
 ```bash
@@ -899,13 +927,12 @@ cluster by id (a plain string, so `--var="diagnostics_existing_cluster_id=<id>"`
 ### Durable monitoring
 
 Every run logs its `STREAM_PROGRESS` and `BULK_STATS` metrics to the run log (see [Streaming](#streaming)
-and the `bulk_stats` knob). That is ephemeral. To keep those metrics for querying **across jobs and over
-time** (dashboards, alerting, capacity trends), turn on the durable monitoring sink: the run then **also**
-appends the same metrics as rows in a shared Delta table. It is off by default and strictly
-observability — a sink fault (missing table, permission, transient error) only **warns** and skips, never
-failing an export.
+and the `bulk_stats` knob). That is ephemeral. To keep a durable record of **every run and every batch**
+(for support, dashboards, alerting, capacity trends), turn on the monitoring log: the run then **also**
+appends rows to a shared Delta table. It is off by default. When it is on it is part of the export's
+contract, not best-effort: see [Fail-closed](#fail-closed-when-on) below.
 
-**One-time setup — create the table.** Table creation is a separate, deliberate step, not something the
+**One-time setup: create the table.** Table creation is a separate, deliberate step, not something the
 export path does (so export jobs never need `CREATE`). Point `monitoring_log_table` at a
 `catalog.schema.table` (per target, or `--var`), then run the hand-authored `_log table create` job once:
 
@@ -913,83 +940,109 @@ export path does (so export jobs never need `CREATE`). Point `monitoring_log_tab
 databricks bundle run log_table_create -t <target> -p <profile>
 ```
 
-It runs `CREATE TABLE IF NOT EXISTS` with the sink's schema (from
+It runs `CREATE TABLE IF NOT EXISTS` with the log's schema (from
 `pipeline_lib/monitoring_sink.py`, the single source of truth shared with the writer) and is idempotent
 (safe to re-run). The identity that runs **this** job needs `CREATE TABLE` (and `USE CATALOG`/`USE
 SCHEMA`) on the target schema; the export jobs only ever **append**, so their run identity needs only
 `MODIFY` on the table. If a name is blank or not a three-part identifier it fails closed.
 
-**Turn the sink on.** Set `monitoring_log_enabled` (global `${var.monitoring_log_enabled}` per target, a
-pipeline's own `monitoring_log_enabled:`, or a per-run `--params monitoring_log_enabled=true` — the same
-three-layer precedence as every knob). With the sink on but `monitoring_log_table` unset or the table not
-yet created, the run warns and skips the sink (the export is unaffected).
+**Turn the log on.** Set `monitoring_log_enabled` (global `${var.monitoring_log_enabled}` per target, a
+pipeline's own `monitoring_log_enabled:`, or a per-run `--params monitoring_log_enabled=true`, the same
+three-layer precedence as every knob).
 
-**What lands in the table.** One append-only table, distinguished by a `record_type` column, with common
-columns `config_name`, `job_run_id`, `record_type`, `batch_id`, `event_ts`, `batch_start_ts`,
-`batch_end_ts`, a `VARIANT` `payload`, and a write-time `ingest_ts`. `batch_start_ts`/`batch_end_ts` are
-the beginning-to-end wall clock of a batch (NULL where not applicable). Rows are atomic (aggregation is
-left to SQL/views), so nothing the run log shows is lost:
+**What lands in the table: the row model.** One append-only table. Every row has `config_name`,
+`job_run_id`, `record_type`, `status`, `batch_id`, `event_ts`, `batch_start_ts`, `batch_end_ts`, a
+`VARIANT` `payload`, and a write-time `ingest_ts`. There are two levels, each with a start and an end:
 
-- `stream_progress` — one per streaming micro-batch; `payload` is the whole `StreamingQueryProgress`
-  (durationMs breakdown, per-source backlog, offsets). `batch_start_ts`/`batch_end_ts` come from the
-  progress `timestamp` + `batchDuration`.
-- `bulk_stats_partition` — one per DataFrame partition; `payload` is that partition's raw bulk-send stats
-  (sends, docs, rtt/http/took percentiles, timeouts, 429/409 rejections, retries, dedup, GIL wait).
-  **Requires `bulk_stats` on as well** (they come from the connector's per-partition stats).
-- `bulk_stats_batch` — the driver-side facts not in any partition (`collect_ms`, `merge_ms`, `written`,
-  `num_partitions`), with `batch_start_ts`/`batch_end_ts` for the batch's beginning-to-end duration.
-- `run_summary` — one per run (mode, es_index, connector version, and the batch/row totals).
-- `run_error` — one per **failed** run (a timeout that exhausts retries included); `payload` carries
-  `exception_type`, `message`, `mode`, `es_index`, and `elapsed_ms`, and `batch_start_ts`/`batch_end_ts`
-  bracket how long the run ran before failing. This is the durable trace a hard failure would otherwise
-  leave only in the run log.
+| `record_type` | When it is written | `status` | `payload` |
+|---|---|---|---|
+| `run_start` | once per run, before anything else | `started` | mode, es_index, view, source, trigger, connector version, effective write settings |
+| `batch_start` | immediately **before** a batch's data is sent to ES | `started` | mode |
+| `batch_end` | when the batch's write finishes | `success` / `error` | ES counts (`written`, `errors`, ...) or `exception_type` / `message` / `elapsed_ms` |
+| `batch_summary` | per batch, the diagnostics | `success` / `error` | `es`: write rollup (`collect_ms`, `bulk_write_wall_ms`, and with `bulk_stats` on the `overall` totals and `tail` straggler facts); streaming also `progress`: Spark's whole `StreamingQueryProgress` (backlog, step durations, rates, offsets) |
+| `run_end` | when the run ends in-process | `success` / `error` / `stopped` | totals (batches, rows) or the error |
 
-Example — the per-run 429 pressure and throughput across all pipelines:
+A **batch-mode** run is exactly one batch (`batch_id` 0); a **streaming** run has one set of batch rows per
+micro-batch (its micro-batch id). `batch_end` and `batch_summary` are separate because in streaming Spark
+publishes a batch's progress only after the batch has committed: `batch_start`/`batch_end` are written
+inline from the batch itself, and `batch_summary` follows a few seconds later from the notebook's wait loop.
+`stopped` is a continuous stream whose query ended without an error while the notebook kept running. A
+**job cancel is not that**: it interrupts the notebook itself (seen live), so a cancelled run leaves
+`run_start` with no `run_end`, exactly like a killed run; a batch summary interrupted that way is written
+by the next run's start-up sweep.
+`batch_start_ts`/`batch_end_ts` carry the run's or batch's wall clock (for `batch_summary`, from Spark's
+progress timestamp + `batchDuration`).
+
+**Reading the gaps.** A `batch_start` with no `batch_end` is a batch that never finished (the task was
+killed, or the driver died mid-write); a `run_start` with no `run_end` is a run that was killed
+outright or **cancelled** (a cancel interrupts the notebook before it can write `run_end`).
+A batch retried by the task's retry policy shows a second `batch_start` for the same `batch_id`.
+Per-partition bulk-send detail is **not** stored (too granular for this log); it still prints in the run
+log when `bulk_stats` is on.
+
+<a id="fail-closed-when-on"></a>**Fail-closed when on.** With `monitoring_log_enabled` on, the log is
+required: `monitoring_log_table` unset or malformed, the table missing or not writable (checked by writing
+`run_start`), or **any** failed append fails the task, so support receives the failure notification and no
+further data is sent without a log record. Because `batch_start` is written before a batch's data is sent,
+a log outage stops the export before the next batch reaches ES. A failure while recording a failure never
+hides the original error (the log fault is attached to it as a note). In streaming, each batch also leaves
+a small relay file under `<checkpoint>/_batch_relay/<batch_id>` (its ES diagnostics) that guarantees its
+`batch_summary` even if Spark's progress report is lost; it is deleted once the summary is written, swept
+into a summary by the next run if a run dies first, and with the log on a failed relay write fails the
+batch like any other log write. **The trade-off:** a log write that fails AFTER a batch's data reached ES
+(its `batch_end` or relay) fails the micro-batch before the checkpoint advances, so the task's retry
+re-sends that batch. With `es_id_field` set that re-send is an idempotent overwrite; without it, ES assigns
+new ids and the batch's rows are **duplicated**, the same as for any other mid-batch failure. With the log **off**, nothing is
+written and nothing about the export changes.
+
+Example: every batch of the last day, with its outcome and duration:
 
 ```sql
-SELECT config_name, job_run_id,
-       sum(payload:rejected_429::bigint)  AS docs_429,
-       sum(payload:docs_retried::bigint)  AS docs_retried,
-       sum(payload:docs_sent::bigint)     AS docs_sent
-FROM <catalog>.<schema>.<table>
-WHERE record_type = 'bulk_stats_partition'
-GROUP BY config_name, job_run_id
-ORDER BY docs_429 DESC;
-```
-
-Example — how long each batch took, beginning to end:
-
-```sql
-SELECT config_name, job_run_id, batch_id,
+SELECT config_name, job_run_id, batch_id, status,
        batch_start_ts, batch_end_ts,
-       timestampdiff(MILLISECOND, batch_start_ts, batch_end_ts) AS batch_ms
+       timestampdiff(MILLISECOND, batch_start_ts, batch_end_ts) AS batch_ms,
+       payload:written::bigint AS written, payload:message::string AS error
 FROM <catalog>.<schema>.<table>
-WHERE record_type IN ('bulk_stats_batch', 'stream_progress')
+WHERE record_type = 'batch_end' AND event_ts > current_timestamp() - INTERVAL 1 DAY
 ORDER BY batch_start_ts DESC;
 ```
 
-Example — recent failures (what ended a run, and when):
+Example: batches that started but never finished (killed mid-write):
 
 ```sql
-SELECT config_name, job_run_id, batch_start_ts AS run_start, batch_end_ts AS failed_at,
-       payload:exception_type::string AS exception, payload:message::string AS message
-FROM <catalog>.<schema>.<table>
-WHERE record_type = 'run_error'
-ORDER BY failed_at DESC;
+SELECT s.config_name, s.job_run_id, s.batch_id, s.batch_start_ts
+FROM <catalog>.<schema>.<table> s
+LEFT ANTI JOIN <catalog>.<schema>.<table> e
+  ON e.record_type = 'batch_end' AND e.job_run_id = s.job_run_id AND e.config_name = s.config_name
+ AND e.batch_id = s.batch_id AND e.event_ts >= s.event_ts
+WHERE s.record_type = 'batch_start'
+ORDER BY s.batch_start_ts DESC;
 ```
 
-The table is **liquid-clustered** on `(config_name, event_ts)` — the columns monitoring queries filter by —
+Example: streaming backlog and 429 pressure per micro-batch:
+
+```sql
+SELECT config_name, batch_id, batch_start_ts,
+       payload:progress.sources[0].metrics.numFilesOutstanding::bigint AS files_outstanding,
+       payload:es.overall.rejected_429::bigint AS docs_429,
+       payload:es.overall.docs_per_send::double AS docs_per_send
+FROM <catalog>.<schema>.<table>
+WHERE record_type = 'batch_summary'
+ORDER BY batch_start_ts DESC;
+```
+
+The table is **liquid-clustered** on `(config_name, event_ts)` (the columns monitoring queries filter by),
 so data skipping holds up as it grows (`CLUSTER BY`, set at create and ensured on an existing table by a
-re-run). The sink appends one small file per micro-batch per record type; the `_log table create` job also
-sets `delta.autoOptimize.optimizeWrite`/`autoCompact` to keep the table compact. `VARIANT` and liquid
+re-run). The log appends a few small files per batch; the `_log table create` job also sets
+`delta.autoOptimize.optimizeWrite`/`autoCompact` to keep the table compact. `VARIANT` and liquid
 clustering require DBR 15.3+ / recent serverless (every target here qualifies).
 
-**Keeping it bounded — retention.** The table grows without limit otherwise (one `bulk_stats_partition`
-row per partition per micro-batch on an always-on stream). The hand-authored `_log table prune` job
-enforces retention: it DELETEs rows older than `monitoring_log_retention_days` (default 90; `0` disables
-the delete), then OPTIMIZEs (reclusters/compacts) and VACUUMs. It ships on a daily schedule that is
-**PAUSED** by default (`${var.schedule_pause_status}`); unpause it per target once the table exists and the
-sink is on, or run it on demand:
+**Keeping it bounded: retention.** The table grows without limit otherwise (several rows per batch, and an
+always-on stream runs a batch every trigger). The hand-authored `_log table prune` job enforces retention:
+it DELETEs rows older than `monitoring_log_retention_days` (default 90; `0` disables the delete), then
+OPTIMIZEs (reclusters/compacts) and VACUUMs. It ships on a daily schedule that is **PAUSED** by default
+(`${var.schedule_pause_status}`); unpause it per target once the table exists and the log is on, or run it
+on demand:
 
 ```bash
 databricks bundle run log_table_prune -t <target> -p <profile>
@@ -998,7 +1051,52 @@ databricks bundle run log_table_prune -t <target> -p <profile>
 **Evolving the schema.** `_log table create` is **re-runnable**: when a newer build adds a column, re-run
 the job and it **additively** applies the new columns (`ALTER TABLE ADD COLUMNS`) and ensures clustering,
 **without** dropping or replacing the table, so existing rows are preserved. It never drops or renames a
-column (an obsolete column is warned, not removed).
+column (an obsolete column is warned, not removed). **Upgrading to this row model** (the `status` column
+and the `run_start` ... `batch_summary` record types): re-run `_log table create` once **before** deploying
+the new export jobs, so `status` exists when they start appending (with the log on, an append into a table
+without it fails the task). Rows written by the previous model keep their old record types
+(`stream_progress`, `bulk_stats_partition`, `bulk_stats_batch`, `run_summary`, `run_error`) and age out
+through retention.
+
+### Cluster log delivery
+
+Optionally, classic **job clusters** can deliver their driver, executor, and init-script logs to a Unity
+Catalog Volume, so the full Spark/driver logs survive after the cluster terminates (useful for a
+post-mortem on a continuous stream). It is **opt-in per job cluster config**, in two steps:
+
+1. Set the `cluster_log_volume_path` variable to the destination in **every** target the config deploys
+   to (a simple string, so per target or `--var`), e.g. `/Volumes/<catalog>/<schema>/<volume>/cluster_logs`.
+2. In the job cluster config (`_pipelines/job_cluster_configs/<key>.yml`), add the block (the example in
+   `standard_batch.yml` is commented out), then re-run `scripts/gen_jobs.py`:
+
+```yaml
+cluster_log_conf:
+  volumes:
+    destination: ${var.cluster_log_volume_path}
+```
+
+The generator inlines the spec verbatim, so every job using that config gets it. It is deliberately not
+injected into every job cluster automatically: the Jobs API rejects an empty `cluster_log_conf` (`400
+Invalid cluster log storage info`, seen live), and a bundle cannot drop a nested block at deploy, so an
+opted-in config whose target leaves the path empty **fails that deploy** (loudly, nothing is half-applied).
+Things to know:
+
+- **Classic job clusters only.** Serverless compute does not support cluster log delivery, so serverless
+  pipelines and the serverless maintenance jobs are unaffected; their output stays in the run log.
+  `existing_cluster` pipelines use whatever the existing cluster is configured with. The `_es diagnostics`
+  job's optional job cluster takes its spec verbatim from `diagnostics_job_clusters`: add a
+  `cluster_log_conf` block to that spec to deliver its logs too.
+- **Where logs land.** Databricks writes under `<destination>/<cluster-id>/` (`driver/`, `executor/`,
+  `init_scripts/`), delivering periodically (about every 5 minutes) and at termination.
+- **Permissions.** The identity the job cluster runs as needs `READ VOLUME` and `WRITE VOLUME` on the
+  volume (plus `USE CATALOG`/`USE SCHEMA`).
+- **They accumulate.** There is **no automatic retention**: every cluster (every continuous restart, every
+  scheduled run) adds a directory, and nothing in this bundle deletes them. Prune the volume yourself (or
+  add a cleanup job) if storage matters.
+- **What is in them.** Everything the notebook prints and the driver/executors log: config, host URLs,
+  error messages and stack traces. Secret values read through `dbutils.secrets` are redacted in notebook
+  output; this README does not claim the same for the delivered log files, so treat the volume as
+  sensitive and restrict who can read it.
 
 ### Feed status
 
@@ -1093,24 +1191,34 @@ Shared library + tests (the config schema, used by the generator and both notebo
   pipeline_lib/
     config.py                   Loads/validates a pipeline definition; resolves ${environment} and
                                 derives view substitutions + job parameters (single source of truth)
-    monitoring_sink.py          Pure schema + row builders for the durable monitoring sink (single
-                                source of truth for the table columns, shared by the writer + creator)
+    monitoring_sink.py          Pure schema + row builders for the durable monitoring log (single
+                                source of truth for the table columns and row model, shared by the
+                                writer + creator)
+    stream_wait.py              The streaming wait loop (short awaitTermination slices + an isActive
+                                liveness check), so a failed stream always fails the task
     feed_status.py              Pure feed status classifier, status table schema/SQL, trigger map and
                                 Quartz previous-fire (see Feed status)
   tests/
     test_config.py              Offline unit tests for pipeline_lib.config (plain pytest)
     test_monitoring_sink.py     Offline unit tests for pipeline_lib.monitoring_sink
+    test_stream_wait.py         Offline unit tests for pipeline_lib.stream_wait (fake query)
     test_feed_status.py         Offline unit tests for pipeline_lib.feed_status
 
 Generated / tooling (do not hand-edit the generated jobs):
   scripts/
     gen_jobs.py                 Generates resources/<config_name>.job.yml from the configs (--check guards drift)
   resources/
-    deploy_views.job.yml        The deploy_views job (hand-authored)
-    log_table_create.job.yml    The _log table create job (hand-authored)
-    log_table_prune.job.yml     The _log table prune job (hand-authored; daily, paused by default)
+    _build_wheel.job.yml        The build_wheel job (hand-authored)
+    _checkpoint_clear.job.yml   The _checkpoint clear job (hand-authored)
+    _deploy_views.job.yml       The deploy_views job (hand-authored)
+    _es_diagnostics.job.yml     The _es diagnostics job (hand-authored)
+    _log_table_create.job.yml   The _log table create job (hand-authored)
+    _log_table_prune.job.yml    The _log table prune job (hand-authored; daily, paused by default)
     _feed_status.job.yml        The _feed status job (hand-authored; every 5 min, paused by default)
     <config_name>.job.yml       GENERATED per-index job (one per pipeline_configs config)
+
+Hand-authored resource files (starting with `_`) are visually separate from generated ones. Config names
+and job_group names may not start with `_` (checked at generation) to prevent conflicts.
 ```
 
 ## License & Attribution

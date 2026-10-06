@@ -133,6 +133,119 @@ def _num(value):
     return str(value)
 
 
+def bulk_stats_overall(bulk_stats):
+    """The cluster-wide rollup of the connector's per-partition `bulk_stats` as a plain dict: the SINGLE
+    computation behind both the `BULK_STATS overall` log line (format_bulk_stats renders this dict) and the
+    durable batch_summary row (monitoring_sink stores it), so the console and the table can never disagree.
+
+    Reports only figures that recombine EXACTLY across partitions: total sends/docs/bytes, docs-per-send,
+    bytes-per-doc/send, the wall-weighted concurrency, the send-weighted MEAN rtt/http/took, the MAX
+    rtt/http/took, and the failure/retry/reject/dedup/cpu/gil totals. It deliberately does NOT synthesize a
+    global p50/p95 (percentiles cannot be recombined from per-partition percentiles). A value that cannot
+    be computed (a field absent on an older connector, or absent on SOME partitions) is None.
+
+    Returns None for a non-list or empty input. FAIL-SOFT on content: any missing/renamed/oddly-typed
+    field yields None for that figure rather than an exception."""
+    if not isinstance(bulk_stats, list) or not bulk_stats:
+        return None
+    parts = [p if isinstance(p, dict) else {} for p in bulk_stats]
+
+    def _numeric(p, key):
+        v = p.get(key)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    def _sum(key):
+        # A plain left-to-right += (not sum()): Python 3.12+ sum() uses compensated float summation, which
+        # differs in the last digits, and the rendered totals must stay byte-identical across versions.
+        total = 0
+        for p in parts:
+            v = _numeric(p, key)
+            if v is not None:
+                total += v
+        return total
+
+    def _all_present(*keys):
+        """True only when EVERY partition carries a numeric value for EVERY key. Used to gate the
+        optional cpu/gil rollups: a field only SOME partitions emit (a connector-version mix) must
+        NOT be summed into a total that looks cluster-wide but understates contention, and a pair
+        like gil (total, max) must be sourced together so it never reads total=None max=<value>."""
+        return all(_numeric(p, k) is not None for p in parts for k in keys)
+
+    def _sum_opt(key):
+        """Sum `key` across partitions, or None unless every partition carries it."""
+        return _sum(key) if _all_present(key) else None
+
+    def _pair_ratio(num, den):
+        """num/den as a float, or None when either is non-numeric or den is falsy."""
+        ok = (isinstance(num, (int, float)) and not isinstance(num, bool)
+              and isinstance(den, (int, float)) and not isinstance(den, bool) and den)
+        return (num / den) if ok else None
+
+    def _rounded(value, ndigits):
+        """None-safe round: keep None as None, else round."""
+        return round(value, ndigits) if value is not None else None
+
+    # Send-weighted mean of a per-partition mean: sum(mean_i * n_i) / sum(n_i), which is the exact
+    # overall mean when every send is counted. Partitions with a non-numeric mean or zero sends are
+    # skipped. None when nothing weighed in.
+    def _weighted_mean(mean_key):
+        num = 0.0
+        den = 0
+        for p in parts:
+            m = p.get(mean_key)
+            n = p.get("n_sends")
+            if (isinstance(m, (int, float)) and not isinstance(m, bool)
+                    and isinstance(n, int) and not isinstance(n, bool) and n > 0):
+                num += m * n
+                den += n
+        return (num / den) if den else None
+
+    def _max(max_key):
+        vals = [v for v in (_numeric(p, max_key) for p in parts) if v is not None]
+        return max(vals) if vals else None
+
+    total_sends = _sum("n_sends")
+    total_docs = _sum("docs_sent")
+    total_bytes = _sum("bytes_sent")
+    # gil total and max are sourced together (both None unless every partition has both), so the rollup
+    # never shows an inconsistent total/max pair.
+    gil_ok = _all_present("gil_wait_ms_total", "gil_wait_ms_max")
+    return {
+        "partitions": len(parts),
+        "sends": total_sends,
+        "docs": total_docs,
+        "docs_per_send": round((total_docs / total_sends) if total_sends else 0.0, 2),
+        "bytes_per_doc": _rounded(_pair_ratio(total_bytes, total_docs), 1),
+        "bytes_per_send": _rounded(_pair_ratio(total_bytes, total_sends), 1),
+        "concurrency": _rounded(_pair_ratio(_sum("send_busy_ms"), _sum("partition_wall_ms")), 2),
+        "rtt_ms_mean": _weighted_mean("rtt_ms_mean"),
+        "rtt_ms_max": _max("rtt_ms_max"),
+        "http_ms_mean": _weighted_mean("http_ms_mean"),
+        "http_ms_max": _max("http_ms_max"),
+        "took_ms_mean": _weighted_mean("took_ms_mean"),
+        "took_ms_max": _max("took_ms_max"),
+        # Failed-send accounting (connector 0.9.7+): count and wall time of sends that RAISED, split by
+        # timeout vs other transport error. None on older wheels.
+        "timeout_sends": _sum_opt("timeout_sends"),
+        "timeout_wait_ms": _rounded(_sum_opt("timeout_wait_ms"), 1),
+        "error_sends": _sum_opt("error_sends"),
+        "error_wait_ms": _rounded(_sum_opt("error_wait_ms"), 1),
+        # Retry/reject accounting (connector 0.9.7+): docs re-sent for a retryable 429, and non-2xx item
+        # responses bucketed by status (transient 429/503 vs permanent 400/409). None on older wheels.
+        "docs_retried": _sum_opt("docs_retried"),
+        "rejected_429": _sum_opt("rejected_429"),
+        "rejected_409": _sum_opt("rejected_409"),
+        "rejected_4xx_other": _sum_opt("rejected_4xx_other"),
+        "rejected_5xx": _sum_opt("rejected_5xx"),
+        # Dedup accounting (connector 0.10.0+, op_type=create): create-ops that returned 409 and were
+        # counted as an already-exists no-op, distinct from rejected_409. None on older wheels.
+        "docs_deduped": _sum_opt("docs_deduped"),
+        "send_cpu_ms": _rounded(_sum_opt("send_cpu_ms"), 1),  # off-CPU send time = busy - cpu
+        "gil_wait_ms_total": _rounded(_sum("gil_wait_ms_total"), 1) if gil_ok else None,
+        "gil_wait_ms_max": _max("gil_wait_ms_max") if gil_ok else None,
+    }
+
+
 def format_bulk_stats(bulk_stats, oneline=False, now=None):
     """Render the connector's per-partition `bulk_stats` as greppable BULK_STATS log line(s).
 
@@ -169,58 +282,7 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
             return f"{BULK_STATS_TAG} <no bulk stats: {type(bulk_stats).__name__}>"
 
         parts = [p if isinstance(p, dict) else {} for p in bulk_stats]
-
-        def _sum(key):
-            total = 0
-            for p in parts:
-                v = p.get(key)
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    total += v
-            return total
-
-        def _numeric(p, key):
-            v = p.get(key)
-            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
-
-        def _all_present(*keys):
-            """True only when EVERY partition carries a numeric value for EVERY key. Used to gate the
-            optional cpu/gil rollups: a field only SOME partitions emit (a connector-version mix) must
-            NOT be summed into a total that looks cluster-wide but understates contention, and a pair
-            like gil (total, max) must be sourced together so it never renders total=n/a max=<value>."""
-            return all(_numeric(p, k) is not None for p in parts for k in keys)
-
-        def _sum_opt(key):
-            """Sum `key` across partitions, or None (renders n/a) unless every partition carries it."""
-            return _sum(key) if _all_present(key) else None
-
-        total_sends = _sum("n_sends")
-        total_docs = _sum("docs_sent")
-        total_bytes = _sum("bytes_sent")
-        total_busy = _sum("send_busy_ms")
-        total_wall = _sum("partition_wall_ms")
-        total_cpu = _sum_opt("send_cpu_ms")            # off-CPU send time = busy - cpu (n/a on old wheels)
-        # Failed-send accounting (connector 0.9.7+): count and wall time of sends that RAISED, split by
-        # timeout vs other transport error. n/a on older wheels (gated by _sum_opt / _all_present).
-        total_timeout_sends = _sum_opt("timeout_sends")
-        total_timeout_wait = _sum_opt("timeout_wait_ms")
-        total_error_sends = _sum_opt("error_sends")
-        total_error_wait = _sum_opt("error_wait_ms")
-        # Retry/reject accounting (connector 0.9.7+): docs re-sent for a retryable 429, and non-2xx item
-        # responses bucketed by status (transient 429/503 vs permanent 400/409). n/a on older wheels.
-        total_docs_retried = _sum_opt("docs_retried")
-        total_rej_429 = _sum_opt("rejected_429")
-        total_rej_409 = _sum_opt("rejected_409")
-        total_rej_4xx = _sum_opt("rejected_4xx_other")
-        total_rej_5xx = _sum_opt("rejected_5xx")
-        # Dedup accounting (connector 0.10.0+, op_type=create): create-ops that returned 409 and were
-        # counted as an already-exists no-op (a successful dedup on a resend), distinct from rejected_409
-        # (a genuine index-mode version conflict). n/a on older wheels.
-        total_docs_deduped = _sum_opt("docs_deduped")
-        # gil total and max are sourced together (both n/a unless every partition has both), so the
-        # rollup never shows an inconsistent total/max pair. (max is read below, where _max is defined.)
-        gil_ok = _all_present("gil_wait_ms_total", "gil_wait_ms_max")
-        total_gil = _sum("gil_wait_ms_total") if gil_ok else None
-        docs_per_send = (total_docs / total_sends) if total_sends else 0.0
+        o = bulk_stats_overall(bulk_stats)
 
         def _pair_ratio(num, den):
             """num/den as a float, or None when either is non-numeric or den is falsy (renders n/a)."""
@@ -232,44 +294,25 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
             """None-safe round for _num: keep None as None so it renders n/a, else round."""
             return round(value, ndigits) if value is not None else None
 
-        # Send-weighted mean of a per-partition mean: sum(mean_i * n_i) / sum(n_i), which is the exact
-        # overall mean when every send is counted. Partitions with a non-numeric mean or zero sends are
-        # skipped. Returns None when nothing weighed in (so it renders n/a).
-        def _weighted_mean(mean_key):
-            num = 0.0
-            den = 0
-            for p in parts:
-                m = p.get(mean_key)
-                n = p.get("n_sends")
-                if (isinstance(m, (int, float)) and not isinstance(m, bool)
-                        and isinstance(n, int) and not isinstance(n, bool) and n > 0):
-                    num += m * n
-                    den += n
-            return (num / den) if den else None
-
-        def _max(max_key):
-            vals = [p.get(max_key) for p in parts]
-            vals = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
-            return max(vals) if vals else None
-
+        # The overall line renders the bulk_stats_overall dict verbatim (the single rollup computation).
         overall = (
-            f"{BULK_STATS_TAG} overall: partitions={len(parts)} sends={total_sends} docs={total_docs} "
-            f"docs/send={_num(round(docs_per_send, 2))} "
-            f"bytes/doc={_num(_rounded(_pair_ratio(total_bytes, total_docs), 1))} "
-            f"bytes/send={_num(_rounded(_pair_ratio(total_bytes, total_sends), 1))} "
-            f"conc(busy/wall)={_num(_rounded(_pair_ratio(total_busy, total_wall), 2))} "
-            f"rtt_ms(mean={_num(_weighted_mean('rtt_ms_mean'))} max={_num(_max('rtt_ms_max'))}) "
-            f"http_ms(mean={_num(_weighted_mean('http_ms_mean'))} max={_num(_max('http_ms_max'))}) "
-            f"took_ms(mean={_num(_weighted_mean('took_ms_mean'))} max={_num(_max('took_ms_max'))}) "
-            f"timeouts(sends={_num(total_timeout_sends)} wait_ms={_num(_rounded(total_timeout_wait, 1))}) "
-            f"errors(sends={_num(total_error_sends)} wait_ms={_num(_rounded(total_error_wait, 1))}) "
-            f"retried={_num(total_docs_retried)} "
-            f"rejected(429={_num(total_rej_429)} 409={_num(total_rej_409)} "
-            f"4xx={_num(total_rej_4xx)} 5xx={_num(total_rej_5xx)}) "
-            f"deduped={_num(total_docs_deduped)} "
-            f"cpu_ms(total={_num(_rounded(total_cpu, 1))}) "
-            f"gil_wait_ms(total={_num(_rounded(total_gil, 1))} "
-            f"max={_num(_max('gil_wait_ms_max') if gil_ok else None)})"
+            f"{BULK_STATS_TAG} overall: partitions={o['partitions']} sends={o['sends']} docs={o['docs']} "
+            f"docs/send={_num(o['docs_per_send'])} "
+            f"bytes/doc={_num(o['bytes_per_doc'])} "
+            f"bytes/send={_num(o['bytes_per_send'])} "
+            f"conc(busy/wall)={_num(o['concurrency'])} "
+            f"rtt_ms(mean={_num(o['rtt_ms_mean'])} max={_num(o['rtt_ms_max'])}) "
+            f"http_ms(mean={_num(o['http_ms_mean'])} max={_num(o['http_ms_max'])}) "
+            f"took_ms(mean={_num(o['took_ms_mean'])} max={_num(o['took_ms_max'])}) "
+            f"timeouts(sends={_num(o['timeout_sends'])} wait_ms={_num(o['timeout_wait_ms'])}) "
+            f"errors(sends={_num(o['error_sends'])} wait_ms={_num(o['error_wait_ms'])}) "
+            f"retried={_num(o['docs_retried'])} "
+            f"rejected(429={_num(o['rejected_429'])} 409={_num(o['rejected_409'])} "
+            f"4xx={_num(o['rejected_4xx_other'])} 5xx={_num(o['rejected_5xx'])}) "
+            f"deduped={_num(o['docs_deduped'])} "
+            f"cpu_ms(total={_num(o['send_cpu_ms'])}) "
+            f"gil_wait_ms(total={_num(o['gil_wait_ms_total'])} "
+            f"max={_num(o['gil_wait_ms_max'])})"
         )
         if oneline:
             return _with_ts(overall, now)
@@ -365,6 +408,62 @@ def _percentile(vals, q):
     return nums[idx]
 
 
+def bulk_stats_tail(result):
+    """The straggler/skew facts behind a write's wall-time tail, as a plain dict: the SINGLE computation
+    behind both the `BULK_STATS tail:` log line (format_tail_summary renders this dict) and the durable
+    batch_summary row. See format_tail_summary for what each figure means.
+
+    `result` is the connector's bulk_write return dict. Returns None for a non-dict input, and a dict with
+    only collect_ms / merge_ms (no partition facts) when it carries no bulk_stats. A figure that cannot be
+    computed is None. FAIL-SOFT on content, like bulk_stats_overall."""
+    if not isinstance(result, dict):
+        return None
+    out = {"collect_ms": result.get("collect_ms"), "merge_ms": result.get("merge_ms")}
+    parts = result.get("bulk_stats")
+    if not isinstance(parts, list) or not parts:
+        return out
+    parts = [p if isinstance(p, dict) else {} for p in parts]
+
+    def _val(p, key):
+        v = p.get(key)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    # Slowest partition by wall clock: it sets the write's tail. Only partitions carrying a numeric
+    # partition_wall_ms are eligible; if none do, the wall figures are None but skew/counts still report.
+    walls = [(_val(p, "partition_wall_ms"), i) for i, p in enumerate(parts)]
+    walls = [(w, i) for (w, i) in walls if w is not None]
+    if walls:
+        slow_wall, slow_i = max(walls, key=lambda t: t[0])
+        sp = parts[slow_i]
+        wall_vals = [w for (w, _i) in walls]
+        wall_med = _median(wall_vals)
+        out.update({
+            "slowest_partition": slow_i,
+            "slowest_wall_ms": slow_wall,
+            "slowest_sends": _val(sp, "n_sends"),
+            "slowest_rtt_ms_max": _val(sp, "rtt_ms_max"),
+            "slowest_http_ms_max": _val(sp, "http_ms_max"),
+            "slowest_took_ms_max": _val(sp, "took_ms_max"),
+            "slowest_timeout_wait_ms": _val(sp, "timeout_wait_ms"),
+            "slowest_rejected_429": _val(sp, "rejected_429"),
+            "slowest_docs_retried": _val(sp, "docs_retried"),
+            "slowest_docs_deduped": _val(sp, "docs_deduped"),
+            "slowest_gil_wait_ms_total": _val(sp, "gil_wait_ms_total"),
+            "slowest_concurrency": _ratio(_val(sp, "send_busy_ms"), _val(sp, "partition_wall_ms")),
+            "slowest_docs": _val(sp, "docs_sent"),
+            "median_wall_ms": wall_med,
+            "wall_p95": _percentile(wall_vals, 0.95),
+            "wall_max_over_median": _ratio(slow_wall, wall_med),
+            # Require a POSITIVE median: with a zero median (e.g. empty/near-empty partitions) `w > 2*0`
+            # collapses to `w > 0` and would flag every non-empty partition, a meaningless count.
+            "stragglers_over_2x": (sum(1 for w in wall_vals if w > 2 * wall_med)
+                                   if isinstance(wall_med, (int, float)) and wall_med > 0 else 0),
+        })
+    docs = [d for d in (_val(p, "docs_sent") for p in parts) if d is not None]
+    out["docs_max_over_median"] = _ratio(max(docs), _median(docs)) if docs else None
+    return out
+
+
 def format_tail_summary(result, now=None):
     """Render a one-line `BULK_STATS tail:` summary from a bulk_write result dict, calling out the
     STRAGGLER and SKEW behind a wall-time tail that persists after "all tasks complete".
@@ -388,71 +487,44 @@ def format_tail_summary(result, now=None):
     try:
         if not isinstance(result, dict):
             return f"{BULK_STATS_TAG} tail: <no result: {type(result).__name__}>"
-        counts = (f"collect_ms={_num(result.get('collect_ms'))} "
-                  f"merge_ms={_num(result.get('merge_ms'))}")
+        t = bulk_stats_tail(result)
+        counts = (f"collect_ms={_num(t['collect_ms'])} "
+                  f"merge_ms={_num(t['merge_ms'])}")
         parts = result.get("bulk_stats")
         if not isinstance(parts, list) or not parts:
             return _with_ts(f"{BULK_STATS_TAG} tail: <no bulk stats> {counts}", now)
-        parts = [p if isinstance(p, dict) else {} for p in parts]
-
-        def _val(p, key):
-            v = p.get(key)
-            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
-
-        # Slowest partition by wall clock: it sets the write's tail. Only partitions carrying a numeric
-        # partition_wall_ms are eligible; if none do, the wall figures render n/a but skew/counts still
-        # report.
-        walls = [(_val(p, "partition_wall_ms"), i) for i, p in enumerate(parts)]
-        walls = [(w, i) for (w, i) in walls if w is not None]
-        if walls:
-            slow_wall, slow_i = max(walls, key=lambda t: t[0])
-            sp = parts[slow_i]
-            conc = _ratio(_val(sp, "send_busy_ms"), _val(sp, "partition_wall_ms"))
-            # The slowest partition's shape: n_sends (few big sends vs many small), rtt_ms_max vs
-            # took_ms_max (a big rtt with a small took = time waiting on the network / ES bulk queue,
-            # not indexing), busy/wall concurrency, and docs.
-            # gil_wait_ms_total on the slowest partition is a first-class "why it lagged" signal: a large
-            # value beside a large rtt_ms_max says the tail is GIL starvation (the worker could not read
-            # the ES response), not the network / ES queue. n/a on connectors without the probe.
-            # timeout_wait_ms on the slowest partition is a first-class "why it lagged" signal too: a large
-            # value says the tail is time spent on connector-owned timeout re-sends (retry_transport_timeout),
-            # distinct from GIL starvation or a slow-but-succeeding round trip. http_ms_max sits between
-            # rtt and took (network vs ES). rejected_429 + docs_retried say the tail is item-level 429
-            # backpressure (ES write queue full); docs_deduped says it is create-mode dedup of a resend
-            # (op_type=create, 0.10.0+). All n/a on connectors without them (pre-0.9.7 / pre-0.10.0).
-            slow = (f"slowest=part{slow_i} wall_ms={_num(slow_wall)} "
-                    f"sends={_num(_val(sp, 'n_sends'))} "
-                    f"rtt_ms_max={_num(_val(sp, 'rtt_ms_max'))} "
-                    f"http_ms_max={_num(_val(sp, 'http_ms_max'))} "
-                    f"took_ms_max={_num(_val(sp, 'took_ms_max'))} "
-                    f"timeout_wait_ms={_num(_val(sp, 'timeout_wait_ms'))} "
-                    f"rejected_429={_num(_val(sp, 'rejected_429'))} "
-                    f"docs_retried={_num(_val(sp, 'docs_retried'))} "
-                    f"docs_deduped={_num(_val(sp, 'docs_deduped'))} "
-                    f"gil_wait_ms_total={_num(_val(sp, 'gil_wait_ms_total'))} "
-                    f"conc={_num(conc)} docs={_num(_val(sp, 'docs_sent'))}")
-            wall_vals = [w for (w, _i) in walls]
-            wall_med = _median(wall_vals)
+        # The slowest partition's shape: n_sends (few big sends vs many small), rtt_ms_max vs took_ms_max (a
+        # big rtt with a small took = time waiting on the network / ES bulk queue, not indexing), busy/wall
+        # concurrency, and docs. gil_wait_ms_total on the slowest partition is a first-class "why it lagged"
+        # signal: a large value beside a large rtt_ms_max says the tail is GIL starvation (the worker could
+        # not read the ES response), not the network / ES queue. timeout_wait_ms says the tail is time spent
+        # on connector-owned timeout re-sends (retry_transport_timeout). http_ms_max sits between rtt and
+        # took (network vs ES). rejected_429 + docs_retried say the tail is item-level 429 backpressure (ES
+        # write queue full); docs_deduped says it is create-mode dedup of a resend (op_type=create,
+        # 0.10.0+). All n/a on connectors without them (pre-0.9.7 / pre-0.10.0).
+        if "slowest_partition" in t:
+            slow = (f"slowest=part{t['slowest_partition']} wall_ms={_num(t['slowest_wall_ms'])} "
+                    f"sends={_num(t['slowest_sends'])} "
+                    f"rtt_ms_max={_num(t['slowest_rtt_ms_max'])} "
+                    f"http_ms_max={_num(t['slowest_http_ms_max'])} "
+                    f"took_ms_max={_num(t['slowest_took_ms_max'])} "
+                    f"timeout_wait_ms={_num(t['slowest_timeout_wait_ms'])} "
+                    f"rejected_429={_num(t['slowest_rejected_429'])} "
+                    f"docs_retried={_num(t['slowest_docs_retried'])} "
+                    f"docs_deduped={_num(t['slowest_docs_deduped'])} "
+                    f"gil_wait_ms_total={_num(t['slowest_gil_wait_ms_total'])} "
+                    f"conc={_num(t['slowest_concurrency'])} docs={_num(t['slowest_docs'])}")
             # How the slow tail is shaped across partitions: p95 vs median vs max says whether it is one
             # outlier (max >> p95 ~ median) or a broad slow tail (p95 >> median), and stragglers>2x counts
             # how many partitions ran past 2x the median wall (1 == a lone straggler; many == systemic).
-            # Require a POSITIVE median: with a zero median (e.g. empty/near-empty partitions) `w > 2*0`
-            # collapses to `w > 0` and would flag every non-empty partition, a meaningless count.
-            straggler_ct = (sum(1 for w in wall_vals if w > 2 * wall_med)
-                            if isinstance(wall_med, (int, float)) and wall_med > 0 else 0)
-            wall_tokens = (f"median_wall_ms={_num(wall_med)} "
-                           f"wall_p95={_num(_percentile(wall_vals, 0.95))} "
-                           f"wall_max/median={_num(_ratio(slow_wall, wall_med))} "
-                           f"stragglers>2x={straggler_ct}")
+            wall_tokens = (f"median_wall_ms={_num(t['median_wall_ms'])} "
+                           f"wall_p95={_num(t['wall_p95'])} "
+                           f"wall_max/median={_num(t['wall_max_over_median'])} "
+                           f"stragglers>2x={t['stragglers_over_2x']}")
         else:
             slow = "slowest=n/a"
             wall_tokens = "median_wall_ms=n/a wall_p95=n/a wall_max/median=n/a stragglers>2x=0"
-
-        docs = [d for d in (_val(p, "docs_sent") for p in parts) if d is not None]
-        if docs:
-            docs_tokens = f"docs_max/median={_num(_ratio(max(docs), _median(docs)))}"
-        else:
-            docs_tokens = "docs_max/median=n/a"
+        docs_tokens = f"docs_max/median={_num(t['docs_max_over_median'])}"
 
         return _with_ts(f"{BULK_STATS_TAG} tail: {slow} | {wall_tokens} {docs_tokens} {counts}", now)
     except Exception as _e:  # never let a diagnostic formatter disturb the export
