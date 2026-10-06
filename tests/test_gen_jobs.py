@@ -255,9 +255,15 @@ def test_render_existing_cluster():
 def test_render_job_cluster_inlines_spec():
     spec = {"spark_version": "15.4.x-scala2.12", "node_type_id": "m5d.large", "num_workers": 2}
     job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "standard_batch"}), spec)
-    # The spec is inlined verbatim, PLUS the injected per-environment policy_id bundle-variable ref and
-    # apply_policy_default_values (so the policy's own defaults fill omitted cluster attrs at deploy).
-    expected_new_cluster = {**spec, "policy_id": "${var.cluster_policy_id}", "apply_policy_default_values": True}
+    # The spec is inlined verbatim, PLUS the injected per-environment policy_id bundle-variable ref,
+    # apply_policy_default_values (so the policy's own defaults fill omitted cluster attrs at deploy),
+    # and cluster_log_conf bundle-variable ref (resolved per target at deploy).
+    expected_new_cluster = {
+        **spec,
+        "policy_id": "${var.cluster_policy_id}",
+        "apply_policy_default_values": True,
+        "cluster_log_conf": "${var.cluster_log_conf}",
+    }
     assert job["job_clusters"] == [{"job_cluster_key": "standard_batch", "new_cluster": expected_new_cluster}]
     # The caller's loaded spec dict must NOT be mutated (render builds a copy); policy_id is not added to it.
     assert "policy_id" not in spec
@@ -301,6 +307,48 @@ def test_render_job_cluster_without_spec_fails_closed():
         gen_jobs.render_job_yaml(
             "x.yml", "x", _cfg({"type": "job_cluster", "job_cluster_config": "std"}), None
         )
+
+
+def test_render_job_cluster_injects_log_conf_var_ref():
+    # The generated job cluster spec always includes cluster_log_conf as a bundle variable reference,
+    # resolved per target at deploy time. When the variable is empty {}, DAB omits it from the deploy.
+    spec = {"spark_version": "15.4.x-scala2.12", "num_workers": 1}
+    job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "std"}), spec)
+    nc = job["job_clusters"][0]["new_cluster"]
+    assert nc["cluster_log_conf"] == "${var.cluster_log_conf}"
+    # The other injected fields are also present.
+    assert nc["policy_id"] == "${var.cluster_policy_id}"
+    assert nc["apply_policy_default_values"] is True
+
+
+def test_render_job_cluster_log_conf_with_group():
+    # Job groups with job_cluster compute also get cluster_log_conf injected as a variable reference.
+    spec = {"spark_version": "15.4.x-scala2.12", "num_workers": 1}
+    members = [("ecs_dns.yml", "ecs_dns", _cfg({"type": "job_cluster", "job_cluster_config": "std"}), spec)]
+    text = gen_jobs.render_group_job_yaml("test_group", members)
+    parsed = yaml.safe_load(text)
+    job = parsed["resources"]["jobs"]["index_pipeline_group_test_group"]
+    nc = job["job_clusters"][0]["new_cluster"]
+    assert nc["cluster_log_conf"] == "${var.cluster_log_conf}"
+
+
+def test_render_serverless_no_log_conf():
+    # Serverless jobs (no job_clusters block) are unaffected by cluster_log_conf.
+    job = _render_job(_cfg())  # default serverless
+    assert "job_clusters" not in job
+    # Render a serverless job directly - it should have no job_clusters block.
+    text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", _cfg())
+    parsed = yaml.safe_load(text)
+    job = parsed["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
+    assert "job_clusters" not in job
+
+
+def test_render_existing_cluster_no_log_conf():
+    # Existing cluster jobs have no job_clusters block, so cluster_log_conf is not used.
+    compute = {"type": "existing_cluster", "cluster_config": "interactive_primary"}
+    job = _render_job(_cfg(compute))
+    assert "job_clusters" not in job
+    assert "cluster_log_conf" not in job["tasks"][0]
 
 
 # --------------------------------------------------------------------------- load_job_cluster_spec
