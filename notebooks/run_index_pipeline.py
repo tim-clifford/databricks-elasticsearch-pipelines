@@ -831,7 +831,8 @@ if PIPELINE_MODE == "streaming":
 # stream using the `reader` prepared in the previous cell, and export each micro-batch via foreach_batch.
 # The trigger is chosen below: availableNow (drain-and-stop, the scheduled/serverless default) or
 # ProcessingTime (an always-on continuous job). `reader` carries over from the previous cell via the
-# shared notebook session; this cell re-opens the same `if PIPELINE_MODE == "streaming":
+# shared notebook session; this cell re-opens the same `if PIPELINE_MODE == "streaming":` guard.
+if PIPELINE_MODE == "streaming":
     with RECORDER.guard(spark):
         stream_df = reader.table(SOURCE_FQN)
 
