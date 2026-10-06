@@ -793,6 +793,9 @@ if PIPELINE_MODE == "streaming":
         # but before its summary was written leaves that relay behind, and the sweep at the end of this cell
         # summarizes it first (with the relay off, leftovers are simply deleted).
         relay_dir = f"{checkpoint_location}/_batch_relay"
+        # Make sure it EXISTS (idempotent), so a later listing that fails is a real failure, never a benign
+        # "absent" that has to be recognized by its error text (the end-of-run sweep fails closed on it).
+        dbutils.fs.mkdirs(relay_dir)
         # The relay is needed only when something consumes it: the monitoring log (batch_summary.es) or the
         # bulk_stats relay-to-cell print.
         _RELAY_ON = MONITORING_ACTIVE or BULK_STATS.strip().lower() == "true"
