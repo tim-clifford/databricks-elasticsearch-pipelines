@@ -1035,8 +1035,9 @@ How it decides, cheaply enough for hundreds of feeds:
   `IGNORED_OPERATIONS` in `pipeline_lib/feed_status.py` before pointing a stream at a merged-into table.
 - **Run state** comes from the monitoring log's `run_start` / `run_end` / `batch_start` rows (latest run
   per config, last `log_lookback_days` days, default 35). For a batch feed on an **unpaused** schedule, the latest
-  successful run must have started at or after the latest fire at least 10 minutes ago
-  (`schedule_grace_minutes`); a paused or on-demand job is judged on its last run alone. The trigger and its
+  fire at least 10 minutes ago (`schedule_grace_minutes`) must not have come after the latest successful run
+  ended (a fire that landed while that run was still going was skipped for overlap, not missed); a paused or
+  on-demand job is judged on its last run alone. The trigger and its
   pause state are read from the generated `resources/*.job.yml`, so a job group's members share its trigger.
 
 ```bash

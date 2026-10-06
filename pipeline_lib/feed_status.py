@@ -433,8 +433,10 @@ def classify_batch(run, trigger, now, threshold_minutes=DEFAULT_BEHIND_THRESHOLD
     - no logged run                         => UNKNOWN no_runs_logged
     - running (no run_end) < threshold      => IN_PROGRESS run_in_progress; >= threshold => BEHIND
     - ended error                           => BEHIND last_run_failed
-    - ended success, active schedule, but the run started before the latest fire at least grace_minutes
-      ago (so the run for that fire never happened)  => BEHIND missed_schedule
+    - ended success, active schedule, but the latest fire at least grace_minutes ago came AFTER that run
+      ended (so nothing ran for it)  => BEHIND missed_schedule. A fire that landed while the run was still
+      going was skipped for overlap (max_concurrent_runs 1, queue off), not missed, so a run longer than
+      the schedule interval does not read as behind.
     - ended success otherwise               => CAUGHT_UP last_run_succeeded
     - any other run_end status              => UNKNOWN unknown_run_status (allow-list)
     A paused or on-demand trigger has no expected fire time, so only the last run's outcome counts."""
@@ -457,7 +459,7 @@ def classify_batch(run, trigger, now, threshold_minutes=DEFAULT_BEHIND_THRESHOLD
         except UnsupportedCron as e:
             return unknown_result("unsupported_cron", detail=str(e), **fields)
         fields["expected_run_ts"] = expected
-        if run["started_at"] < expected:
+        if expected > (run["run_ended_at"] or run["started_at"]):
             return _result(BEHIND, "missed_schedule", **fields)
     return _result(CAUGHT_UP, "last_run_succeeded", **fields)
 

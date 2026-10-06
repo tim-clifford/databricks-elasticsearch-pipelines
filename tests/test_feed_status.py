@@ -568,3 +568,14 @@ def test_streaming_sent_position_before_retained_history_is_unknown_not_caught_u
 def test_new_table_whole_history_still_covers():
     # A young table: history back to version 0 is whole and reaches any sent position.
     assert s(ckpt(0), hist((1, 2, "WRITE"), (0, 3, "CREATE TABLE")), run=ENDED)["status"] == PENDING
+
+
+def test_batch_run_longer_than_interval_is_not_missed_schedule():
+    # 10-min cron, run 11:30:10-11:47 (17 min, so the 11:40 fire was skipped for overlap). At 11:58 the
+    # latest fire >= grace ago is 11:40, which landed while the run was going: caught up, not missed.
+    r = {"job_run_id": "j1", "started_at": utc(2026, 10, 5, 11, 30, 10), "run_ended_at": utc(2026, 10, 5, 11, 47),
+         "run_end_status": "success"}
+    assert classify_batch(r, SCHED, utc(2026, 10, 5, 11, 58))["status"] == CAUGHT_UP
+    # At 12:01 the latest fire >= grace ago is 11:50, after the run ended, and no run is logged for it.
+    out = classify_batch(r, SCHED, utc(2026, 10, 5, 12, 1))
+    assert (out["status"], out["status_reason"]) == (BEHIND, "missed_schedule")
