@@ -851,8 +851,7 @@ if PIPELINE_MODE == "streaming":
             try:
                 _names = [f.name for f in dbutils.fs.ls(relay_dir)]
             except Exception as _e:
-                if "FileNotFound" in str(_e) or "No such file" in str(_e) or "does not exist" in str(_e):
-                    return
+                # relay_dir is created at setup, so a failed listing is a real failure, never "absent".
                 if final and MONITORING_ACTIVE:
                     raise MonitoringLogError(f"could not list {relay_dir} to summarize unrecorded batches "
                                              f"({type(_e).__name__}: {_e})") from _e
@@ -1312,8 +1311,8 @@ if PIPELINE_MODE == "streaming":
             # in testing: recentProgress right after the end missed a batch that moved rows). Poll briefly for
             # the stragglers; any batch whose progress never arrives still gets its summary from the relayed ES
             # diagnostics alone, so the record is complete either way.
-            if MONITORING_ACTIVE and _batch_ids:
-                for _attempt in range(5):
+            if MONITORING_ACTIVE:
+                for _attempt in range(5 if _batch_ids else 0):
                     if _progress_mark["last"] is not None and _progress_mark["last"] >= _batch_ids[-1]:
                         break
                     time.sleep(2)
