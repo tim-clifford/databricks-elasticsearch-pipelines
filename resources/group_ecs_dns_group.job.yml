@@ -45,6 +45,8 @@ resources:
             ca_certs: ${var.ca_certs}
             monitoring_log_table: ${var.monitoring_log_table}
             streaming_trigger_interval: ''
+            job_run_id: '{{job.run_id}}'
+            task_run_id: '{{task.run_id}}'
             pipeline_mode: batch
             filter_condition: ${var.filter_condition}
             chunk_size: ${var.chunk_size}
@@ -85,6 +87,8 @@ resources:
             ca_certs: ${var.ca_certs}
             monitoring_log_table: ${var.monitoring_log_table}
             streaming_trigger_interval: ''
+            job_run_id: '{{job.run_id}}'
+            task_run_id: '{{task.run_id}}'
             pipeline_mode: batch
             filter_condition: ${var.filter_condition}
             chunk_size: ${var.chunk_size}

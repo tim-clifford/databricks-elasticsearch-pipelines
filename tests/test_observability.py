@@ -492,3 +492,11 @@ def test_bulk_stats_partial_cpu_gil_presence_renders_na_not_partial_total():
     line = format_bulk_stats(mixed, oneline=True)
     assert "cpu_ms(total=n/a)" in line                       # not "12.0": only one partition had it
     assert "gil_wait_ms(total=n/a max=n/a)" in line          # total and max sourced together, both n/a
+
+
+def test_bulk_stats_overall_and_tail_defensive_returns():
+    from pipeline_lib.observability import bulk_stats_overall, bulk_stats_tail
+    assert bulk_stats_overall(None) is None and bulk_stats_overall([]) is None and bulk_stats_overall("x") is None
+    assert bulk_stats_tail(None) is None and bulk_stats_tail(["x"]) is None
+    assert bulk_stats_tail({"collect_ms": 3, "merge_ms": 1}) == {"collect_ms": 3, "merge_ms": 1}
+    assert bulk_stats_tail({"collect_ms": 3, "merge_ms": 1, "bulk_stats": []}) == {"collect_ms": 3, "merge_ms": 1}

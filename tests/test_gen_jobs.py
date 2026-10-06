@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 import gen_jobs  # noqa: E402
 from pipeline_lib.config import (  # noqa: E402
     RUNTIME_KNOB_NAMES,
+    PipelineConfigError,
     job_parameters,
     runtime_knob_global_refs,
     validate_config,
@@ -249,6 +250,39 @@ def test_render_existing_cluster():
 
 
 # --------------------------------------------------------------------------- render: job_cluster
+
+
+def test_render_job_cluster_never_injects_cluster_log_conf():
+    # Regression: the Jobs API rejects an EMPTY cluster_log_conf (400 "Invalid cluster log storage info",
+    # seen live on FEVM), so injecting a ${var...} reference into every job cluster broke every
+    # job-cluster deploy whenever log delivery was off. Delivery is opt-in per job cluster config instead.
+    spec = {"spark_version": "15.4.x-scala2.12", "num_workers": 1}
+    job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "std"}), spec)
+    assert "cluster_log_conf" not in job["job_clusters"][0]["new_cluster"]
+
+
+def test_render_job_cluster_passes_an_opted_in_cluster_log_conf_through_verbatim():
+    log_conf = {"volumes": {"destination": "${var.cluster_log_volume_path}"}}
+    spec = {"spark_version": "15.4.x-scala2.12", "num_workers": 1, "cluster_log_conf": log_conf}
+    job = _render_job(_cfg({"type": "job_cluster", "job_cluster_config": "std"}), spec)
+    assert job["job_clusters"][0]["new_cluster"]["cluster_log_conf"] == log_conf
+
+
+def test_shipped_job_cluster_configs_do_not_enable_cluster_log_delivery():
+    # main ships cluster_log_volume_path empty, and an opted-in config with an empty destination fails the
+    # deploy, so no shipped config may opt in (the example in standard_batch.yml stays commented out).
+    cfg_dir = os.path.join(_REPO_ROOT, "_pipelines", "job_cluster_configs")
+    names = [n for n in os.listdir(cfg_dir) if n.endswith((".yml", ".yaml"))]
+    assert names
+    for name in names:
+        spec = yaml.safe_load(open(os.path.join(cfg_dir, name)))
+        assert "cluster_log_conf" not in spec, name
+
+
+def test_cluster_log_volume_path_var_is_a_simple_empty_string():
+    doc = yaml.safe_load(open(os.path.join(_REPO_ROOT, "databricks.yml")))
+    var = doc["variables"]["cluster_log_volume_path"]
+    assert var.get("type") is None and var["default"] == ""
 
 
 def test_render_job_cluster_inlines_spec():
@@ -779,7 +813,7 @@ def test_render_singleton_set_bulk_stats_bakes_literal():
 def test_shipped_deploy_views_job_disables_queue():
     # deploy_views is hand-authored (not generated), so guard its skip-not-queue setting against drift
     # back to the queuing default, matching every generated job.
-    path = os.path.join(_REPO_ROOT, "resources", "deploy_views.job.yml")
+    path = os.path.join(_REPO_ROOT, "resources", "_deploy_views.job.yml")
     with open(path) as fh:
         job = yaml.safe_load(fh)["resources"]["jobs"]["deploy_views"]
     assert job["max_concurrent_runs"] == 1
@@ -787,12 +821,12 @@ def test_shipped_deploy_views_job_disables_queue():
 
 
 @pytest.mark.parametrize("filename,job_key", [
-    ("deploy_views.job.yml", "deploy_views"),
-    ("checkpoint_clear.job.yml", "checkpoint_clear"),
-    ("build_wheel.job.yml", "build_wheel"),
-    ("es_diagnostics.job.yml", "es_diagnostics"),
-    ("log_table_create.job.yml", "log_table_create"),
-    ("log_table_prune.job.yml", "log_table_prune"),
+    ("_deploy_views.job.yml", "deploy_views"),
+    ("_checkpoint_clear.job.yml", "checkpoint_clear"),
+    ("_build_wheel.job.yml", "build_wheel"),
+    ("_es_diagnostics.job.yml", "es_diagnostics"),
+    ("_log_table_create.job.yml", "log_table_create"),
+    ("_log_table_prune.job.yml", "log_table_prune"),
 ])
 def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
     # The hand-authored jobs are NOT emitted by gen_jobs, so guard their failure-email block against drift:
@@ -819,7 +853,7 @@ def test_shipped_build_wheel_job_shape():
     # skip-not-queue like every other job, its two required run parameters (blank defaults, so a bare run
     # fails closed in the notebook), and the wheel_path base_parameter the notebook derives the upload dir
     # from. The notebook's build/upload behavior is proven by a live run, not here.
-    path = os.path.join(_REPO_ROOT, "resources", "build_wheel.job.yml")
+    path = os.path.join(_REPO_ROOT, "resources", "_build_wheel.job.yml")
     with open(path) as fh:
         job = yaml.safe_load(fh)["resources"]["jobs"]["build_wheel"]
     assert job["max_concurrent_runs"] == 1
@@ -838,7 +872,7 @@ def test_shipped_log_table_create_job_shape():
     # skip-not-queue like every other job, the serverless notebook task, and the monitoring_log_table
     # base_parameter wired from the bundle variable (the notebook validates it and runs CREATE TABLE IF NOT
     # EXISTS). The notebook's create behavior is proven by a live run, not here.
-    path = os.path.join(_REPO_ROOT, "resources", "log_table_create.job.yml")
+    path = os.path.join(_REPO_ROOT, "resources", "_log_table_create.job.yml")
     with open(path) as fh:
         job = yaml.safe_load(fh)["resources"]["jobs"]["log_table_create"]
     assert job["max_concurrent_runs"] == 1
@@ -855,7 +889,7 @@ def test_shipped_log_table_prune_job_shape():
     # skip-not-queue like every other job, the serverless notebook task, both deploy-time base_parameters
     # (table + retention), and a daily schedule PAUSED by default via ${var.schedule_pause_status}. The
     # notebook's prune/optimize/vacuum behavior is proven by a live run, not here.
-    path = os.path.join(_REPO_ROOT, "resources", "log_table_prune.job.yml")
+    path = os.path.join(_REPO_ROOT, "resources", "_log_table_prune.job.yml")
     with open(path) as fh:
         job = yaml.safe_load(fh)["resources"]["jobs"]["log_table_prune"]
     assert job["max_concurrent_runs"] == 1
@@ -872,6 +906,22 @@ def test_shipped_log_table_prune_job_shape():
     }
     # No run-time job parameters: both values are deploy-time base_parameters, not overridable per run.
     assert "parameters" not in job
+
+
+def test_shipped_checkpoint_clear_job_allows_concurrent_runs():
+    # checkpoint_clear is the ONLY hand-authored job that allows concurrent runs (max_concurrent_runs: 20).
+    # This is safe because each run targets one config's checkpoint via its config_name param: two runs on
+    # the same config are harmless (second finds nothing), and runs on different configs are independent.
+    # Unlike other jobs (which all have max_concurrent_runs: 1), this exception is documented in the job's
+    # comment and allows concurrent clears of different pipelines' checkpoints.
+    path = os.path.join(_REPO_ROOT, "resources", "_checkpoint_clear.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["checkpoint_clear"]
+    assert job["max_concurrent_runs"] == 20, "checkpoint_clear must allow concurrent runs"
+    assert job["queue"] == {"enabled": False}
+    assert job["parameters"] == [{"name": "config_name", "default": ""}]
+    (task,) = job["tasks"]
+    assert task["notebook_task"]["notebook_path"] == "../notebooks/checkpoint_clear.py"
 
 
 # --------------------------------------------------------------------------- job groups
@@ -1337,11 +1387,11 @@ def test_shipped_databricks_yml_declares_global_job_tags():
 
 
 @pytest.mark.parametrize("filename,job_key", [
-    ("deploy_views.job.yml", "deploy_views"),
-    ("checkpoint_clear.job.yml", "checkpoint_clear"),
-    ("build_wheel.job.yml", "build_wheel"),
-    ("es_diagnostics.job.yml", "es_diagnostics"),
-    ("log_table_create.job.yml", "log_table_create"),
+    ("_deploy_views.job.yml", "deploy_views"),
+    ("_checkpoint_clear.job.yml", "checkpoint_clear"),
+    ("_build_wheel.job.yml", "build_wheel"),
+    ("_es_diagnostics.job.yml", "es_diagnostics"),
+    ("_log_table_create.job.yml", "log_table_create"),
 ])
 def test_shipped_fixed_jobs_reference_global_job_tags(filename, job_key):
     # The 5 hand-authored jobs are NOT emitted by gen_jobs, so guard against drift: each must reference the
@@ -1442,3 +1492,103 @@ def test_es_index_list_multidigit_dropped_count_stays_within_cap():
     m = re.search(r"\.\.\.\+(\d+)$", value)
     assert m and int(m.group(1)) == dropped        # the full count survives (not sliced)
     assert len(value.split()[:-1]) + dropped == 200  # every name kept-or-counted
+
+
+def test_config_name_underscore_prefix_rejected(tmp_path, monkeypatch):
+    # Config names starting with underscore are reserved for hand-authored files and rejected at generation.
+    # This prevents a generated file from overwriting a hand-authored _prefixed file.
+    monkeypatch.chdir(tmp_path)
+    # Create config dir and write a config with underscore prefix
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    (config_dir / "_reserved.yml").write_text(
+        "es_index_name: test-index\n"
+        "pipeline_mode: batch\n"
+        "view: {catalog: c, schema: s, name: v}\n"
+        "source: {catalog: c, schema: s, table: t}\n"
+    )
+    resources_dir = tmp_path / "resources"
+    resources_dir.mkdir()
+    dab_yml = tmp_path / "databricks.yml"
+    dab_yml.write_text(
+        "variables:\n"
+        "  job_name_prefix: {default: ''}\n"
+        "  support_email: {default: []}\n"
+        "  global_job_tags: {type: complex, default: {}}\n"
+        "  pipeline_mode: {default: batch}\n"
+        "  streaming_start: {default: new}\n"
+    )
+    # Monkeypatch the module paths to use tmp_path
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    with pytest.raises(ValueError, match="config name.*must not start with '_'"):
+        gen_jobs.main(argv=[])
+
+
+def test_job_group_underscore_prefix_rejected(tmp_path, monkeypatch):
+    # Job group names starting with underscore are reserved and rejected at generation.
+    monkeypatch.chdir(tmp_path)
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    (config_dir / "test.yml").write_text(
+        "es_index_name: test-index\n"
+        "pipeline_mode: batch\n"
+        "job_group: _reserved\n"
+        "view: {catalog: c, schema: s, name: v}\n"
+        "source: {catalog: c, schema: s, table: t}\n"
+    )
+    resources_dir = tmp_path / "resources"
+    resources_dir.mkdir()
+    dab_yml = tmp_path / "databricks.yml"
+    dab_yml.write_text(
+        "variables:\n"
+        "  job_name_prefix: {default: ''}\n"
+        "  support_email: {default: []}\n"
+        "  global_job_tags: {type: complex, default: {}}\n"
+        "  pipeline_mode: {default: batch}\n"
+        "  streaming_start: {default: new}\n"
+    )
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    with pytest.raises(PipelineConfigError, match="job_group"):
+        gen_jobs.main(argv=[])
+
+
+def test_hand_authored_file_not_treated_as_orphan(tmp_path, monkeypatch):
+    # A hand-authored `_`-prefixed resource (no generated marker) beside a STALE generated file whose config
+    # is gone: running the generator's real orphan path flags (--check) and then deletes (write mode) ONLY
+    # the generated orphan, never the hand-authored file.
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    resources_dir = tmp_path / "resources"
+    resources_dir.mkdir()
+    hand_authored = resources_dir / "_custom.job.yml"
+    hand_authored.write_text("resources:\n  jobs:\n    custom_job: {}\n")
+    stale = resources_dir / "gone_pipeline.job.yml"
+    stale.write_text(gen_jobs._GENERATED_MARKER + " from a deleted config\nresources: {}\n")
+    dab_yml = tmp_path / "databricks.yml"
+    dab_yml.write_text(
+        "variables:\n"
+        "  job_name_prefix: {default: ''}\n"
+        "  support_email: {default: []}\n"
+        "  global_job_tags: {type: complex, default: {}}\n"
+        "  pipeline_mode: {default: batch}\n"
+        "  streaming_start: {default: new}\n"
+    )
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    assert gen_jobs.existing_generated_files() == [str(stale)]
+    # --check fails on the stale orphan and leaves both files in place.
+    assert gen_jobs.main(["--check"]) != 0
+    assert stale.exists() and hand_authored.exists()
+    # Write mode removes the orphan only.
+    assert gen_jobs.main([]) == 0
+    assert not stale.exists()
+    assert hand_authored.exists()
+
