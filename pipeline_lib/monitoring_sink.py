@@ -9,16 +9,19 @@ Why this module exists, and what it deliberately is NOT:
 - It is PURE: no Spark, no dbutils, no Databricks. Every function here is unit-testable off-cluster
   (plain pytest), exactly like pipeline_lib/observability.py. The notebooks own all Spark I/O.
 
-THE ROW MODEL. Two levels, each with a start and an end, plus one diagnostics row per batch:
-- run_start / run_end: one pair per job run (run_end is absent only when the run was killed outright,
-  which is itself the signal: a run_start with no run_end is a run that died).
-- batch_start / batch_end / batch_summary: one set per batch. A batch-mode run is exactly ONE batch
-  (batch_id BATCH_MODE_BATCH_ID); a streaming run has one per micro-batch (the micro-batch id). A
-  batch_start with no batch_end is a batch that never finished.
-- batch_end is the OUTCOME (status success|error, end time, ES counts or the error); batch_summary is the
-  DIAGNOSTICS (the ES write rollup and, for streaming, Spark's progress report for that batch). They are
-  separate because in streaming Spark only publishes a batch's progress AFTER the batch has committed,
-  later than batch_end is written.
+THE ROW MODEL. Two levels, each with a start and an end, plus Spark's report for streaming batches:
+- run_start / run_end: one pair per job run (run_end is absent when the run was killed or cancelled,
+  which is itself the signal: a run_start with no run_end is a run that did not end in-process).
+- batch_start / batch_end: one pair per batch. A batch-mode run is exactly ONE batch (batch_id
+  BATCH_MODE_BATCH_ID); a streaming run has one per micro-batch (the micro-batch id). batch_end is the
+  OUTCOME and the ES DIAGNOSTICS, written inline as the batch finishes, in both modes: status success
+  (ES counts + `es`, the write rollup from es_write_summary) or error (the error, plus counts/diagnostics
+  when the write returned). A batch_start with no batch_end is a batch that never finished.
+- batch_summary (streaming only): Spark's StreamingQueryProgress for the batch, recorded when the notebook's
+  wait loop sees it. Spark publishes it only after the batch commits, asynchronously, and keeps only the
+  last few in memory, so it is best-effort by nature: a batch_end with no batch_summary is a batch whose
+  report was lost (e.g. a cancel moments after it committed). Batch mode has no Spark progress, so no
+  batch_summary.
 
 DESIGN INVARIANT - when the log is ON it is part of the contract, not best-effort. The builders RAISE on
 unusable input (a builder that silently produced no row would be exactly the missing log entry this
@@ -58,7 +61,7 @@ RECORD_TYPES = (
     "run_end",        # one per run that ended in-process: success | error | stopped, totals or the error
     "batch_start",    # one per batch, written immediately BEFORE the batch's data is sent to ES
     "batch_end",      # one per batch that ended: success (ES counts) | error (the exception)
-    "batch_summary",  # one per batch with diagnostics: ES write rollup (+ Spark progress for streaming)
+    "batch_summary",  # streaming only: Spark's progress report for a batch, when it was seen
 )
 
 # The allow-list of status values, and which statuses each record_type may carry. `stopped` is a
@@ -70,7 +73,7 @@ _ALLOWED_STATUS = {
     "run_end": ("success", "error", "stopped"),
     "batch_start": ("started",),
     "batch_end": ("success", "error"),
-    "batch_summary": ("success", "error"),
+    "batch_summary": ("success",),
 }
 
 # A batch-mode run is exactly ONE batch; its batch rows carry this id so batch and streaming rows join
@@ -228,36 +231,28 @@ def batch_start_row(config_name, job_run_id, batch_id, facts, start, now=None):
 
 
 def batch_end_row(config_name, job_run_id, batch_id, status, facts, start, end, now=None):
-    """The `batch_end` row: the batch's OUTCOME. status success (facts = es_counts) or error (facts =
-    error_facts), with the batch's start and end wall clocks."""
+    """The `batch_end` row: the batch's OUTCOME and ES DIAGNOSTICS. status success (facts =
+    batch_success_facts(...): ES counts + the `es` write rollup) or error (facts = error_facts, plus the
+    counts/diagnostics when the write returned), with the batch's start and end wall clocks."""
     return _row(config_name, job_run_id, "batch_end", status, batch_id, facts, now, start=start, end=end)
 
 
-def batch_summary_row(config_name, job_run_id, batch_id, es=None, progress=None, status="success", now=None):
-    """The `batch_summary` row: the batch's DIAGNOSTICS. `es` is es_write_summary(...) (the ES write
-    rollup); `progress` is Spark's StreamingQueryProgress dict for the batch (streaming only; stored
-    whole, so nothing the runtime reports is dropped). At least one must be present. status mirrors the
-    batch's outcome: a streaming summary is only ever written for a committed batch (success), while a
-    batch-mode write that returned diagnostics but then failed reconciliation is summarized as error.
-    batch_start_ts /
-    batch_end_ts come from the progress (Spark's trigger timestamp + batchDuration) when there is one, and
-    are NULL otherwise (an es-only summary: batch mode, or a streaming batch whose progress report was never
-    seen); the batch's own wall clock is always on its batch_start / batch_end rows."""
-    if es is None and progress is None:
-        raise ValueError("batch_summary needs an es summary, a progress report, or both")
-    if es is not None and not isinstance(es, dict):
-        raise ValueError(f"batch_summary es must be a dict, got {type(es).__name__}")
-    if progress is not None and not isinstance(progress, dict):
+def batch_summary_row(config_name, job_run_id, batch_id, progress, now=None):
+    """The `batch_summary` row (streaming only): Spark's StreamingQueryProgress dict for the batch, stored
+    WHOLE (backlog, step durations, rates, offsets, nothing the runtime reports is dropped).
+    batch_start_ts / batch_end_ts are Spark's trigger timestamp and trigger + batchDuration (Spark's view
+    of the batch; the batch's own wall clock is on its batch_start / batch_end rows)."""
+    if not isinstance(progress, dict):
         raise ValueError(f"batch_summary progress must be a dict, got {type(progress).__name__}")
-    payload = {}
-    start = end = None
-    if es is not None:
-        payload["es"] = es
-    if progress is not None:
-        payload["progress"] = progress
-        start, end = _progress_bounds(progress)
-    return _row(config_name, job_run_id, "batch_summary", status, batch_id, payload, now,
+    start, end = _progress_bounds(progress)
+    return _row(config_name, job_run_id, "batch_summary", "success", batch_id, {"progress": progress}, now,
                 start=start, end=end)
+
+
+def batch_success_facts(result, wall_ms=None):
+    """The `batch_end` payload for a successful batch: the ES counts (es_counts) plus `es`, the ES write
+    rollup (es_write_summary). One helper so batch and streaming batches carry identical batch_end rows."""
+    return {**es_counts(result), "es": es_write_summary(result, wall_ms=wall_ms)}
 
 
 def es_counts(result):
@@ -270,7 +265,7 @@ def es_counts(result):
 
 
 def es_write_summary(result, wall_ms=None):
-    """The ES write DIAGNOSTICS for batch_summary, from a bulk_write result: the driver-side facts
+    """The ES write DIAGNOSTICS (batch_end's `es` field), from a bulk_write result: the driver-side facts
     (collect_ms, merge_ms, num_partitions, and the driver-measured bulk_write wall time when given) plus,
     when bulk_stats is on, the cluster-wide `overall` rollup and the straggler `tail` facts. The rollups
     come from observability's bulk_stats_overall / bulk_stats_tail, the SAME computation behind the
@@ -319,24 +314,6 @@ def progress_batch_ids(progresses, last_batch_id):
             continue
         by_id[bid] = p
     return [by_id[b] for b in sorted(by_id)]
-
-
-def leftover_relay_ids(names, below=None):
-    """The batch ids among relay directory entry `names` (as listed; a trailing "/" is ignored) that are
-    below `below` (None = all), ascending. Non-numeric names are skipped. The streaming runner writes one
-    relay directory per batch that ended successfully and deletes it once that batch's batch_summary is
-    written, so whatever is left below the batch being recorded is a batch whose progress report was never
-    seen (evicted from query.recentProgress's bounded buffer, or a read that kept failing). Those still owe
-    a batch_summary, written from the relayed ES diagnostics alone, so no batch is silently skipped."""
-    out = []
-    for name in names or []:
-        n = str(name).rstrip("/")
-        if not n.isdigit():
-            continue
-        bid = int(n)
-        if below is None or bid < below:
-            out.append(bid)
-    return sorted(out)
 
 
 def validate_table_name(name, where="monitoring_log_table"):

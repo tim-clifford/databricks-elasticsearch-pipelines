@@ -291,7 +291,7 @@ variables:
 
   # GLOBAL default for the durable monitoring log (a run-time knob, so scripts/gen_jobs.py bakes
   # ${var.monitoring_log_enabled} as the job-parameter default for every pipeline that OMITS it). When
-  # true the run also APPENDS run_start / run_end and, per batch, batch_start / batch_end / batch_summary
+  # true the run also APPENDS run_start / run_end, per batch batch_start / batch_end, and per streaming batch a batch_summary
   # rows to the ${var.monitoring_log_table} Delta table (in addition to logging them). Precedence, highest first: a
   # per-run `--params monitoring_log_enabled=<v>` > a pipeline's own `monitoring_log_enabled:` in its
   # config > this global default > OFF. Empty default so the sink is off everywhere out of the box; set

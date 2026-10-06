@@ -28,10 +28,10 @@ from pipeline_lib.monitoring_sink import (
     assert_columns_consistent,
     batch_end_row,
     batch_start_row,
+    batch_success_facts,
     batch_summary_row,
     create_table_sql,
     error_facts,
-    leftover_relay_ids,
     es_counts,
     es_write_summary,
     missing_columns,
@@ -159,59 +159,44 @@ def test_unknown_record_type_rejected():
         ms._row("cfg", "r", "stream_progress", "success", 1, {})
 
 
-# --- batch_summary -----------------------------------------------------------------------------
+# --- batch_summary (streaming only: Spark's progress) ------------------------------------------
 
-def test_batch_summary_streaming_stores_es_and_whole_progress_with_progress_timing():
-    es = es_write_summary(RESULT)
-    row = batch_summary_row("cfg", "run1", 7, es=es, progress=PROGRESS, now=FIXED)
+def test_batch_summary_stores_whole_progress_with_progress_timing():
+    row = batch_summary_row("cfg", "run1", 7, PROGRESS, now=FIXED)
     assert (row["record_type"], row["status"], row["batch_id"]) == ("batch_summary", "success", 7)
-    payload = json.loads(row["payload"])
-    assert payload["progress"] == PROGRESS
-    assert payload["es"]["num_partitions"] == 2
+    assert json.loads(row["payload"]) == {"progress": PROGRESS}
     # start = progress timestamp, end = start + batchDuration (5.5 s).
     assert row["batch_start_ts"] == "2026-09-29T21:18:30.000000"
     assert row["batch_end_ts"] == "2026-09-29T21:18:35.500000"
 
 
-def test_batch_summary_batch_mode_es_only_has_null_timing():
-    row = batch_summary_row("cfg", "run1", BATCH_MODE_BATCH_ID, es=es_write_summary(RESULT), now=FIXED)
-    payload = json.loads(row["payload"])
-    assert set(payload) == {"es"}
-    assert row["batch_start_ts"] is None and row["batch_end_ts"] is None
+@pytest.mark.parametrize("bad", [None, "x", ["p"], 3])
+def test_batch_summary_requires_a_progress_dict(bad):
+    with pytest.raises(ValueError, match="progress must be a dict"):
+        batch_summary_row("cfg", "run1", 7, bad)
 
 
-def test_batch_summary_progress_only_allowed():
-    row = batch_summary_row("cfg", "run1", 7, progress=PROGRESS, now=FIXED)
-    assert set(json.loads(row["payload"])) == {"progress"}
-
-
-def test_batch_summary_error_status_allowed_and_started_rejected():
-    row = batch_summary_row("cfg", "run1", 0, es=es_write_summary(RESULT), status="error", now=FIXED)
-    assert row["status"] == "error"
+def test_batch_summary_only_success_status():
+    from pipeline_lib import monitoring_sink as ms
     with pytest.raises(ValueError, match="not allowed for batch_summary"):
-        batch_summary_row("cfg", "run1", 0, es=es_write_summary(RESULT), status="started")
-
-
-def test_batch_summary_needs_something():
-    with pytest.raises(ValueError, match="needs an es summary"):
-        batch_summary_row("cfg", "run1", 7)
-
-
-@pytest.mark.parametrize("kw", [{"es": "x"}, {"progress": ["x"]}])
-def test_batch_summary_rejects_non_dict_parts(kw):
-    with pytest.raises(ValueError, match="must be a dict"):
-        batch_summary_row("cfg", "run1", 7, **kw)
+        ms._row("cfg", "r", "batch_summary", "error", 1, {})
 
 
 def test_batch_summary_bad_progress_timestamp_leaves_timing_null():
-    row = batch_summary_row("cfg", "run1", 7, progress=dict(PROGRESS, timestamp="nope"), now=FIXED)
+    row = batch_summary_row("cfg", "run1", 7, dict(PROGRESS, timestamp="nope"), now=FIXED)
     assert row["batch_start_ts"] is None and row["batch_end_ts"] is None
 
 
 def test_batch_summary_missing_duration_end_equals_start():
     p = {k: v for k, v in PROGRESS.items() if k != "batchDuration"}
-    row = batch_summary_row("cfg", "run1", 7, progress=p, now=FIXED)
+    row = batch_summary_row("cfg", "run1", 7, p, now=FIXED)
     assert row["batch_start_ts"] == row["batch_end_ts"] == "2026-09-29T21:18:30.000000"
+
+
+def test_batch_success_facts_are_counts_plus_es_rollup():
+    facts = batch_success_facts(RESULT, wall_ms=1300.0)
+    assert facts == {**es_counts(RESULT), "es": es_write_summary(RESULT, wall_ms=1300.0)}
+    assert facts["written"] == 800 and facts["es"]["bulk_write_wall_ms"] == 1300.0
 
 
 # --- es_counts / es_write_summary / error_facts ------------------------------------------------
@@ -302,20 +287,6 @@ def test_progress_batch_ids_skips_unusable_entries(junk):
 def test_progress_batch_ids_empty_input():
     assert progress_batch_ids(None, last_batch_id=None) == []
     assert progress_batch_ids([], last_batch_id=3) == []
-
-
-# --- leftover_relay_ids (no silent batch_summary gaps) ------------------------------------------
-
-def test_leftover_relay_ids_below_the_batch_being_recorded():
-    assert leftover_relay_ids(["3/", "1/", "7/", "12/"], below=7) == [1, 3]
-
-
-def test_leftover_relay_ids_none_means_all_ascending():
-    assert leftover_relay_ids(["10", "2", "x", "_SUCCESS", "4/"]) == [2, 4, 10]
-
-
-def test_leftover_relay_ids_empty():
-    assert leftover_relay_ids([], below=3) == [] and leftover_relay_ids(None) == []
 
 
 # --- event_ts / payload serialization ----------------------------------------------------------

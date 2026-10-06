@@ -50,8 +50,9 @@
 # MAGIC   micro-batch (default from config; empty => Spark defaults). Streaming only; useful for a backfill.
 # MAGIC - `monitoring_log_enabled`: `true` | `false` (default from `${var.monitoring_log_enabled}`/config;
 # MAGIC   empty => off). When true, the run ALSO appends rows to `monitoring_log_table`: `run_start` and
-# MAGIC   `run_end` for the run, and `batch_start` / `batch_end` / `batch_summary` for every batch (one batch in
-# MAGIC   batch mode, one per micro-batch in streaming). See pipeline_lib/monitoring_sink.py for the row model.
+# MAGIC   `run_end` for the run, `batch_start` / `batch_end` for every batch (one batch in batch mode, one per
+# MAGIC   micro-batch in streaming), and per streaming batch a `batch_summary` (Spark's progress report). See
+# MAGIC   pipeline_lib/monitoring_sink.py for the row model.
 # MAGIC   When ON the log is part of the contract, not best-effort: an unset/malformed/unwritable table or
 # MAGIC   ANY failed append FAILS the task (so support is notified and no further data is sent unlogged).
 # MAGIC   A batch's `batch_start` row is written before its data is sent, so a log outage stops the export
@@ -221,38 +222,17 @@ from pipeline_lib.config import (  # noqa: E402
     view_substitutions,
     write_config_overrides,
 )
-# Durable monitoring log (optional): pure row builders + the table schema/name validator, shared with
-# the `_log table create` job. Kept in pipeline_lib so it is unit-tested off-cluster; this notebook owns
-# only the Spark append (append_monitoring_rows below).
-from pipeline_lib.monitoring_sink import (  # noqa: E402
-    BATCH_MODE_BATCH_ID,
-    ROW_FIELDS,
-    batch_end_row,
-    batch_start_row,
-    batch_summary_row,
-    error_facts,
-    es_counts,
-    es_write_summary,
-    leftover_relay_ids,
-    progress_batch_ids,
-    run_end_row,
-    run_start_row,
-    validate_table_name,
-)
-# Ephemeral per-batch observability (pure Python, no Spark): the STREAM_PROGRESS / BULK_STATS log-line
-# formatters. Kept in pipeline_lib so they are unit-tested off-cluster.
+# The monitoring log (optional): the row model, the fail-closed writer, and the run / batch / stream steps that
+# use it. All in pipeline_lib, unit-tested off-cluster with fakes; this notebook only wires them together.
+from pipeline_lib.batch_export import run_batch_export  # noqa: E402
+from pipeline_lib.monitoring_writer import MonitoringLog, resolve_log_table, spark_append  # noqa: E402
+from pipeline_lib.run_record import RunRecorder  # noqa: E402
+from pipeline_lib.stream_batch import make_foreach_batch  # noqa: E402
+from pipeline_lib.stream_progress import ProgressRecorder  # noqa: E402
+# Log-line tag for this notebook's own streaming status lines.
 import json  # noqa: E402
-import time  # noqa: E402
 import uuid  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
-from pipeline_lib.observability import (  # noqa: E402
-    BULK_STATS_TAG,
-    PROGRESS_TAG,
-    bulk_stats_relay_line,
-    format_bulk_stats,
-    format_progress,
-    format_tail_summary,
-)
+from pipeline_lib.observability import PROGRESS_TAG  # noqa: E402
 # Streaming checkpoint offsets-state classifier (pure Python, dependency-injected ls; unit-tested
 # off-cluster). Decides seed-vs-resume for streaming_start=new; fail-closed so an existing checkpoint is
 # never misread as a first run (which would drain over an un-exported backlog).
@@ -261,6 +241,7 @@ from pipeline_lib.checkpoint import checkpoint_location as checkpoint_location_f
 # The streaming wait loop (pure, duck-typed query; unit-tested off-cluster with a fake query).
 from pipeline_lib.stream_wait import await_stream as _await_stream  # noqa: E402
 
+# COMMAND ----------
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
 # override fails closed immediately without wasting the config load/resolve on a run that can't
 # proceed. Each uses the same shared validator the config schema uses (single source of truth):
@@ -338,28 +319,20 @@ MAX_PARTITION_BYTES = require_max_partition_bytes(MAX_PARTITION_BYTES, "max_part
 MAX_FILES_PER_TRIGGER = require_max_files_per_trigger(MAX_FILES_PER_TRIGGER, "max_files_per_trigger job parameter")
 MAX_BYTES_PER_TRIGGER = require_max_bytes_per_trigger(MAX_BYTES_PER_TRIGGER, "max_bytes_per_trigger job parameter")
 
-# Durable monitoring log setup (OPTIONAL; when ON it is part of the contract, FAIL-CLOSED). Canonicalize
-# the enable flag with the SAME validator the config/registry use (a bad --params value fails closed here).
-# The log is ACTIVE when it resolves true; it then REQUIRES a valid table name, so the log switched on with
-# the table unset or malformed fails the run here, before any data moves (an export that silently runs
-# unlogged is exactly what this guards against). Off => every append below is a no-op and nothing about the
-# export changes.
+# COMMAND ----------
+# MONITORING LOG setup (optional). Canonicalize the enable flag with the SAME validator the config/registry use
+# (a bad --params value fails closed), then resolve the table: with the log ON the table is REQUIRED, so an
+# unset or malformed one fails the run here, before any data moves (pipeline_lib.monitoring_writer). With the log
+# OFF every append is a no-op and nothing about the export changes.
 MONITORING_LOG_ENABLED = require_es_flag(MONITORING_LOG_ENABLED, "monitoring_log_enabled job parameter")
-_MONITORING_TABLE = ""
-if MONITORING_LOG_ENABLED == "true":
-    if not MONITORING_LOG_TABLE:
-        raise ValueError("monitoring_log_enabled=true but monitoring_log_table is unset "
-                         "(${var.monitoring_log_table}): set the bundle variable and run the `_log table "
-                         "create` job, or turn monitoring_log_enabled off")
-    _MONITORING_TABLE = validate_table_name(MONITORING_LOG_TABLE, "monitoring_log_table")
-MONITORING_ACTIVE = bool(_MONITORING_TABLE)
+MONITORING_LOG = MonitoringLog(resolve_log_table(MONITORING_LOG_ENABLED, MONITORING_LOG_TABLE), spark_append)
 
 
 def _resolve_job_run_id():
-    """The Databricks job run id, used to group a run's monitoring rows. Preferred source: the job_run_id
-    base_parameter ({{job.run_id}}, resolved by the Jobs service; a literal "{{" means it was not
-    substituted, so it is ignored). Fallbacks, for interactive/legacy runs: the notebook context tags, then
-    a per-process uuid (so a run's rows still share an id, just not the platform run id)."""
+    """The Databricks job run id that groups a run's monitoring rows. Preferred: the job_run_id base_parameter
+    ({{job.run_id}}, resolved by the Jobs service; a literal "{{" means it was not substituted and is ignored).
+    Fallbacks, for interactive runs: the notebook context tags, then a per-process uuid (so the run's rows still
+    share an id)."""
     if JOB_RUN_ID_PARAM and "{{" not in JOB_RUN_ID_PARAM:
         return JOB_RUN_ID_PARAM
     try:
@@ -373,62 +346,11 @@ def _resolve_job_run_id():
     return f"local-{uuid.uuid4().hex[:12]}"
 
 
-JOB_RUN_ID = _resolve_job_run_id() if MONITORING_ACTIVE else ""
+JOB_RUN_ID = _resolve_job_run_id() if MONITORING_LOG.active else ""
+if MONITORING_LOG.active:
+    print(f"monitoring log ACTIVE -> {MONITORING_LOG.table} (job_run_id={JOB_RUN_ID})")
 
-
-class MonitoringLogError(RuntimeError):
-    """A monitoring log append failed while the log is ON. Raised (never swallowed) so the batch, and with it
-    the task, fails: support is notified and no further data is sent without a log record."""
-
-
-def append_monitoring_rows(rows, session=None):
-    """Append monitoring rows (dicts keyed by ROW_FIELDS, from pipeline_lib.monitoring_sink builders) to the
-    shared Delta table. No-op when the log is off. When ON, FAIL-CLOSED: any error raises
-    MonitoringLogError (chained to the cause). Builds a DataFrame with the payload + timestamps as strings,
-    then parse_json -> VARIANT and cast -> TIMESTAMP, stamps ingest_ts = current_timestamp() (the write
-    time), and appends BY NAME via writeTo().append() (so the table's physical column order does not matter,
-    e.g. a migrated table with `status` added last). A `session` is passed from foreachBatch (its micro-batch
-    session); elsewhere the global spark is used."""
-    if not MONITORING_ACTIVE or not rows:
-        return
-    sess = session if session is not None else spark
-    try:
-        from pyspark.sql import functions as _F  # noqa: E402
-        _schema = ("config_name string, job_run_id string, record_type string, status string, "
-                   "batch_id bigint, event_ts string, batch_start_ts string, batch_end_ts string, "
-                   "payload string")
-        _df = sess.createDataFrame([tuple(r[f] for f in ROW_FIELDS) for r in rows], _schema)
-        _df = (_df
-               .withColumn("event_ts", _F.col("event_ts").cast("timestamp"))
-               .withColumn("batch_start_ts", _F.col("batch_start_ts").cast("timestamp"))
-               .withColumn("batch_end_ts", _F.col("batch_end_ts").cast("timestamp"))
-               .withColumn("payload", _F.expr("parse_json(payload)"))
-               .withColumn("ingest_ts", _F.current_timestamp()))
-        _df.writeTo(_MONITORING_TABLE).append()
-    except Exception as _e:
-        raise MonitoringLogError(
-            f"monitoring log append to {_MONITORING_TABLE!r} failed ({type(_e).__name__}: {_e}); "
-            f"{len(rows)} row(s) ({', '.join(sorted({r['record_type'] for r in rows}))}) not persisted. "
-            f"Failing the task so no further data is sent without a log record.") from _e
-
-
-def append_failure_rows(rows, exc, session=None):
-    """Append the rows that record a failure (`exc`) WITHOUT ever masking it: the caller re-raises `exc`
-    afterwards. If the append itself fails (often the same outage that caused `exc`), that is attached to
-    `exc` as a note, so the original error stays the one the run fails with and the log fault is still
-    visible next to it."""
-    try:
-        append_monitoring_rows(rows, session=session)
-    except Exception as _log_exc:
-        _note = f"monitoring log: the failure row(s) could not be written either: {_log_exc}"
-        print(f"WARNING: {_note}")
-        if hasattr(exc, "add_note"):  # Python 3.11+; serverless environment versions are not pinned here
-            exc.add_note(_note)
-
-
-if MONITORING_ACTIVE:
-    print(f"monitoring log ACTIVE -> {_MONITORING_TABLE} (job_run_id={JOB_RUN_ID})")
-
+# COMMAND ----------
 # The ES connection settings are required for any run that WRITES to ES: fail closed on an empty one
 # rather than constructing a broken EsWriteConfig. These come from this pipeline's es_host_config (a
 # complex bundle variable in databricks.yml, resolved per target); an empty value means that host
@@ -539,61 +461,31 @@ if MAX_PARTITION_BYTES != "0":
               f"({type(_e).__name__}: {_e}); continuing on the engine default")
 
 # COMMAND ----------
-# RUN START. From here on every outcome of the run is recorded in the monitoring log (when it is on):
-# `run_start` now, and `run_end` when the run ends - written by the export cells on success / graceful stop,
-# and by run_guard (below) on ANY exception raised in a guarded cell, so a failure while preparing the
-# export (reading the secret, the view, the checkpoint) is recorded too, not only one inside the ES write.
-# A run killed outright (cancel, driver loss) cannot write run_end: its run_start with no run_end IS the
-# record. Writing run_start is also the log's startup check: a missing or unwritable table fails the run
-# here, before any data moves.
-import contextlib  # noqa: E402
-
-_RUN_START_DT = datetime.now(timezone.utc)
+# RUN START. From here on every outcome of the run is recorded in the monitoring log (when it is on): run_start
+# now, and run_end when the run ends: by the export cells on success or a graceful stop, and by RECORDER.guard
+# (wrapping every later cell) on ANY exception, so a failure while preparing the export (the secret, the view,
+# the checkpoint) is recorded too. A run killed or cancelled outright cannot write run_end: its run_start with no
+# run_end IS the record. Writing run_start is also the log's startup check: a missing or unwritable table fails
+# the run here, before any data moves.
 _RUN_TRIGGER = ((f"continuous({STREAMING_TRIGGER_INTERVAL})" if STREAMING_TRIGGER_INTERVAL else "availableNow")
                 if PIPELINE_MODE == "streaming" else None)
-# The identity a run's rows share; repeated on run_end so either row alone says what ran.
-_RUN_IDENTITY = {"mode": PIPELINE_MODE, "es_index": cfg["es_index_name"], "trigger": _RUN_TRIGGER}
-append_monitoring_rows([run_start_row(CONFIG_NAME, JOB_RUN_ID, {
-    **_RUN_IDENTITY,
+RECORDER = RunRecorder(MONITORING_LOG, CONFIG_NAME, JOB_RUN_ID,
+                       {"mode": PIPELINE_MODE, "es_index": cfg["es_index_name"], "trigger": _RUN_TRIGGER})
+RECORDER.start({
     "view": VIEW_FQN, "source": SOURCE_FQN, "environment": ENVIRONMENT,
     "connector_version": _connector_version, "filter_condition": FILTER_CONDITION,
     "task_run_id": TASK_RUN_ID if TASK_RUN_ID and "{{" not in TASK_RUN_ID else None,
     "write_overrides": write_overrides, "write_repartition": WRITE_REPARTITION,
     "streaming_start": STREAMING_START if PIPELINE_MODE == "streaming" else None,
     "checkpoint": checkpoint_location_for(CHECKPOINT_BASE_PATH, CONFIG_NAME) if PIPELINE_MODE == "streaming" else None,
-}, _RUN_START_DT)])
-_RUN_END_WRITTEN = False
+}, spark)
 
+# Set by whichever mode cell below runs, and read by the summary/exit cell. Initialized to None so the backstop
+# cell can fail closed if NO mode handled the run (e.g. a mode added to the allow-list without an export cell
+# here) rather than exiting on a stale/empty summary.
+RUN_SUMMARY = None
 
-def record_run_end(status, facts):
-    """Write this run's run_end row (status success | stopped; error goes through run_guard). Raises on a
-    log failure like every other append: a run whose end cannot be recorded fails."""
-    global _RUN_END_WRITTEN
-    append_monitoring_rows([run_end_row(CONFIG_NAME, JOB_RUN_ID, status, {**_RUN_IDENTITY, **facts},
-                                        _RUN_START_DT, datetime.now(timezone.utc))])
-    _RUN_END_WRITTEN = True
-
-
-@contextlib.contextmanager
-def run_guard():
-    """Wrap a cell's body so an exception it raises is recorded as this run's run_end (status error) before
-    it propagates. Written at most once per run, never masks the exception (append_failure_rows), and the
-    exception is always re-raised, so failure semantics are unchanged: the task still fails and its retry
-    policy applies."""
-    global _RUN_END_WRITTEN
-    try:
-        yield
-    except Exception as _exc:
-        if not _RUN_END_WRITTEN:
-            _RUN_END_WRITTEN = True
-            _end = datetime.now(timezone.utc)
-            append_failure_rows([run_end_row(CONFIG_NAME, JOB_RUN_ID, "error", {
-                **_RUN_IDENTITY, **error_facts(_exc),
-                "elapsed_ms": (_end - _RUN_START_DT).total_seconds() * 1000.0,
-            }, _RUN_START_DT, _end)], _exc)
-        raise
-
-
+# COMMAND ----------
 # Build the connector write config + the shared filter helper. Both are MODE-INDEPENDENT (batch and
 # streaming write through the same EsWriteConfig and apply the same filter), so they are prepared once
 # here, above the per-mode cells below.
@@ -616,7 +508,7 @@ def run_guard():
 # on the driver and every executor. verify_certs=false together with a set ca_certs is a contradiction
 # the connector rejects in EsWriteConfig.__post_init__ (raised on the driver here), so we don't
 # re-check it pipeline-side - the connector is the single source of truth for that rule.
-with run_guard():
+with RECORDER.guard(spark):
     es_write_config = EsWriteConfig(
         hosts=ES_HOST_URL,
         api_key=dbutils.secrets.get(SECRET_SCOPE_NAME, SECRET_KEY_NAME),
@@ -632,96 +524,35 @@ def apply_filter(df):
     written once and applied identically to a batch DataFrame or a streaming micro-batch."""
     return df.filter(FILTER_CONDITION) if FILTER_CONDITION else df
 
-
-# Set by whichever mode cell below runs, and read by the summary/exit cell. Initialized to None so the
-# backstop cell can fail closed if NO mode handled the run (e.g. a mode added to the allow-list without
-# an export cell here) rather than exiting on a stale/empty summary.
-RUN_SUMMARY = None
-
 # COMMAND ----------
-# BATCH export. Read the whole (optionally filtered) deployed view and bulk_write it in one shot.
-# bulk_write returns the count dict; reconcile_or_raise then FAILS the run if any document was rejected
-# (errors > 0) or any row went unaccounted for, so a partial export surfaces as a job failure, not a
-# silent success. (raise_on_error=False so the result is printed for the log before we reconcile.)
-#
-# Monitoring log (when on): a batch-mode run is exactly ONE batch (batch_id BATCH_MODE_BATCH_ID), recorded
-# like a streaming micro-batch: batch_start immediately before the write, then batch_end (the outcome) and
-# batch_summary (the ES write diagnostics), then the run's run_end. A failure (a timeout that exhausts
-# retries RAISES from bulk_write, or a reconcile mismatch) records batch_end status=error (plus the
-# diagnostics when the write returned some) before it propagates, and run_guard records run_end.
+# BATCH export. Read the whole (optionally filtered) deployed view and export it as this run's ONE batch
+# (pipeline_lib.batch_export.run_batch_export): batch_start -> bulk_write -> reconcile -> batch_end, where
+# reconcile_or_raise FAILS the run if any document was rejected or any row went unaccounted for, so a partial
+# export surfaces as a job failure, not a silent success. batch_end carries the ES counts and diagnostics; a
+# failure is recorded as batch_end status error before it propagates (and RECORDER.guard records run_end).
 if PIPELINE_MODE == "batch":
-    with run_guard():
+    with RECORDER.guard(spark):
         export_df = apply_filter(spark.table(VIEW_FQN))
         # bulk_write runs one ES bulk stream per DataFrame partition (mapInPandas), so write parallelism ==
-        # partition count. Read parallelism (max_partition_bytes, set above) is the primary lever: the scan
-        # and this narrow, shuffle-free transform preserve that partition count through to the write, so
-        # the write already fans out and WRITE_REPARTITION defaults to 0 (off). Set WRITE_REPARTITION > 0
-        # only to override the write's partition count independently of the read (e.g. a view that
-        # shuffles resets it to spark.sql.shuffle.partitions); the target is the same either way, ~2-3x
-        # total worker cores. Repartition AFTER the filter so the surviving rows spread evenly.
+        # partition count. Read parallelism (max_partition_bytes, set above) is the primary lever: the scan and
+        # this narrow, shuffle-free transform preserve that partition count through to the write, so
+        # WRITE_REPARTITION defaults to 0 (off). Set it > 0 only to override the write's partition count
+        # independently of the read (e.g. a view that shuffles resets it to spark.sql.shuffle.partitions); the
+        # target is ~2-3x total worker cores either way. Repartition AFTER the filter so surviving rows spread.
         if WRITE_REPARTITION > 0:
             export_df = export_df.repartition(WRITE_REPARTITION)
-        # Beginning-of-batch wall clock (UTC). In batch mode the whole export IS the batch.
-        _export_start_dt = datetime.now(timezone.utc)
-        append_monitoring_rows([batch_start_row(CONFIG_NAME, JOB_RUN_ID, BATCH_MODE_BATCH_ID,
-                                                {"mode": "batch"}, _export_start_dt)])
-        result = None
-        try:
-            # Driver wall clock around the write, to LOCATE a tail that persists after the Spark UI shows
-            # every write task complete. bulk_write's own collect_ms (under bulk_stats) is the time INSIDE
-            # Spark's collect (the write job PLUS Spark's result finalization), so if this driver-measured
-            # wall is ~collect_ms the tail is inside the write itself - typically a straggler partition,
-            # which the BULK_STATS tail line below then names - whereas wall well above collect_ms would be
-            # work between the collect and this return. Two time.time() calls on the driver; nothing
-            # touches the write path.
-            _bw_t0 = time.time()
-            result = bulk_write(export_df, es_write_config)
-            _bw_wall_ms = (time.time() - _bw_t0) * 1000.0
-            # Print the core count dict on one line; when bulk_stats is on, result also carries a
-            # per-partition 'bulk_stats' list, which we render SEPARATELY (below) as readable BULK_STATS
-            # lines rather than dumping the raw list into the result line. reconcile_or_raise reads only
-            # the counts, so the extra key is ignored there.
-            _core_result = {k: v for k, v in result.items() if k != "bulk_stats"}
-            print(f"batch bulk_write result: {_core_result}")
-            print(f"{BULK_STATS_TAG} driver: bulk_write_wall_ms={_bw_wall_ms:.1f}")
-            if "bulk_stats" in result:
-                # The tail/straggler summary FIRST (the one-line answer to "where did the wall time go"),
-                # then the full per-partition breakdown. Both fail-soft.
-                print(format_tail_summary(result))
-                print(format_bulk_stats(result["bulk_stats"]))
-            reconcile_or_raise(result, index=es_write_config.index)
-        except Exception as _exc:
-            _fail_dt = datetime.now(timezone.utc)
-            _rows = [batch_end_row(CONFIG_NAME, JOB_RUN_ID, BATCH_MODE_BATCH_ID, "error", {
-                **error_facts(_exc),
-                # The counts too when the write returned (a reconcile failure), so the table says HOW the
-                # batch failed reconciliation, not only that it did.
-                **(es_counts(result) if isinstance(result, dict) else {}),
-                "elapsed_ms": (_fail_dt - _export_start_dt).total_seconds() * 1000.0,
-            }, _export_start_dt, _fail_dt)]
-            if isinstance(result, dict):
-                _rows.append(batch_summary_row(CONFIG_NAME, JOB_RUN_ID, BATCH_MODE_BATCH_ID,
-                                               es=es_write_summary(result, wall_ms=_bw_wall_ms), status="error"))
-            append_failure_rows(_rows, _exc)
-            raise
-        _bw_end_dt = datetime.now(timezone.utc)
-        append_monitoring_rows([
-            batch_end_row(CONFIG_NAME, JOB_RUN_ID, BATCH_MODE_BATCH_ID, "success", es_counts(result),
-                          _export_start_dt, _bw_end_dt),
-            batch_summary_row(CONFIG_NAME, JOB_RUN_ID, BATCH_MODE_BATCH_ID,
-                              es=es_write_summary(result, wall_ms=_bw_wall_ms)),
-        ])
-        RUN_SUMMARY = (
-            f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
-            f"ignored={result['ignored']} total_input={result['total_input']}"
-        )
+        result = run_batch_export(export_df, es_write_config, bulk_write=bulk_write, reconcile=reconcile_or_raise,
+                                  log=MONITORING_LOG, config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID, session=spark)
+        RUN_SUMMARY = (f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
+                       f"ignored={result['ignored']} total_input={result['total_input']}")
         print(f"BATCH EXPORT COMPLETE: {RUN_SUMMARY}")
-        record_run_end("success", {"batches": 1, **es_counts(result)})
+        RECORDER.end("success", {"batches": 1, **{k: result[k] for k in
+                                                  ("written", "deleted", "errors", "ignored", "total_input")}}, spark)
 
 # COMMAND ----------
 # STREAMING setup (streaming mode only). Prepare everything the stream needs BEFORE starting it, so a
 # problem here surfaces in this cell rather than mid-stream: the checkpoint location, the rendered
-# per-micro-batch SELECT, and the foreachBatch writer (with a driver-side totals accumulator).
+# per-micro-batch SELECT, the foreachBatch function, and the progress recorder.
 #
 # The design constraint: we must NOT read the deployed VIEW and join it back to each micro-batch (that
 # would scan the huge source side of the view every trigger). Instead we take the view's OWN SELECT
@@ -736,7 +567,7 @@ if PIPELINE_MODE == "batch":
 # emit different results than batch (which scans the full view). This is a limitation of streaming
 # mode: do not point a streaming pipeline at an aggregating view; use batch mode for those.
 if PIPELINE_MODE == "streaming":
-    with run_guard():
+    with RECORDER.guard(spark):
         # checkpoint_base_path was validated non-empty at the validation stage above (streaming only).
         # Per-stream subfolder keyed by config_name (stable + unique + filesystem-safe), so each stream's
         # checkpoint is isolated and survives across runs.
@@ -781,266 +612,63 @@ if PIPELINE_MODE == "streaming":
         metrics_dir = f"{checkpoint_location}/_run_metrics"
         dbutils.fs.rm(metrics_dir, recurse=True)
 
-        # Per-batch RELAY directory, a SIBLING of _run_metrics (kept out of it so the summary's
-        # spark.read.json(metrics_dir) never sees these files). Under Spark Connect foreachBatch runs
-        # server-side (its prints reach only the driver log, and its Python memory is a different process),
-        # while the wait loop in the run cell runs in this notebook process. An in-memory handoff cannot cross
-        # that split, so foreachBatch writes each batch's diagnostics to `{relay_dir}/{batch_id}` (via the SAME
-        # Spark write it uses for the row count - the one file mechanism proven to work server-side here):
-        # one JSON line with the ES write summary (for the batch_summary row) and the BULK_STATS overall+tail
-        # text (to print into the cell). The wait loop reads it once Spark has published that batch's progress
-        # and joins the two into the batch's batch_summary. A relay is deleted only AFTER its batch_summary is
-        # written, and the directory is NOT cleared at run start: an attempt that died after a batch committed
-        # but before its summary was written leaves that relay behind, and the sweep at the end of this cell
-        # summarizes it first (with the relay off, leftovers are simply deleted).
-        relay_dir = f"{checkpoint_location}/_batch_relay"
-        # Make sure it EXISTS (idempotent), so a later listing that fails is a real failure, never a benign
-        # "absent" that has to be recognized by its error text (the end-of-run sweep fails closed on it).
-        dbutils.fs.mkdirs(relay_dir)
-        # The relay is needed only when something consumes it: the monitoring log (batch_summary.es) or the
-        # bulk_stats relay-to-cell print.
-        _RELAY_ON = MONITORING_ACTIVE or BULK_STATS.strip().lower() == "true"
+        # Per-batch PRINT RELAY (bulk_stats on only), a sibling of _run_metrics. Under Spark Connect foreachBatch
+        # runs on the cluster, so its BULK_STATS print reaches only the driver log; it also writes the line to
+        # `{print_relay_dir}/{batch_id}` and the progress recorder (this notebook process) prints it into the
+        # cell and deletes it. BEST-EFFORT and nothing else: no log row depends on it. Cleared at run start.
+        print_relay_dir = f"{checkpoint_location}/_bulk_stats_relay"
+        dbutils.fs.rm(print_relay_dir, recurse=True)
+        dbutils.fs.rm(f"{checkpoint_location}/_batch_relay", recurse=True)  # a previous build's relay; unused now
+        _BULK_STATS_ON = BULK_STATS.strip().lower() == "true"
 
-        def read_relay(batch_id):
-            """Read the relay foreachBatch wrote for `batch_id` (a Spark `.text()` output directory holding one
-            `part-*` file with one JSON line) and return it as a dict, or None when it is absent or unreadable.
-            Does NOT delete it: the caller drops it (drop_relay) only once the batch's summary is safely
-            written, so a failed read or a failed summary append leaves it for a later sweep instead of losing
-            the batch's diagnostics. Runs in the notebook process via dbutils.fs, so any checkpoint URI works
-            (no FUSE mount needed). FAIL-SOFT: returns None on any problem."""
-            try:
-                for f in dbutils.fs.ls(f"{relay_dir}/{int(batch_id)}"):
-                    if f.name.startswith("part-"):
-                        return json.loads(dbutils.fs.head(f.path, 1024 * 1024))
-            except Exception:
-                pass
-            return None
-
-        def drop_relay(batch_id):
-            """Delete `batch_id`'s spent relay directory (best-effort), so an always-on stream does not
-            accumulate one directory per batch."""
-            try:
-                dbutils.fs.rm(f"{relay_dir}/{int(batch_id)}", recurse=True)
-            except Exception:
-                pass
-
-        def _summary_already_written(job_run_id, batch_id):
-            """True when the monitoring table already holds a batch_summary for this (config, run, batch).
-            Consulted before every swept summary: a leftover outside this run's recorded range may be a batch a
-            previous process summarized just before its best-effort relay delete failed (the in-process range
-            starts empty after a restart). Leftovers are rare, so the extra read is cheap. Raises on a read
-            failure (fail-closed)."""
-            return spark.sql(
-                f"SELECT 1 FROM {_MONITORING_TABLE} WHERE record_type = 'batch_summary' "
-                f"AND config_name = :c AND job_run_id = :r AND batch_id = :b LIMIT 1",
-                args={"c": CONFIG_NAME, "r": str(job_run_id), "b": int(batch_id)},
-            ).count() > 0
-
-        def summarize_leftover_relays(below=None, final=False):
-            """Write a batch_summary for every batch that ended successfully (it left a relay directory) but
-            whose progress report was never recorded, for ids below `below` (None = all): its report was
-            evicted from query.recentProgress's bounded buffer before a poll saw it, reads kept failing, or an
-            earlier attempt died before summarizing it. The summary carries the relayed ES diagnostics alone,
-            with a warning, so no batch is silently skipped (pipeline_lib.monitoring_sink.leftover_relay_ids).
-            A relay is dropped only after its summary is written; an unreadable one is left (and warned) for
-            the next sweep. With the log off, leftovers are just dropped. A listing failure only warns, except on
-            the `final` sweep of a run (there is no later sweep to catch up), where it raises so a committed
-            batch can never be left silently unsummarized; the same goes for an unreadable relay there."""
-            if not _RELAY_ON:
-                return
-            try:
-                _names = [f.name for f in dbutils.fs.ls(relay_dir)]
-            except Exception as _e:
-                # relay_dir is created at setup, so a failed listing is a real failure, never "absent".
-                if final and MONITORING_ACTIVE:
-                    raise MonitoringLogError(f"could not list {relay_dir} to summarize unrecorded batches "
-                                             f"({type(_e).__name__}: {_e})") from _e
-                print(f"WARNING: could not list {relay_dir} for unrecorded batches ({type(_e).__name__}: {_e})")
-                return
-            for _bid in leftover_relay_ids(_names, below):
-                # Within the range of batches THIS run recorded the batch was already summarized (its relay
-                # outlived a failed best-effort delete): drop it, never summarize it twice. Below that range it
-                # is a previous run's leftover (batch ids continue across runs) and is still owed a summary.
-                _recorded = (_progress_mark["first"] is not None
-                             and _progress_mark["first"] <= _bid <= _progress_mark["last"])
-                if not MONITORING_ACTIVE or _recorded:
-                    drop_relay(_bid)
-                    continue
-                _relay = read_relay(_bid)
-                if not (_relay and _relay.get("es")):
-                    if final:
-                        raise MonitoringLogError(f"could not read the relayed diagnostics for unrecorded batch "
-                                                 f"{_bid} ({relay_dir}/{_bid}); its batch_summary cannot be "
-                                                 f"written. If that directory is damaged, delete it to proceed "
-                                                 f"(the batch keeps its batch_start/batch_end rows).")
-                    print(f"WARNING: could not read the relayed diagnostics for unrecorded batch {_bid}; "
-                          f"retrying on the next sweep")
-                    continue
-                _owner = _relay.get("job_run_id")
-                if not _owner:
-                    # Written by a run with the log OFF (bulk_stats relay only): that batch has no batch_start /
-                    # batch_end rows to complete, so there is nothing to summarize. Just clear it.
-                    drop_relay(_bid)
-                    continue
-                if _summary_already_written(_owner, _bid):
-                    drop_relay(_bid)  # summarized before a restart; only its cleanup was lost
-                    continue
-                print(f"WARNING: {PROGRESS_TAG} no progress report seen for batch {_bid}; writing its "
-                      f"batch_summary from the relayed ES diagnostics only")
-                # Filed under the run that executed the batch (it may be an earlier, dead run).
-                append_monitoring_rows([batch_summary_row(CONFIG_NAME, _owner, _bid, es=_relay["es"])])
-                drop_relay(_bid)
-
-        def foreach_batch(batch_df, batch_id: int):
-            # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so
-            # the deployed view's projection/joins/hints apply to exactly this batch. Both the register and
-            # the query go through batch_df.sparkSession, NOT the notebook's global `spark`: inside
-            # foreachBatch the micro-batch can carry a cloned session, and a temp view is session-scoped, so
-            # binding both to the batch's own session keeps the view visible to the query in every runtime.
-            # filter_condition is applied to the transformed rows.
-            session = batch_df.sparkSession
+        def _transform(batch_df, session):
+            # Register the batch as the ${source} temp view and run the rendered view SELECT over it, so the
+            # deployed view's projection/joins/hints apply to exactly this batch. Both go through the batch's
+            # OWN session (a temp view is session-scoped and the micro-batch can carry a cloned session).
+            # filter_condition is applied to the transformed rows; the optional repartition follows (same knob
+            # and rationale as the batch path).
             batch_df.createOrReplaceTempView(BATCH_SOURCE_VIEW)
             transformed = apply_filter(session.sql(RENDERED_SELECT))
-            # Optional per-micro-batch repartition, same knob and rationale as the batch path: read
-            # parallelism (max_partition_bytes) is the primary lever and its partition count carries
-            # through this shuffle-free transform to the write, so WRITE_REPARTITION defaults to 0 (off).
-            # Set it > 0 only to override the write's partition count independently (e.g. a view that
-            # shuffles), targeting ~2-3x worker cores, the same target as the batch path.
-            if WRITE_REPARTITION > 0:
-                transformed = transformed.repartition(WRITE_REPARTITION)
-            # Monitoring log (when on): batch_start goes in BEFORE any of this batch's data is sent, so a log
-            # outage fails the micro-batch (and the task) before the data moves rather than after. Appended
-            # from the micro-batch's OWN session (this runs server-side). FAIL-CLOSED like every append.
-            _fb_start_dt = datetime.now(timezone.utc)
-            append_monitoring_rows([batch_start_row(CONFIG_NAME, JOB_RUN_ID, int(batch_id), {"mode": "streaming"},
-                                                    _fb_start_dt)], session=session)
-            # Write via the connector, capturing its AUTHORITATIVE result (not our own .count() of the
-            # input, which would over-report a partially-failed batch). raise_on_error=True makes bulk_write
-            # itself raise on any rejected/unaccounted row, so a batch that does not FULLY succeed fails the
-            # micro-batch here: the checkpoint does not advance and Spark reprocesses the batch. That retry
-            # is an idempotent upsert ONLY when es_id_field is set (deterministic _id); with es_id_field
-            # OMITTED, ES assigns fresh random _ids, so the reprocessed rows land as NEW documents and the
-            # retry DUPLICATES them - streaming replays are routine, so omit es_id_field only for a stream
-            # where duplicates are acceptable. If it never recovers the run fails with no summary. A failed
-            # write records batch_end status=error (never masking the write's own error) before re-raising.
-            _bw_t0 = time.time()
-            try:
-                result = bulk_write(transformed, es_write_config, raise_on_error=True)
-            except Exception as _exc:
-                _fail_dt = datetime.now(timezone.utc)
-                append_failure_rows([batch_end_row(CONFIG_NAME, JOB_RUN_ID, int(batch_id), "error", {
-                    **error_facts(_exc), "elapsed_ms": (_fail_dt - _fb_start_dt).total_seconds() * 1000.0,
-                }, _fb_start_dt, _fail_dt)], _exc, session=session)
-                raise
-            _bw_wall_ms = (time.time() - _bw_t0) * 1000.0
-            _fb_end_dt = datetime.now(timezone.utc)
-            # When bulk_stats is on, log a COMPACT one-line rollup of this micro-batch's ES bulk-send
-            # diagnostics (overall docs/send, rtt, took) so an always-on run has per-batch visibility
-            # without the full per-partition breakdown flooding the log. format_bulk_stats is fail-soft,
-            # so a diagnostic-formatting fault can never disturb the write. This print runs server-side
-            # (micro-batch), so its stdout lands in the driver LOG (surfacing as stderr), not the cell.
-            if "bulk_stats" in result:
-                print(format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}")
-            # Persist this clean batch's authoritative written count as one JSON file, keyed by batch_id so
-            # the summary can dedup a retried batch (write mode append; each batch is its own small file).
-            session.createDataFrame(
-                [(int(batch_id), int(result.get("written", 0) or 0))], "batch_id bigint, written bigint"
-            ).coalesce(1).write.mode("append").json(metrics_dir)
-            # The batch's OUTCOME, last, so status=success means everything this batch had to do is done.
-            # (Its diagnostics follow as batch_summary from the wait loop, once Spark publishes the progress.)
-            append_monitoring_rows([batch_end_row(CONFIG_NAME, JOB_RUN_ID, int(batch_id), "success",
-                                                  es_counts(result), _fb_start_dt, _fb_end_dt)], session=session)
-            # Relay this batch's diagnostics to the wait loop (see relay_dir above), AFTER batch_end, so a relay
-            # directory always means the batch ended successfully (summarize_leftover_relays relies on that).
-            # With the monitoring log ON the relay is part of the log (it is how this batch's batch_summary is
-            # guaranteed even if its progress report is lost), so a failed relay write FAILS the batch like any
-            # log write. With the log off it only feeds the BULK_STATS cell print, so a fault just warns.
-            if _RELAY_ON:
-                try:
-                    # job_run_id travels with the relay so a summary written later by a DIFFERENT run (the
-                    # start-up sweep) is still filed under the run whose batch_start/batch_end it completes.
-                    _relay = json.dumps({"es": es_write_summary(result, wall_ms=_bw_wall_ms),
-                                         "line": bulk_stats_relay_line(result, batch_id),
-                                         "job_run_id": JOB_RUN_ID}, default=str)
-                    session.createDataFrame([(_relay,)], "line string") \
-                        .coalesce(1).write.mode("overwrite").text(f"{relay_dir}/{int(batch_id)}")
-                except Exception as _e:
-                    if MONITORING_ACTIVE:
-                        raise MonitoringLogError(f"could not write batch {batch_id}'s relay for its batch_summary "
-                                                 f"({type(_e).__name__}: {_e})") from _e
-                    print(f"WARNING: could not relay batch {batch_id} diagnostics to the notebook "
-                          f"({type(_e).__name__}: {_e}); continuing")
+            return transformed.repartition(WRITE_REPARTITION) if WRITE_REPARTITION > 0 else transformed
 
-        # THE WAIT LOOP: how this notebook waits on a running stream, records each batch's progress, and notices
-        # the stream ending: pipeline_lib.stream_wait.await_stream (see its docstring for why a blocking
-        # awaitTermination() plus a StreamingQueryListener was replaced: both ride long-lived Spark Connect
-        # calls, and a blocking awaitTermination() was reproduced never returning after its query FAILED,
-        # leaving the task RUNNING and never restarted). It waits in short slices and checks query.isActive
-        # between them, so an ended stream is noticed within one slice. It never touches the stream itself:
-        # a micro-batch of any length simply spans many slices, and batch_start / batch_end are written inline
-        # from foreachBatch, not from here.
-        #
-        # Progress: each slice reads query.recentProgress (a short request/response; the server keeps the last
-        # spark.sql.streaming.numRecentProgressUpdates reports, default 100) and records every batch newer than
-        # the last one recorded (progress_batch_ids: a high-water mark, idle triggers skipped). A missed or
-        # failed read is filled in by the next one, which a dropped listener event never was. For each new
-        # batch: print its STREAM_PROGRESS line (and the relayed BULK_STATS line), and, when the monitoring log
-        # is on, append its batch_summary. A failed read only warns (retried next slice); a failed APPEND raises
-        # (the log's fail-closed contract), and the caller stops the query and fails the task.
-        _POLL_SECONDS = 10
-        # The first and highest batch ids THIS run recorded (a dict so the helpers can update it).
-        _progress_mark = {"first": None, "last": None}
+        def _write_metrics(session, batch_id, written):
+            # One small JSON file per clean batch, keyed by batch_id so the drain summary dedups a retried batch.
+            session.createDataFrame([(int(batch_id), int(written))], "batch_id bigint, written bigint") \
+                .coalesce(1).write.mode("append").json(metrics_dir)
 
-        def record_progress(query):
-            """Record every newly executed batch in query.recentProgress (see THE WAIT LOOP above)."""
+        def _write_print_relay(session, batch_id, text):
+            session.createDataFrame([(text,)], "line string") \
+                .coalesce(1).write.mode("overwrite").text(f"{print_relay_dir}/{int(batch_id)}")
+
+        def _read_print_relay(batch_id):
+            """Return and delete the relayed BULK_STATS line for `batch_id` (best-effort; None if absent)."""
+            d = f"{print_relay_dir}/{int(batch_id)}"
+            line = None
             try:
-                _reports = [json.loads(p.json) for p in query.recentProgress]
-            except Exception as _e:
-                print(f"WARNING: {PROGRESS_TAG} could not read query progress ({type(_e).__name__}: {_e}); "
-                      f"retrying on the next poll")
-                return
-            for _p in progress_batch_ids(_reports, _progress_mark["last"]):
-                _bid = _p["batchId"]
-                summarize_leftover_relays(below=_bid)  # earlier batches whose report was never seen
-                print(format_progress(_p))
-                _relay = read_relay(_bid) if _RELAY_ON else None
-                # A missing relay here is normally a momentary read blip (with the log on, every committed batch
-                # has one: a failed relay write fails the batch). Retry briefly; if it is still unreadable, the
-                # summary is written from Spark's progress alone and that batch's ES rollup is not kept (the
-                # outcome rows and the summary row still exist; only the es diagnostics field is missing).
-                for _retry in range(2):
-                    if _relay is not None or not (_RELAY_ON and MONITORING_ACTIVE):
+                for f in dbutils.fs.ls(d):
+                    if f.name.startswith("part-"):
+                        line = dbutils.fs.head(f.path, 1024 * 1024).rstrip("\n")
                         break
-                    time.sleep(1)
-                    _relay = read_relay(_bid)
-                if _relay and _relay.get("line"):
-                    print(_relay["line"])
-                if MONITORING_ACTIVE:
-                    append_monitoring_rows([batch_summary_row(CONFIG_NAME, JOB_RUN_ID, _bid,
-                                                              es=(_relay or {}).get("es"), progress=_p)])
-                if _RELAY_ON:
-                    drop_relay(_bid)  # only once its summary is written (a failed append raised above)
-                if _progress_mark["first"] is None:
-                    _progress_mark["first"] = _bid
-                _progress_mark["last"] = _bid
+                dbutils.fs.rm(d, recurse=True)
+            except Exception:
+                pass
+            return line
 
-        def await_stream(query, record=True):
-            """Block until `query` ends (pipeline_lib.stream_wait.await_stream: _POLL_SECONDS slices plus the
-            isActive liveness check), recording progress between slices when `record` is set. The no-op
-            seed drain passes False: its batches send nothing to ES, so there is nothing to record. Returns
-            only on a clean end; raises the query's exception when it failed, or a monitoring log failure
-            (after stopping the query)."""
-            _await_stream(query, _POLL_SECONDS, record=record_progress if record else None,
-                          log=lambda m: print(f"{PROGRESS_TAG} {m}"))
+        # The foreachBatch function (pipeline_lib.stream_batch): transform -> batch_start -> bulk_write -> metrics
+        # -> batch_end (+ ES diagnostics) -> print relay. Its order and failure handling are unit-tested.
+        foreach_batch = make_foreach_batch(
+            transform=_transform, bulk_write=bulk_write, write_config=es_write_config, log=MONITORING_LOG,
+            config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID, write_metrics=_write_metrics,
+            write_print_relay=_write_print_relay if _BULK_STATS_ON else None)
+        # Records each batch's Spark progress report (STREAM_PROGRESS line + batch_summary row) between the wait
+        # loop's slices (pipeline_lib.stream_progress).
+        PROGRESS = ProgressRecorder(MONITORING_LOG, CONFIG_NAME, JOB_RUN_ID, spark,
+                                    read_print_relay=_read_print_relay if _BULK_STATS_ON else None)
+        # How often the wait loop (pipeline_lib.stream_wait) checks the stream between waits.
+        POLL_SECONDS = 10
 
-        # Settle what a previous attempt left behind (see relay_dir above): summarize committed batches it
-        # never summarized, or, with the relay off, just clear the leftovers.
-        if _RELAY_ON:
-            summarize_leftover_relays()  # not final: the stream's own sweeps and end-of-run pass follow
-        else:
-            dbutils.fs.rm(relay_dir, recurse=True)
-        # The previous runner's relay directory name; nothing reads it any more, so remove it if present.
-        dbutils.fs.rm(f"{checkpoint_location}/_bulk_stats_relay", recurse=True)
+        def _wait_log(message):
+            print(f"{PROGRESS_TAG} {message}")
 
 # COMMAND ----------
 # STREAMING run - STEP 1 of 2: PREPARE the checkpoint (streaming mode only). Build the Delta stream
@@ -1072,7 +700,7 @@ if PIPELINE_MODE == "streaming":
 # - "full": omit startingVersion and use the REAL foreachBatch, so the first micro-batches backfill the
 #   whole existing table to ES (intentional history export).
 if PIPELINE_MODE == "streaming":
-    with run_guard():
+    with RECORDER.guard(spark):
         # The seed drain's batch bound (used by the "new" first-run path below). maxFilesPerTrigger MUST be
         # set on the no-op seed so the source's initial snapshot is consumed as bounded, resumable
         # micro-batches instead of one unbounded batch that can stall on a large-history source. Reuse the
@@ -1166,7 +794,7 @@ if PIPELINE_MODE == "streaming":
                     .trigger(availableNow=True)
                     .start()
                 )
-                await_stream(seed_query, record=False)
+                _await_stream(seed_query, POLL_SECONDS, record=None, log=_wait_log)
                 # The seed exists to persist a resume offset. A numeric startingVersion under availableNow
                 # normally commits at least one offset even with no new data, but we do NOT rely on that: if
                 # there is nothing to drain at/after the pinned version (e.g. the current version is a
@@ -1206,7 +834,7 @@ if PIPELINE_MODE == "streaming":
 # ProcessingTime (an always-on continuous job). `reader` carries over from the previous cell via the
 # shared notebook session; this cell re-opens the same `if PIPELINE_MODE == "streaming":` guard.
 if PIPELINE_MODE == "streaming":
-    with run_guard():
+    with RECORDER.guard(spark):
         stream_df = reader.table(SOURCE_FQN)
 
         # The Spark-UI query name: CONFIG_NAME (readable identifier of THIS pipeline) plus a short unique
@@ -1226,8 +854,9 @@ if PIPELINE_MODE == "streaming":
         #   (serverless rejects ProcessingTime). The generated job carries a Databricks Jobs `continuous`
         #   trigger that keeps this run perpetually alive (auto-restarting on failure); each restart resumes
         #   from the checkpoint (the startingVersion seed above is skipped once an offset exists).
-        # Either way the run then waits in await_stream (the wait loop, see the setup cell), which records each
-        # batch's progress and fails the task promptly if the stream fails, even if the wait call misses it.
+        # Either way the run then waits in pipeline_lib.stream_wait.await_stream: short wait slices with liveness
+        # checks between them (a blocking awaitTermination() was reproduced never returning after its query FAILED,
+        # leaving the task RUNNING and never restarted), recording each batch's progress as it goes.
         writer = (
             stream_df.writeStream
             .queryName(_QUERY_NAME)  # unique per-run name (CONFIG_NAME + suffix): legible + collision-free
@@ -1238,107 +867,85 @@ if PIPELINE_MODE == "streaming":
             print(f"continuous streaming: ProcessingTime trigger every {STREAMING_TRIGGER_INTERVAL!r} "
                   f"(always-on; this run does not self-terminate)")
             query = writer.trigger(processingTime=STREAMING_TRIGGER_INTERVAL).start()
-            print(f"{PROGRESS_TAG} query started: name={query.name!r} id={query.id} runId={query.runId}")
-            # await_stream returns ONLY if the stream stops: on a FAILURE it raises (the run fails and the Jobs
-            # continuous trigger restarts it, so a lost batch never passes silently), and if the query stops
-            # without an error it returns normally (run_end status stopped). A JOB CANCEL is not that: it
-            # interrupts this notebook (seen live), so nothing below runs and the run keeps a run_start with no
-            # run_end; an interrupted batch_summary is written by the next run's start-up sweep. There is NO
-            # drain-and-stop reconciliation for an always-on run - observability is the per-batch rows written
-            # as each batch commits plus the Databricks Jobs continuous-run state (RUNNING / restart count /
-            # failure notifications). So set a summary noting the stop and do NOT run the availableNow summary
-            # below (this branch owns its own RUN_SUMMARY).
-            await_stream(query)
-            # Batches that committed just before the stop may not have had their report polled yet: record
-            # them, then summarize any whose report never arrived, as the availableNow branch does.
-            record_progress(query)
-            summarize_leftover_relays(final=True)
-            RUN_SUMMARY = (
-                f"streaming_trigger=continuous({STREAMING_TRIGGER_INTERVAL}) stopped; "
-                f"checkpoint={checkpoint_location}"
-            )
-            print(f"CONTINUOUS STREAM STOPPED: {RUN_SUMMARY}")
-            record_run_end("stopped", {"checkpoint": checkpoint_location,
-                                       "last_batch_recorded": _progress_mark["last"]})
         else:
-            # availableNow (drain-and-stop): start, drain to completion, then summarize THIS run.
-            query = writer.trigger(availableNow=True).start()
-            print(f"{PROGRESS_TAG} query started: name={query.name!r} id={query.id} runId={query.runId}")
-            await_stream(query)
+            query = writer.trigger(availableNow=True).start()  # drain-and-stop
+        print(f"{PROGRESS_TAG} query started: name={query.name!r} id={query.id} runId={query.runId}")
+        # Returns only when the stream ends without an error; raises the stream's error (the task fails and its
+        # retry policy applies). A JOB CANCEL interrupts this notebook instead (seen live), leaving run_start with
+        # no run_end.
+        _await_stream(query, POLL_SECONDS, record=PROGRESS, log=_wait_log)
+        if STREAMING_TRIGGER_INTERVAL:
+            # An always-on stream that stopped WITHOUT an error. Batches that committed just before the stop may
+            # not have had their report polled yet: record them once more.
+            PROGRESS(query)
+            RUN_SUMMARY = f"streaming_trigger=continuous({STREAMING_TRIGGER_INTERVAL}) stopped; checkpoint={checkpoint_location}"
+            print(f"CONTINUOUS STREAM STOPPED: {RUN_SUMMARY}")
+            RECORDER.end("stopped", {"checkpoint": checkpoint_location,
+                                     "last_batch_recorded": PROGRESS.last_batch_id}, spark)
 
-            # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
-            # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
-            # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
-            # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that
-            # was retried within this run is counted once, not summed twice - then total. A run with no new
-            # source data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid
-            # outcome, not a failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch
-            # that did not fully succeed failed the run instead of recording, and the total is exact.
-            from pyspark.sql import functions as _F  # noqa: E402
+# COMMAND ----------
+# STREAMING drain summary (availableNow only): how many batches and rows THIS run pushed, read back from the
+# per-batch metrics files foreachBatch wrote; then the run's run_end.
+if PIPELINE_MODE == "streaming" and not STREAMING_TRIGGER_INTERVAL:
+    with RECORDER.guard(spark):
+        # Report how many rows this run pushed, read back from the per-batch JSON metrics foreachBatch
+        # wrote under metrics_dir (see above). This is the reliable driver-side total: it survives the
+        # server-side foreachBatch boundary and the async delivery of query.recentProgress, both of which
+        # under-reported in testing. DEDUP by batch_id first (max written per batch_id), so a batch that
+        # was retried within this run is counted once, not summed twice - then total. A run with no new
+        # source data wrote no metric files (empty dir), which reads as 0 batches / 0 rows: a valid
+        # outcome, not a failure. Each recorded batch used bulk_write(raise_on_error=True), so any batch
+        # that did not fully succeed failed the run instead of recording, and the total is exact.
+        from pyspark.sql import functions as _F  # noqa: E402
 
-            def _metrics_dir_missing():
-                # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
-                # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
-                # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
-                # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
-                # run that already pushed rows is exactly the fail-open bug this must avoid.
-                try:
-                    dbutils.fs.ls(metrics_dir)
-                    return False  # path exists
-                except Exception as _e:
-                    # Verified on this runtime: a missing path raises ExecutionError wrapping
-                    # CloudFileNotFoundException with text "No such file or directory". Match the not-found
-                    # signal explicitly; re-raise everything else.
-                    _msg = str(_e)
-                    if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
-                        return True  # positively not-found: no batches wrote metrics
-                    raise  # anything else is a real failure - do not swallow it
+        def _metrics_dir_missing():
+            # Existence probe that FAILS CLOSED: return True (treat as "no metric files, 0 batches ran")
+            # ONLY when dbutils.fs.ls positively reports the path does not exist. dbutils wraps that as an
+            # error whose text contains FileNotFoundException; any OTHER error (permission/403, transient
+            # IO, etc.) is re-raised so it fails the run rather than being misread as "0 rows" - masking a
+            # run that already pushed rows is exactly the fail-open bug this must avoid.
+            try:
+                dbutils.fs.ls(metrics_dir)
+                return False  # path exists
+            except Exception as _e:
+                # Verified on this runtime: a missing path raises ExecutionError wrapping
+                # CloudFileNotFoundException with text "No such file or directory". Match the not-found
+                # signal explicitly; re-raise everything else.
+                _msg = str(_e)
+                if "FileNotFoundException" in _msg or "No such file or directory" in _msg or "does not exist" in _msg:
+                    return True  # positively not-found: no batches wrote metrics
+                raise  # anything else is a real failure - do not swallow it
 
-            _batch_ids = []
-            if _metrics_dir_missing():
-                # No metric files => the stream drained zero micro-batches (no new source data since the last
-                # run). A valid outcome, reported as 0, not a failure.
-                num_batches, rows_pushed = 0, 0
-            else:
-                # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the
-                # run rather than being silently reported as 0.
-                _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
-                _rows = _per_batch.collect()
-                _batch_ids = sorted(int(r["batch_id"]) for r in _rows)
-                num_batches, rows_pushed = len(_rows), sum(int(r["written"] or 0) for r in _rows)
+        _batch_ids = []
+        if _metrics_dir_missing():
+            # No metric files => the stream drained zero micro-batches (no new source data since the last
+            # run). A valid outcome, reported as 0, not a failure.
+            num_batches, rows_pushed = 0, 0
+        else:
+            # Dir exists: read it WITHOUT catching, so any genuine read failure propagates and fails the
+            # run rather than being silently reported as 0.
+            _per_batch = spark.read.json(metrics_dir).groupBy("batch_id").agg(_F.max("written").alias("written"))
+            _rows = _per_batch.collect()
+            _batch_ids = sorted(int(r["batch_id"]) for r in _rows)
+            num_batches, rows_pushed = len(_rows), sum(int(r["written"] or 0) for r in _rows)
 
-            # Every batch this run executed owes a batch_summary. Spark publishes a batch's progress
-            # asynchronously, so the LAST batch's report can still be in flight when the query terminates (seen
-            # in testing: recentProgress right after the end missed a batch that moved rows). Poll briefly for
-            # the stragglers; any batch whose progress never arrives still gets its summary from the relayed ES
-            # diagnostics alone, so the record is complete either way.
-            if MONITORING_ACTIVE and _batch_ids:
-                for _attempt in range(5):
-                    if _progress_mark["last"] is not None and _progress_mark["last"] >= _batch_ids[-1]:
-                        break
-                    time.sleep(2)
-                    record_progress(query)
-            # Whatever is still unrecorded (its report never arrived, or a crashed earlier run left it) is
-            # summarized from its relayed ES diagnostics alone, so every executed batch ends up with a
-            # batch_summary; with the log off this just clears the leftovers. Runs on every drain, zero
-            # batches included.
-            summarize_leftover_relays(final=True)
-
-            RUN_SUMMARY = (
-                f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
-                f"checkpoint={checkpoint_location}"
-            )
-            if rows_pushed == 0:
-                print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
-            print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
-            record_run_end("success", {"streaming_start": STREAMING_START, "batches": num_batches,
-                                       "rows_pushed": rows_pushed, "checkpoint": checkpoint_location})
+        # Spark can publish the LAST batch's progress just after the query terminates: wait briefly for it.
+        # A batch whose report never arrives keeps batch_start / batch_end without a batch_summary.
+        if _batch_ids:
+            PROGRESS.catch_up(query, _batch_ids[-1])
+        RUN_SUMMARY = (f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
+                       f"checkpoint={checkpoint_location}")
+        if rows_pushed == 0:
+            print("STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)")
+        print(f"STREAMING EXPORT COMPLETE: {RUN_SUMMARY}")
+        RECORDER.end("success", {"streaming_start": STREAMING_START, "batches": num_batches,
+                                 "rows_pushed": rows_pushed, "checkpoint": checkpoint_location}, spark)
 
 # COMMAND ----------
 # Fail-closed backstop: every supported mode's cell above sets RUN_SUMMARY. If it is still None, the
 # effective PIPELINE_MODE passed allow-list validation but no export cell handled it (e.g. a new mode
 # added to the allow-list without a corresponding cell). Raise rather than exit on an empty summary.
-with run_guard():
+with RECORDER.guard(spark):
     if RUN_SUMMARY is None:
         raise ValueError(f"no export ran for pipeline_mode {PIPELINE_MODE!r} (allow-listed but unhandled)")
 

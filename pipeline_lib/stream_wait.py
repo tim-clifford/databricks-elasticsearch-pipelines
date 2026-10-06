@@ -31,7 +31,8 @@ def await_stream(query, poll_seconds, record=None, log=print):
     when it failed, exactly as a blocking awaitTermination() would.
 
     `record` (optional) is called with the query after every slice, to record progress (the notebook prints
-    each new batch's STREAM_PROGRESS line and appends its batch_summary row). Its contract:
+    each new batch's STREAM_PROGRESS line and appends its batch_summary row: stream_progress.ProgressRecorder).
+    Its contract:
     - It handles its OWN transient read problems (a failed progress read warns and is retried next slice).
     - Whatever it RAISES is a real failure (a monitoring log append that failed): the loop stops the query,
       if it is still running, and re-raises, so the task fails instead of streaming on unlogged.
