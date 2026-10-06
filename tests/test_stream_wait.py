@@ -93,12 +93,6 @@ def test_hung_wait_call_is_caught_by_isactive_and_the_failure_is_raised():
     assert q.wait_calls == 3
 
 
-def test_hung_wait_call_on_a_cleanly_stopped_query_returns():
-    q = FakeQuery([False], active=[False], failure=None)
-    logs = _run(q)
-    assert any("no longer active" in m for m in logs)
-
-
 def test_slow_query_keeps_waiting_through_many_slices():
     # A long micro-batch: many "still running" slices, the query active throughout, then a clean end.
     q = FakeQuery([False] * 500 + [True], active=[True])
@@ -110,7 +104,7 @@ def test_isactive_error_is_not_fatal_and_waiting_continues():
     q = FakeQuery([False, False, True], active=[RuntimeError("rpc blip"), True])
     logs = _run(q)
     assert q.wait_calls == 3
-    assert any("could not check whether the query is active" in m for m in logs)
+    assert any("could not check the query's state" in m for m in logs)
 
 
 def test_record_runs_every_slice():
@@ -177,15 +171,6 @@ def test_record_failure_after_liveness_detected_failure_raises_the_query_error()
     assert any("append failed" in n for n in getattr(info.value, "__notes__", []))
 
 
-def test_persistent_isactive_errors_fail_instead_of_spinning_forever():
-    # Isaac finding: the wait call keeps saying "running" and isActive errors every slice; the loop must
-    # give up (fail the task, so the retry policy applies) rather than hang.
-    q = FakeQuery([False], active=[RuntimeError("rpc down")])
-    with pytest.raises(RuntimeError, match="could not determine whether the query is active"):
-        _run(q)
-    assert q.wait_calls == 30
-
-
 def test_isactive_error_streak_resets_on_a_good_check():
     # 29 errors, one good check, 29 errors, then a clean end: never 30 in a row, so no failure.
     errs = [RuntimeError("blip")] * 29
@@ -214,3 +199,54 @@ def test_exception_check_error_is_not_fatal():
     q = FlakyException([False, False, True], active=[True])
     _run(q)
     assert q.wait_calls == 3
+
+
+def test_isactive_errors_with_a_readable_exception_check_do_not_fail_a_healthy_stream():
+    # Isaac finding: if only isActive errors while the query's recorded state is still readable (no
+    # failure), the stream is healthy and must not be failed after MAX_ISACTIVE_ERRORS slices.
+    q = FakeQuery([False] * 40 + [True], active=[RuntimeError("isActive rpc broken")])
+    _run(q)
+    assert q.wait_calls == 41
+
+
+def test_unreadable_state_on_both_checks_still_fails_after_the_limit():
+    class Unreadable(FakeQuery):
+        def exception(self):
+            raise RuntimeError("exception rpc broken")
+
+    q = Unreadable([False], active=[RuntimeError("isActive rpc broken")])
+    with pytest.raises(RuntimeError, match="could not determine whether the query is active"):
+        _run(q)
+    assert q.wait_calls == 30
+
+
+def test_liveness_end_with_late_failure_visibility_raises_via_confirming_wait():
+    # Isaac finding: isActive flips False before exception() is populated. The end must be confirmed by a
+    # final wait call, which raises the failure, instead of being reported as a clean stop.
+    class LateFailure(FakeQuery):
+        def awaitTermination(self, timeout):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                return False  # the wait call missed the end
+            raise QueryFailed("failure visible only to the confirming wait")
+
+        def exception(self):
+            return None  # not yet populated
+
+    q = LateFailure([False], active=[False])
+    with pytest.raises(QueryFailed, match="confirming wait"):
+        _run(q)
+
+
+def test_liveness_end_that_cannot_be_confirmed_fails_closed():
+    # isActive says ended, no failure recorded, but the confirming wait still says "running": the outcome is
+    # unknown, so fail (a restart is safe) rather than report a clean stop.
+    q = FakeQuery([False], active=[False], failure=None)
+    with pytest.raises(RuntimeError, match="could not confirm how the query ended"):
+        _run(q)
+
+
+def test_liveness_end_confirmed_clean_returns():
+    q = FakeQuery([False, True], active=[False], failure=None)
+    _run(q)
+    assert q.wait_calls == 2

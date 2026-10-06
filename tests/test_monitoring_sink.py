@@ -243,6 +243,11 @@ def test_es_write_summary_without_bulk_stats_has_driver_facts_only():
     assert s == {"collect_ms": 5, "merge_ms": 1, "num_partitions": None, "bulk_write_wall_ms": None}
 
 
+def test_es_write_summary_empty_bulk_stats_list_has_no_rollups():
+    s = es_write_summary({"written": 0, "collect_ms": 2, "merge_ms": 0, "bulk_stats": []})
+    assert s == {"collect_ms": 2, "merge_ms": 0, "num_partitions": 0, "bulk_write_wall_ms": None}
+
+
 def test_es_write_summary_rejects_non_dict():
     with pytest.raises(ValueError):
         es_write_summary("x")
