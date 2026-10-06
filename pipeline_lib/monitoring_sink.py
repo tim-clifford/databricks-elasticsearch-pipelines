@@ -240,8 +240,9 @@ def batch_summary_row(config_name, job_run_id, batch_id, es=None, progress=None,
     batch's outcome: a streaming summary is only ever written for a committed batch (success), while a
     batch-mode write that returned diagnostics but then failed reconciliation is summarized as error.
     batch_start_ts /
-    batch_end_ts come from the progress (trigger timestamp + batchDuration) when there is one, else from
-    the es summary's own start/end."""
+    batch_end_ts come from the progress (Spark's trigger timestamp + batchDuration) when there is one, and
+    are NULL otherwise (an es-only summary: batch mode, or a streaming batch whose progress report was never
+    seen); the batch's own wall clock is always on its batch_start / batch_end rows."""
     if es is None and progress is None:
         raise ValueError("batch_summary needs an es summary, a progress report, or both")
     if es is not None and not isinstance(es, dict):

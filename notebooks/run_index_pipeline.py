@@ -838,7 +838,11 @@ if PIPELINE_MODE == "streaming":
                 print(f"WARNING: could not list {relay_dir} for unrecorded batches ({type(_e).__name__}: {_e})")
                 return
             for _bid in leftover_relay_ids(_names, below):
-                if not MONITORING_ACTIVE:
+                # At or below this run's high-water mark the batch was already recorded (its relay outlived a
+                # failed best-effort delete): drop it, never summarize it twice. The start-up sweep runs before
+                # any batch is recorded (mark None), so a previous attempt's leftovers are never skipped here.
+                _recorded = _progress_mark["last"] is not None and _bid <= _progress_mark["last"]
+                if not MONITORING_ACTIVE or _recorded:
                     drop_relay(_bid)
                     continue
                 _relay = read_relay(_bid)
