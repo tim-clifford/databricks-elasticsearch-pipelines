@@ -18,7 +18,8 @@ PURE: the query is duck-typed (awaitTermination(timeout), isActive, exception(),
 no Spark import and is unit-tested off-cluster with a fake query.
 """
 
-# How many CONSECUTIVE slices may fail to read query.isActive before the loop gives up and raises. A
+# How many CONSECUTIVE slices may fail to read the query's state (BOTH isActive and exception()) before the
+# loop gives up and raises. A
 # transient blip is tolerated (the next slice decides), but a state that can never be read must not leave
 # the task waiting forever, which is the hang this module exists to prevent. 30 slices of 10 s = 5 min.
 MAX_ISACTIVE_ERRORS = 30
@@ -61,36 +62,44 @@ def await_stream(query, poll_seconds, record=None, log=print):
                         query_exc.add_note(f"monitoring log: final progress not recorded: {record_exc}")
             raise
         if not ended:
+            # Two independent liveness signals, each a fresh request to the server: isActive, and the failure
+            # the server has RECORDED for the query (query.exception()). Either one ending the wait is enough,
+            # so the hang guard does not depend on isActive alone (the reproduced hang was a long-held wait
+            # call; the server itself knew the query had FAILED). A check that errors means "cannot tell this
+            # slice"; only when BOTH fail does the slice count toward MAX_ISACTIVE_ERRORS, so one broken call
+            # cannot fail a stream whose state is still readable through the other.
+            state_read = False
+            check_errors = []
             try:
                 ended = not query.isActive
+                state_read = True
+                if ended:
+                    log("query is no longer active although the wait call had not returned; "
+                        "treating it as ended")
             except Exception as check_exc:
+                check_errors.append(check_exc)
+            if not ended:
+                try:
+                    ended = query.exception() is not None
+                    state_read = True
+                    if ended:
+                        log("query has a recorded failure although the wait call had not returned; "
+                            "treating it as ended")
+                except Exception as check_exc:
+                    check_errors.append(check_exc)
+            if state_read:
+                isactive_errors = 0
+            else:
                 isactive_errors += 1
+                last = check_errors[-1]
                 if isactive_errors >= MAX_ISACTIVE_ERRORS:
                     raise RuntimeError(
                         f"could not determine whether the query is active for {isactive_errors} consecutive "
                         f"polls ({poll_seconds}s apart); failing rather than waiting blind "
-                        f"(last error: {type(check_exc).__name__}: {check_exc})") from check_exc
-                log(f"WARNING: could not check whether the query is active ({type(check_exc).__name__}: "
-                    f"{check_exc}); checking again on the next poll")
-            else:
-                isactive_errors = 0
-                if ended:
-                    log("query is no longer active although the wait call had not returned; "
-                        "treating it as ended")
-        if not ended:
-            # A second, independent liveness signal: a failure the server has RECORDED for the query. Guards
-            # the case where both the wait call and isActive keep reporting "running" for a failed query (each
-            # is a fresh request to the server, which knew the query FAILED in the reproduced hang, but this
-            # does not depend on isActive alone). A failed check only warns; the next slice asks again.
-            try:
-                ended = query.exception() is not None
-            except Exception as exc_check:
-                log(f"WARNING: could not read the query's recorded failure ({type(exc_check).__name__}: "
-                    f"{exc_check}); checking again on the next poll")
-            else:
-                if ended:
-                    log("query has a recorded failure although the wait call had not returned; "
-                        "treating it as ended")
+                        f"(last error: {type(last).__name__}: {last})") from last
+            for check_exc in check_errors:
+                log(f"WARNING: could not check the query's state ({type(check_exc).__name__}: {check_exc}); "
+                    f"checking again on the next poll")
         if record is not None:
             try:
                 record(query)

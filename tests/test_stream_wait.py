@@ -110,7 +110,7 @@ def test_isactive_error_is_not_fatal_and_waiting_continues():
     q = FakeQuery([False, False, True], active=[RuntimeError("rpc blip"), True])
     logs = _run(q)
     assert q.wait_calls == 3
-    assert any("could not check whether the query is active" in m for m in logs)
+    assert any("could not check the query's state" in m for m in logs)
 
 
 def test_record_runs_every_slice():
@@ -177,15 +177,6 @@ def test_record_failure_after_liveness_detected_failure_raises_the_query_error()
     assert any("append failed" in n for n in getattr(info.value, "__notes__", []))
 
 
-def test_persistent_isactive_errors_fail_instead_of_spinning_forever():
-    # Isaac finding: the wait call keeps saying "running" and isActive errors every slice; the loop must
-    # give up (fail the task, so the retry policy applies) rather than hang.
-    q = FakeQuery([False], active=[RuntimeError("rpc down")])
-    with pytest.raises(RuntimeError, match="could not determine whether the query is active"):
-        _run(q)
-    assert q.wait_calls == 30
-
-
 def test_isactive_error_streak_resets_on_a_good_check():
     # 29 errors, one good check, 29 errors, then a clean end: never 30 in a row, so no failure.
     errs = [RuntimeError("blip")] * 29
@@ -214,3 +205,22 @@ def test_exception_check_error_is_not_fatal():
     q = FlakyException([False, False, True], active=[True])
     _run(q)
     assert q.wait_calls == 3
+
+
+def test_isactive_errors_with_a_readable_exception_check_do_not_fail_a_healthy_stream():
+    # Isaac finding: if only isActive errors while the query's recorded state is still readable (no
+    # failure), the stream is healthy and must not be failed after MAX_ISACTIVE_ERRORS slices.
+    q = FakeQuery([False] * 40 + [True], active=[RuntimeError("isActive rpc broken")])
+    _run(q)
+    assert q.wait_calls == 41
+
+
+def test_unreadable_state_on_both_checks_still_fails_after_the_limit():
+    class Unreadable(FakeQuery):
+        def exception(self):
+            raise RuntimeError("exception rpc broken")
+
+    q = Unreadable([False], active=[RuntimeError("isActive rpc broken")])
+    with pytest.raises(RuntimeError, match="could not determine whether the query is active"):
+        _run(q)
+    assert q.wait_calls == 30

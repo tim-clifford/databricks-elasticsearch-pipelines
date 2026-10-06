@@ -1004,8 +1004,9 @@ if PIPELINE_MODE == "streaming":
                 print(format_progress(_p))
                 _relay = read_relay(_bid) if _RELAY_ON else None
                 # A missing relay here is normally a momentary read blip (with the log on, every committed batch
-                # has one: a failed relay write fails the batch). Retry briefly before falling back to a
-                # progress-only summary, so a blip does not cost the batch its ES diagnostics.
+                # has one: a failed relay write fails the batch). Retry briefly; if it is still unreadable, the
+                # summary is written from Spark's progress alone and that batch's ES rollup is not kept (the
+                # outcome rows and the summary row still exist; only the es diagnostics field is missing).
                 for _retry in range(2):
                     if _relay is not None or not (_RELAY_ON and MONITORING_ACTIVE):
                         break
@@ -1310,15 +1311,17 @@ if PIPELINE_MODE == "streaming":
             # in testing: recentProgress right after the end missed a batch that moved rows). Poll briefly for
             # the stragglers; any batch whose progress never arrives still gets its summary from the relayed ES
             # diagnostics alone, so the record is complete either way.
-            if MONITORING_ACTIVE:
-                for _attempt in range(5 if _batch_ids else 0):
+            if MONITORING_ACTIVE and _batch_ids:
+                for _attempt in range(5):
                     if _progress_mark["last"] is not None and _progress_mark["last"] >= _batch_ids[-1]:
                         break
                     time.sleep(2)
                     record_progress(query)
-                # Whatever is still unrecorded (its report never arrived) is summarized from its relayed ES
-                # diagnostics alone, so every executed batch ends up with a batch_summary.
-                summarize_leftover_relays(final=True)
+            # Whatever is still unrecorded (its report never arrived, or a crashed earlier run left it) is
+            # summarized from its relayed ES diagnostics alone, so every executed batch ends up with a
+            # batch_summary; with the log off this just clears the leftovers. Runs on every drain, zero
+            # batches included.
+            summarize_leftover_relays(final=True)
 
             RUN_SUMMARY = (
                 f"streaming_start={STREAMING_START} batches={num_batches} rows_pushed={rows_pushed} "
