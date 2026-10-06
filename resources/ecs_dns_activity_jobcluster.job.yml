@@ -67,7 +67,6 @@ resources:
             project: elastic
           policy_id: ${var.cluster_policy_id}
           apply_policy_default_values: true
-          cluster_log_conf: ${var.cluster_log_conf}
       tasks:
       - task_key: index_pipeline_ecs_dns_activity_jobcluster
         job_cluster_key: standard_batch

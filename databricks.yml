@@ -216,32 +216,22 @@ variables:
     description: "UC Volume path to a CA bundle (PEM) the connector uses to verify the ES TLS cert. Empty default (system CAs); set per target below or override with --var. One global bundle for all host configs; incompatible with verify_certs=false."
     default: ""
 
-  # GLOBAL cluster log delivery configuration for CLASSIC (job cluster) compute. Configures Databricks to
-  # deliver driver, executor, and init-script logs from job clusters to a Unity Catalog Volume,
-  # persisting them after the cluster terminates. Logs are delivered periodically (about every 5 minutes)
-  # and at cluster shutdown. Serverless compute does not support cluster log delivery (logs are only in
-  # the run log); existing_cluster compute may or may not have logs available per the cluster's own config.
-  # Only job_cluster (new ephemeral cluster) compute uses this feature per pipeline. This is a `type:
-  # complex` variable holding the whole cluster_log_conf structure (empty {} default omits log delivery).
-  # Set it PER TARGET below in the variables block or via variable-overrides.json, never via --var (the
-  # CLI rejects complex-type --var). The value is a cluster_log_conf structure: {volumes: {destination:
-  # "/Volumes/<catalog>/<schema>/<volume>/<optional_subdir>"}} where the identity running the cluster
-  # needs READ_VOLUME and WRITE_VOLUME permission on that volume. Logs ACCUMULATE with no automatic
-  # retention: operators must prune them manually or via a scheduled cleanup job (document in the README
-  # how to add one). Example (uncomment the stanza and replace the path):
-  #
-  #   cluster_log_conf:
-  #     volumes:
-  #       destination: /Volumes/my_catalog/my_schema/my_volume/es_cluster_logs
-  #
-  # This is a per-target choice (deploy-time): Databricks has no run-time cluster-log swap, so re-deploy
-  # to change or disable it. The variable is threaded to scripts/gen_jobs.py which injects it into every
-  # generated job's job_cluster new_cluster specs. When empty ({}) DAB omits it from the deploy, so no
-  # logs are delivered.
-  cluster_log_conf:
-    type: complex
-    description: "Job cluster log delivery config (volumes destination). Empty {} => off (omitted). type: complex, so NOT settable via --var; set per target / variable-overrides.json. Logs accumulate with no auto-retention. See README 'Cluster log delivery'."
-    default: {}
+  # CLUSTER LOG DELIVERY destination for CLASSIC job clusters: a UC Volume path (e.g.
+  # /Volumes/<catalog>/<schema>/<volume>/cluster_logs) Databricks delivers driver, executor, and
+  # init-script logs to (under <path>/<cluster-id>/), so they survive after the cluster terminates.
+  # OPT-IN PER JOB CLUSTER CONFIG: a _pipelines/job_cluster_configs/<key>.yml enables it by adding
+  #     cluster_log_conf:
+  #       volumes:
+  #         destination: ${var.cluster_log_volume_path}
+  # (the generator inlines that spec verbatim into every job using the config). It is NOT injected
+  # unconditionally because the Jobs API rejects an empty cluster_log_conf (400 "Invalid cluster log
+  # storage info", seen live), and a bundle cannot omit a nested block at deploy. So a config that opts
+  # in needs this set to a real path in EVERY target it deploys to (empty there fails the deploy, loudly).
+  # Serverless has no cluster log delivery. Logs ACCUMULATE: nothing here deletes them. See the README
+  # "Cluster log delivery" section (grants, contents). Simple string, so --var-settable.
+  cluster_log_volume_path:
+    description: "UC Volume path job-cluster logs are delivered to, for job cluster configs that opt in with a cluster_log_conf block referencing ${var.cluster_log_volume_path}. Empty default (unused). Must be set in every target such a config deploys to. Logs accumulate; no automatic cleanup."
+    default: ""
 
   # GLOBAL fully-qualified name (catalog.schema.table) of the shared monitoring Delta table every job
   # appends its metrics to when monitoring_log_enabled is on. Threaded exactly like checkpoint_base_path /
@@ -534,9 +524,9 @@ targets:
       # monitoring_log_enabled: "true"  # turn the durable monitoring sink ON for the whole dev target (a
                                    # pipeline's own monitoring_log_enabled or a --params override still
                                    # wins). Empty default (off). When on, a missing table fails the run.
-      # cluster_log_conf: {}       # job cluster log delivery disabled (empty default). To enable, uncomment
-                                   # and set to {volumes: {destination: "/Volumes/<catalog>/<schema>/<volume>/logs"}}.
-                                   # Logs accumulate; manually prune them or set up a cleanup job.
+      # cluster_log_volume_path: "/Volumes/<catalog>/<schema>/<volume>/cluster_logs"  # job-cluster log
+                                   # delivery destination; used only by a job cluster config that opts in
+                                   # with a cluster_log_conf block (see the variable's comment above).
       # bulk_stats: "true"         # turn connector bulk-send diagnostics ON for the whole dev target (a
                                    # pipeline's own bulk_stats or a --params override still wins). Empty
                                    # default (off) inherited when omitted.
@@ -579,8 +569,6 @@ targets:
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""
       ca_certs: ""                 # /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
-      # cluster_log_conf: {}       # job cluster log delivery disabled (empty default). To enable, uncomment
-                                   # and set to {volumes: {destination: "/Volumes/<catalog>/<schema>/<volume>/logs"}}.
       # STG Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-stg-es-host:9200
@@ -606,8 +594,6 @@ targets:
       # interactive_primary:       # existing/interactive cluster config (uncomment with the declaration above)
       #   cluster_id: ""
       ca_certs: ""                 # /Volumes/<catalog>/<schema>/<volume>/certs/es-ca.pem - empty => system CAs
-      # cluster_log_conf: {}       # job cluster log delivery disabled (empty default). To enable, uncomment
-                                   # and set to {volumes: {destination: "/Volumes/<catalog>/<schema>/<volume>/logs"}}.
       # PRD Elasticsearch connection. Fill in (leave "" to fail closed until configured).
       es_host_primary:
         es_host_url: ""            # e.g. https://your-prd-es-host:9200

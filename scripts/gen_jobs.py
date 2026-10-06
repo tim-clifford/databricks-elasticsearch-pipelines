@@ -664,12 +664,10 @@ def _job_clusters_for(members: list) -> list | None:
 
     Each job cluster gets the per-environment policy injected (policy_id bound to the cluster_policy_id
     variable, authoritative over any policy_id in the spec file, plus apply_policy_default_values: true so
-    the policy's own defaults fill omitted attrs). The cluster_log_conf is also injected as a bundle
-    variable reference (${var.cluster_log_conf}), resolved per target at deploy time. Built as a COPY so
-    the caller's loaded spec is never mutated; custom_tags, cluster_log_conf, and all other spec fields pass
-    through verbatim. Same key always resolves to the same spec file, so dedup is safe. Returns None when no
-    member uses job_cluster compute (serverless/existing_cluster jobs have no block). Emitted sorted by key
-    for deterministic --check.
+    the policy's own defaults fill omitted attrs). Built as a COPY so the caller's loaded spec is never
+    mutated; custom_tags and all other spec fields pass through verbatim. Same key always resolves to the
+    same spec file, so dedup is safe. Returns None when no member uses job_cluster compute
+    (serverless/existing_cluster jobs have no block). Emitted sorted by key for deterministic --check.
     """
     by_key: dict = {}
     for name, cfg, spec in members:
@@ -681,15 +679,9 @@ def _job_clusters_for(members: list) -> list | None:
                 f"job_cluster compute for '{name}' requires a loaded new_cluster spec "
                 f"(job_cluster_config '{key}'); none was provided"
             )
-        new_cluster = {
-            **spec,
-            "policy_id": "${var.cluster_policy_id}",
-            "apply_policy_default_values": True,
-            "cluster_log_conf": "${var.cluster_log_conf}",
-        }
         by_key[key] = {
             "job_cluster_key": key,
-            "new_cluster": new_cluster,
+            "new_cluster": {**spec, "policy_id": "${var.cluster_policy_id}", "apply_policy_default_values": True},
         }
     return [by_key[k] for k in sorted(by_key)] or None
 
@@ -761,8 +753,7 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     before; see _build_task, _trigger_block, _job_clusters_for, and _assemble_job for the shared logic
     (also used by render_group_job_yaml). A job_cluster compute REQUIRES job_cluster_spec (loaded by the
     caller via load_job_cluster_spec); it is unused otherwise and a job_cluster compute without it fails
-    closed. Job clusters get cluster_log_conf injected as a bundle variable reference, resolved per
-    target at deploy time.
+    closed.
     """
     streaming_trigger_interval = cfg["continuous"]["trigger_interval"] if cfg["continuous"] else ""
     task = _build_task(name, cfg, streaming_trigger_interval, include_run_time_knobs=False)
@@ -912,8 +903,7 @@ def render_group_job_yaml(group_name: str, members: list, global_job_tags: dict 
     its own base_parameters (see _build_task). Trigger, display postfix, and job-cluster sharing are
     resolved across members (see the resolvers). Tasks are emitted sorted by config name for deterministic
     output; task keys stay index_pipeline_<member> (unique per member). The job resource key is
-    index_pipeline_group_<group>. Job clusters get cluster_log_conf injected as a bundle variable
-    reference, resolved per target at deploy time.
+    index_pipeline_group_<group>.
     """
     pause_status = _resolve_group_pause_status(group_name, members)
     trigger, effective_interval = _resolve_group_trigger(group_name, members, pause_status)

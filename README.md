@@ -1051,17 +1051,24 @@ through retention.
 
 Optionally, classic **job clusters** can deliver their driver, executor, and init-script logs to a Unity
 Catalog Volume, so the full Spark/driver logs survive after the cluster terminates (useful for a
-post-mortem on a continuous stream). Set the `cluster_log_conf` variable per target (it is `type:
-complex`, so in the target's `variables` block or `variable-overrides.json`, not `--var`):
+post-mortem on a continuous stream). It is **opt-in per job cluster config**, in two steps:
+
+1. Set the `cluster_log_volume_path` variable to the destination in **every** target the config deploys
+   to (a simple string, so per target or `--var`), e.g. `/Volumes/<catalog>/<schema>/<volume>/cluster_logs`.
+2. In the job cluster config (`_pipelines/job_cluster_configs/<key>.yml`), add the block (the example in
+   `standard_batch.yml` is commented out), then re-run `scripts/gen_jobs.py`:
 
 ```yaml
 cluster_log_conf:
   volumes:
-    destination: /Volumes/<catalog>/<schema>/<volume>/cluster_logs
+    destination: ${var.cluster_log_volume_path}
 ```
 
-`scripts/gen_jobs.py` wires `${var.cluster_log_conf}` into every generated job-cluster spec, so it applies
-to every pipeline on `job_cluster` compute (one setting per target). Things to know:
+The generator inlines the spec verbatim, so every job using that config gets it. It is deliberately not
+injected into every job cluster automatically: the Jobs API rejects an empty `cluster_log_conf` (`400
+Invalid cluster log storage info`, seen live), and a bundle cannot drop a nested block at deploy, so an
+opted-in config whose target leaves the path empty **fails that deploy** (loudly, nothing is half-applied).
+Things to know:
 
 - **Classic job clusters only.** Serverless compute does not support cluster log delivery, so serverless
   pipelines and the serverless maintenance jobs are unaffected; their output stays in the run log.
