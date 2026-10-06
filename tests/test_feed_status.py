@@ -626,6 +626,8 @@ def test_run_state_sql_pairs_by_attempt_not_job_run():
     q = run_state_sql("c.s.log", 7)
     assert "GROUP BY config_name, job_run_id, batch_start_ts" in q
     assert "FULL OUTER JOIN batches" in q
+    # the LATEST attempt per config, ordered by the attempt's own start
+    assert "max_by(named_struct(" in q and "run_started_at) AS a" in q
 
 
 def test_feed_triggers_config_in_two_jobs_is_unsupported():
@@ -639,3 +641,11 @@ def test_log_vocabulary_comes_from_monitoring_sink():
     from pipeline_lib.monitoring_sink import RECORD_TYPES as RT, STATUSES as ST
     assert {fs.LOG_RUN_START, fs.LOG_RUN_END, fs.LOG_BATCH_START} <= set(RT)
     assert {fs.RUN_SUCCESS, fs.RUN_ERROR, fs.RUN_STOPPED} <= set(ST)
+
+
+def test_missing_log_vocabulary_names_what_was_removed():
+    from pipeline_lib.feed_status import missing_log_vocabulary
+    from pipeline_lib.monitoring_sink import RECORD_TYPES as RT, STATUSES as ST
+    assert missing_log_vocabulary(RT, ST) == []
+    assert missing_log_vocabulary([t for t in RT if t != "run_end"], ST) == ["run_end"]
+    assert missing_log_vocabulary(RT, [x for x in ST if x != "stopped"]) == ["stopped"]

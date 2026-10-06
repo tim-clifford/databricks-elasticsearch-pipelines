@@ -86,10 +86,18 @@ LOG_BATCH_START = "batch_start"
 RUN_SUCCESS = "success"
 RUN_ERROR = "error"
 RUN_STOPPED = "stopped"
-_missing = ({LOG_RUN_START, LOG_RUN_END, LOG_BATCH_START} - set(RECORD_TYPES)) | \
-    ({RUN_SUCCESS, RUN_ERROR, RUN_STOPPED} - set(LOG_STATUSES))
+
+
+def missing_log_vocabulary(record_types, statuses):
+    """The log record_type / status names this job reads that `record_types` / `statuses` do not define
+    (sorted). Empty when the monitoring log's vocabulary still covers everything read here."""
+    return sorted(({LOG_RUN_START, LOG_RUN_END, LOG_BATCH_START} - set(record_types))
+                  | ({RUN_SUCCESS, RUN_ERROR, RUN_STOPPED} - set(statuses)))
+
+
+_missing = missing_log_vocabulary(RECORD_TYPES, LOG_STATUSES)
 if _missing:
-    raise ImportError(f"feed_status reads log values monitoring_sink no longer defines: {sorted(_missing)}")
+    raise ImportError(f"feed_status reads log values monitoring_sink no longer defines: {_missing}")
 
 # DESCRIBE HISTORY `operation` values that can NOT carry new rows for a skipChangeCommits Delta stream, so
 # a commit with one of these is never "unsent data". An ALLOW-LIST of the safe-to-ignore set: any
