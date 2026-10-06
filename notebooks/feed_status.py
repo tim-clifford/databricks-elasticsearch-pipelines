@@ -35,6 +35,8 @@ import glob
 import os
 import sys
 import time
+
+_RUN_T0 = time.time()
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -263,7 +265,8 @@ spark.sql(fs.merge_status_sql(STATUS_TABLE, _TEMP_VIEW))
 COUNTS = {s: sum(1 for r in ROWS if r["status"] == s) for s in fs.STATUSES}
 for r in ROWS:
     print(f"{r['config_name']}: {r['status']} ({r['status_reason']})" + (f" - {r['detail']}" if r["detail"] else ""))
-SUMMARY = f"feed_status table={STATUS_TABLE} feeds={len(ROWS)} " + " ".join(f"{k}={v}" for k, v in COUNTS.items())
+SUMMARY = (f"feed_status table={STATUS_TABLE} feeds={len(ROWS)} sources={len(by_source)} "
+           + " ".join(f"{k}={v}" for k, v in COUNTS.items()) + f" elapsed_s={time.time() - _RUN_T0:.1f}")
 print(SUMMARY)
 
 # COMMAND ----------

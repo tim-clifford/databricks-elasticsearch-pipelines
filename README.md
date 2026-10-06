@@ -1000,6 +1000,53 @@ the job and it **additively** applies the new columns (`ALTER TABLE ADD COLUMNS`
 **without** dropping or replacing the table, so existing rows are preserved. It never drops or renames a
 column (an obsolete column is warned, not removed).
 
+### Feed status
+
+The hand-authored `_feed status` job keeps a small Delta table (`feed_status_table`) with **one row per
+pipeline config** saying whether that feed's export is caught up, for a dashboard. It runs every 5 minutes
+(**PAUSED** by default via `${var.schedule_pause_status}`, like every schedule here), creates the table on
+its first run, and MERGEs, so the table always holds exactly the current configs. It needs the monitoring
+log table (`monitoring_log_table`, with the sink on for every pipeline) and never touches Elasticsearch.
+
+| status | streaming feed | batch feed |
+|---|---|---|
+| `CAUGHT_UP` | no source commit with rows is waiting past the checkpoint | the last run succeeded and covers the latest scheduled fire |
+| `IN_PROGRESS` | a send is running (in-flight checkpoint offsets and an open run), started < threshold ago | a run is open (run_start, no run_end), started < threshold ago |
+| `PENDING` | rows are waiting, < threshold old, and nothing is sending them yet | n/a |
+| `BEHIND` | rows waited >= threshold, or the send has run >= threshold | the last run failed, a run has been open >= threshold, or a scheduled fire was missed |
+| `UNKNOWN` | the job could not establish the answer; `status_reason` / `detail` say why | same |
+
+The threshold is `feed_status_behind_threshold_minutes` (default 60). Every row carries a `status_reason`
+code (e.g. `unsent_over_threshold`, `missed_schedule`, `no_checkpoint`) and the facts behind it
+(`oldest_unsent_ts`, `lag_minutes`, `sent_through_version`, `in_flight_since`, `last_run_*`,
+`expected_run_ts`).
+
+How it decides, cheaply enough for hundreds of feeds:
+- **Streaming position** comes from the stream's own checkpoint: every source version below the last
+  committed offset's `reservoirVersion` is sent. Uncommitted offsets past it are a batch in flight, but they
+  only count as a running send while the feed's latest logged run is still open (a crashed run leaves them
+  behind).
+- **Arrival time** comes from `DESCRIBE HISTORY <source> LIMIT 20` on each **distinct** source table (a
+  source shared by several feeds is read once), widened only if the window does not reach back to the sent
+  position. The window must provably reach it, so a commit landing mid-evaluation cannot hide an older
+  unsent one. Commits that cannot carry rows for the stream (OPTIMIZE, VACUUM, UPDATE/DELETE under
+  `skipChangeCommits`, property and schema changes) are ignored; any other operation counts as data. MERGE
+  is also ignored for now (no source uses it); an insert-only MERGE does add rows, so revisit
+  `IGNORED_OPERATIONS` in `pipeline_lib/feed_status.py` before pointing a stream at a merged-into table.
+- **Run state** comes from the monitoring log's `run_start` / `run_end` / `batch_start` rows (latest run
+  per config, last `log_lookback_days` days, default 35). For a batch feed on an **unpaused** schedule, the latest
+  successful run must have started at or after the latest fire at least 10 minutes ago
+  (`schedule_grace_minutes`); a paused or on-demand job is judged on its last run alone. The trigger and its
+  pause state are read from the generated `resources/*.job.yml`, so a job group's members share its trigger.
+
+```bash
+databricks bundle run feed_status -t <target> -p <profile>
+```
+
+The job's identity needs CREATE TABLE + MODIFY on the status table's schema, SELECT on the monitoring log
+and on every streaming source, and READ VOLUME on the checkpoint volume. It fails (and notifies) only when
+the monitor itself is broken; a feed it cannot evaluate is recorded as `UNKNOWN` instead.
+
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
@@ -1038,6 +1085,8 @@ Shared notebooks (run by the jobs, not edited per pipeline):
                                 migration; see Durable monitoring)
     log_table_prune.py          Run by the _log table prune job: retention for the monitoring table
                                 (DELETE old rows, then OPTIMIZE + VACUUM; see Durable monitoring)
+    feed_status.py              Run by the _feed status job: one CAUGHT_UP/IN_PROGRESS/PENDING/BEHIND/
+                                UNKNOWN row per config into the feed status table (see Feed status)
 
 Shared library + tests (the config schema, used by the generator and both notebooks):
   pipeline_lib/
@@ -1045,9 +1094,12 @@ Shared library + tests (the config schema, used by the generator and both notebo
                                 derives view substitutions + job parameters (single source of truth)
     monitoring_sink.py          Pure schema + row builders for the durable monitoring sink (single
                                 source of truth for the table columns, shared by the writer + creator)
+    feed_status.py              Pure feed status classifier, status table schema/SQL, trigger map and
+                                Quartz previous-fire (see Feed status)
   tests/
     test_config.py              Offline unit tests for pipeline_lib.config (plain pytest)
     test_monitoring_sink.py     Offline unit tests for pipeline_lib.monitoring_sink
+    test_feed_status.py         Offline unit tests for pipeline_lib.feed_status
 
 Generated / tooling (do not hand-edit the generated jobs):
   scripts/
@@ -1056,6 +1108,7 @@ Generated / tooling (do not hand-edit the generated jobs):
     deploy_views.job.yml        The deploy_views job (hand-authored)
     log_table_create.job.yml    The _log table create job (hand-authored)
     log_table_prune.job.yml     The _log table prune job (hand-authored; daily, paused by default)
+    _feed_status.job.yml        The _feed status job (hand-authored; every 5 min, paused by default)
     <config_name>.job.yml       GENERATED per-index job (one per pipeline_configs config)
 ```
 
