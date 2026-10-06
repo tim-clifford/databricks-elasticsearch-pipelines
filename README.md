@@ -989,7 +989,10 @@ hides the original error (the log fault is attached to it as a note). In streami
 a small relay file under `<checkpoint>/_batch_relay/<batch_id>` (its ES diagnostics) that guarantees its
 `batch_summary` even if Spark's progress report is lost; it is deleted once the summary is written, swept
 into a summary by the next run if a run dies first, and with the log on a failed relay write fails the
-batch like any other log write. With the log **off**, nothing is
+batch like any other log write. **The trade-off:** a log write that fails AFTER a batch's data reached ES
+(its `batch_end` or relay) fails the micro-batch before the checkpoint advances, so the task's retry
+re-sends that batch. With `es_id_field` set that re-send is an idempotent overwrite; without it, ES assigns
+new ids and the batch's rows are **duplicated**, the same as for any other mid-batch failure. With the log **off**, nothing is
 written and nothing about the export changes.
 
 Example: every batch of the last day, with its outcome and duration:

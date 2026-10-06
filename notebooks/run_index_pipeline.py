@@ -993,6 +993,14 @@ if PIPELINE_MODE == "streaming":
                 summarize_leftover_relays(below=_bid)  # earlier batches whose report was never seen
                 print(format_progress(_p))
                 _relay = read_relay(_bid) if _RELAY_ON else None
+                # A missing relay here is normally a momentary read blip (with the log on, every committed batch
+                # has one: a failed relay write fails the batch). Retry briefly before falling back to a
+                # progress-only summary, so a blip does not cost the batch its ES diagnostics.
+                for _retry in range(2):
+                    if _relay is not None or not (_RELAY_ON and MONITORING_ACTIVE):
+                        break
+                    time.sleep(1)
+                    _relay = read_relay(_bid)
                 if _relay and _relay.get("line"):
                     print(_relay["line"])
                 if MONITORING_ACTIVE:
