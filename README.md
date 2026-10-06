@@ -985,7 +985,11 @@ required: `monitoring_log_table` unset or malformed, the table missing or not wr
 `run_start`), or **any** failed append fails the task, so support receives the failure notification and no
 further data is sent without a log record. Because `batch_start` is written before a batch's data is sent,
 a log outage stops the export before the next batch reaches ES. A failure while recording a failure never
-hides the original error (the log fault is attached to it as a note). With the log **off**, nothing is
+hides the original error (the log fault is attached to it as a note). In streaming, each batch also leaves
+a small relay file under `<checkpoint>/_batch_relay/<batch_id>` (its ES diagnostics) that guarantees its
+`batch_summary` even if Spark's progress report is lost; it is deleted once the summary is written, swept
+into a summary by the next run if a run dies first, and with the log on a failed relay write fails the
+batch like any other log write. With the log **off**, nothing is
 written and nothing about the export changes.
 
 Example: every batch of the last day, with its outcome and duration:
