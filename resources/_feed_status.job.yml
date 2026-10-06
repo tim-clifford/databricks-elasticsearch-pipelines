@@ -44,14 +44,16 @@ resources:
         - task_key: feed_status
           notebook_task:
             notebook_path: ../notebooks/feed_status.py
-            # All deploy-time values. schedule_pause_status resolves the generated jobs' pause state;
-            # checkpoint_base_path and environment must match what the export jobs use.
+            # All deploy-time values. schedule_pause_status resolves the generated jobs' pause state and
+            # pipeline_mode the mode of configs that omit it; checkpoint_base_path and environment must
+            # match what the export jobs use.
             base_parameters:
               feed_status_table: ${var.feed_status_table}
               monitoring_log_table: ${var.monitoring_log_table}
               checkpoint_base_path: ${var.checkpoint_base_path}
               environment: ${var.environment}
               schedule_pause_status: ${var.schedule_pause_status}
+              pipeline_mode: ${var.pipeline_mode}
               behind_threshold_minutes: ${var.feed_status_behind_threshold_minutes}
           # Per-task failure notifications, mirroring every other job (see scripts/gen_jobs.py _build_task).
           email_notifications:

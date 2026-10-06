@@ -22,6 +22,8 @@
 # MAGIC - `environment`: folded into `${environment}` in config names, as for the export jobs.
 # MAGIC - `schedule_pause_status`: the target's `${var.schedule_pause_status}`, to resolve each generated job's
 # MAGIC   pause state (a paused schedule is not expected to fire, so it cannot be "missed").
+# MAGIC - `pipeline_mode`: the target's `${var.pipeline_mode}` global, the mode of a config that omits its own
+# MAGIC   (the same `config or global` resolution as the generated jobs' pipeline_mode default).
 # MAGIC - `behind_threshold_minutes` (default 60), `schedule_grace_minutes` (default 10),
 # MAGIC   `log_lookback_days` (default 35), `max_workers` (default 8: live measurement showed DESCRIBE HISTORY
 # MAGIC   throughput flattening at about 8 concurrent calls).
@@ -45,6 +47,7 @@ dbutils.widgets.text("monitoring_log_table", "", "catalog.schema.table of the mo
 dbutils.widgets.text("checkpoint_base_path", "", "Streaming checkpoint base path (as the export jobs use)")
 dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
 dbutils.widgets.text("schedule_pause_status", "", "The target's schedule_pause_status (PAUSED|UNPAUSED)")
+dbutils.widgets.text("pipeline_mode", "", "The target's pipeline_mode global, for configs that omit pipeline_mode")
 dbutils.widgets.text("behind_threshold_minutes", "", "Minutes after which waiting data / a running send is BEHIND")
 dbutils.widgets.text("schedule_grace_minutes", "", "Minutes a scheduled run may take to start before it counts as missed")
 dbutils.widgets.text("log_lookback_days", "", "Days of monitoring log read for run state")
@@ -59,7 +62,7 @@ import yaml  # noqa: E402
 
 from pipeline_lib import feed_status as fs  # noqa: E402
 from pipeline_lib.checkpoint import checkpoint_location  # noqa: E402
-from pipeline_lib.config import load_config, require_pause_status, resolve_config  # noqa: E402
+from pipeline_lib.config import load_config, require_pause_status, require_pipeline_mode, resolve_config  # noqa: E402
 from pipeline_lib.monitoring_sink import validate_table_name  # noqa: E402
 
 
@@ -79,6 +82,7 @@ CHECKPOINT_BASE_PATH = dbutils.widgets.get("checkpoint_base_path").strip()
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
 SCHEDULE_PAUSE_STATUS = require_pause_status(dbutils.widgets.get("schedule_pause_status").strip(),
                                              "schedule_pause_status")
+GLOBAL_PIPELINE_MODE = require_pipeline_mode(dbutils.widgets.get("pipeline_mode").strip(), "pipeline_mode")
 THRESHOLD_MIN = _int_widget("behind_threshold_minutes", fs.DEFAULT_BEHIND_THRESHOLD_MINUTES)
 GRACE_MIN = _int_widget("schedule_grace_minutes", fs.DEFAULT_SCHEDULE_GRACE_MINUTES, minimum=0)
 LOOKBACK_DAYS = _int_widget("log_lookback_days", fs.DEFAULT_LOG_LOOKBACK_DAYS)
@@ -111,8 +115,12 @@ TRIGGERS = fs.feed_triggers(job_docs, SCHEDULE_PAUSE_STATUS)
 if not FEEDS:
     raise RuntimeError(f"no pipeline configs found under {CONFIG_DIR}; refusing to MERGE an empty status set")
 
-STREAMING = sorted(n for n, c in FEEDS.items() if c["pipeline_mode"] == "streaming")
-BATCH = sorted(n for n, c in FEEDS.items() if c["pipeline_mode"] == "batch")
+# Each feed's EFFECTIVE mode (its own pipeline_mode, else the target global). An allow-list: a mode that is
+# neither batch nor streaming makes just that feed UNKNOWN, never the whole refresh fail.
+MODES = {n: fs.effective_pipeline_mode(c["pipeline_mode"], GLOBAL_PIPELINE_MODE) for n, c in FEEDS.items()}
+STREAMING = sorted(n for n, m in MODES.items() if m == "streaming")
+BATCH = sorted(n for n, m in MODES.items() if m == "batch")
+UNSUPPORTED_MODE = sorted(n for n, m in MODES.items() if m is None)
 if STREAMING and not CHECKPOINT_BASE_PATH:
     raise ValueError("checkpoint_base_path is required when any config is pipeline_mode: streaming")
 print(f"{len(FEEDS)} feed(s): {len(STREAMING)} streaming, {len(BATCH)} batch")
@@ -187,7 +195,9 @@ def _read_history(source, limit):
 # feed on that source, and widen the window (doubling to the cap) only for sources with a feed that could
 # not be decided. Batch: classify from the run state and the deployed trigger.
 NOW = datetime.now(timezone.utc)
-RESULTS = {}
+RESULTS = {n: fs.unknown_result("unsupported_pipeline_mode",
+                                detail=f"pipeline_mode {FEEDS[n]['pipeline_mode']!r} / global {GLOBAL_PIPELINE_MODE!r}")
+           for n in UNSUPPORTED_MODE}
 
 by_source = {}
 for name in STREAMING:
@@ -254,7 +264,7 @@ if missing:
 
 # COMMAND ----------
 # Write: one row per feed, MERGEd so the table always holds exactly the current feeds.
-ROWS = [fs.to_row(name, FEEDS[name]["pipeline_mode"], TRIGGERS.get(name), RESULTS[name], NOW,
+ROWS = [fs.to_row(name, MODES[name], TRIGGERS.get(name), RESULTS[name], NOW,
                   source_table=_source_fqn(FEEDS[name]))
         for name in sorted(FEEDS)]
 

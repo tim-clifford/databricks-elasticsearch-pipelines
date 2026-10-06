@@ -58,7 +58,7 @@ REASONS = {
     PENDING: ("unsent_within_threshold",),
     BEHIND: ("unsent_over_threshold", "send_over_threshold", "run_over_threshold", "last_run_failed",
              "missed_schedule"),
-    UNKNOWN: ("no_checkpoint", "no_committed_batch", "bad_checkpoint", "source_unreadable",
+    UNKNOWN: ("unsupported_pipeline_mode", "no_checkpoint", "no_committed_batch", "bad_checkpoint", "source_unreadable",
               "history_window_exceeded", "history_retention_exceeded", "offset_ahead_of_table", "no_runs_logged", "unknown_run_status",
               "unsupported_cron", "no_job_for_config", "unsupported_trigger", "evaluation_error"),
 }
@@ -491,6 +491,22 @@ def classify_batch(run, trigger, now, threshold_minutes=DEFAULT_BEHIND_THRESHOLD
         if expected > (run["run_ended_at"] or run["started_at"]):
             return _result(BEHIND, "missed_schedule", **fields)
     return _result(CAUGHT_UP, "last_run_succeeded", **fields)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Effective mode
+# ---------------------------------------------------------------------------------------------------
+
+PIPELINE_MODES = ("batch", "streaming")
+
+
+def effective_pipeline_mode(config_mode, global_mode):
+    """The mode a feed's job runs by default: the config's own pipeline_mode, else (config omitted it, stored
+    "") the target-wide ${var.pipeline_mode} global, exactly as the generated job's pipeline_mode parameter
+    default resolves. Returns None for anything outside PIPELINE_MODES (the caller reports that feed
+    UNKNOWN unsupported_pipeline_mode rather than guessing)."""
+    mode = config_mode or global_mode
+    return mode if mode in PIPELINE_MODES else None
 
 
 # ---------------------------------------------------------------------------------------------------

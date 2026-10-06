@@ -649,3 +649,55 @@ def test_missing_log_vocabulary_names_what_was_removed():
     assert missing_log_vocabulary(RT, ST) == []
     assert missing_log_vocabulary([t for t in RT if t != "run_end"], ST) == ["run_end"]
     assert missing_log_vocabulary(RT, [x for x in ST if x != "stopped"]) == ["stopped"]
+
+
+def test_effective_pipeline_mode_inherits_the_global_and_fails_closed():
+    from pipeline_lib.feed_status import effective_pipeline_mode
+    assert effective_pipeline_mode("streaming", "batch") == "streaming"
+    assert effective_pipeline_mode("", "batch") == "batch"          # omitted => inherits the global
+    assert effective_pipeline_mode("", "streaming") == "streaming"
+    assert effective_pipeline_mode("", "") is None
+    assert effective_pipeline_mode("weird", "batch") is None
+    assert "unsupported_pipeline_mode" in REASONS[UNKNOWN]
+
+
+def test_effective_mode_matches_the_generated_jobs_default():
+    # The generated job's pipeline_mode parameter default is the config's own value or ${var.pipeline_mode};
+    # effective_pipeline_mode must agree for every committed config.
+    import glob, os, yaml
+    from pipeline_lib.config import load_config
+    from pipeline_lib.feed_status import effective_pipeline_mode
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    defaults = {}
+    for p in glob.glob(os.path.join(root, "resources", "*.yml")):
+        for job in ((yaml.safe_load(open(p)) or {}).get("resources") or {}).get("jobs", {}).values():
+            params = {x["name"]: x.get("default") for x in job.get("parameters") or []}
+            for t in job.get("tasks") or []:
+                c = ((t.get("notebook_task") or {}).get("base_parameters") or {}).get("config_name")
+                if c and "pipeline_mode" in params:
+                    defaults[c] = params["pipeline_mode"]
+    assert defaults
+    for c, default in defaults.items():
+        cfg = load_config(os.path.join(root, "_pipelines", "pipeline_configs", f"{c}.yml"))
+        expect = default if default != "${var.pipeline_mode}" else "batch"
+        assert effective_pipeline_mode(cfg["pipeline_mode"], "batch") == expect, c
+
+
+def test_import_fails_when_monitoring_sink_drops_a_name_read_here():
+    # In a fresh interpreter (so no other test sees a reloaded module): drop one record type from
+    # monitoring_sink, then importing feed_status must raise ImportError naming it.
+    import os, subprocess, sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = ("import pipeline_lib.monitoring_sink as ms\n"
+            "ms.RECORD_TYPES = tuple(t for t in ms.RECORD_TYPES if t != 'batch_start')\n"
+            "try:\n    import pipeline_lib.feed_status\nexcept ImportError as e:\n    print('RAISED', e)\n")
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "RAISED" in out.stdout and "batch_start" in out.stdout
+
+
+def test_feed_triggers_skips_a_runner_task_without_config_name():
+    doc = {"resources": {"jobs": {"k": {"tasks": [
+        {"task_key": "t", "notebook_task": {"notebook_path": "../notebooks/run_index_pipeline.py",
+                                            "base_parameters": {"environment": "x"}}}]}}}}
+    assert feed_triggers([doc], "PAUSED") == {}
