@@ -822,9 +822,10 @@ if PIPELINE_MODE == "streaming":
 
         def _summary_already_written(job_run_id, batch_id):
             """True when the monitoring table already holds a batch_summary for this (config, run, batch).
-            Consulted only by the START-UP sweep, whose leftovers may include a batch the previous process
-            summarized just before its best-effort relay delete failed (the in-process high-water mark, which
-            guards the later sweeps, starts empty after a restart). Raises on a read failure (fail-closed)."""
+            Consulted before every swept summary: a leftover outside this run's recorded range may be a batch a
+            previous process summarized just before its best-effort relay delete failed (the in-process range
+            starts empty after a restart). Leftovers are rare, so the extra read is cheap. Raises on a read
+            failure (fail-closed)."""
             return spark.sql(
                 f"SELECT 1 FROM {_MONITORING_TABLE} WHERE record_type = 'batch_summary' "
                 f"AND config_name = :c AND job_run_id = :r AND batch_id = :b LIMIT 1",
@@ -854,10 +855,11 @@ if PIPELINE_MODE == "streaming":
                 print(f"WARNING: could not list {relay_dir} for unrecorded batches ({type(_e).__name__}: {_e})")
                 return
             for _bid in leftover_relay_ids(_names, below):
-                # At or below this run's high-water mark the batch was already recorded (its relay outlived a
-                # failed best-effort delete): drop it, never summarize it twice. The start-up sweep runs before
-                # any batch is recorded (mark None), so a previous attempt's leftovers are never skipped here.
-                _recorded = _progress_mark["last"] is not None and _bid <= _progress_mark["last"]
+                # Within the range of batches THIS run recorded the batch was already summarized (its relay
+                # outlived a failed best-effort delete): drop it, never summarize it twice. Below that range it
+                # is a previous run's leftover (batch ids continue across runs) and is still owed a summary.
+                _recorded = (_progress_mark["first"] is not None
+                             and _progress_mark["first"] <= _bid <= _progress_mark["last"])
                 if not MONITORING_ACTIVE or _recorded:
                     drop_relay(_bid)
                     continue
@@ -877,7 +879,7 @@ if PIPELINE_MODE == "streaming":
                     # batch_end rows to complete, so there is nothing to summarize. Just clear it.
                     drop_relay(_bid)
                     continue
-                if _progress_mark["last"] is None and _summary_already_written(_owner, _bid):
+                if _summary_already_written(_owner, _bid):
                     drop_relay(_bid)  # summarized before a restart; only its cleanup was lost
                     continue
                 print(f"WARNING: {PROGRESS_TAG} no progress report seen for batch {_bid}; writing its "
@@ -983,7 +985,8 @@ if PIPELINE_MODE == "streaming":
         # is on, append its batch_summary. A failed read only warns (retried next slice); a failed APPEND raises
         # (the log's fail-closed contract), and the caller stops the query and fails the task.
         _POLL_SECONDS = 10
-        _progress_mark = {"last": None}  # highest batch id recorded (a dict so the helpers can update it)
+        # The first and highest batch ids THIS run recorded (a dict so the helpers can update it).
+        _progress_mark = {"first": None, "last": None}
 
         def record_progress(query):
             """Record every newly executed batch in query.recentProgress (see THE WAIT LOOP above)."""
@@ -1013,6 +1016,8 @@ if PIPELINE_MODE == "streaming":
                                                               es=(_relay or {}).get("es"), progress=_p)])
                 if _RELAY_ON:
                     drop_relay(_bid)  # only once its summary is written (a failed append raised above)
+                if _progress_mark["first"] is None:
+                    _progress_mark["first"] = _bid
                 _progress_mark["last"] = _bid
 
         def await_stream(query, record=True):
