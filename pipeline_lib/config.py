@@ -1588,6 +1588,10 @@ def job_base_parameters(
       Trigger.availableNow (drain-and-stop, today's behavior), scheduled or on-demand. A deploy-time
       property, not overridable per run (continuous is a per-pipeline config choice), so it is a
       base_parameter, not a job parameter. Ignored by a batch run.
+    - `job_run_id` / `task_run_id`: the Jobs dynamic value references {{job.run_id}} / {{task.run_id}},
+      constant here and resolved by the Jobs service per run, so the monitoring log groups a run's rows
+      by the PLATFORM run id (the notebook context does not expose it on every compute type: on
+      serverless the old context-tag lookup fell back to a per-process id, splitting a retried run).
     All values are strings, as job base_parameters must be.
 
     Run-time-overridable knobs (pipeline_mode, filter_condition, streaming_start, the EsWriteConfig
@@ -1605,6 +1609,8 @@ def job_base_parameters(
         "ca_certs": ca_certs_ref,
         "monitoring_log_table": monitoring_log_table_ref,
         "streaming_trigger_interval": streaming_trigger_interval,
+        "job_run_id": "{{job.run_id}}",
+        "task_run_id": "{{task.run_id}}",
     }
 
 

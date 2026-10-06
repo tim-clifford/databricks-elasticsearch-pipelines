@@ -677,6 +677,9 @@ def test_job_base_parameters():
         "ca_certs": "${var.ca_certs}",
         "monitoring_log_table": "${var.monitoring_log_table}",
         "streaming_trigger_interval": "",
+        # Jobs dynamic value references, resolved per run by the Jobs service (monitoring log run id).
+        "job_run_id": "{{job.run_id}}",
+        "task_run_id": "{{task.run_id}}",
     }
 
 

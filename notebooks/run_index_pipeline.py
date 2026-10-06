@@ -155,6 +155,10 @@ dbutils.widgets.text("max_bytes_per_trigger", "", "Streaming: max bytes per micr
 # also APPENDS its run and batch rows to that table (in addition to the log lines), and the table is then
 # REQUIRED: unset, malformed, missing, or unwritable fails the run (see the setup below).
 dbutils.widgets.text("monitoring_log_enabled", "", "Durable monitoring sink: true|false; also append run metrics to ${var.monitoring_log_table} (empty => off)")
+# job_run_id / task_run_id: deploy-time base_parameters bound to the Jobs dynamic value references
+# {{job.run_id}} / {{task.run_id}} (resolved per run by the Jobs service; empty on an interactive run).
+dbutils.widgets.text("job_run_id", "", "Databricks job run id ({{job.run_id}}; set by the generated job)")
+dbutils.widgets.text("task_run_id", "", "Databricks task run id ({{task.run_id}}; set by the generated job)")
 dbutils.widgets.text("monitoring_log_table", "", "Fully-qualified catalog.schema.table for the monitoring sink (deploy-time; empty => sink skipped). Created by the `_log table create` job.")
 CONFIG_NAME = dbutils.widgets.get("config_name").strip()
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
@@ -184,6 +188,8 @@ MAX_FILES_PER_TRIGGER = dbutils.widgets.get("max_files_per_trigger").strip()
 MAX_BYTES_PER_TRIGGER = dbutils.widgets.get("max_bytes_per_trigger").strip()
 MONITORING_LOG_ENABLED = dbutils.widgets.get("monitoring_log_enabled").strip()
 MONITORING_LOG_TABLE = dbutils.widgets.get("monitoring_log_table").strip()
+JOB_RUN_ID_PARAM = dbutils.widgets.get("job_run_id").strip()
+TASK_RUN_ID = dbutils.widgets.get("task_run_id").strip()
 if not CONFIG_NAME:
     raise ValueError("missing required parameter: config_name")
 
@@ -348,9 +354,12 @@ MONITORING_ACTIVE = bool(_MONITORING_TABLE)
 
 
 def _resolve_job_run_id():
-    """Best-effort Databricks job run id, used to group a run's monitoring rows. Any failure falls back to a
-    per-process uuid so a run's rows still share an id (just not the platform run id). Task retries of a
-    run share the job run id, so a retried batch shows up as a second batch_start for the same batch_id."""
+    """The Databricks job run id, used to group a run's monitoring rows. Preferred source: the job_run_id
+    base_parameter ({{job.run_id}}, resolved by the Jobs service; a literal "{{" means it was not
+    substituted, so it is ignored). Fallbacks, for interactive/legacy runs: the notebook context tags, then
+    a per-process uuid (so a run's rows still share an id, just not the platform run id)."""
+    if JOB_RUN_ID_PARAM and "{{" not in JOB_RUN_ID_PARAM:
+        return JOB_RUN_ID_PARAM
     try:
         _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
         _tags = json.loads(_ctx.toJson()).get("tags", {}) or {}
@@ -546,6 +555,7 @@ append_monitoring_rows([run_start_row(CONFIG_NAME, JOB_RUN_ID, {
     **_RUN_IDENTITY,
     "view": VIEW_FQN, "source": SOURCE_FQN, "environment": ENVIRONMENT,
     "connector_version": _connector_version, "filter_condition": FILTER_CONDITION,
+    "task_run_id": TASK_RUN_ID if TASK_RUN_ID and "{{" not in TASK_RUN_ID else None,
     "write_overrides": write_overrides, "write_repartition": WRITE_REPARTITION,
     "streaming_start": STREAMING_START if PIPELINE_MODE == "streaming" else None,
     "checkpoint": f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}" if PIPELINE_MODE == "streaming" else None,
