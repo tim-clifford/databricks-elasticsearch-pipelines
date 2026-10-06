@@ -320,6 +320,24 @@ def progress_batch_ids(progresses, last_batch_id):
     return [by_id[b] for b in sorted(by_id)]
 
 
+def leftover_relay_ids(names, below=None):
+    """The batch ids among relay directory entry `names` (as listed; a trailing "/" is ignored) that are
+    below `below` (None = all), ascending. Non-numeric names are skipped. The streaming runner writes one
+    relay directory per batch that ended successfully and deletes it once that batch's batch_summary is
+    written, so whatever is left below the batch being recorded is a batch whose progress report was never
+    seen (evicted from query.recentProgress's bounded buffer, or a read that kept failing). Those still owe
+    a batch_summary, written from the relayed ES diagnostics alone, so no batch is silently skipped."""
+    out = []
+    for name in names or []:
+        n = str(name).rstrip("/")
+        if not n.isdigit():
+            continue
+        bid = int(n)
+        if below is None or bid < below:
+            out.append(bid)
+    return sorted(out)
+
+
 def validate_table_name(name, where="monitoring_log_table"):
     """Canonicalize and fail-closed-validate a monitoring table name. Returns the stripped
     `catalog.schema.table` when valid; raises ValueError otherwise. Requires EXACTLY three dot-separated

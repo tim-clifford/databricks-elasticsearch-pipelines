@@ -1559,16 +1559,17 @@ def test_job_group_underscore_prefix_rejected(tmp_path, monkeypatch):
 
 
 def test_hand_authored_file_not_treated_as_orphan(tmp_path, monkeypatch):
-    # Hand-authored resource files (starting with underscore, no generated marker) are never flagged as orphans.
-    monkeypatch.chdir(tmp_path)
+    # A hand-authored `_`-prefixed resource (no generated marker) beside a STALE generated file whose config
+    # is gone: running the generator's real orphan path flags (--check) and then deletes (write mode) ONLY
+    # the generated orphan, never the hand-authored file.
     config_dir = tmp_path / "_pipelines" / "pipeline_configs"
     config_dir.mkdir(parents=True)
     resources_dir = tmp_path / "resources"
     resources_dir.mkdir()
-    # Create a hand-authored file (no generated marker) starting with underscore
     hand_authored = resources_dir / "_custom.job.yml"
     hand_authored.write_text("resources:\n  jobs:\n    custom_job: {}\n")
-    # Create an empty config dir to trigger "no configs found" normally, but orphan cleanup should prevent failure
+    stale = resources_dir / "gone_pipeline.job.yml"
+    stale.write_text(gen_jobs._GENERATED_MARKER + " from a deleted config\nresources: {}\n")
     dab_yml = tmp_path / "databricks.yml"
     dab_yml.write_text(
         "variables:\n"
@@ -1582,7 +1583,12 @@ def test_hand_authored_file_not_treated_as_orphan(tmp_path, monkeypatch):
     monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
     monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
-    # Run with --check; the hand-authored file should NOT be flagged as orphan, and with no configs the tool should still succeed
-    # (actually it will report "no index configs found" error since there are no configs AND no orphans to clean up, which is expected)
-    # Let's instead verify the is_generated function correctly identifies it
-    assert not gen_jobs.is_generated(str(hand_authored))
+    assert gen_jobs.existing_generated_files() == [str(stale)]
+    # --check fails on the stale orphan and leaves both files in place.
+    assert gen_jobs.main(["--check"]) != 0
+    assert stale.exists() and hand_authored.exists()
+    # Write mode removes the orphan only.
+    assert gen_jobs.main([]) == 0
+    assert not stale.exists()
+    assert hand_authored.exists()
+

@@ -157,3 +157,32 @@ def test_query_failure_records_final_progress_when_record_works():
     with pytest.raises(QueryFailed):
         _run(q, record=lambda _q: calls.append(1))
     assert calls == [1, 1]
+
+
+def test_record_failure_after_liveness_detected_failure_raises_the_query_error():
+    # Isaac finding: on the isActive-end path a failed monitoring append must not mask the stream's error.
+    q = FakeQuery([False], active=[False], failure=QueryFailed("the stream error"))
+
+    def record(_query):
+        raise RuntimeError("append failed")
+
+    with pytest.raises(QueryFailed, match="the stream error") as info:
+        _run(q, record=record)
+    assert any("append failed" in n for n in getattr(info.value, "__notes__", []))
+
+
+def test_persistent_isactive_errors_fail_instead_of_spinning_forever():
+    # Isaac finding: the wait call keeps saying "running" and isActive errors every slice; the loop must
+    # give up (fail the task, so the retry policy applies) rather than hang.
+    q = FakeQuery([False], active=[RuntimeError("rpc down")])
+    with pytest.raises(RuntimeError, match="could not determine whether the query is active"):
+        _run(q)
+    assert q.wait_calls == 30
+
+
+def test_isactive_error_streak_resets_on_a_good_check():
+    # 29 errors, one good check, 29 errors, then a clean end: never 30 in a row, so no failure.
+    errs = [RuntimeError("blip")] * 29
+    q = FakeQuery([False] * 60 + [True], active=errs + [True] + errs + [True])
+    _run(q)
+    assert q.wait_calls == 61

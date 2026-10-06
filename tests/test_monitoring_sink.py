@@ -31,6 +31,7 @@ from pipeline_lib.monitoring_sink import (
     batch_summary_row,
     create_table_sql,
     error_facts,
+    leftover_relay_ids,
     es_counts,
     es_write_summary,
     missing_columns,
@@ -296,6 +297,20 @@ def test_progress_batch_ids_skips_unusable_entries(junk):
 def test_progress_batch_ids_empty_input():
     assert progress_batch_ids(None, last_batch_id=None) == []
     assert progress_batch_ids([], last_batch_id=3) == []
+
+
+# --- leftover_relay_ids (no silent batch_summary gaps) ------------------------------------------
+
+def test_leftover_relay_ids_below_the_batch_being_recorded():
+    assert leftover_relay_ids(["3/", "1/", "7/", "12/"], below=7) == [1, 3]
+
+
+def test_leftover_relay_ids_none_means_all_ascending():
+    assert leftover_relay_ids(["10", "2", "x", "_SUCCESS", "4/"]) == [2, 4, 10]
+
+
+def test_leftover_relay_ids_empty():
+    assert leftover_relay_ids([], below=3) == [] and leftover_relay_ids(None) == []
 
 
 # --- event_ts / payload serialization ----------------------------------------------------------
