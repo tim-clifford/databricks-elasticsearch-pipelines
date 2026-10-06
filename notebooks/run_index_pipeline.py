@@ -871,7 +871,12 @@ if PIPELINE_MODE == "streaming":
                     print(f"WARNING: could not read the relayed diagnostics for unrecorded batch {_bid}; "
                           f"retrying on the next sweep")
                     continue
-                _owner = _relay.get("job_run_id") or JOB_RUN_ID
+                _owner = _relay.get("job_run_id")
+                if not _owner:
+                    # Written by a run with the log OFF (bulk_stats relay only): that batch has no batch_start /
+                    # batch_end rows to complete, so there is nothing to summarize. Just clear it.
+                    drop_relay(_bid)
+                    continue
                 if _progress_mark["last"] is None and _summary_already_written(_owner, _bid):
                     drop_relay(_bid)  # summarized before a restart; only its cleanup was lost
                     continue
