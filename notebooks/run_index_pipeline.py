@@ -848,7 +848,9 @@ if PIPELINE_MODE == "streaming":
                     continue
                 print(f"WARNING: {PROGRESS_TAG} no progress report seen for batch {_bid}; writing its "
                       f"batch_summary from the relayed ES diagnostics only")
-                append_monitoring_rows([batch_summary_row(CONFIG_NAME, JOB_RUN_ID, _bid, es=_relay["es"])])
+                # Filed under the run that executed the batch (it may be an earlier, dead run).
+                append_monitoring_rows([batch_summary_row(CONFIG_NAME, _relay.get("job_run_id") or JOB_RUN_ID,
+                                                          _bid, es=_relay["es"])])
                 drop_relay(_bid)
 
         def foreach_batch(batch_df, batch_id: int):
@@ -916,8 +918,11 @@ if PIPELINE_MODE == "streaming":
             # summary is written from Spark's progress alone. The outcome rows never depend on it.
             if _RELAY_ON:
                 try:
+                    # job_run_id travels with the relay so a summary written later by a DIFFERENT run (the
+                    # start-up sweep) is still filed under the run whose batch_start/batch_end it completes.
                     _relay = json.dumps({"es": es_write_summary(result, wall_ms=_bw_wall_ms),
-                                         "line": bulk_stats_relay_line(result, batch_id)}, default=str)
+                                         "line": bulk_stats_relay_line(result, batch_id),
+                                         "job_run_id": JOB_RUN_ID}, default=str)
                     session.createDataFrame([(_relay,)], "line string") \
                         .coalesce(1).write.mode("overwrite").text(f"{relay_dir}/{int(batch_id)}")
                 except Exception as _e:
