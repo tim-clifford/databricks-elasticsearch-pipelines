@@ -138,6 +138,7 @@ STATUS_TABLE_COLUMNS = (
 )
 RESULT_FIELDS = tuple(name for name, _type in STATUS_TABLE_COLUMNS)
 _TS_FIELDS = frozenset(name for name, sql_type in STATUS_TABLE_COLUMNS if sql_type == "TIMESTAMP")
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def create_status_table_sql(table_name):
@@ -170,9 +171,9 @@ def run_state_sql(log_table, lookback_days=DEFAULT_LOG_LOOKBACK_DAYS):
     """One row per config_name: its LATEST logged run within the lookback window, as columns job_run_id,
     run_started_at, run_ended_at, run_end_status, last_batch_started_at.
 
-    A run is ordered by its run_start time, falling back to its newest batch_start: a long-lived
-    continuous run whose run_start has aged out of the window is still found (and still reads as running)
-    through its recent batch_start rows. The event_ts predicate lets the clustered (config_name, event_ts)
+    A run is ordered by its run_start time, falling back to its newest batch_start, then its run_end: a
+    long-lived continuous run whose run_start has aged out of the window is still found (and still reads
+    as running) through its recent batch_start rows, and one that just ended through its run_end. The event_ts predicate lets the clustered (config_name, event_ts)
     monitoring table skip old files."""
     canonical = validate_table_name(log_table, "monitoring_log_table")
     days = int(lookback_days)
@@ -195,7 +196,7 @@ SELECT config_name, latest.* FROM (
     max_by(named_struct('job_run_id', job_run_id, 'run_started_at', run_started_at,
                         'run_ended_at', run_ended_at, 'run_end_status', run_end_status,
                         'last_batch_started_at', last_batch_started_at),
-           coalesce(run_started_at, last_batch_started_at)) AS latest
+           coalesce(run_started_at, last_batch_started_at, run_ended_at)) AS latest
   FROM runs GROUP BY config_name
 )""".strip()
 
@@ -379,8 +380,10 @@ def classify_streaming(checkpoint, history, history_limit, run, now,
                     key=lambda h: h["version"])
     waiting = [h for h in unsent if h["version"] >= waiting_from]
     oldest = unsent[0]["timestamp"] if unsent else None
+    # Clamped at 0: a commit newer than `now` (it landed after evaluation began, or writer clock skew) is
+    # simply fresh, never a negative age.
     common.update(oldest_unsent_ts=oldest, in_flight_since=since,
-                  lag_minutes=_minutes(now - oldest) if oldest else None)
+                  lag_minutes=max(0.0, _minutes(now - oldest)) if oldest else None)
 
     # Decisive regardless of window coverage: anything older than these is older still.
     if active and since is not None and now - since >= threshold:
@@ -410,7 +413,7 @@ def latest_run(row):
     batch_start (see run_state_sql)."""
     if not row:
         return None
-    started = row.get("run_started_at") or row.get("last_batch_started_at")
+    started = row.get("run_started_at") or row.get("last_batch_started_at") or row.get("run_ended_at")
     return {
         "job_run_id": row.get("job_run_id"),
         "started_at": started,
@@ -479,8 +482,9 @@ def feed_triggers(job_docs, schedule_pause_status):
 
     Each value is {"kind": "schedule"|"continuous"|"on_demand", "cron": str|None, "paused": bool|None},
     or {"kind": "unsupported", "detail": ...} when the trigger's pause state is neither a literal nor the
-    global reference. Jobs whose tasks do not run the index-pipeline notebook are skipped."""
-    out = {}
+    global reference, or when one config is run by more than one job (fail closed: which trigger applies
+    is ambiguous). Jobs whose tasks do not run the index-pipeline notebook are skipped."""
+    out, seen = {}, set()
     for doc in job_docs:
         jobs = ((doc or {}).get("resources") or {}).get("jobs") or {}
         for job in jobs.values():
@@ -503,14 +507,20 @@ def feed_triggers(job_docs, schedule_pause_status):
                 if not str(nb.get("notebook_path", "")).endswith(_RUNNER_NOTEBOOK):
                     continue
                 name = (nb.get("base_parameters") or {}).get("config_name")
-                if name:
+                if not name:
+                    continue
+                if name in seen:
+                    out[name] = {"kind": "unsupported", "detail": f"config {name!r} is run by more than one job"}
+                else:
                     out[name] = trig
+                seen.add(name)
     return out
 
 
 def to_row(config_name, pipeline_mode, trigger, result, evaluated_at, source_table=None):
-    """Finish a result into a status-table row: identity, trigger columns, and timestamps formatted as
-    UTC `YYYY-MM-DD HH:MM:SS.ffffff` strings (cast to TIMESTAMP by the notebook's temp view)."""
+    """Finish a result into a status-table row: identity, trigger columns, and every TIMESTAMP field as
+    integer microseconds since the Unix epoch (the notebook converts with timestamp_micros(), so the stored
+    value never depends on the Spark session time zone). A naive datetime is taken as UTC."""
     row = dict(result)
     row.update(config_name=config_name, pipeline_mode=pipeline_mode, evaluated_at=evaluated_at,
                trigger=(trigger or {}).get("kind"), trigger_paused=(trigger or {}).get("paused"),
@@ -518,9 +528,9 @@ def to_row(config_name, pipeline_mode, trigger, result, evaluated_at, source_tab
     for f in _TS_FIELDS:
         v = row.get(f)
         if isinstance(v, datetime):
-            if v.tzinfo is not None:
-                v = v.astimezone(timezone.utc)
-            row[f] = v.strftime("%Y-%m-%d %H:%M:%S.%f")
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=timezone.utc)
+            row[f] = (v - _EPOCH) // timedelta(microseconds=1)
     return {f: row.get(f) for f in RESULT_FIELDS}
 
 

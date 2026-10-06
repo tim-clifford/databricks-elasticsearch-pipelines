@@ -511,9 +511,11 @@ def test_to_row_shapes_and_formats_timestamps():
     row = to_row("cfg", "streaming", {"kind": "schedule", "paused": False}, res, NOW, source_table="c.s.t")
     assert tuple(row) == RESULT_FIELDS
     assert row["config_name"] == "cfg" and row["trigger"] == "schedule" and row["trigger_paused"] is False
-    assert row["oldest_unsent_ts"] == "2026-10-05 11:50:00.000000"
+    # timestamps are epoch microseconds (2026-10-05 11:50:00 UTC / 12:00:00 UTC)
+    assert row["oldest_unsent_ts"] == 1791201000000000
     assert row["source_table"] == "c.s.t"
-    assert row["evaluated_at"] == "2026-10-05 12:00:00.000000"
+    assert row["evaluated_at"] == 1791201600000000
+    assert row["last_run_end_ts"] == 1791200400000000  # ENDED ended 11:40 UTC
     assert to_row("b", "batch", None, b(None), NOW, source_table="c.s.t")["source_table"] is None
 
 
@@ -586,6 +588,35 @@ def test_batch_run_without_any_start_time_is_no_runs_logged():
     assert classify_batch(r, SCHED, NOW)["status_reason"] == "no_runs_logged"
 
 
-def test_to_row_formats_naive_timestamps_unchanged():
-    res = _result(PENDING, "unsent_within_threshold", oldest_unsent_ts=datetime(2026, 10, 5, 11, 50, 7))
-    assert to_row("cfg", "streaming", None, res, NOW)["oldest_unsent_ts"] == "2026-10-05 11:50:07.000000"
+def test_to_row_treats_naive_timestamps_as_utc_and_offsets_correctly():
+    from datetime import timedelta as _td
+    res = _result(PENDING, "unsent_within_threshold", oldest_unsent_ts=datetime(2026, 10, 5, 11, 50, 7),
+                  in_flight_since=datetime(2026, 10, 5, 13, 50, 7, tzinfo=timezone(_td(hours=2))))
+    row = to_row("cfg", "streaming", None, res, NOW)
+    assert row["oldest_unsent_ts"] == 1791201007000000
+    assert row["in_flight_since"] == 1791201007000000  # 13:50:07+02:00 is the same instant
+
+
+def test_zero_step_cron_is_unsupported():
+    for expr in ("0 */0 * * * ?", "0 5/0 * * * ?"):
+        with pytest.raises(UnsupportedCron):
+            previous_fire(expr, NOW)
+
+
+def test_lag_minutes_never_negative_for_a_commit_newer_than_now():
+    out = s(ckpt(9), hist((9, -2, "WRITE")), run=ENDED)  # committed 2 min "after" now
+    assert out["status"] == PENDING and out["lag_minutes"] == 0.0
+
+
+def test_latest_run_falls_back_to_run_end():
+    t = NOW - timedelta(minutes=1)
+    r = latest_run({"job_run_id": "j", "run_started_at": None, "last_batch_started_at": None,
+                    "run_ended_at": t, "run_end_status": "success"})
+    assert r["started_at"] == t
+    assert "coalesce(run_started_at, last_batch_started_at, run_ended_at)" in run_state_sql("c.s.log", 7)
+
+
+def test_feed_triggers_config_in_two_jobs_is_unsupported():
+    docs = [_job({"schedule": {"quartz_cron_expression": "0 */10 * * * ?", "pause_status": "UNPAUSED"}}, ("dup",)),
+            _job(None, ("dup",))]
+    assert feed_triggers(docs, "PAUSED")["dup"]["kind"] == "unsupported"

@@ -100,7 +100,8 @@ for path in sorted(glob.glob(os.path.join(CONFIG_DIR, "*.yml")) + glob.glob(os.p
     FEEDS[name] = resolve_config(load_config(path), ENVIRONMENT)
 
 job_docs = []
-for path in sorted(glob.glob(os.path.join(FILES_ROOT, "resources", "*.yml"))):
+for path in sorted(glob.glob(os.path.join(FILES_ROOT, "resources", "*.yml"))
+                   + glob.glob(os.path.join(FILES_ROOT, "resources", "*.yaml"))):
     with open(path) as fh:
         job_docs.append(yaml.safe_load(fh))
 TRIGGERS = fs.feed_triggers(job_docs, SCHEDULE_PAUSE_STATUS)
@@ -257,8 +258,10 @@ ROWS = [fs.to_row(name, FEEDS[name]["pipeline_mode"], TRIGGERS.get(name), RESULT
                   source_table=_source_fqn(FEEDS[name]))
         for name in sorted(FEEDS)]
 
-_schema = ", ".join(f"{n} {'STRING' if t == 'TIMESTAMP' else t}" for n, t in fs.STATUS_TABLE_COLUMNS)
-_cast = [F.col(n).cast("timestamp").alias(n) if t == "TIMESTAMP" else F.col(n)
+# to_row carries timestamps as epoch microseconds; timestamp_micros() makes them TIMESTAMPs independent of
+# the session time zone.
+_schema = ", ".join(f"{n} {'BIGINT' if t == 'TIMESTAMP' else t}" for n, t in fs.STATUS_TABLE_COLUMNS)
+_cast = [F.expr(f"timestamp_micros({n})").alias(n) if t == "TIMESTAMP" else F.col(n)
          for n, t in fs.STATUS_TABLE_COLUMNS]
 _TEMP_VIEW = "_feed_status_rows"
 spark.createDataFrame([tuple(r[f] for f in fs.RESULT_FIELDS) for r in ROWS], _schema) \
