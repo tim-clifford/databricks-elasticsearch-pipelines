@@ -48,6 +48,7 @@ def await_stream(query, poll_seconds, record=None, log=print):
     is what propagates, even when recording progress then fails too (that is attached as a note). `log`
     receives one-line status messages."""
     isactive_errors = 0
+    ended_by_liveness = False  # the end was seen by a state check, not by the wait call
     while True:
         try:
             ended = query.awaitTermination(poll_seconds)  # True once terminated; RAISES if it failed
@@ -87,6 +88,8 @@ def await_stream(query, poll_seconds, record=None, log=print):
                             "treating it as ended")
                 except Exception as check_exc:
                     check_errors.append(check_exc)
+            if ended:
+                ended_by_liveness = True
             if state_read:
                 isactive_errors = 0
             else:
@@ -123,4 +126,17 @@ def await_stream(query, poll_seconds, record=None, log=print):
             failure = query.exception()
             if failure is not None:
                 raise failure
+            if ended_by_liveness:
+                # The wait call never reported this end, so CONFIRM the outcome before calling it clean: the
+                # failure may not be visible to exception() yet (isActive can flip first). For an ended query
+                # the wait call returns at once: True for a clean end, or it RAISES the failure. If it still
+                # says "running", the outcome is unknown, so fail (the task's retry restarts the stream,
+                # which is always safe) rather than report a clean stop that would never be restarted.
+                confirmed = query.awaitTermination(poll_seconds)
+                failure = query.exception()
+                if failure is not None:
+                    raise failure
+                if not confirmed:
+                    raise RuntimeError("the query reported itself ended, but the wait call could not confirm "
+                                       "how the query ended; failing so the stream is restarted")
             return

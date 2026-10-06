@@ -93,12 +93,6 @@ def test_hung_wait_call_is_caught_by_isactive_and_the_failure_is_raised():
     assert q.wait_calls == 3
 
 
-def test_hung_wait_call_on_a_cleanly_stopped_query_returns():
-    q = FakeQuery([False], active=[False], failure=None)
-    logs = _run(q)
-    assert any("no longer active" in m for m in logs)
-
-
 def test_slow_query_keeps_waiting_through_many_slices():
     # A long micro-batch: many "still running" slices, the query active throughout, then a clean end.
     q = FakeQuery([False] * 500 + [True], active=[True])
@@ -224,3 +218,35 @@ def test_unreadable_state_on_both_checks_still_fails_after_the_limit():
     with pytest.raises(RuntimeError, match="could not determine whether the query is active"):
         _run(q)
     assert q.wait_calls == 30
+
+
+def test_liveness_end_with_late_failure_visibility_raises_via_confirming_wait():
+    # Isaac finding: isActive flips False before exception() is populated. The end must be confirmed by a
+    # final wait call, which raises the failure, instead of being reported as a clean stop.
+    class LateFailure(FakeQuery):
+        def awaitTermination(self, timeout):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                return False  # the wait call missed the end
+            raise QueryFailed("failure visible only to the confirming wait")
+
+        def exception(self):
+            return None  # not yet populated
+
+    q = LateFailure([False], active=[False])
+    with pytest.raises(QueryFailed, match="confirming wait"):
+        _run(q)
+
+
+def test_liveness_end_that_cannot_be_confirmed_fails_closed():
+    # isActive says ended, no failure recorded, but the confirming wait still says "running": the outcome is
+    # unknown, so fail (a restart is safe) rather than report a clean stop.
+    q = FakeQuery([False], active=[False], failure=None)
+    with pytest.raises(RuntimeError, match="could not confirm how the query ended"):
+        _run(q)
+
+
+def test_liveness_end_confirmed_clean_returns():
+    q = FakeQuery([False, True], active=[False], failure=None)
+    _run(q)
+    assert q.wait_calls == 2
