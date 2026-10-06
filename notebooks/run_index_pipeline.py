@@ -1181,8 +1181,10 @@ if PIPELINE_MODE == "streaming":
             query = writer.trigger(processingTime=STREAMING_TRIGGER_INTERVAL).start()
             print(f"{PROGRESS_TAG} query started: name={query.name!r} id={query.id} runId={query.runId}")
             # await_stream returns ONLY if the stream stops: on a FAILURE it raises (the run fails and the Jobs
-            # continuous trigger restarts it, so a lost batch never passes silently), and on a GRACEFUL stop
-            # (job cancel, redeploy, cluster shutdown) it returns normally. Either way there is NO
+            # continuous trigger restarts it, so a lost batch never passes silently), and if the query stops
+            # without an error it returns normally (run_end status stopped). A JOB CANCEL is not that: it
+            # interrupts this notebook (seen live), so nothing below runs and the run keeps a run_start with no
+            # run_end; an interrupted batch_summary is written by the next run's start-up sweep. There is NO
             # drain-and-stop reconciliation for an always-on run - observability is the per-batch rows written
             # as each batch commits plus the Databricks Jobs continuous-run state (RUNNING / restart count /
             # failure notifications). So set a summary noting the stop and do NOT run the availableNow summary

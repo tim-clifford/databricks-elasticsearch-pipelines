@@ -62,7 +62,7 @@ RECORD_TYPES = (
 )
 
 # The allow-list of status values, and which statuses each record_type may carry. `stopped` is a
-# continuous stream that ended WITHOUT an error (a job cancel, redeploy, or cluster shutdown), which is
+# continuous stream whose query ended WITHOUT an error while the notebook kept running, which is
 # neither a success nor a failure of the export.
 STATUSES = ("started", "success", "error", "stopped")
 _ALLOWED_STATUS = {

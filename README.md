@@ -966,12 +966,16 @@ A **batch-mode** run is exactly one batch (`batch_id` 0); a **streaming** run ha
 micro-batch (its micro-batch id). `batch_end` and `batch_summary` are separate because in streaming Spark
 publishes a batch's progress only after the batch has committed: `batch_start`/`batch_end` are written
 inline from the batch itself, and `batch_summary` follows a few seconds later from the notebook's wait loop.
-`stopped` is a continuous stream that ended without an error (a cancel, redeploy, or cluster shutdown).
+`stopped` is a continuous stream whose query ended without an error while the notebook kept running. A
+**job cancel is not that**: it interrupts the notebook itself (seen live), so a cancelled run leaves
+`run_start` with no `run_end`, exactly like a killed run; a batch summary interrupted that way is written
+by the next run's start-up sweep.
 `batch_start_ts`/`batch_end_ts` carry the run's or batch's wall clock (for `batch_summary`, from Spark's
 progress timestamp + `batchDuration`).
 
 **Reading the gaps.** A `batch_start` with no `batch_end` is a batch that never finished (the task was
-killed, or the driver died mid-write); a `run_start` with no `run_end` is a run that was killed outright.
+killed, or the driver died mid-write); a `run_start` with no `run_end` is a run that was killed
+outright or **cancelled** (a cancel interrupts the notebook before it can write `run_end`).
 A batch retried by the task's retry policy shows a second `batch_start` for the same `batch_id`.
 Per-partition bulk-send detail is **not** stored (too granular for this log); it still prints in the run
 log when `bulk_stats` is on.
