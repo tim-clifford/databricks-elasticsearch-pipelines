@@ -5,8 +5,8 @@ StreamingQueryProgress JSON and calls format_progress() to emit one greppable lo
 here, apart from the notebook, so it is unit-testable off-cluster (plain pytest, no Spark session).
 
 DESIGN INVARIANT - these are OBSERVABILITY ONLY. They never change what is written, the checkpoint, or
-reconciliation. format_progress in particular is FAIL-SOFT: it is driven from a listener callback whose
-failure must not destabilize the export, so any missing/renamed/oddly-typed field is omitted, never
+reconciliation. format_progress in particular is FAIL-SOFT: it is driven from the streaming progress recorder,
+whose formatting must not destabilize the export, so any missing/renamed/oddly-typed field is omitted, never
 raised. It reads values exactly as the runtime emits them - notably the Delta source's backlog metrics
 (numFilesOutstanding / numBytesOutstanding) arrive as STRINGS - and surfaces every metric key present,
 so a metric this runtime does not emit today (e.g. numNewListedFiles) simply appears when it does.
@@ -41,7 +41,7 @@ _GIL_KEYS = ("gil_wait_ms_total", "gil_wait_ms_p95", "gil_wait_ms_max")
 def _ts_token(now=None):
     """Wall-clock `ts=<ISO-8601 UTC, ms>Z` token appended to each emitted line so the trail can be
     placed in real time and correlated with ES/cluster metrics. It matters most for the streaming
-    BULK_STATS relay: `foreachBatch` BUILDS the line server-side, but the listener PRINTS it client-side
+    BULK_STATS relay: `foreachBatch` BUILDS the line server-side, but the notebook PRINTS it client-side
     later, so the driver log's own line timestamp is the relay time, not the batch time -- this token
     captures the batch time at the moment the line is built. `now=None` reads the current UTC time; tests
     pass a fixed datetime. Fail-soft: returns '' if the clock read fails, so a formatter never raises."""
@@ -136,7 +136,7 @@ def _num(value):
 def bulk_stats_overall(bulk_stats):
     """The cluster-wide rollup of the connector's per-partition `bulk_stats` as a plain dict: the SINGLE
     computation behind both the `BULK_STATS overall` log line (format_bulk_stats renders this dict) and the
-    durable batch_summary row (monitoring_sink stores it), so the console and the table can never disagree.
+    durable batch_end row's `es` field (monitoring_sink stores it), so the console and the table can never disagree.
 
     Reports only figures that recombine EXACTLY across partitions: total sends/docs/bytes, docs-per-send,
     bytes-per-doc/send, the wall-weighted concurrency, the send-weighted MEAN rtt/http/took, the MAX
@@ -347,7 +347,7 @@ def format_progress(progress, now=None):
 
     A `ts=<UTC>` wall-clock token is appended so the batch can be placed in real time. FAIL-SOFT by
     contract (see module docstring): returns a best-effort string for any input and never raises, so a
-    listener callback built on it cannot destabilize the stream. A non-dict input yields a marker line
+    progress recorder built on it cannot destabilize the stream. A non-dict input yields a marker line
     rather than an exception. `now` is injectable for tests; None uses the current time.
     """
     if not isinstance(progress, dict):
@@ -411,7 +411,7 @@ def _percentile(vals, q):
 def bulk_stats_tail(result):
     """The straggler/skew facts behind a write's wall-time tail, as a plain dict: the SINGLE computation
     behind both the `BULK_STATS tail:` log line (format_tail_summary renders this dict) and the durable
-    batch_summary row. See format_tail_summary for what each figure means.
+    batch_end row's `es` field. See format_tail_summary for what each figure means.
 
     `result` is the connector's bulk_write return dict. Returns None for a non-dict input, and a dict with
     only collect_ms / merge_ms (no partition facts) when it carries no bulk_stats. A figure that cannot be
@@ -539,11 +539,11 @@ def bulk_stats_relay_line(result, batch_id, now=None):
 
     The streaming path cannot print the connector's bulk_stats into the notebook cell directly: under
     Spark Connect `foreachBatch` runs SERVER-side (its stdout goes to the driver log, and its Python
-    memory is a different process), while the StreamingQueryListener callback runs CLIENT-side (its
+    memory is a different process), while the notebook's progress recorder runs CLIENT-side (its
     stdout reaches the cell - that is why STREAM_PROGRESS shows there). An in-memory handoff cannot
     bridge the two. So `foreachBatch` writes this text to a small per-batch file (via the same Spark
-    write it already uses for the per-batch row count) and the listener reads it for the batch it is
-    reporting - a file is the one channel both sides share. This function is the PURE part (the content);
+    write it already uses for the per-batch row count) and the recorder reads it for the batch it is
+    reporting - a file is the one channel both sides share. Best-effort: only the cell print depends on it. This function is the PURE part (the content);
     the notebook owns the file I/O so this module stays Spark/Databricks-free and unit-testable.
 
     FAIL-SOFT: never raises (format_* are fail-soft), so a diagnostic fault cannot disturb the write."""

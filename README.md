@@ -32,9 +32,9 @@ The bundle deploys:
   share one cluster).
 - **Optional durable monitoring log**: every run logs its `STREAM_PROGRESS` / `BULK_STATS` metrics to the
   run log; turning on `monitoring_log_enabled` **also** records every run and every batch in a shared,
-  liquid-clustered Delta table: `run_start` / `run_end` per run and `batch_start` / `batch_end` /
-  `batch_summary` per batch (one batch in batch mode, one per micro-batch in streaming), with status,
-  timing, ES counts and diagnostics. The table is created once by the hand-authored `_log table create`
+  liquid-clustered Delta table: `run_start` / `run_end` per run and `batch_start` / `batch_end` per batch
+  (one batch in batch mode, one per micro-batch in streaming), with status, timing, ES counts and
+  diagnostics, plus a `batch_summary` with Spark's progress report for each streaming micro-batch. The table is created once by the hand-authored `_log table create`
   job (re-run it to additively migrate the schema); a `_log table prune` job bounds its growth with
   retention. Off by default; when ON it is **fail-closed** (a failed log write fails the task, so no data
   is sent unlogged). See [Durable monitoring](#durable-monitoring).
@@ -699,7 +699,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
     line plus that `tail:` summary per micro-batch. Every line carries a `ts=<UTC>` wall-clock token so a
     batch can be placed in real time; this matters because a micro-batch's write runs server-side (its
     log output does not reach the notebook cell), so each batch's line is written to a small per-batch
-    file and re-emitted by the notebook's wait loop, appearing alongside the `STREAM_PROGRESS` line (in the
+    file and re-emitted by the notebook's progress recorder (best-effort), appearing alongside the `STREAM_PROGRESS` line (in the
     notebook cell for an interactive run, in the driver log for a job run) LATER than the batch actually
     ran, so the ambient log timestamp is the relay time and the embedded `ts=` is the true batch time.
     `rtt_ms - took_ms`
@@ -958,20 +958,22 @@ three-layer precedence as every knob).
 |---|---|---|---|
 | `run_start` | once per run, before anything else | `started` | mode, es_index, view, source, trigger, connector version, effective write settings |
 | `batch_start` | immediately **before** a batch's data is sent to ES | `started` | mode |
-| `batch_end` | when the batch's write finishes | `success` / `error` | ES counts (`written`, `errors`, ...) or `exception_type` / `message` / `elapsed_ms` |
-| `batch_summary` | per batch, the diagnostics | `success` / `error` | `es`: write rollup (`collect_ms`, `bulk_write_wall_ms`, and with `bulk_stats` on the `overall` totals and `tail` straggler facts); streaming also `progress`: Spark's whole `StreamingQueryProgress` (backlog, step durations, rates, offsets) |
+| `batch_end` | when the batch's write finishes | `success` / `error` | ES counts (`written`, `errors`, ...) plus `es`, the write diagnostics (`collect_ms`, `bulk_write_wall_ms`, and with `bulk_stats` on the `overall` totals and `tail` straggler facts); on error `exception_type` / `message` / `elapsed_ms` (plus the counts when the write returned) |
+| `batch_summary` | streaming only: when the notebook sees Spark's progress report for the batch | `success` | `progress`: Spark's whole `StreamingQueryProgress` (backlog, step durations, rates, source offsets) |
 | `run_end` | when the run ends in-process | `success` / `error` / `stopped` | totals (batches, rows) or the error |
 
 A **batch-mode** run is exactly one batch (`batch_id` 0); a **streaming** run has one set of batch rows per
-micro-batch (its micro-batch id). `batch_end` and `batch_summary` are separate because in streaming Spark
-publishes a batch's progress only after the batch has committed: `batch_start`/`batch_end` are written
-inline from the batch itself, and `batch_summary` follows a few seconds later from the notebook's wait loop.
+micro-batch (its micro-batch id). `batch_start` / `batch_end` are written inline from the batch itself and
+carry everything about OUR side of the batch (outcome, counts, ES diagnostics) in both modes. `batch_summary`
+is Spark's side, and only streaming has it: Spark publishes a batch's progress report after the batch commits,
+asynchronously, and keeps only the last few in memory, so the notebook's wait loop records it a few seconds
+later, best-effort by nature. A `batch_end` with no `batch_summary` is a streaming batch whose report was lost
+(typically a cancel moments after it committed); its outcome and ES diagnostics are still in `batch_end`.
 `stopped` is a continuous stream whose query ended without an error while the notebook kept running. A
 **job cancel is not that**: it interrupts the notebook itself (seen live), so a cancelled run leaves
-`run_start` with no `run_end`, exactly like a killed run; a batch summary interrupted that way is written
-by the next run's start-up sweep.
-`batch_start_ts`/`batch_end_ts` carry the run's or batch's wall clock (for `batch_summary`, from Spark's
-progress timestamp + `batchDuration`).
+`run_start` with no `run_end`, exactly like a killed run.
+`batch_start_ts`/`batch_end_ts` carry the run's or batch's wall clock (for `batch_summary`, Spark's trigger
+timestamp + `batchDuration`).
 
 **Reading the gaps.** A `batch_start` with no `batch_end` is a batch that never finished (the task was
 killed, or the driver died mid-write); a `run_start` with no `run_end` is a run that was killed
@@ -985,12 +987,9 @@ required: `monitoring_log_table` unset or malformed, the table missing or not wr
 `run_start`), or **any** failed append fails the task, so support receives the failure notification and no
 further data is sent without a log record. Because `batch_start` is written before a batch's data is sent,
 a log outage stops the export before the next batch reaches ES. A failure while recording a failure never
-hides the original error (the log fault is attached to it as a note). In streaming, each batch also leaves
-a small relay file under `<checkpoint>/_batch_relay/<batch_id>` (its ES diagnostics) that guarantees its
-`batch_summary` even if Spark's progress report is lost; it is deleted once the summary is written, swept
-into a summary by the next run if a run dies first, and with the log on a failed relay write fails the
-batch like any other log write. **The trade-off:** a log write that fails AFTER a batch's data reached ES
-(its `batch_end` or relay) fails the micro-batch before the checkpoint advances, so the task's retry
+hides the original error (the log fault is attached to it as a note). A failed `batch_summary` append
+fails the task too (the wait loop stops the stream). **The trade-off:** a log write that fails AFTER a
+batch's data reached ES (its `batch_end`) fails the micro-batch before the checkpoint advances, so the task's retry
 re-sends that batch. With `es_id_field` set that re-send is an idempotent overwrite; without it, ES assigns
 new ids and the batch's rows are **duplicated**, the same as for any other mid-batch failure. With the log **off**, nothing is
 written and nothing about the export changes.
@@ -1022,13 +1021,16 @@ ORDER BY s.batch_start_ts DESC;
 Example: streaming backlog and 429 pressure per micro-batch:
 
 ```sql
-SELECT config_name, batch_id, batch_start_ts,
-       payload:progress.sources[0].metrics.numFilesOutstanding::bigint AS files_outstanding,
-       payload:es.overall.rejected_429::bigint AS docs_429,
-       payload:es.overall.docs_per_send::double AS docs_per_send
-FROM <catalog>.<schema>.<table>
-WHERE record_type = 'batch_summary'
-ORDER BY batch_start_ts DESC;
+SELECT e.config_name, e.batch_id, e.batch_start_ts,
+       s.payload:progress.sources[0].metrics.numFilesOutstanding::bigint AS files_outstanding,
+       e.payload:es.overall.rejected_429::bigint AS docs_429,
+       e.payload:es.overall.docs_per_send::double AS docs_per_send
+FROM <catalog>.<schema>.<table> e
+LEFT JOIN <catalog>.<schema>.<table> s
+  ON s.record_type = 'batch_summary' AND s.config_name = e.config_name AND s.job_run_id = e.job_run_id
+ AND s.batch_id = e.batch_id
+WHERE e.record_type = 'batch_end' AND e.status = 'success'
+ORDER BY e.batch_start_ts DESC;
 ```
 
 The table is **liquid-clustered** on `(config_name, event_ts)` (the columns monitoring queries filter by),
