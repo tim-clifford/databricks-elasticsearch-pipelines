@@ -13,6 +13,8 @@ import re
 import pytest
 
 from pipeline_lib.log_table_migration import RETIRED_COLUMNS, create_or_migrate
+
+RETIRED = [old for old, _new in RETIRED_COLUMNS]
 from pipeline_lib.monitoring_sink import MONITORING_TABLE_COLUMNS
 
 TABLE = "cat.sch.mon"
@@ -24,13 +26,22 @@ class Field:
         self.metadata = {"comment": comment} if comment is not None else {}
 
 
+class Result:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def collect(self):
+        return self.rows
+
+
 class FakeSpark:
     """`columns`: the existing table's {name: comment}, or None when the table does not exist. `fail_on`: a
-    statement prefix that raises."""
+    statement prefix that raises. `unbackfilled`: what the retired-column data check counts."""
 
-    def __init__(self, columns, fail_on=None, create_noop=False):
+    def __init__(self, columns, fail_on=None, create_noop=False, unbackfilled=0):
         self.columns = None if columns is None else dict(columns)
         self.fail_on = fail_on
+        self.unbackfilled = unbackfilled
         self.create_noop = create_noop
         self.statements = []
         self.catalog = self
@@ -55,10 +66,14 @@ class FakeSpark:
         elif " DROP COLUMNS " in stmt:
             for name in re.search(r"DROP COLUMNS \(([^)]*)\)", stmt).group(1).split(", "):
                 del self.columns[name]
+        elif stmt.startswith("SELECT count(*)"):
+            return Result([{"n": self.unbackfilled}])
+        return Result([])
 
     def kinds(self):
         return ["CREATE" if s.startswith("CREATE") else "ADD" if " ADD COLUMNS " in s else
-                "DROP" if " DROP COLUMNS " in s else s for s in self.statements]
+                "DROP" if " DROP COLUMNS " in s else "CHECK" if s.startswith("SELECT count(*)") else s
+                for s in self.statements]
 
 
 def _current():
@@ -105,28 +120,54 @@ def test_unknown_extra_column_is_warned_and_kept():
 # --- TEMPORARY: the retired timestamp columns (remove with RETIRED_COLUMNS) ---------------------
 
 def test_retired_columns_are_dropped_in_one_statement():
-    spark = FakeSpark({**_current(), **{c: None for c in RETIRED_COLUMNS}})
+    spark = FakeSpark({**_current(), **{c: None for c in RETIRED}})
     printed = []
     summary = create_or_migrate(spark, TABLE, printer=printed.append)
-    assert spark.kinds() == ["CREATE", "DROP"]
+    assert spark.kinds() == ["CREATE", "CHECK", "DROP"]
+    assert spark.statements[1] == (
+        f"SELECT count(*) AS n FROM {TABLE} WHERE (start_ts IS NULL AND batch_start_ts IS NOT NULL) OR "
+        f"(end_ts IS NULL AND batch_end_ts IS NOT NULL) OR (logged_ts IS NULL AND ingest_ts IS NOT NULL)")
     assert spark.statements[-1] == f"ALTER TABLE {TABLE} DROP COLUMNS (batch_start_ts, batch_end_ts, ingest_ts)"
     assert spark.columns == _current()
-    assert f"outcome=MIGRATED(added=[], dropped={list(RETIRED_COLUMNS)})" in summary
+    assert f"outcome=MIGRATED(added=[], dropped={RETIRED})" in summary
     assert not any(p.startswith("WARNING") for p in printed)  # retired columns are not "unknown"
 
 
 def test_only_the_retired_columns_present_are_dropped():
     spark = FakeSpark({**_current(), "ingest_ts": None})
     create_or_migrate(spark, TABLE, printer=_quiet())
+    assert spark.statements[1] == (
+        f"SELECT count(*) AS n FROM {TABLE} WHERE (logged_ts IS NULL AND ingest_ts IS NOT NULL)")
     assert spark.statements[-1] == f"ALTER TABLE {TABLE} DROP COLUMNS (ingest_ts)"
+
+
+def test_retired_columns_holding_unbackfilled_data_are_kept():
+    # A table the earlier build's backfill never ran on: dropping would lose those timestamps.
+    spark = FakeSpark({**_current(), **{c: None for c in RETIRED}}, unbackfilled=7)
+    printed = []
+    summary = create_or_migrate(spark, TABLE, printer=printed.append)
+    assert spark.kinds() == ["CREATE", "CHECK"]  # no DROP
+    assert all(c in spark.columns for c in RETIRED)
+    assert "outcome=ALREADY_EXISTS" in summary
+    warnings = [p for p in printed if p.startswith("WARNING")]
+    assert len(warnings) == 1 and "7 row(s)" in warnings[0] and "not dropping" in warnings[0]
+
+
+def test_a_failed_data_check_keeps_the_columns():
+    spark = FakeSpark({**_current(), **{c: None for c in RETIRED}}, fail_on="SELECT count(*)")
+    printed = []
+    summary = create_or_migrate(spark, TABLE, printer=printed.append)
+    assert "DROP" not in spark.kinds() and all(c in spark.columns for c in RETIRED)
+    assert "outcome=ALREADY_EXISTS" in summary
+    assert sum(p.startswith("WARNING") for p in printed) == 1
 
 
 def test_a_failed_drop_only_warns_and_keeps_the_columns():
     # As on a table without column mapping, where Delta rejects DROP COLUMNS.
-    spark = FakeSpark({**_current(), **{c: None for c in RETIRED_COLUMNS}}, fail_on=f"ALTER TABLE {TABLE} DROP")
+    spark = FakeSpark({**_current(), **{c: None for c in RETIRED}}, fail_on=f"ALTER TABLE {TABLE} DROP")
     printed = []
     summary = create_or_migrate(spark, TABLE, printer=printed.append)
-    assert all(c in spark.columns for c in RETIRED_COLUMNS)
+    assert all(c in spark.columns for c in RETIRED)
     assert "outcome=ALREADY_EXISTS" in summary
     warnings = [p for p in printed if p.startswith("WARNING")]
     assert len(warnings) == 1 and "could not drop retired columns" in warnings[0]
@@ -134,7 +175,7 @@ def test_a_failed_drop_only_warns_and_keeps_the_columns():
 
 
 def test_drop_never_enables_column_mapping():
-    spark = FakeSpark({**_current(), **{c: None for c in RETIRED_COLUMNS}}, fail_on=f"ALTER TABLE {TABLE} DROP")
+    spark = FakeSpark({**_current(), **{c: None for c in RETIRED}}, fail_on=f"ALTER TABLE {TABLE} DROP")
     create_or_migrate(spark, TABLE, printer=_quiet())
     assert not any("columnMapping" in s or "TBLPROPERTIES" in s for s in spark.statements[1:])
 
@@ -144,7 +185,7 @@ def test_added_columns_and_the_drop_run_in_one_migration():
     old = {n: c for n, c in current.items() if n != "docs_written"}
     spark = FakeSpark({**old, "ingest_ts": None})
     summary = create_or_migrate(spark, TABLE, printer=_quiet())
-    assert spark.kinds() == ["CREATE", "ADD", "DROP"]
+    assert spark.kinds() == ["CREATE", "ADD", "CHECK", "DROP"]
     assert spark.columns == current
     assert "outcome=MIGRATED(added=['docs_written'], dropped=['ingest_ts'])" in summary
 

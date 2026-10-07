@@ -15,7 +15,8 @@
 # MAGIC replacing the table, so existing rows are preserved; re-run it BEFORE deploying that build (writers fail
 # MAGIC closed on a missing column). It never drops a column it does not know (an extra column is warned about),
 # MAGIC except, temporarily, the three timestamp columns an earlier build used
-# MAGIC (`pipeline_lib.log_table_migration.RETIRED_COLUMNS`), where a failed drop only warns. The export jobs
+# MAGIC (`pipeline_lib.log_table_migration.RETIRED_COLUMNS`), only when no row would lose data; a skipped or
+# MAGIC failed drop only warns. The export jobs
 # MAGIC only ever APPEND to the table, so their run identity needs only `MODIFY`; the identity that runs THIS
 # MAGIC job needs `CREATE TABLE` / `ALTER` (and `USE CATALOG`/`USE SCHEMA`) on the target schema.
 # MAGIC

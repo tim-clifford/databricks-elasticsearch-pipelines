@@ -19,9 +19,10 @@ from pipeline_lib.monitoring_sink import (
 )
 
 # TEMPORARY (remove this constant, _drop_retired_columns and its call once deployed to stg and these columns are
-# gone): the timestamp columns an earlier build wrote under other names (now start_ts / end_ts / logged_ts). Only
-# the dev and stg tables have them; a table created by this build never does.
-RETIRED_COLUMNS = ("batch_start_ts", "batch_end_ts", "ingest_ts")
+# gone): the timestamp columns an earlier build wrote under other names, as (retired name, current name). Only the
+# dev and stg tables have them, already copied into the current columns by that build's backfill; a table created
+# by this build never does.
+RETIRED_COLUMNS = (("batch_start_ts", "start_ts"), ("batch_end_ts", "end_ts"), ("ingest_ts", "logged_ts"))
 
 
 def create_or_migrate(spark, table_name, printer=print):
@@ -56,7 +57,8 @@ def _migrate(spark, table, printer):
     dropped = _drop_retired_columns(spark, table, existing_cols, printer)
 
     expected = [name for name, _type, _comment in MONITORING_TABLE_COLUMNS]
-    extra = [c for c in existing_cols if c not in expected and c not in RETIRED_COLUMNS]
+    retired = [old for old, _new in RETIRED_COLUMNS]
+    extra = [c for c in existing_cols if c not in expected and c not in retired]
     if extra:
         printer(f"WARNING: existing table {table!r} has columns {extra} not in the expected schema. Left as-is "
                 f"(never dropped); remove them deliberately if they are obsolete.")
@@ -68,16 +70,28 @@ def _migrate(spark, table, printer):
 
 def _drop_retired_columns(spark, table, existing_cols, printer):
     """TEMPORARY: drop the RETIRED_COLUMNS the table still has, in one statement, and return the names dropped.
-    Delta allows DROP COLUMNS only with column mapping enabled on the table; this never enables it (that is an
-    irreversible table-protocol upgrade). If the drop fails for that or any other reason, it only WARNS: the
+
+    It drops only when no row would lose data: first it counts the rows where a retired column holds a value its
+    current column lacks (a table the earlier build's backfill never ran on). Any such row, or a failed count,
+    keeps the columns. Delta allows DROP COLUMNS only with column mapping enabled on the table; this never
+    enables it (that is an irreversible table-protocol upgrade). Every failure here only WARNS: the retired
     columns are NULL on every new row and harmless, so they are left for a deliberate manual drop."""
-    present = [c for c in RETIRED_COLUMNS if c in existing_cols]
-    if not present:
+    pairs = [(old, new) for old, new in RETIRED_COLUMNS if old in existing_cols]
+    if not pairs:
         return []
+    present = [old for old, _new in pairs]
+    unbackfilled = " OR ".join(f"({new} IS NULL AND {old} IS NOT NULL)" for old, new in pairs)
+    check_sql = f"SELECT count(*) AS n FROM {table} WHERE {unbackfilled}"
     drop_sql = f"ALTER TABLE {table} DROP COLUMNS ({', '.join(present)})"
-    printer(f"dropping retired columns {present}")
-    printer(f"  {drop_sql}")
     try:
+        n = spark.sql(check_sql).collect()[0]["n"]
+        if n:
+            printer(f"WARNING: not dropping retired columns {present}: {n} row(s) hold values the current columns "
+                    f"lack (the earlier build's backfill has not run on this table). Dropping them would lose "
+                    f"those timestamps, so they were left in place.")
+            return []
+        printer(f"dropping retired columns {present}")
+        printer(f"  {drop_sql}")
         spark.sql(drop_sql)
     except Exception as exc:  # noqa: BLE001 - deliberate safety net; see the docstring
         printer(f"WARNING: could not drop retired columns {present} ({type(exc).__name__}: {exc}). They are "
