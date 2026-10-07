@@ -53,6 +53,14 @@ def create_or_migrate(spark, table_name, printer=print):
 def _migrate(spark, table, printer):
     """Bring an existing table to the current schema; returns the outcome token for the summary."""
     existing_cols = [f.name for f in spark.table(table).schema]
+    # Every build of this job created the table with a write-time column (ingest_ts, now logged_ts). A table with
+    # neither was not created here: migrating it would leave its rows with NULL logged_ts, which retention never
+    # deletes. Fail closed before changing anything.
+    if "logged_ts" not in existing_cols and "ingest_ts" not in existing_cols:
+        raise RuntimeError(
+            f"log_table_create FAILED: existing table {table!r} has neither logged_ts nor ingest_ts, so it was not "
+            f"created by this job (columns: {existing_cols}); refusing to migrate it. Point monitoring_log_table at "
+            f"a table this job created, or drop and re-create this one deliberately.")
 
     to_add = missing_columns(existing_cols)
     added = [name for name, _type, _comment in to_add]

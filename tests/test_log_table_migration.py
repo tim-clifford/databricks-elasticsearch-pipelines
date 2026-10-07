@@ -166,6 +166,13 @@ def test_rerun_with_an_unreadable_backfill_count_is_still_reported_as_a_migratio
     assert "outcome=MIGRATED(added=[], commented=[], backfilled_rows=unknown)" in summary
 
 
+def test_a_table_this_job_did_not_create_is_refused_before_any_change():
+    spark = FakeSpark({"config_name": None, "payload": None})
+    with pytest.raises(RuntimeError, match="neither logged_ts nor ingest_ts"):
+        create_or_migrate(spark, TABLE, printer=lambda *_: None)
+    assert spark.kinds() == ["CREATE"]  # the no-op CREATE IF NOT EXISTS only; no ALTER, no UPDATE
+
+
 def test_bad_table_name_fails_before_any_sql():
     spark = FakeSpark(None)
     with pytest.raises(ValueError):
