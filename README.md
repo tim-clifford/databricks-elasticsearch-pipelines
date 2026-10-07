@@ -35,7 +35,7 @@ The bundle deploys:
   liquid-clustered Delta table: `run_start` / `run_end` per run and `batch_start` / `batch_end` per batch
   (one batch in batch mode, one per micro-batch in streaming), with status, timing, ES counts and
   diagnostics, plus a `batch_summary` with Spark's progress report for each streaming micro-batch. The table is created once by the hand-authored `_log table create`
-  job (re-run it to additively migrate the schema); a `_log table prune` job bounds its growth with
+  job (re-run it to add a column introduced later); a `_log table prune` job bounds its growth with
   retention. Off by default; when ON it is **fail-closed** (a failed log write fails the task, so no data
   is sent unlogged). See [Durable monitoring](#durable-monitoring).
 
@@ -1051,8 +1051,7 @@ ORDER BY e.start_ts DESC;
 ```
 
 The table is **liquid-clustered** on `(config_name, event_ts)` (the columns monitoring queries filter by),
-so data skipping holds up as it grows (`CLUSTER BY`, set at create and ensured on an existing table by a
-re-run). The log appends a few small files per batch; the `_log table create` job also sets
+so data skipping holds up as it grows (`CLUSTER BY`, set at create). The log appends a few small files per batch; the `_log table create` job also sets
 `delta.autoOptimize.optimizeWrite`/`autoCompact` to keep the table compact. `VARIANT` and liquid
 clustering require DBR 15.3+ / recent serverless (every target here qualifies).
 
@@ -1067,36 +1066,22 @@ on demand:
 databricks bundle run log_table_prune -t <target> -p <profile>
 ```
 
-**Evolving the schema.** `_log table create` is **re-runnable** (the logic is in
-`pipeline_lib/log_table_migration.py`). On an existing table it **additively** adds the columns a newer
-build introduced (`ALTER TABLE ADD COLUMNS`, with their comments), sets every column comment that changed
-in one `ALTER`, ensures clustering, and backfills the new columns on rows an older build wrote, **without**
-dropping or replacing the table, so existing rows are preserved. It never drops a column: a renamed one is
-kept and marked `DEPRECATED` in its comment, and any other unknown column is warned about. A re-run with
-nothing to do changes nothing (the backfill only selects rows not yet backfilled).
+**Adding a column later.** `_log table create` is **re-runnable** (the logic is in
+`pipeline_lib/log_table_migration.py`). On an existing table it adds any column the schema has and the table
+lacks (`ALTER TABLE ADD COLUMNS`, with its comment), **without** dropping or replacing the table, so existing
+rows are preserved and get NULL for the new column. To add a field: add it to `MONITORING_TABLE_COLUMNS`,
+then re-run `_log table create` **before** deploying the build that writes it (with the log on, a job whose
+rows have a column the table lacks fails its first append, before any data moves). The `ADD COLUMNS` is a
+Delta metadata commit, which can conflict with a log append that a running job has in flight; that fails the
+task once (fail-closed), and its retry policy restarts it. The job never drops a column it does not know: an
+unknown column is warned about and left alone.
 
-**Upgrading to the renamed columns** (`batch_start_ts` / `batch_end_ts` / `ingest_ts` became `start_ts` /
-`end_ts` / `logged_ts`, plus `task_run_id` and the surfaced columns):
-1. Re-run `_log table create` **before** deploying the new export jobs. It adds the new columns, marks the
-   old ones `DEPRECATED`, and backfills every existing row (the run summary reports `backfilled_rows`).
-   Jobs still running the old build keep appending (their rows leave the new columns NULL). With the log
-   on, a new-build job against an un-migrated table fails its first append, before any data moves.
-2. Deploy, and restart the export jobs on the new build. New rows fill only the new columns.
-3. Re-run `_log table create` once more after **every** job runs the new build: it backfills the rows the
-   old jobs wrote between steps 1 and 2. Until then those rows have NULL `logged_ts`, so retention skips
-   them (it never deletes them early).
-
-Each schema change in step 1 is a Delta metadata commit, which can conflict with a log append that a
-running job has in flight; that fails the task once (fail-closed), and its retry policy restarts it.
-
-The backfill copies the old timestamp columns and derives the surfaced columns from the payload with the
-same rules the writer uses; `task_run_id` is filled only on old `run_start` rows (the old build kept it in
-that payload). The deprecated columns are dropped in a later release, once nothing reads them. **Upgrading from the earlier row model** (before the `status` column
-and the `run_start` ... `batch_summary` record types): re-run `_log table create` once **before** deploying
-the new export jobs, so `status` exists when they start appending (with the log on, an append into a table
-without it fails the task). Rows written by the previous model keep their old record types
-(`stream_progress`, `bulk_stats_partition`, `bulk_stats_batch`, `run_summary`, `run_error`) and age out
-through retention.
+**Temporary: retired columns.** Tables migrated by an earlier build (dev and stg) still carry
+`batch_start_ts`, `batch_end_ts` and `ingest_ts`, the old names of `start_ts`, `end_ts` and `logged_ts`.
+Until that is done everywhere, `_log table create` drops them in one `ALTER TABLE ... DROP COLUMNS`. Delta
+allows that only with column mapping enabled (`delta.columnMapping.mode = 'name'`); the job never enables it,
+and if the drop fails it only warns and leaves the columns (they are NULL on new rows and harmless). This
+step is removed once it has run in stg.
 
 ### Cluster log delivery
 
@@ -1172,7 +1157,7 @@ Shared notebooks (run by the jobs, not edited per pipeline):
                                 exports to Elasticsearch via the connector - batch (bulk_write over the
                                 deployed view) or streaming (view SELECT over each source micro-batch)
     log_table_create.py         Run by the _log table create job: creates the shared monitoring Delta
-                                table, or migrates an existing one (pipeline_lib.log_table_migration;
+                                table, or adds a newly introduced column (pipeline_lib.log_table_migration;
                                 see Durable monitoring)
     log_table_prune.py          Run by the _log table prune job: retention for the monitoring table
                                 (DELETE old rows, then OPTIMIZE + VACUUM; see Durable monitoring)
@@ -1184,8 +1169,8 @@ Shared library + tests (the config schema, used by the generator and both notebo
     monitoring_sink.py          Pure schema + row builders for the durable monitoring log (single
                                 source of truth for the table columns and row model, shared by the
                                 writer + creator)
-    log_table_migration.py      The _log table create job's create-or-migrate step (add columns,
-                                comments, clustering, backfill), unit-tested with a fake session
+    log_table_migration.py      The _log table create job's create-or-add-columns step, unit-tested
+                                with a fake session
     stream_wait.py              The streaming wait loop (short awaitTermination slices + an isActive
                                 liveness check), so a failed stream always fails the task
   tests/
