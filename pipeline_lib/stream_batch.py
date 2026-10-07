@@ -24,13 +24,13 @@ from pipeline_lib.observability import bulk_stats_relay_line, format_bulk_stats
 
 
 def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name, job_run_id, write_metrics,
-                       write_print_relay=None, printer=print, clock=None, timer=time.time):
+                       task_run_id="", write_print_relay=None, printer=print, clock=None, timer=time.time):
     """Build the foreachBatch function.
 
     - transform(batch_df, session) -> the DataFrame to write (the view's SELECT over the batch, filtered,
       optionally repartitioned).
     - bulk_write(df, write_config, raise_on_error=True) -> the connector's result dict.
-    - log: a MonitoringLog.
+    - log: a MonitoringLog. task_run_id: this attempt's {{task.run_id}} ("" on an interactive run).
     - write_metrics(session, batch_id, written): persist the batch's written count (the drain summary reads it).
     - write_print_relay(session, batch_id, text) or None: hand the BULK_STATS line to the notebook's progress
       recorder; None when bulk_stats is off.
@@ -42,7 +42,8 @@ def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name,
         session = batch_df.sparkSession
         transformed = transform(batch_df, session)
         start = clock()
-        log.append([batch_start_row(config_name, job_run_id, batch_id, {"mode": "streaming"}, start)], session)
+        log.append([batch_start_row(config_name, job_run_id, task_run_id, batch_id, {"mode": "streaming"}, start)],
+                   session)
         try:
             # raise_on_error=True: bulk_write itself raises on any rejected/unaccounted row, so a batch that does
             # not FULLY succeed fails here and is reprocessed (idempotent only with es_id_field set).
@@ -52,14 +53,14 @@ def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name,
             write_metrics(session, batch_id, int(result.get("written", 0) or 0))
         except Exception as exc:
             end = clock()
-            log.append_failure([batch_end_row(config_name, job_run_id, batch_id, "error", {
+            log.append_failure([batch_end_row(config_name, job_run_id, task_run_id, batch_id, "error", {
                 **error_facts(exc), "elapsed_ms": (end - start).total_seconds() * 1000.0,
             }, start, end)], exc, session, log=printer)
             raise
         if "bulk_stats" in result:
             # A compact per-batch rollup in the driver log (this runs on the cluster).
             printer(format_bulk_stats(result["bulk_stats"], oneline=True) + f" batch_id={batch_id}")
-        log.append([batch_end_row(config_name, job_run_id, batch_id, "success",
+        log.append([batch_end_row(config_name, job_run_id, task_run_id, batch_id, "success",
                                   batch_success_facts(result, wall_ms=wall_ms), start, clock())], session)
         if write_print_relay is not None:
             try:

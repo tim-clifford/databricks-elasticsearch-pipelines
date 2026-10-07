@@ -2,7 +2,9 @@
 
 The load-bearing contracts:
 - The DDL (MONITORING_TABLE_COLUMNS) and the row shape (ROW_FIELDS) cannot drift: ROW_FIELDS is exactly
-  the columns minus the writer-supplied ingest_ts.
+  the columns minus the writer-supplied logged_ts.
+- The surfaced columns are copied from the payload by ONE rule set (SURFACED_COLUMNS) that both the builders
+  and the migration's backfill_sql use, so new rows and backfilled old rows agree.
 - The row vocabulary is CLOSED: RECORD_TYPES x STATUSES, with each record_type allowed only its own
   statuses, and batch rows (and only batch rows) carrying a batch id.
 - Builders FAIL CLOSED: a malformed row raises rather than being silently dropped, because with the log on
@@ -18,19 +20,25 @@ import pytest
 from pipeline_lib.monitoring_sink import (
     BATCH_MODE_BATCH_ID,
     CLUSTER_BY_COLUMNS,
+    DEPRECATED_COLUMNS,
     MAX_ERROR_MESSAGE_CHARS,
     MONITORING_TABLE_COLUMNS,
     RECORD_TYPES,
     ROW_FIELDS,
     STATUSES,
+    SURFACED_COLUMNS,
     alter_add_columns_sql,
     alter_cluster_by_sql,
+    alter_column_comments_sql,
     assert_columns_consistent,
+    backfill_sql,
     batch_end_row,
     batch_start_row,
     batch_success_facts,
     batch_summary_row,
+    comment_changes,
     create_table_sql,
+    deprecated_comment,
     error_facts,
     es_counts,
     es_write_summary,
@@ -62,22 +70,41 @@ PROGRESS = {"id": "q", "runId": "r", "name": "cfg-1234", "batchId": 7, "numInput
 
 # --- schema invariants -------------------------------------------------------------------------
 
-def test_columns_consistent_row_fields_are_columns_minus_ingest_ts():
+def test_columns_consistent_row_fields_are_columns_minus_logged_ts():
     assert_columns_consistent()
-    col_names = [name for name, _t in MONITORING_TABLE_COLUMNS]
-    assert col_names[-1] == "ingest_ts"
+    col_names = [name for name, _t, _c in MONITORING_TABLE_COLUMNS]
+    assert col_names[-1] == "logged_ts"
     assert tuple(col_names[:-1]) == ROW_FIELDS
 
 
 def test_table_has_expected_columns_and_types():
-    cols = dict(MONITORING_TABLE_COLUMNS)
-    assert cols["payload"] == "VARIANT"
-    assert cols["status"] == "STRING"
-    assert cols["batch_id"] == "BIGINT"
-    assert cols["event_ts"] == "TIMESTAMP"
-    assert cols["batch_start_ts"] == "TIMESTAMP"
-    assert cols["batch_end_ts"] == "TIMESTAMP"
-    assert cols["ingest_ts"] == "TIMESTAMP"
+    cols = {name: sql_type for name, sql_type, _c in MONITORING_TABLE_COLUMNS}
+    assert cols == {
+        "config_name": "STRING", "job_run_id": "STRING", "task_run_id": "STRING", "record_type": "STRING",
+        "status": "STRING", "batch_id": "BIGINT", "event_ts": "TIMESTAMP", "start_ts": "TIMESTAMP",
+        "end_ts": "TIMESTAMP", "docs_written": "BIGINT", "error_type": "STRING", "error_message": "STRING",
+        "files_outstanding": "BIGINT", "bytes_outstanding": "BIGINT", "payload": "VARIANT",
+        "logged_ts": "TIMESTAMP",
+    }
+
+
+def test_deprecated_columns_map_old_names_to_new_ones():
+    assert DEPRECATED_COLUMNS == (("batch_start_ts", "start_ts"), ("batch_end_ts", "end_ts"),
+                                  ("ingest_ts", "logged_ts"))
+
+
+def test_every_column_has_a_sql_safe_comment():
+    for name, _t, comment in MONITORING_TABLE_COLUMNS:
+        assert comment and "'" not in comment and "\\" not in comment, name
+    for _old, new in DEPRECATED_COLUMNS:
+        assert deprecated_comment(new).startswith("DEPRECATED: replaced by " + new)
+
+
+def test_assert_columns_consistent_catches_a_surfaced_column_that_is_not_a_column(monkeypatch):
+    from pipeline_lib import monitoring_sink as ms
+    monkeypatch.setattr(ms, "SURFACED_COLUMNS", ms.SURFACED_COLUMNS + (("nope", None, None, (("x",),), "string"),))
+    with pytest.raises(AssertionError):
+        ms.assert_columns_consistent()
 
 
 def test_record_types_and_statuses_are_the_closed_sets():
@@ -92,105 +119,105 @@ def test_batch_mode_batch_id_is_zero():
 # --- run rows ----------------------------------------------------------------------------------
 
 def test_run_start_row_shape():
-    row = run_start_row("cfg", "run1", {"mode": "batch", "es_index": "idx"}, START, now=FIXED)
+    row = run_start_row("cfg", "run1", "task1", {"mode": "batch", "es_index": "idx"}, START, now=FIXED)
     assert set(row) == set(ROW_FIELDS)
     assert (row["record_type"], row["status"], row["batch_id"]) == ("run_start", "started", None)
-    assert row["batch_start_ts"] == "2026-09-29T21:18:30.000000"
-    assert row["batch_end_ts"] is None
+    assert row["start_ts"] == "2026-09-29T21:18:30.000000"
+    assert row["end_ts"] is None
     assert json.loads(row["payload"]) == {"mode": "batch", "es_index": "idx"}
     assert row["event_ts"] == "2026-09-29T21:18:32.458000"
 
 
 @pytest.mark.parametrize("status", ["success", "error", "stopped"])
 def test_run_end_row_allows_terminal_statuses(status):
-    row = run_end_row("cfg", "run1", status, {"x": 1}, START, END, now=FIXED)
+    row = run_end_row("cfg", "run1", "task1", status, {"x": 1}, START, END, now=FIXED)
     assert (row["record_type"], row["status"], row["batch_id"]) == ("run_end", status, None)
-    assert row["batch_start_ts"] == "2026-09-29T21:18:30.000000"
-    assert row["batch_end_ts"] == "2026-09-29T21:18:35.500000"
+    assert row["start_ts"] == "2026-09-29T21:18:30.000000"
+    assert row["end_ts"] == "2026-09-29T21:18:35.500000"
 
 
 def test_run_end_row_rejects_started():
     with pytest.raises(ValueError, match="not allowed for run_end"):
-        run_end_row("cfg", "run1", "started", {}, START, END)
+        run_end_row("cfg", "run1", "task1", "started", {}, START, END)
 
 
 def test_run_rows_reject_a_batch_id():
     from pipeline_lib import monitoring_sink as ms
     with pytest.raises(ValueError, match="run row"):
-        ms._row("cfg", "r", "run_start", "started", 3, {})
+        ms._row("cfg", "r", "t", "run_start", "started", 3, {})
 
 
 # --- batch rows --------------------------------------------------------------------------------
 
 def test_batch_start_row_shape():
-    row = batch_start_row("cfg", "run1", 5, {"mode": "streaming"}, START, now=FIXED)
+    row = batch_start_row("cfg", "run1", "task1", 5, {"mode": "streaming"}, START, now=FIXED)
     assert (row["record_type"], row["status"], row["batch_id"]) == ("batch_start", "started", 5)
-    assert row["batch_start_ts"] == "2026-09-29T21:18:30.000000"
-    assert row["batch_end_ts"] is None
+    assert row["start_ts"] == "2026-09-29T21:18:30.000000"
+    assert row["end_ts"] is None
 
 
 @pytest.mark.parametrize("status", ["success", "error"])
 def test_batch_end_row_allows_success_and_error(status):
-    row = batch_end_row("cfg", "run1", 0, status, {"written": 1}, START, END, now=FIXED)
+    row = batch_end_row("cfg", "run1", "task1", 0, status, {"written": 1}, START, END, now=FIXED)
     assert (row["record_type"], row["status"], row["batch_id"]) == ("batch_end", status, 0)
-    assert row["batch_end_ts"] == "2026-09-29T21:18:35.500000"
+    assert row["end_ts"] == "2026-09-29T21:18:35.500000"
 
 
 def test_batch_end_row_rejects_stopped():
     with pytest.raises(ValueError, match="not allowed for batch_end"):
-        batch_end_row("cfg", "run1", 0, "stopped", {}, START, END)
+        batch_end_row("cfg", "run1", "task1", 0, "stopped", {}, START, END)
 
 
 @pytest.mark.parametrize("bad", [None, -1, True, "3", 2.0])
 def test_batch_rows_require_non_negative_int_batch_id(bad):
     with pytest.raises(ValueError, match="batch_id"):
-        batch_start_row("cfg", "run1", bad, {}, START)
+        batch_start_row("cfg", "run1", "task1", bad, {}, START)
 
 
 @pytest.mark.parametrize("bad", [None, [], "x", 3])
 def test_rows_reject_non_dict_payload(bad):
     with pytest.raises(ValueError, match="payload must be a dict"):
-        batch_start_row("cfg", "run1", 0, bad, START)
+        batch_start_row("cfg", "run1", "task1", 0, bad, START)
 
 
 def test_unknown_record_type_rejected():
     from pipeline_lib import monitoring_sink as ms
     with pytest.raises(ValueError, match="unknown record_type"):
-        ms._row("cfg", "r", "stream_progress", "success", 1, {})
+        ms._row("cfg", "r", "t", "stream_progress", "success", 1, {})
 
 
 # --- batch_summary (streaming only: Spark's progress) ------------------------------------------
 
 def test_batch_summary_stores_whole_progress_with_progress_timing():
-    row = batch_summary_row("cfg", "run1", 7, PROGRESS, now=FIXED)
+    row = batch_summary_row("cfg", "run1", "task1", 7, PROGRESS, now=FIXED)
     assert (row["record_type"], row["status"], row["batch_id"]) == ("batch_summary", "success", 7)
     assert json.loads(row["payload"]) == {"progress": PROGRESS}
     # start = progress timestamp, end = start + batchDuration (5.5 s).
-    assert row["batch_start_ts"] == "2026-09-29T21:18:30.000000"
-    assert row["batch_end_ts"] == "2026-09-29T21:18:35.500000"
+    assert row["start_ts"] == "2026-09-29T21:18:30.000000"
+    assert row["end_ts"] == "2026-09-29T21:18:35.500000"
 
 
 @pytest.mark.parametrize("bad", [None, "x", ["p"], 3])
 def test_batch_summary_requires_a_progress_dict(bad):
     with pytest.raises(ValueError, match="progress must be a dict"):
-        batch_summary_row("cfg", "run1", 7, bad)
+        batch_summary_row("cfg", "run1", "task1", 7, bad)
 
 
 def test_batch_summary_only_success_status():
     from pipeline_lib import monitoring_sink as ms
     with pytest.raises(ValueError, match="not allowed for batch_summary"):
-        ms._row("cfg", "r", "batch_summary", "error", 1, {})
+        ms._row("cfg", "r", "t", "batch_summary", "error", 1, {})
 
 
 def test_batch_summary_bad_progress_timestamp_leaves_timing_null():
-    row = batch_summary_row("cfg", "run1", 7, dict(PROGRESS, timestamp="nope"), now=FIXED)
-    assert row["batch_start_ts"] is None and row["batch_end_ts"] is None
+    row = batch_summary_row("cfg", "run1", "task1", 7, dict(PROGRESS, timestamp="nope"), now=FIXED)
+    assert row["start_ts"] is None and row["end_ts"] is None
 
 
 def test_batch_summary_missing_duration_end_equals_start():
     p = {k: v for k, v in PROGRESS.items() if k != "batchDuration"}
-    row = batch_summary_row("cfg", "run1", 7, p, now=FIXED)
-    assert row["batch_start_ts"] == row["batch_end_ts"] == "2026-09-29T21:18:30.000000"
+    row = batch_summary_row("cfg", "run1", "task1", 7, p, now=FIXED)
+    assert row["start_ts"] == row["end_ts"] == "2026-09-29T21:18:30.000000"
 
 
 def test_batch_success_facts_are_counts_plus_es_rollup():
@@ -289,29 +316,105 @@ def test_progress_batch_ids_empty_input():
     assert progress_batch_ids([], last_batch_id=3) == []
 
 
+# --- task_run_id and the surfaced columns -----------------------------------------------------
+
+def test_task_run_id_is_stored_and_empty_means_null():
+    assert run_start_row("c", "r", "t-77", {}, START, now=FIXED)["task_run_id"] == "t-77"
+    assert run_start_row("c", "r", "", {}, START, now=FIXED)["task_run_id"] is None
+
+
+def test_task_run_id_is_on_every_record_type():
+    rows = [run_start_row("c", "r", "t", {}, START), run_end_row("c", "r", "t", "success", {}, START, END),
+            batch_start_row("c", "r", "t", 1, {}, START), batch_end_row("c", "r", "t", 1, "success", {}, START, END),
+            batch_summary_row("c", "r", "t", 1, PROGRESS)]
+    assert [r["task_run_id"] for r in rows] == ["t"] * 5
+
+
+def test_batch_end_success_surfaces_docs_written_and_no_error():
+    row = batch_end_row("c", "r", "t", 0, "success", batch_success_facts(RESULT), START, END, now=FIXED)
+    assert row["docs_written"] == 800
+    assert row["error_type"] is None and row["error_message"] is None
+    assert row["files_outstanding"] is None and row["bytes_outstanding"] is None
+
+
+def test_error_rows_surface_type_and_message():
+    facts = {**error_facts(ValueError("boom")), "written": 5}
+    row = batch_end_row("c", "r", "t", 0, "error", facts, START, END, now=FIXED)
+    assert (row["error_type"], row["error_message"], row["docs_written"]) == ("ValueError", "boom", 5)
+    run = run_end_row("c", "r", "t", "error", error_facts(KeyError("k")), START, END, now=FIXED)
+    assert (run["error_type"], run["error_message"], run["docs_written"]) == ("KeyError", "'k'", None)
+
+
+def test_error_columns_are_null_on_a_success_row_even_if_the_payload_has_those_keys():
+    row = run_end_row("c", "r", "t", "success", {"exception_type": "X", "message": "m"}, START, END)
+    assert row["error_type"] is None and row["error_message"] is None
+
+
+@pytest.mark.parametrize("facts,expected", [
+    ({"written": 12}, 12),            # batch-mode run_end
+    ({"rows_pushed": 34}, 34),        # streaming run_end
+    ({"written": 12, "rows_pushed": 34}, 12),  # the first path wins
+    ({}, None),
+])
+def test_run_end_docs_written_from_either_payload_key(facts, expected):
+    assert run_end_row("c", "r", "t", "success", facts, START, END)["docs_written"] == expected
+
+
+def test_docs_written_only_on_batch_end_and_run_end():
+    assert batch_start_row("c", "r", "t", 0, {"written": 3}, START)["docs_written"] is None
+    assert run_start_row("c", "r", "t", {"written": 3}, START)["docs_written"] is None
+
+
+def test_batch_summary_surfaces_the_backlog_from_the_first_source():
+    progress = dict(PROGRESS, sources=[{"metrics": {"numFilesOutstanding": "19", "numBytesOutstanding": "19442"}},
+                                       {"metrics": {"numFilesOutstanding": "99"}}])
+    row = batch_summary_row("c", "r", "t", 7, progress, now=FIXED)
+    assert (row["files_outstanding"], row["bytes_outstanding"]) == (19, 19442)
+    assert row["docs_written"] is None and row["error_type"] is None
+
+
+@pytest.mark.parametrize("sources", [None, [], "x", [{}], [{"metrics": None}], [{"metrics": {"numFilesOutstanding": "lots"}}],
+                                     [{"metrics": {"numFilesOutstanding": True}}], [{"metrics": {"numFilesOutstanding": 1.5}}]])
+def test_backlog_columns_are_fail_soft_null(sources):
+    row = batch_summary_row("c", "r", "t", 7, dict(PROGRESS, sources=sources), now=FIXED)
+    assert row["files_outstanding"] is None
+
+
+@pytest.mark.parametrize("value,expected", [(5, 5), (5.0, 5), ("5", 5), (" 5 ", 5), ("-2", -2), ("5.5", None),
+                                            (True, None), ([5], None), ({}, None)])
+def test_bigint_surfacing_accepts_integers_in_spark_forms_only(value, expected):
+    row = batch_end_row("c", "r", "t", 0, "success", {"written": value}, START, END)
+    assert row["docs_written"] == expected
+
+
+def test_string_surfacing_rejects_non_strings():
+    row = batch_end_row("c", "r", "t", 0, "error", {"exception_type": 3, "message": None}, START, END)
+    assert row["error_type"] is None and row["error_message"] is None
+
+
 # --- event_ts / payload serialization ----------------------------------------------------------
 
 def test_event_ts_naive_now_treated_as_utc():
     naive = datetime(2026, 1, 2, 3, 4, 5, 6000)
-    row = run_start_row("c", "r", {}, None, now=naive)
+    row = run_start_row("c", "r", "task1", {}, None, now=naive)
     assert row["event_ts"] == "2026-01-02T03:04:05.006000"
 
 
 def test_event_ts_tzaware_converted_to_utc():
     # +02:00 wall clock 05:00 is 03:00 UTC.
     aware = datetime(2026, 1, 2, 5, 0, 0, tzinfo=timezone(timedelta(hours=2)))
-    row = run_start_row("c", "r", {}, None, now=aware)
+    row = run_start_row("c", "r", "task1", {}, None, now=aware)
     assert row["event_ts"].startswith("2026-01-02T03:00:00")
 
 
 def test_payload_is_deterministic_sorted_json():
-    row = run_start_row("c", "r", {"b": 1, "a": 2}, None, now=FIXED)
+    row = run_start_row("c", "r", "task1", {"b": 1, "a": 2}, None, now=FIXED)
     assert row["payload"] == '{"a":2,"b":1}'
 
 
 def test_payload_serialization_is_fail_soft_on_odd_types():
     # A datetime is not JSON-serializable by default; default=str must stringify it, not raise.
-    row = run_start_row("c", "r", {"when": FIXED}, None, now=FIXED)
+    row = run_start_row("c", "r", "task1", {"when": FIXED}, None, now=FIXED)
     assert "2026-09-29" in json.loads(row["payload"])["when"]
 
 
@@ -350,8 +453,10 @@ def test_create_table_sql_is_idempotent_and_has_every_column():
     sql = create_table_sql("cat.sch.monitoring")
     assert "CREATE TABLE IF NOT EXISTS cat.sch.monitoring" in sql
     assert "USING DELTA" in sql
-    for name, sql_type in MONITORING_TABLE_COLUMNS:
-        assert f"{name} {sql_type}" in sql
+    for name, sql_type, comment in MONITORING_TABLE_COLUMNS:
+        assert f"{name} {sql_type} COMMENT '{comment}'" in sql
+    for old, _new in DEPRECATED_COLUMNS:
+        assert old not in sql  # a fresh table never gets the deprecated columns
 
 
 def test_create_table_sql_validates_name():
@@ -359,7 +464,14 @@ def test_create_table_sql_validates_name():
         create_table_sql("bad name")
 
 
-# --- batch_start_ts / batch_end_ts timing columns ---------------------------------------------
+def test_create_table_sql_rejects_an_unsafe_comment(monkeypatch):
+    from pipeline_lib import monitoring_sink as ms
+    bad = (("config_name", "STRING", "it's"),) + ms.MONITORING_TABLE_COLUMNS[1:]
+    monkeypatch.setattr(ms, "MONITORING_TABLE_COLUMNS", bad)
+    with pytest.raises(ValueError, match="column comment"):
+        ms.create_table_sql("cat.sch.t")
+
+
 def test_create_table_sql_has_cluster_by_before_tblproperties():
     sql = create_table_sql("cat.sch.monitoring")
     assert f"CLUSTER BY ({', '.join(CLUSTER_BY_COLUMNS)})" in sql
@@ -369,21 +481,114 @@ def test_create_table_sql_has_cluster_by_before_tblproperties():
 
 # --- additive migration: missing_columns / alter_add_columns_sql / alter_cluster_by_sql --------
 
+# The columns a table created by the previous build (#61) has.
+PREVIOUS_BUILD_COLUMNS = ["config_name", "job_run_id", "record_type", "batch_id", "event_ts", "batch_start_ts",
+                          "batch_end_ts", "payload", "ingest_ts", "status"]
+
+
 def test_missing_columns_additive_only():
-    all_names = [name for name, _t in MONITORING_TABLE_COLUMNS]
+    all_names = [name for name, _t, _c in MONITORING_TABLE_COLUMNS]
     # Nothing missing when every column is present (order-insensitive).
     assert missing_columns(list(reversed(all_names))) == []
-    # An old table lacking the two timing columns => exactly those two are reported, with types.
-    old = [n for n in all_names if n not in ("batch_start_ts", "batch_end_ts")]
-    assert missing_columns(old) == [("batch_start_ts", "TIMESTAMP"), ("batch_end_ts", "TIMESTAMP")]
+    # The previous build's table => exactly the new columns, in schema order, with types and comments.
+    got = missing_columns(PREVIOUS_BUILD_COLUMNS)
+    assert [n for n, _t, _c in got] == ["task_run_id", "start_ts", "end_ts", "docs_written", "error_type",
+                                        "error_message", "files_outstanding", "bytes_outstanding", "logged_ts"]
+    assert all(col in MONITORING_TABLE_COLUMNS for col in got)
     # Extra columns in the table are NEVER reported for dropping (additive allow-list).
     assert missing_columns(all_names + ["some_future_col"]) == []
 
 
-def test_alter_add_columns_sql_additive_and_none_when_empty():
-    sql = alter_add_columns_sql("cat.sch.t", [("batch_start_ts", "TIMESTAMP"), ("batch_end_ts", "TIMESTAMP")])
-    assert sql == "ALTER TABLE cat.sch.t ADD COLUMNS (batch_start_ts TIMESTAMP, batch_end_ts TIMESTAMP)"
+def test_alter_add_columns_sql_additive_with_comments_and_none_when_empty():
+    sql = alter_add_columns_sql("cat.sch.t", [("start_ts", "TIMESTAMP", "a b"), ("end_ts", "TIMESTAMP", "c")])
+    assert sql == "ALTER TABLE cat.sch.t ADD COLUMNS (start_ts TIMESTAMP COMMENT 'a b', end_ts TIMESTAMP COMMENT 'c')"
     assert alter_add_columns_sql("cat.sch.t", []) is None
+
+
+def test_alter_add_columns_sql_rejects_an_unsafe_comment():
+    with pytest.raises(ValueError, match="column comment"):
+        alter_add_columns_sql("cat.sch.t", [("x", "STRING", "a'; DROP TABLE y; --")])
+
+
+# --- column comments ---------------------------------------------------------------------------
+
+def _current_comments():
+    return {name: comment for name, _t, comment in MONITORING_TABLE_COLUMNS}
+
+
+def test_comment_changes_none_when_everything_is_current():
+    current = {**_current_comments(), **{old: deprecated_comment(new) for old, new in DEPRECATED_COLUMNS}}
+    assert comment_changes(current) == []
+    assert alter_column_comments_sql("cat.sch.t", comment_changes(current)) is None
+
+
+def test_comment_changes_on_the_previous_build_table():
+    # Old columns had no comments; the new ones were just added WITH their comments.
+    existing = {n: None for n in PREVIOUS_BUILD_COLUMNS}
+    existing.update({n: c for n, c in _current_comments().items() if n not in existing})
+    changes = dict(comment_changes(existing))
+    assert set(changes) == {"config_name", "job_run_id", "record_type", "batch_id", "event_ts", "payload",
+                            "status", "batch_start_ts", "batch_end_ts", "ingest_ts"}
+    assert changes["batch_start_ts"] == deprecated_comment("start_ts")
+    assert changes["ingest_ts"] == deprecated_comment("logged_ts")
+    assert changes["payload"] == _current_comments()["payload"]
+
+
+def test_comment_changes_skips_columns_the_table_lacks():
+    assert comment_changes({"config_name": "old text"}) == [("config_name", _current_comments()["config_name"])]
+
+
+def test_alter_column_comments_sql_is_one_statement():
+    sql = alter_column_comments_sql("cat.sch.t", [("a", "x y"), ("b", "z")])
+    assert sql == "ALTER TABLE cat.sch.t ALTER COLUMN a COMMENT 'x y', b COMMENT 'z'"
+
+
+def test_alter_column_comments_sql_fail_closed():
+    with pytest.raises(ValueError):
+        alter_column_comments_sql("bad name", [("a", "x")])
+    with pytest.raises(ValueError, match="column comment"):
+        alter_column_comments_sql("cat.sch.t", [("a", "it's")])
+
+
+# --- backfill_sql ------------------------------------------------------------------------------
+
+def test_backfill_sql_previous_build_table():
+    sql = backfill_sql("cat.sch.t", PREVIOUS_BUILD_COLUMNS)
+    assert sql.startswith("UPDATE cat.sch.t SET\n")
+    assert sql.endswith("\nWHERE logged_ts IS NULL AND ingest_ts IS NOT NULL")
+    for old, new in DEPRECATED_COLUMNS:
+        assert f"  {new} = {old}," in sql
+    assert ("task_run_id = CASE WHEN record_type = 'run_start' THEN try_variant_get(payload, '$.task_run_id', "
+            "'string') END") in sql
+    assert ("docs_written = CASE WHEN record_type IN ('batch_end', 'run_end') THEN coalesce(try_variant_get("
+            "payload, '$.written', 'bigint'), try_variant_get(payload, '$.rows_pushed', 'bigint')) END") in sql
+    assert "error_type = CASE WHEN status = 'error' THEN try_variant_get(payload, '$.exception_type', 'string') END" in sql
+    assert "error_message = CASE WHEN status = 'error' THEN try_variant_get(payload, '$.message', 'string') END" in sql
+    assert ("files_outstanding = CASE WHEN record_type IN ('batch_summary') THEN try_variant_get(payload, "
+            "'$.progress.sources[0].metrics.numFilesOutstanding', 'bigint') END") in sql
+    assert ("bytes_outstanding = CASE WHEN record_type IN ('batch_summary') THEN try_variant_get(payload, "
+            "'$.progress.sources[0].metrics.numBytesOutstanding', 'bigint') END") in sql
+
+
+def test_backfill_sql_sets_every_surfaced_column():
+    sql = backfill_sql("cat.sch.t", PREVIOUS_BUILD_COLUMNS)
+    for column, *_rest in SURFACED_COLUMNS:
+        assert f"  {column} = " in sql
+
+
+def test_backfill_sql_copies_only_the_deprecated_columns_present():
+    sql = backfill_sql("cat.sch.t", [c for c in PREVIOUS_BUILD_COLUMNS if c not in ("batch_start_ts", "batch_end_ts")])
+    assert "batch_start_ts" not in sql and "batch_end_ts" not in sql
+    assert "logged_ts = ingest_ts" in sql
+
+
+def test_backfill_sql_none_on_a_table_with_no_older_rows():
+    assert backfill_sql("cat.sch.t", [n for n, _t, _c in MONITORING_TABLE_COLUMNS]) is None
+
+
+def test_backfill_sql_fail_closed_on_bad_name():
+    with pytest.raises(ValueError):
+        backfill_sql("bad name", PREVIOUS_BUILD_COLUMNS)
 
 
 def test_alter_cluster_by_sql():
@@ -405,7 +610,7 @@ def test_alter_add_columns_sql_fail_closed_on_bad_name():
 
 def test_prune_sql_builds_delete_with_interval():
     assert prune_sql("cat.sch.t", 90) == (
-        "DELETE FROM cat.sch.t WHERE ingest_ts < current_timestamp() - INTERVAL 90 DAYS"
+        "DELETE FROM cat.sch.t WHERE logged_ts < current_timestamp() - INTERVAL 90 DAYS"
     )
 
 

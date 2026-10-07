@@ -14,7 +14,7 @@ No object here holds a Spark session: the session is passed to every append (the
 inside foreachBatch, the notebook's `spark` elsewhere), because a MonitoringLog is captured by the foreachBatch
 function, which Spark Connect ships to the cluster.
 """
-from pipeline_lib.monitoring_sink import ROW_FIELDS, validate_table_name
+from pipeline_lib.monitoring_sink import MONITORING_TABLE_COLUMNS, ROW_FIELDS, validate_table_name
 
 
 class MonitoringLogError(RuntimeError):
@@ -77,19 +77,29 @@ class MonitoringLog:
 
 def spark_append(table, rows, session):
     """The Spark write behind MonitoringLog on a cluster: build a DataFrame from `rows` (payload and timestamps
-    as strings), parse the payload to VARIANT, cast the timestamps, stamp ingest_ts = current_timestamp() (the
+    as strings), parse the payload to VARIANT, cast the timestamps, stamp logged_ts = current_timestamp() (the
     write time), and append BY NAME via writeTo().append(), so the table's physical column order does not
-    matter (a migrated table has `status` last). Raises on any failure; MonitoringLog turns that into
-    MonitoringLogError. Not unit-tested off-cluster (it is Spark I/O); proven live."""
+    matter (a migrated table has its newer columns last, after the DEPRECATED ones, which new rows leave NULL).
+    The DataFrame schema is derived from MONITORING_TABLE_COLUMNS (spark_row_schema), never re-typed. Raises on
+    any failure; MonitoringLog turns that into MonitoringLogError. Not unit-tested off-cluster (it is Spark
+    I/O); proven live."""
     from pyspark.sql import functions as F
 
-    schema = ("config_name string, job_run_id string, record_type string, status string, batch_id bigint, "
-              "event_ts string, batch_start_ts string, batch_end_ts string, payload string")
-    df = session.createDataFrame([tuple(r[f] for f in ROW_FIELDS) for r in rows], schema)
-    df = (df
-          .withColumn("event_ts", F.col("event_ts").cast("timestamp"))
-          .withColumn("batch_start_ts", F.col("batch_start_ts").cast("timestamp"))
-          .withColumn("batch_end_ts", F.col("batch_end_ts").cast("timestamp"))
-          .withColumn("payload", F.expr("parse_json(payload)"))
-          .withColumn("ingest_ts", F.current_timestamp()))
+    df = session.createDataFrame([tuple(r[f] for f in ROW_FIELDS) for r in rows], spark_row_schema())
+    for name, sql_type, _comment in MONITORING_TABLE_COLUMNS:
+        if name not in ROW_FIELDS:
+            continue
+        if sql_type == "TIMESTAMP":
+            df = df.withColumn(name, F.col(name).cast("timestamp"))
+        elif sql_type == "VARIANT":
+            df = df.withColumn(name, F.expr(f"parse_json({name})"))
+    df = df.withColumn("logged_ts", F.current_timestamp())
     df.writeTo(table).append()
+
+
+def spark_row_schema():
+    """The DDL schema string for a DataFrame of builder rows: every ROW_FIELDS column with its table type,
+    except TIMESTAMP and VARIANT, which the builders hand over as strings (spark_append casts them)."""
+    types = {name: sql_type for name, sql_type, _comment in MONITORING_TABLE_COLUMNS}
+    return ", ".join(f"{name} {'string' if types[name] in ('TIMESTAMP', 'VARIANT') else types[name].lower()}"
+                     for name in ROW_FIELDS)

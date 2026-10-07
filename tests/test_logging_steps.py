@@ -125,7 +125,7 @@ def test_run_start_and_end_rows():
     end, = rows_of(ev, "run_end")
     assert json.loads(start["payload"]) == {"mode": "batch", "es_index": "idx", "view": "v"}
     assert end["status"] == "success" and json.loads(end["payload"])["batches"] == 1
-    assert end["batch_start_ts"] == start["batch_start_ts"]
+    assert end["start_ts"] == start["start_ts"]
 
 
 def test_guard_records_run_end_error_once_and_reraises():
@@ -432,3 +432,85 @@ def test_catch_up_gives_up_after_its_attempts():
     slept = []
     rec.catch_up(q, through_batch_id=4, attempts=3, sleep=slept.append)
     assert rec.last_batch_id is None and len(slept) == 3
+
+
+# --- task_run_id: every step stamps its attempt's id on every row it writes ----------------------
+
+def test_run_recorder_stamps_task_run_id_on_start_end_and_guarded_error():
+    ev = Events()
+    rec = RunRecorder(make_log(ev), "cfg", "run1", {"mode": "batch"}, task_run_id="t9", clock=Clock())
+    rec.start({}, None)
+    with pytest.raises(ValueError):
+        with rec.guard(None):
+            raise ValueError("boom")
+    start, = rows_of(ev, "run_start")
+    end, = rows_of(ev, "run_end")
+    assert (start["task_run_id"], end["task_run_id"]) == ("t9", "t9")
+    assert (end["error_type"], end["error_message"]) == ("ValueError", "boom")
+    assert "task_run_id" not in json.loads(start["payload"])  # a column now, not a payload field
+
+
+def test_batch_export_stamps_task_run_id_on_success_and_error_rows():
+    for fail in (False, True):
+        ev = Events()
+
+        def write(df, cfg):
+            if fail:
+                raise OSError("es down")
+            return dict(RESULT)
+        call = lambda: run_batch_export(  # noqa: E731
+            "DF", WriteConfig(), bulk_write=write, reconcile=lambda result, index: None, log=make_log(ev),
+            config_name="cfg", job_run_id="run1", task_run_id="t9", session=None, printer=lambda *_: None,
+            clock=Clock())
+        if fail:
+            with pytest.raises(OSError):
+                call()
+        else:
+            call()
+        rows = rows_of(ev, "batch_start") + rows_of(ev, "batch_end")
+        assert len(rows) == 2 and {r["task_run_id"] for r in rows} == {"t9"}
+        assert rows[1]["docs_written"] == (None if fail else 3)
+
+
+def test_foreach_batch_stamps_task_run_id_on_success_and_error_rows():
+    for fail in (False, True):
+        ev = Events()
+
+        def write(df, cfg, raise_on_error):
+            if fail:
+                raise OSError("es down")
+            return dict(RESULT)
+        fb = make_foreach_batch(
+            transform=lambda b, s: "T", bulk_write=write, write_config=WriteConfig(), log=make_log(ev),
+            config_name="cfg", job_run_id="run1", task_run_id="t9", write_metrics=lambda s, b, w: None,
+            printer=lambda *_: None, clock=Clock())
+        if fail:
+            with pytest.raises(OSError):
+                fb(FakeBatchDF(), 5)
+        else:
+            fb(FakeBatchDF(), 5)
+        rows = rows_of(ev, "batch_start") + rows_of(ev, "batch_end")
+        assert len(rows) == 2 and {r["task_run_id"] for r in rows} == {"t9"}
+        assert rows[1]["error_type"] == ("OSError" if fail else None)
+
+
+def test_progress_recorder_stamps_task_run_id_and_backlog():
+    ev = Events()
+    rep = dict(report(0), sources=[{"metrics": {"numFilesOutstanding": "4", "numBytesOutstanding": "400"}}])
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None, task_run_id="t9")
+    rec(FakeQuery([[rep]]))
+    row, = rows_of(ev, "batch_summary")
+    assert (row["task_run_id"], row["files_outstanding"], row["bytes_outstanding"]) == ("t9", 4, 400)
+
+
+# --- spark_row_schema: the writer's DataFrame schema comes from the table definition -------------
+
+def test_spark_row_schema_matches_row_fields_and_types():
+    from pipeline_lib.monitoring_sink import ROW_FIELDS
+    from pipeline_lib.monitoring_writer import spark_row_schema
+    fields = [f.split(" ") for f in spark_row_schema().split(", ")]
+    assert [name for name, _t in fields] == list(ROW_FIELDS)
+    types = dict(fields)
+    assert types["batch_id"] == types["docs_written"] == types["files_outstanding"] == "bigint"
+    assert types["start_ts"] == types["event_ts"] == types["payload"] == "string"  # cast by spark_append
+    assert "logged_ts" not in types  # stamped by the writer

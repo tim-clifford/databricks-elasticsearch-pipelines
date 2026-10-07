@@ -22,13 +22,14 @@ from pipeline_lib.observability import BULK_STATS_TAG, format_bulk_stats, format
 
 
 def run_batch_export(df, write_config, *, bulk_write, reconcile, log, config_name, job_run_id, session,
-                     printer=print, clock=None, timer=time.time):
+                     task_run_id="", printer=print, clock=None, timer=time.time):
     """Export `df` as this run's one batch and return the bulk_write result. Raises whatever the write or the
     reconciliation raises, after recording it as batch_end status error; raises MonitoringLogError if the log
     is on and an append fails (batch_start failing means nothing was sent)."""
     clock = clock or (lambda: datetime.now(timezone.utc))
     start = clock()
-    log.append([batch_start_row(config_name, job_run_id, BATCH_MODE_BATCH_ID, {"mode": "batch"}, start)], session)
+    log.append([batch_start_row(config_name, job_run_id, task_run_id, BATCH_MODE_BATCH_ID, {"mode": "batch"},
+                                start)], session)
     result = None
     wall_ms = None
     try:
@@ -53,9 +54,10 @@ def run_batch_export(df, write_config, *, bulk_write, reconcile, log, config_nam
             # A reconcile failure: the write returned, so say HOW it failed reconciliation.
             facts.update(es_counts(result))
             facts["es"] = es_write_summary(result, wall_ms=wall_ms)
-        log.append_failure([batch_end_row(config_name, job_run_id, BATCH_MODE_BATCH_ID, "error", facts, start, end)],
+        log.append_failure([batch_end_row(config_name, job_run_id, task_run_id, BATCH_MODE_BATCH_ID, "error", facts,
+                                          start, end)],
                            exc, session, log=printer)
         raise
-    log.append([batch_end_row(config_name, job_run_id, BATCH_MODE_BATCH_ID, "success",
+    log.append([batch_end_row(config_name, job_run_id, task_run_id, BATCH_MODE_BATCH_ID, "success",
                               batch_success_facts(result, wall_ms=wall_ms), start, clock())], session)
     return result

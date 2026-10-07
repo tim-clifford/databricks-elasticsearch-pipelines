@@ -23,14 +23,17 @@ class ProgressRecorder:
     """Callable(query): record newly executed batches (see the module docstring).
 
     - log: a MonitoringLog; session: the notebook's Spark session (used for the appends).
+    - task_run_id: this attempt's {{task.run_id}} ("" on an interactive run).
     - read_print_relay(batch_id) -> str | None, or None when bulk_stats is off: return and delete the batch's
       relayed BULK_STATS line (best-effort; never raises).
     """
 
-    def __init__(self, log, config_name, job_run_id, session, read_print_relay=None, printer=print):
+    def __init__(self, log, config_name, job_run_id, session, read_print_relay=None, printer=print,
+                 task_run_id=""):
         self.log = log
         self.config_name = config_name
         self.job_run_id = job_run_id
+        self.task_run_id = task_run_id
         self.session = session
         self.read_print_relay = read_print_relay
         self.printer = printer
@@ -50,7 +53,8 @@ class ProgressRecorder:
                 line = self.read_print_relay(batch_id)
                 if line:
                     self.printer(line)
-            self.log.append([batch_summary_row(self.config_name, self.job_run_id, batch_id, report)], self.session)
+            self.log.append([batch_summary_row(self.config_name, self.job_run_id, self.task_run_id, batch_id,
+                                                report)], self.session)
             self.last_batch_id = batch_id
 
     def catch_up(self, query, through_batch_id, attempts=5, sleep=time.sleep, pause_seconds=2):

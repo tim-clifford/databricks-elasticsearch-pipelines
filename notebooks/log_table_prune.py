@@ -8,7 +8,7 @@
 # MAGIC job enforces retention and keeps the table tidy and query-fast.
 # MAGIC
 # MAGIC What it does, in order:
-# MAGIC 1. DELETE rows older than `monitoring_log_retention_days` (by `ingest_ts`). `0` DISABLES the delete
+# MAGIC 1. DELETE rows older than `monitoring_log_retention_days` (by `logged_ts`, the write time). `0` DISABLES the delete
 # MAGIC    (keep ALL rows) - the job then only optimizes/vacuums.
 # MAGIC 2. OPTIMIZE the table (compacts small files and reclusters the liquid-clustered data, including a
 # MAGIC    table that only just had CLUSTER BY set by the `_log table create` migration).
