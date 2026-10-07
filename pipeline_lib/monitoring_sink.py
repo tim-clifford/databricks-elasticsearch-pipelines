@@ -35,23 +35,78 @@ from datetime import datetime, timedelta, timezone
 
 from pipeline_lib.observability import bulk_stats_overall, bulk_stats_tail
 
-# The monitoring table's columns, in order, as (name, sql_type). This ONE tuple drives both the CREATE
-# TABLE statement (create_table_sql) and the row shape (ROW_FIELDS), so the schema is defined exactly
-# once. payload is VARIANT (semi-structured, queryable with `payload:field` paths in SQL); it needs DBR
-# 15.3+ / recent serverless, which every target here runs. event_ts is the batch/emit wall-clock the
-# row is about; ingest_ts is when the row was actually written (a WRITER-SUPPLIED default, see
-# ROW_FIELDS), so a delayed relay is still distinguishable from batch time.
+# The monitoring table's columns, in order, as (name, sql_type, comment). This ONE tuple drives the CREATE TABLE
+# statement (create_table_sql), the column comments (set at create and by the migration), the row shape
+# (ROW_FIELDS) and the writer's DataFrame schema, so the schema is defined exactly once. payload is VARIANT
+# (semi-structured, queryable with `payload:field` paths in SQL); it needs DBR 15.3+ / recent serverless, which
+# every target here runs. The comments are stored on the table, so they are written for someone reading the
+# table in Catalog Explorer: what the column holds and on which rows (see _COMMENT for the allowed characters).
 MONITORING_TABLE_COLUMNS = (
-    ("config_name", "STRING"),     # which pipeline config emitted the row
-    ("job_run_id", "STRING"),      # the Databricks job run id, to group rows of one run across batches
-    ("record_type", "STRING"),     # discriminator; one of RECORD_TYPES
-    ("status", "STRING"),          # one of STATUSES (started | success | error | stopped); see _ALLOWED_STATUS
-    ("batch_id", "BIGINT"),        # batch id (micro-batch id; BATCH_MODE_BATCH_ID in batch mode); NULL on run rows
-    ("event_ts", "TIMESTAMP"),     # UTC wall-clock the row is ABOUT (batch/emit time)
-    ("batch_start_ts", "TIMESTAMP"),  # UTC wall-clock the batch/run STARTED; NULL where not applicable
-    ("batch_end_ts", "TIMESTAMP"),    # UTC wall-clock the batch/run ENDED; NULL where not applicable
-    ("payload", "VARIANT"),        # the type-specific fields, verbatim from the source dict
-    ("ingest_ts", "TIMESTAMP"),    # UTC wall-clock the row was WRITTEN (writer supplies via current_timestamp())
+    ("config_name", "STRING", "Pipeline config that wrote the row."),
+    ("job_run_id", "STRING",
+     "Databricks job run id ({{job.run_id}}). Shared by every retry of the task, so it groups all attempts of "
+     "one job run."),
+    ("task_run_id", "STRING",
+     "Databricks task run id ({{task.run_id}}). One per task attempt, so it tells the retries of a job run "
+     "apart. NULL on an interactive run."),
+    ("record_type", "STRING", "Row kind: run_start, run_end, batch_start, batch_end or batch_summary."),
+    ("status", "STRING",
+     "started (run_start, batch_start), success or error (run_end, batch_end), stopped (run_end of a "
+     "continuous stream that ended without error), success (batch_summary)."),
+    ("batch_id", "BIGINT", "Batch id: the streaming micro-batch id, or 0 for a batch-mode run. NULL on run rows."),
+    ("event_ts", "TIMESTAMP",
+     "UTC time the event this row records happened (the start, the end, or when the progress report was "
+     "seen). Clustering key."),
+    ("start_ts", "TIMESTAMP",
+     "UTC start of the run (run rows) or batch (batch rows) this row describes. On batch_summary, the Spark "
+     "trigger time."),
+    ("end_ts", "TIMESTAMP",
+     "UTC end of the run or batch this row describes. On batch_summary, trigger time plus batchDuration. NULL "
+     "on run_start and batch_start."),
+    ("docs_written", "BIGINT",
+     "Documents written to Elasticsearch: by the batch (batch_end) or by the whole run (run_end). NULL on "
+     "other rows and when not known."),
+    ("error_type", "STRING", "Exception class name on status error rows (run_end, batch_end). NULL otherwise."),
+    ("error_message", "STRING",
+     "Exception message on status error rows, capped at 16000 characters (payload message_truncated marks a "
+     "cut). NULL otherwise."),
+    ("files_outstanding", "BIGINT",
+     "batch_summary only: source files not yet processed after this batch (Spark numFilesOutstanding). The "
+     "streaming backlog."),
+    ("bytes_outstanding", "BIGINT",
+     "batch_summary only: source bytes not yet processed after this batch (Spark numBytesOutstanding). The "
+     "streaming backlog."),
+    ("payload", "VARIANT", "Everything else the row records, by record_type (query with payload:field paths)."),
+    ("logged_ts", "TIMESTAMP",
+     "UTC time the row was committed to this table (set by the writer). Retention (the prune job) is on this "
+     "column."),
+)
+
+# Columns an older build wrote under another name, as (old_name, new_name). The migration in `_log table create`
+# never drops them (dropping data is a deliberate act): it marks each one DEPRECATED in its comment and
+# backfills the new column from it (backfill_sql). New rows leave them NULL; a later release drops them.
+DEPRECATED_COLUMNS = (
+    ("batch_start_ts", "start_ts"),
+    ("batch_end_ts", "end_ts"),
+    ("ingest_ts", "logged_ts"),
+)
+
+# Comments are interpolated into DDL as '...' literals, so they are an ALLOW-LIST of plain characters: no quote
+# or backslash can reach the SQL. The comments are our own constants; a violation is a bug and fails closed.
+_COMMENT = re.compile(r"^[A-Za-z0-9 .,:;()_{}+/-]+$")
+
+# Columns surfaced from the payload, so common questions do not need payload paths. One rule set feeds both the
+# Python builders (new rows) and backfill_sql (rows an older build wrote), so the two can never disagree:
+# (column, record_types it applies to (None = any), status it applies to (None = any), payload paths tried in
+# order (a str key or an int list index), cast). The second docs_written path is the streaming run_end's key.
+SURFACED_COLUMNS = (
+    ("docs_written", ("batch_end", "run_end"), None, (("written",), ("rows_pushed",)), "bigint"),
+    ("error_type", None, "error", (("exception_type",),), "string"),
+    ("error_message", None, "error", (("message",),), "string"),
+    ("files_outstanding", ("batch_summary",), None,
+     (("progress", "sources", 0, "metrics", "numFilesOutstanding"),), "bigint"),
+    ("bytes_outstanding", ("batch_summary",), None,
+     (("progress", "sources", 0, "metrics", "numBytesOutstanding"),), "bigint"),
 )
 
 # The allow-list of record_type values (see THE ROW MODEL above). A row builder only ever emits one of
@@ -87,11 +142,12 @@ BATCH_MODE_BATCH_ID = 0
 MAX_ERROR_MESSAGE_CHARS = 16000
 
 # The fields a row builder emits, in order. This is MONITORING_TABLE_COLUMNS MINUS the writer-supplied
-# ingest_ts (the writer stamps ingest_ts with the Spark current_timestamp() at append time, so a pure
+# logged_ts (the writer stamps logged_ts with the Spark current_timestamp() at append time, so a pure
 # builder never invents it). assert_columns_consistent() enforces the relationship so the two lists
 # cannot drift.
-ROW_FIELDS = ("config_name", "job_run_id", "record_type", "status", "batch_id", "event_ts",
-              "batch_start_ts", "batch_end_ts", "payload")
+ROW_FIELDS = ("config_name", "job_run_id", "task_run_id", "record_type", "status", "batch_id", "event_ts",
+              "start_ts", "end_ts", "docs_written", "error_type", "error_message", "files_outstanding",
+              "bytes_outstanding", "payload")
 
 # Liquid-clustering columns for the monitoring table. Every monitoring query filters by WHICH pipeline
 # (config_name) and a TIME window (event_ts), so clustering on these two gives data skipping as the table
@@ -109,11 +165,14 @@ _NAME_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def assert_columns_consistent():
     """Guard the invariant that ROW_FIELDS is exactly the table columns minus the writer-supplied
-    ingest_ts, so the DDL (MONITORING_TABLE_COLUMNS) and the row shape (ROW_FIELDS) can never drift.
-    Called by tests; cheap enough to be a plain assert."""
-    col_names = [name for name, _type in MONITORING_TABLE_COLUMNS]
-    assert col_names[-1] == "ingest_ts", "ingest_ts must be the last (writer-supplied) column"
-    assert tuple(col_names[:-1]) == ROW_FIELDS, "ROW_FIELDS must equal table columns minus ingest_ts"
+    logged_ts, so the DDL (MONITORING_TABLE_COLUMNS) and the row shape (ROW_FIELDS) can never drift, and that
+    every surfaced and deprecated column names a real column. Called by tests; cheap enough to be a plain assert."""
+    col_names = [name for name, _type, _comment in MONITORING_TABLE_COLUMNS]
+    assert col_names[-1] == "logged_ts", "logged_ts must be the last (writer-supplied) column"
+    assert tuple(col_names[:-1]) == ROW_FIELDS, "ROW_FIELDS must equal table columns minus logged_ts"
+    assert all(c in col_names for c, *_rest in SURFACED_COLUMNS), "every surfaced column must be a table column"
+    assert all(new in col_names and old not in col_names for old, new in DEPRECATED_COLUMNS), \
+        "a deprecated column must be replaced by a table column and not be one itself"
 
 
 def _fmt_ts(dt):
@@ -135,7 +194,7 @@ def _event_ts(now=None):
 
 
 def _opt_ts(dt):
-    """Format an OPTIONAL timing (batch_start_ts / batch_end_ts). Unlike _event_ts, `None` means NULL (not
+    """Format an OPTIONAL timing (start_ts / end_ts). Unlike _event_ts, `None` means NULL (not
     'now'): a row that has no meaningful start/end stores NULL rather than inventing the current time."""
     return None if dt is None else _fmt_ts(dt)
 
@@ -147,13 +206,61 @@ def _json(payload):
     return json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
 
 
-def _row(config_name, job_run_id, record_type, status, batch_id, payload, now=None,
+# The strict cast rule shared by the Python builders (_cast_value) and the backfill SQL (_cast_sql), so the two
+# agree on every input: "bigint" takes a JSON integer, or a string of plain digits (Spark reports its metrics as
+# strings), that fits in a signed 64-bit integer; "string" takes a JSON string. Anything else (a boolean, a
+# fraction, an object, an out-of-range number) is NULL. Spark's own variant cast is looser (true -> 1, 1.5 -> 1,
+# 5 -> "5"), so the SQL checks the value's type with schema_of_variant rather than relying on it.
+_INTEGER_STRING = r"^-?[0-9]+$"
+_BIGINT_MIN, _BIGINT_MAX = -(2 ** 63), 2 ** 63 - 1
+
+
+def _cast_value(value, cast):
+    """`value` under the strict cast rule above, or None."""
+    if cast == "string":
+        return value if isinstance(value, str) else None
+    if isinstance(value, str) and re.match(_INTEGER_STRING, value):
+        value = int(value)
+    if isinstance(value, int) and not isinstance(value, bool) and _BIGINT_MIN <= value <= _BIGINT_MAX:
+        return value
+    return None
+
+
+def _payload_value(payload, paths, cast):
+    """A surfaced column's value: the first of `paths` whose value in `payload` passes the strict cast rule (like
+    the SQL coalesce over the same paths). FAIL-SOFT like every diagnostic: a missing path or a value that does
+    not cast is None (NULL), never an error."""
+    for path in paths:
+        value = payload
+        for key in path:
+            if isinstance(key, int):
+                value = value[key] if isinstance(value, list) and len(value) > key else None
+            else:
+                value = value.get(key) if isinstance(value, dict) else None
+        value = _cast_value(value, cast)
+        if value is not None:
+            return value
+    return None
+
+
+def _surfaced(record_type, status, payload):
+    """The SURFACED_COLUMNS values for one row: each column's payload value on the rows it applies to, else None."""
+    out = {}
+    for column, record_types, only_status, paths, cast in SURFACED_COLUMNS:
+        applies = ((record_types is None or record_type in record_types)
+                   and (only_status is None or status == only_status))
+        out[column] = _payload_value(payload, paths, cast) if applies else None
+    return out
+
+
+def _row(config_name, job_run_id, task_run_id, record_type, status, batch_id, payload, now=None,
          start=None, end=None):
     """Assemble one row dict keyed by ROW_FIELDS. FAIL-CLOSED: record_type must be in RECORD_TYPES, status
     must be one _ALLOWED_STATUS permits for it, payload must be a dict, and a batch row needs an integer
     batch_id (a run row must have none). Any violation raises ValueError: a malformed row is a bug, and a
     silently dropped row is the missing log entry this module exists to prevent. start/end are OPTIONAL
-    datetimes (None => NULL) stored as batch_start_ts / batch_end_ts (the run's or batch's wall clock)."""
+    datetimes (None => NULL) stored as start_ts / end_ts (the run's or batch's wall clock). task_run_id ""
+    (an interactive run) is stored as NULL. The SURFACED_COLUMNS are copied from the payload (_surfaced)."""
     if record_type not in RECORD_TYPES:
         raise ValueError(f"unknown record_type {record_type!r}; allowed: {', '.join(RECORD_TYPES)}")
     if status not in _ALLOWED_STATUS[record_type]:
@@ -169,12 +276,14 @@ def _row(config_name, job_run_id, record_type, status, batch_id, payload, now=No
     return {
         "config_name": config_name,
         "job_run_id": job_run_id,
+        "task_run_id": task_run_id or None,
         "record_type": record_type,
         "status": status,
         "batch_id": batch_id,
         "event_ts": _event_ts(now),
-        "batch_start_ts": _opt_ts(start),
-        "batch_end_ts": _opt_ts(end),
+        "start_ts": _opt_ts(start),
+        "end_ts": _opt_ts(end),
+        **_surfaced(record_type, status, payload),
         "payload": _json(payload),
     }
 
@@ -211,41 +320,41 @@ def error_facts(exc):
     return facts
 
 
-def run_start_row(config_name, job_run_id, facts, start, now=None):
+def run_start_row(config_name, job_run_id, task_run_id, facts, start, now=None):
     """The `run_start` row: the run's identity and effective settings (`facts`: mode, es_index, view,
     source, trigger, connector version, ...), stored verbatim. `start` is the run's start wall clock."""
-    return _row(config_name, job_run_id, "run_start", "started", None, facts, now, start=start)
+    return _row(config_name, job_run_id, task_run_id, "run_start", "started", None, facts, now, start=start)
 
 
-def run_end_row(config_name, job_run_id, status, facts, start, end, now=None):
+def run_end_row(config_name, job_run_id, task_run_id, status, facts, start, end, now=None):
     """The `run_end` row: how the run ended (status success | error | stopped) plus `facts` (totals on
     success, error_facts on error), with the run's start and end wall clocks so its duration is direct."""
-    return _row(config_name, job_run_id, "run_end", status, None, facts, now, start=start, end=end)
+    return _row(config_name, job_run_id, task_run_id, "run_end", status, None, facts, now, start=start, end=end)
 
 
-def batch_start_row(config_name, job_run_id, batch_id, facts, start, now=None):
+def batch_start_row(config_name, job_run_id, task_run_id, batch_id, facts, start, now=None):
     """The `batch_start` row, written immediately BEFORE the batch's data is sent to ES. `facts` carries
     whatever is known up front (at least the mode). With the log on, failing to write this row fails the
     batch before any data is sent."""
-    return _row(config_name, job_run_id, "batch_start", "started", batch_id, facts, now, start=start)
+    return _row(config_name, job_run_id, task_run_id, "batch_start", "started", batch_id, facts, now, start=start)
 
 
-def batch_end_row(config_name, job_run_id, batch_id, status, facts, start, end, now=None):
+def batch_end_row(config_name, job_run_id, task_run_id, batch_id, status, facts, start, end, now=None):
     """The `batch_end` row: the batch's OUTCOME and ES DIAGNOSTICS. status success (facts =
     batch_success_facts(...): ES counts + the `es` write rollup) or error (facts = error_facts, plus the
     counts/diagnostics when the write returned), with the batch's start and end wall clocks."""
-    return _row(config_name, job_run_id, "batch_end", status, batch_id, facts, now, start=start, end=end)
+    return _row(config_name, job_run_id, task_run_id, "batch_end", status, batch_id, facts, now, start=start, end=end)
 
 
-def batch_summary_row(config_name, job_run_id, batch_id, progress, now=None):
+def batch_summary_row(config_name, job_run_id, task_run_id, batch_id, progress, now=None):
     """The `batch_summary` row (streaming only): Spark's StreamingQueryProgress dict for the batch, stored
     WHOLE (backlog, step durations, rates, offsets, nothing the runtime reports is dropped).
-    batch_start_ts / batch_end_ts are Spark's trigger timestamp and trigger + batchDuration (Spark's view
-    of the batch; the batch's own wall clock is on its batch_start / batch_end rows)."""
+    start_ts / end_ts are Spark's trigger timestamp and trigger + batchDuration (Spark's view of the batch;
+    the batch's own wall clock is on its batch_start / batch_end rows)."""
     if not isinstance(progress, dict):
         raise ValueError(f"batch_summary progress must be a dict, got {type(progress).__name__}")
     start, end = _progress_bounds(progress)
-    return _row(config_name, job_run_id, "batch_summary", "success", batch_id, {"progress": progress}, now,
+    return _row(config_name, job_run_id, task_run_id, "batch_summary", "success", batch_id, {"progress": progress}, now,
                 start=start, end=end)
 
 
@@ -339,13 +448,14 @@ def validate_table_name(name, where="monitoring_log_table"):
 def create_table_sql(table_name):
     """The idempotent CREATE TABLE statement the `_log table create` job runs. Validates the name
     (fail-closed via validate_table_name), then builds `CREATE TABLE IF NOT EXISTS <name> (...) USING
-    DELTA CLUSTER BY (...)` from MONITORING_TABLE_COLUMNS (the single schema source) plus auto-optimize
+    DELTA CLUSTER BY (...)` from MONITORING_TABLE_COLUMNS (the single schema source, each column with its
+    COMMENT) plus auto-optimize
     table properties (the sink appends one small file per micro-batch, so predictive/auto compaction keeps
     the table tidy). CLUSTER BY (CLUSTER_BY_COLUMNS) adds data skipping for the time/config queries this
     table serves as it grows. IF NOT EXISTS makes re-running the job a safe no-op. (CLUSTER BY is a
     table_clause that precedes TBLPROPERTIES in the Databricks SQL grammar.)"""
     canonical = validate_table_name(table_name)
-    cols = ",\n  ".join(f"{name} {sql_type}" for name, sql_type in MONITORING_TABLE_COLUMNS)
+    cols = ",\n  ".join(_column_sql(*col) for col in MONITORING_TABLE_COLUMNS)
     cluster_by = ", ".join(CLUSTER_BY_COLUMNS)
     return (
         f"CREATE TABLE IF NOT EXISTS {canonical} (\n  {cols}\n) USING DELTA\n"
@@ -357,26 +467,131 @@ def create_table_sql(table_name):
     )
 
 
+def _sql_comment(comment):
+    """`comment` as a SQL string literal. FAIL-CLOSED allow-list (_COMMENT): a quote or backslash can never
+    reach the DDL."""
+    if not isinstance(comment, str) or not _COMMENT.match(comment):
+        raise ValueError(f"column comment must match {_COMMENT.pattern}, got {comment!r}")
+    return f"'{comment}'"
+
+
+def _column_sql(name, sql_type, comment):
+    """One column definition: `name TYPE COMMENT '...'`."""
+    return f"{name} {sql_type} COMMENT {_sql_comment(comment)}"
+
+
+def deprecated_comment(new_name):
+    """The comment the migration puts on a deprecated column (see DEPRECATED_COLUMNS)."""
+    return f"DEPRECATED: replaced by {new_name}. No longer written (NULL on new rows); dropped in a later release."
+
+
 def missing_columns(existing_names):
     """The MONITORING_TABLE_COLUMNS entries whose column name is NOT already present, as a list of
-    (name, sql_type). ADDITIVE allow-list and order-insensitive: it only ever reports columns to ADD, never
+    (name, sql_type, comment). ADDITIVE allow-list and order-insensitive: it only ever reports columns to ADD, never
     considers dropping/renaming an existing one, so applying its result can never lose data. `existing_names`
     is the current table's column names (any iterable). Drives the re-runnable schema migration in the
     `_log table create` job: add exactly the columns a newer schema introduced."""
     have = set(existing_names)
-    return [(name, sql_type) for name, sql_type in MONITORING_TABLE_COLUMNS if name not in have]
+    return [col for col in MONITORING_TABLE_COLUMNS if col[0] not in have]
 
 
 def alter_add_columns_sql(table_name, cols):
-    """`ALTER TABLE <name> ADD COLUMNS (name type, ...)` for the given (name, sql_type) list (typically the
-    output of missing_columns). Validates the name fail-closed. Returns None when `cols` is empty (nothing
-    to add => the caller skips). ADD COLUMNS is purely additive (existing rows get NULL for the new
+    """`ALTER TABLE <name> ADD COLUMNS (name type COMMENT '...', ...)` for the given (name, sql_type, comment)
+    list (typically the output of missing_columns). Validates the name fail-closed. Returns None when `cols` is
+    empty (nothing to add => the caller skips). ADD COLUMNS is purely additive (existing rows get NULL for the new
     columns); it never rewrites or replaces data."""
     canonical = validate_table_name(table_name)
     if not cols:
         return None
-    added = ", ".join(f"{name} {sql_type}" for name, sql_type in cols)
+    added = ", ".join(_column_sql(name, sql_type, comment) for name, sql_type, comment in cols)
     return f"ALTER TABLE {canonical} ADD COLUMNS ({added})"
+
+
+def comment_changes(existing_comments):
+    """The column comments the migration must set, as a list of (name, comment): every expected column whose
+    current comment differs from MONITORING_TABLE_COLUMNS, and every DEPRECATED_COLUMNS column present whose
+    comment is not yet deprecated_comment(). `existing_comments` maps each existing column name to its comment
+    (None when unset). Columns not in the table are skipped (missing_columns adds them, comment included).
+    An empty list means nothing to change, so a re-run makes no metadata commit."""
+    wanted = [(name, comment) for name, _type, comment in MONITORING_TABLE_COLUMNS]
+    wanted += [(old, deprecated_comment(new)) for old, new in DEPRECATED_COLUMNS]
+    return [(name, comment) for name, comment in wanted
+            if name in existing_comments and existing_comments[name] != comment]
+
+
+def alter_column_comments_sql(table_name, changes):
+    """ONE `ALTER TABLE <name> ALTER COLUMN a COMMENT '...', b COMMENT '...'` for the (name, comment) list from
+    comment_changes, so the migration makes a single metadata commit (multi-column ALTER COLUMN needs Databricks
+    SQL or DBR 16.3+; the create job is serverless). Validates the name and every comment fail-closed. Returns
+    None when `changes` is empty."""
+    canonical = validate_table_name(table_name)
+    if not changes:
+        return None
+    altered = ", ".join(f"{name} COMMENT {_sql_comment(comment)}" for name, comment in changes)
+    return f"ALTER TABLE {canonical} ALTER COLUMN {altered}"
+
+
+def _variant_path(path):
+    """A SURFACED_COLUMNS payload path as a try_variant_get JSON path, e.g. `$.progress.sources[0].metrics.x`."""
+    out = "$"
+    for key in path:
+        if isinstance(key, int):
+            out += f"[{key}]"
+        elif _NAME_PART.match(key):
+            out += f".{key}"
+        else:
+            raise ValueError(f"payload path key {key!r} is not a plain identifier")
+    return out
+
+
+def _cast_sql(path, cast):
+    """One payload path under the strict cast rule (see _cast_value), in SQL. A missing path is NULL (try_variant_get
+    and schema_of_variant of NULL), and every cast is a try_ form, so nothing here raises."""
+    value = f"try_variant_get(payload, '{path}')"
+    if cast == "string":
+        return f"CASE WHEN schema_of_variant({value}) = 'STRING' THEN try_variant_get(payload, '{path}', 'string') END"
+    text = f"try_variant_get(payload, '{path}', 'string')"
+    return (f"CASE schema_of_variant({value}) WHEN 'BIGINT' THEN try_variant_get(payload, '{path}', 'bigint') "
+            f"WHEN 'STRING' THEN CASE WHEN regexp_like({text}, '{_INTEGER_STRING}') THEN try_cast({text} AS BIGINT) "
+            f"END END")
+
+
+def _surfaced_sql(column, record_types, only_status, paths, cast):
+    """The backfill expression for one SURFACED_COLUMNS rule: the same rows, paths and cast as _surfaced, in SQL
+    (_cast_sql per path, coalesced in order like _payload_value)."""
+    gets = [_cast_sql(_variant_path(p), cast) for p in paths]
+    value = gets[0] if len(gets) == 1 else f"coalesce({', '.join(gets)})"
+    conds = []
+    if record_types is not None:
+        quoted = ", ".join(f"'{t}'" for t in record_types)
+        conds.append(f"record_type IN ({quoted})")
+    if only_status is not None:
+        conds.append(f"status = '{only_status}'")
+    return f"{column} = CASE WHEN {' AND '.join(conds)} THEN {value} END" if conds else f"{column} = {value}"
+
+
+def backfill_sql(table_name, existing_names):
+    """The idempotent UPDATE that fills the new columns on rows an older build wrote (they have the
+    DEPRECATED_COLUMNS set and the new columns NULL), or None when the table has no such rows to find (no
+    ingest_ts: it never held an older build's rows). The `_log table create` migration runs it, and it is re-run
+    once after every job has been restarted on the new build, to catch the rows old jobs wrote in between.
+    - start_ts / end_ts / logged_ts are copied from those of batch_start_ts / batch_end_ts / ingest_ts the
+      table has (`existing_names`: its current column names; a very old table may lack the timing columns).
+    - The SURFACED_COLUMNS are derived from the payload by the same rules the builders use (_surfaced_sql).
+    - task_run_id is known only on run_start rows (the older build kept it in that payload); NULL elsewhere.
+    The marker is `logged_ts IS NULL AND ingest_ts IS NOT NULL`: the writer always stamps logged_ts on new rows
+    (ingest_ts on old ones), so a row is selected exactly until it has been backfilled and a re-run is a no-op.
+    Validates the name fail-closed."""
+    canonical = validate_table_name(table_name)
+    have = set(existing_names)
+    if "ingest_ts" not in have:
+        return None
+    sets = [f"{new} = {old}" for old, new in DEPRECATED_COLUMNS if old in have]
+    sets.append("task_run_id = CASE WHEN record_type = 'run_start' "
+                "THEN try_variant_get(payload, '$.task_run_id', 'string') END")
+    sets += [_surfaced_sql(*rule) for rule in SURFACED_COLUMNS]
+    body = ",\n  ".join(sets)
+    return f"UPDATE {canonical} SET\n  {body}\nWHERE logged_ts IS NULL AND ingest_ts IS NOT NULL"
 
 
 def alter_cluster_by_sql(table_name):
@@ -389,24 +604,24 @@ def alter_cluster_by_sql(table_name):
 
 
 def prune_sql(table_name, retention_days):
-    """`DELETE FROM <name> WHERE ingest_ts < current_timestamp() - INTERVAL <n> DAYS` to enforce retention
+    """`DELETE FROM <name> WHERE logged_ts < current_timestamp() - INTERVAL <n> DAYS` to enforce retention
     on the monitoring table (it grows unbounded otherwise: several rows per batch, and an always-on stream
     runs a batch every trigger). Validates the name fail-closed. Returns None when retention_days <= 0 (retention
     DISABLED => keep all rows; the caller skips the DELETE). retention_days is coerced to a non-negative
     int; a non-numeric value raises (fail-closed, since it is interpolated into SQL).
 
-    Retention is on ingest_ts (write time), deliberately NOT the clustered event_ts. ingest_ts is ALWAYS
+    Retention is on logged_ts (write time), deliberately NOT the clustered event_ts. logged_ts is ALWAYS
     set (the writer stamps current_timestamp() at append), whereas event_ts can be NULL from a fail-soft
     builder - and a NULL-event_ts row would then never age out, leaking forever; "age since written" is
     also the correct retention semantic. The cost is that this DELETE predicate is not a clustering key, so
     it does not get event_ts clustered-file skipping; that is acceptable for a once-a-day prune of a
-    retention-bounded table (ingest_ts and event_ts are near-identical for rows this sink writes, since
+    retention-bounded table (logged_ts and event_ts are near-identical for rows this sink writes, since
     builders stamp event_ts at write time, so any skipping would be approximate anyway)."""
     canonical = validate_table_name(table_name)
     days = int(retention_days)
     if days <= 0:
         return None
-    return f"DELETE FROM {canonical} WHERE ingest_ts < current_timestamp() - INTERVAL {days} DAYS"
+    return f"DELETE FROM {canonical} WHERE logged_ts < current_timestamp() - INTERVAL {days} DAYS"
 
 
 def optimize_sql(table_name):

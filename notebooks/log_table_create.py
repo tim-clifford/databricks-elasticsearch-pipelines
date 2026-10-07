@@ -13,7 +13,10 @@
 # MAGIC newer build adds a column to the schema, re-running ADDITIVELY applies it (`ALTER TABLE ADD COLUMNS`
 # MAGIC for the missing columns only) and ensures liquid clustering, WITHOUT dropping or replacing the table,
 # MAGIC so existing rows are preserved. It NEVER drops or renames a column (an extra/renamed column is warned,
-# MAGIC not touched). The export jobs only ever APPEND to the table, so their run identity needs only
+# MAGIC not touched). It also keeps every column COMMENT current (one metadata commit, and none when nothing
+# MAGIC changed), marks a renamed column (`DEPRECATED_COLUMNS`) DEPRECATED in its comment, and backfills the
+# MAGIC new columns on rows an older build wrote (`backfill_sql`, idempotent). After an upgrade, re-run this job
+# MAGIC once every pipeline job is running the new build, to backfill the rows old jobs wrote in between. The export jobs only ever APPEND to the table, so their run identity needs only
 # MAGIC `MODIFY`; the identity that runs THIS job needs `CREATE TABLE` / `ALTER` (and `USE CATALOG`/
 # MAGIC `USE SCHEMA`) on the target schema.
 # MAGIC
@@ -42,14 +45,8 @@ FILES_ROOT = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # .../fi
 if FILES_ROOT not in sys.path:
     sys.path.insert(0, FILES_ROOT)
 
-from pipeline_lib.monitoring_sink import (  # noqa: E402
-    MONITORING_TABLE_COLUMNS,
-    alter_add_columns_sql,
-    alter_cluster_by_sql,
-    create_table_sql,
-    missing_columns,
-    validate_table_name,
-)
+from pipeline_lib.log_table_migration import create_or_migrate  # noqa: E402
+from pipeline_lib.monitoring_sink import create_table_sql, validate_table_name  # noqa: E402
 
 if not MONITORING_LOG_TABLE:
     # monitoring_log_table is empty on main and set per target; with no name there is nothing to create,
@@ -69,66 +66,14 @@ print("  DDL:")
 print(CREATE_SQL)
 
 # COMMAND ----------
-# Cell 2 - CREATE + MIGRATE + VERIFY. Probe existence before and after so the run log states plainly whether
-# this job created the table or found it already there, then confirm the end state. Success is the VERIFIED
-# end state (the table exists AND its columns are a superset of the expected schema), not merely that the
-# CREATE statement ran; if the table is still absent afterwards, or a real error occurs, raise so the run
-# fails closed.
-#
-# RE-RUNNABLE additive migration: CREATE TABLE IF NOT EXISTS leaves a pre-existing table untouched, so when
-# a newer build adds a column it would NOT reach an existing table on its own. So after the create, if the
-# table pre-existed, compute the columns the expected schema has that the table lacks (missing_columns -
-# an ADDITIVE allow-list, never a drop) and apply them with ALTER TABLE ADD COLUMNS, and (idempotently)
-# ensure liquid clustering. This preserves all existing rows (ADD COLUMNS backfills NULL). Columns the
-# table has but the schema does not (an older/renamed column) are WARNED, never dropped - removing data is a
-# deliberate act, not this job's role. Reclustering existing files (OPTIMIZE) is intentionally left to the
-# `_log table prune` maintenance job, since it can be heavy on a large table.
-EXISTED_BEFORE = spark.catalog.tableExists(CANONICAL_TABLE)
-
-spark.sql(CREATE_SQL)
-
-EXISTS_AFTER = spark.catalog.tableExists(CANONICAL_TABLE)
-if not EXISTS_AFTER:
-    raise RuntimeError(
-        f"log_table_create FAILED: table {CANONICAL_TABLE!r} does not exist after CREATE TABLE IF NOT "
-        f"EXISTS ran (no exception was raised); check catalog/schema existence and CREATE grants"
-    )
-
-MIGRATED_COLS = []
-if EXISTED_BEFORE:
-    # Introspect the existing columns and additively reconcile to the expected schema. Everything here
-    # FAILS CLOSED: the schema READ and the ADD COLUMNS / CLUSTER BY statements must all succeed. A
-    # transient fault fails the job (and a re-run retries) rather than being swallowed - correct for an
-    # on-demand maintenance job, since silently skipping migration would leave the table unmigrated and
-    # later appends failing. The table itself is already verified-present above, so this only governs the
-    # additive migration, never whether the create succeeded.
-    existing_cols = [c.name for c in spark.table(CANONICAL_TABLE).schema]
-    expected_cols = [name for name, _type in MONITORING_TABLE_COLUMNS]
-    to_add = missing_columns(existing_cols)
-    add_sql = alter_add_columns_sql(CANONICAL_TABLE, to_add)
-    if add_sql:
-        print(f"migrating: adding missing columns {[n for n, _t in to_add]} to existing table")
-        print(f"  {add_sql}")
-        spark.sql(add_sql)
-        MIGRATED_COLS = [n for n, _t in to_add]
-    # Ensure liquid clustering on a table that predates it (idempotent to set; no-op if already clustered).
-    spark.sql(alter_cluster_by_sql(CANONICAL_TABLE))
-    # Any column the table has that the expected schema does not: warn, never drop.
-    extra_cols = [c for c in existing_cols if c not in expected_cols]
-    if extra_cols:
-        print(
-            f"WARNING: existing table {CANONICAL_TABLE!r} has columns {extra_cols} not in the expected "
-            f"schema. Left as-is (never dropped); remove them deliberately if they are obsolete."
-        )
-
-if EXISTED_BEFORE:
-    OUTCOME = f"MIGRATED(added={MIGRATED_COLS})" if MIGRATED_COLS else "ALREADY_EXISTS"
-else:
-    OUTCOME = "CREATED"
-SUMMARY = f"log_table_create outcome={OUTCOME} table={CANONICAL_TABLE!r} exists_after={EXISTS_AFTER}"
-print(f"LOG TABLE CREATE COMPLETE: {SUMMARY}")
+# Cell 2 - CREATE + MIGRATE + VERIFY (pipeline_lib.log_table_migration.create_or_migrate, unit-tested with a fake
+# session). Creates the table, or brings an existing one to the current schema: adds missing columns, sets the
+# column comments (deprecated columns marked DEPRECATED), ensures liquid clustering, and backfills the new columns
+# on rows an older build wrote. Never drops a column. Success is the VERIFIED end state (the table exists
+# afterwards); anything else raises, so the run fails closed.
+SUMMARY = create_or_migrate(spark, CANONICAL_TABLE)
 
 # COMMAND ----------
 # dbutils.notebook.exit() must be the ONLY statement in its cell: its return value becomes the cell's
-# rendered output. Reached only on success (CREATED or ALREADY_EXISTS, table verified present).
+# rendered output. Reached only on success (CREATED, MIGRATED or ALREADY_EXISTS, table verified present).
 dbutils.notebook.exit(SUMMARY)

@@ -190,7 +190,10 @@ MAX_BYTES_PER_TRIGGER = dbutils.widgets.get("max_bytes_per_trigger").strip()
 MONITORING_LOG_ENABLED = dbutils.widgets.get("monitoring_log_enabled").strip()
 MONITORING_LOG_TABLE = dbutils.widgets.get("monitoring_log_table").strip()
 JOB_RUN_ID_PARAM = dbutils.widgets.get("job_run_id").strip()
+# A literal "{{" means the Jobs service did not substitute it (an interactive run): treat it as unset ("").
 TASK_RUN_ID = dbutils.widgets.get("task_run_id").strip()
+if "{{" in TASK_RUN_ID:
+    TASK_RUN_ID = ""
 if not CONFIG_NAME:
     raise ValueError("missing required parameter: config_name")
 
@@ -469,11 +472,11 @@ if MAX_PARTITION_BYTES != "0":
 _RUN_TRIGGER = ((f"continuous({STREAMING_TRIGGER_INTERVAL})" if STREAMING_TRIGGER_INTERVAL else "availableNow")
                 if PIPELINE_MODE == "streaming" else None)
 RECORDER = RunRecorder(MONITORING_LOG, CONFIG_NAME, JOB_RUN_ID,
-                       {"mode": PIPELINE_MODE, "es_index": cfg["es_index_name"], "trigger": _RUN_TRIGGER})
+                       {"mode": PIPELINE_MODE, "es_index": cfg["es_index_name"], "trigger": _RUN_TRIGGER},
+                       task_run_id=TASK_RUN_ID)
 RECORDER.start({
     "view": VIEW_FQN, "source": SOURCE_FQN, "environment": ENVIRONMENT,
     "connector_version": _connector_version, "filter_condition": FILTER_CONDITION,
-    "task_run_id": TASK_RUN_ID if TASK_RUN_ID and "{{" not in TASK_RUN_ID else None,
     "write_overrides": write_overrides, "write_repartition": WRITE_REPARTITION,
     "streaming_start": STREAMING_START if PIPELINE_MODE == "streaming" else None,
     "checkpoint": f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}" if PIPELINE_MODE == "streaming" else None,
@@ -541,7 +544,8 @@ if PIPELINE_MODE == "batch":
         if WRITE_REPARTITION > 0:
             export_df = export_df.repartition(WRITE_REPARTITION)
         result = run_batch_export(export_df, es_write_config, bulk_write=bulk_write, reconcile=reconcile_or_raise,
-                                  log=MONITORING_LOG, config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID, session=spark)
+                                  log=MONITORING_LOG, config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID,
+                                  task_run_id=TASK_RUN_ID, session=spark)
         RUN_SUMMARY = (f"written={result['written']} deleted={result['deleted']} errors={result['errors']} "
                        f"ignored={result['ignored']} total_input={result['total_input']}")
         print(f"BATCH EXPORT COMPLETE: {RUN_SUMMARY}")
@@ -657,12 +661,13 @@ if PIPELINE_MODE == "streaming":
         # -> batch_end (+ ES diagnostics) -> print relay. Its order and failure handling are unit-tested.
         foreach_batch = make_foreach_batch(
             transform=_transform, bulk_write=bulk_write, write_config=es_write_config, log=MONITORING_LOG,
-            config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID, write_metrics=_write_metrics,
+            config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID, task_run_id=TASK_RUN_ID, write_metrics=_write_metrics,
             write_print_relay=_write_print_relay if _BULK_STATS_ON else None)
         # Records each batch's Spark progress report (STREAM_PROGRESS line + batch_summary row) between the wait
         # loop's slices (pipeline_lib.stream_progress).
         PROGRESS = ProgressRecorder(MONITORING_LOG, CONFIG_NAME, JOB_RUN_ID, spark,
-                                    read_print_relay=_read_print_relay if _BULK_STATS_ON else None)
+                                    read_print_relay=_read_print_relay if _BULK_STATS_ON else None,
+                                    task_run_id=TASK_RUN_ID)
         # How often the wait loop (pipeline_lib.stream_wait) checks the stream between waits.
         POLL_SECONDS = 10
 

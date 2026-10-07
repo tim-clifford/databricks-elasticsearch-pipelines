@@ -15,13 +15,14 @@ from pipeline_lib.monitoring_sink import error_facts, run_end_row, run_start_row
 
 class RunRecorder:
     """Writes this run's run-level rows through a MonitoringLog. `identity` (mode, es_index, trigger) is
-    repeated on run_end so either row alone says what ran. `clock` returns the current UTC datetime (injected
-    for tests)."""
+    repeated on run_end so either row alone says what ran. `task_run_id` is this attempt's {{task.run_id}} (""
+    on an interactive run). `clock` returns the current UTC datetime (injected for tests)."""
 
-    def __init__(self, log, config_name, job_run_id, identity, clock=None):
+    def __init__(self, log, config_name, job_run_id, identity, task_run_id="", clock=None):
         self.log = log
         self.config_name = config_name
         self.job_run_id = job_run_id
+        self.task_run_id = task_run_id
         self.identity = dict(identity)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.started_at = None
@@ -30,12 +31,13 @@ class RunRecorder:
     def start(self, facts, session):
         """Write run_start: the identity plus `facts` (the run's effective settings). Raises on a log failure."""
         self.started_at = self._clock()
-        self.log.append([run_start_row(self.config_name, self.job_run_id, {**self.identity, **facts},
+        self.log.append([run_start_row(self.config_name, self.job_run_id, self.task_run_id, {**self.identity, **facts},
                                        self.started_at)], session)
 
     def end(self, status, facts, session):
         """Write run_end for an in-process ending (status success | stopped). Raises on a log failure."""
-        self.log.append([run_end_row(self.config_name, self.job_run_id, status, {**self.identity, **facts},
+        self.log.append([run_end_row(self.config_name, self.job_run_id, self.task_run_id, status,
+                                     {**self.identity, **facts},
                                      self.started_at, self._clock())], session)
         self.ended = True
 
@@ -50,7 +52,7 @@ class RunRecorder:
                 self.ended = True
                 end = self._clock()
                 elapsed = ((end - self.started_at).total_seconds() * 1000.0) if self.started_at else None
-                self.log.append_failure([run_end_row(self.config_name, self.job_run_id, "error", {
+                self.log.append_failure([run_end_row(self.config_name, self.job_run_id, self.task_run_id, "error", {
                     **self.identity, **error_facts(exc), "elapsed_ms": elapsed,
                 }, self.started_at, end)], exc, session)
             raise

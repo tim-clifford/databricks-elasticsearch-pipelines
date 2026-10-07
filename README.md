@@ -950,9 +950,27 @@ SCHEMA`) on the target schema; the export jobs only ever **append**, so their ru
 pipeline's own `monitoring_log_enabled:`, or a per-run `--params monitoring_log_enabled=true`, the same
 three-layer precedence as every knob).
 
-**What lands in the table: the row model.** One append-only table. Every row has `config_name`,
-`job_run_id`, `record_type`, `status`, `batch_id`, `event_ts`, `batch_start_ts`, `batch_end_ts`, a
-`VARIANT` `payload`, and a write-time `ingest_ts`. There are two levels, each with a start and an end:
+**What lands in the table: the row model.** One append-only table. Every column carries a `COMMENT`
+describing it (`DESCRIBE TABLE <table>` or Catalog Explorer shows them), defined next to the column in
+`pipeline_lib/monitoring_sink.py`:
+
+| Column | Holds |
+|---|---|
+| `config_name` | the pipeline config that wrote the row |
+| `job_run_id` | `{{job.run_id}}`: shared by every retry of the task, so it groups all attempts of one job run |
+| `task_run_id` | `{{task.run_id}}`: one per task attempt, so it tells the retries apart (NULL on an interactive run) |
+| `record_type`, `status` | the row kind and its outcome (table below) |
+| `batch_id` | the micro-batch id, or `0` for a batch-mode run; NULL on run rows |
+| `event_ts` | when the event this row records happened (clustering key) |
+| `start_ts`, `end_ts` | the span of the run or batch the row describes (`end_ts` NULL on `run_start` / `batch_start`) |
+| `docs_written` | documents written by the batch (`batch_end`) or the whole run (`run_end`) |
+| `error_type`, `error_message` | the exception on status `error` rows |
+| `files_outstanding`, `bytes_outstanding` | `batch_summary` only: the streaming backlog left after the batch (Spark's `numFilesOutstanding` / `numBytesOutstanding`) |
+| `payload` | `VARIANT`: everything else the row records |
+| `logged_ts` | when the row was committed to the table (retention is on this) |
+
+The surfaced columns (`docs_written` through `bytes_outstanding`) are copies of payload fields, NULL on the
+rows they don't apply to. There are two levels, each with a start and an end:
 
 | `record_type` | When it is written | `status` | `payload` |
 |---|---|---|---|
@@ -972,13 +990,14 @@ later, best-effort by nature. A `batch_end` with no `batch_summary` is a streami
 `stopped` is a continuous stream whose query ended without an error while the notebook kept running. A
 **job cancel is not that**: it interrupts the notebook itself (seen live), so a cancelled run leaves
 `run_start` with no `run_end`, exactly like a killed run.
-`batch_start_ts`/`batch_end_ts` carry the run's or batch's wall clock (for `batch_summary`, Spark's trigger
+`start_ts`/`end_ts` carry the run's or batch's wall clock (for `batch_summary`, Spark's trigger
 timestamp + `batchDuration`).
 
 **Reading the gaps.** A `batch_start` with no `batch_end` is a batch that never finished (the task was
 killed, or the driver died mid-write); a `run_start` with no `run_end` is a run that was killed
 outright or **cancelled** (a cancel interrupts the notebook before it can write `run_end`).
-A batch retried by the task's retry policy shows a second `batch_start` for the same `batch_id`.
+A batch retried by the task's retry policy shows a second `batch_start` for the same `batch_id`, under the
+retry's own `task_run_id`.
 Per-partition bulk-send detail is **not** stored (too granular for this log); it still prints in the run
 log when `bulk_stats` is on.
 
@@ -997,32 +1016,30 @@ written and nothing about the export changes.
 Example: every batch of the last day, with its outcome and duration:
 
 ```sql
-SELECT config_name, job_run_id, batch_id, status,
-       batch_start_ts, batch_end_ts,
-       timestampdiff(MILLISECOND, batch_start_ts, batch_end_ts) AS batch_ms,
-       payload:written::bigint AS written, payload:message::string AS error
+SELECT config_name, job_run_id, task_run_id, batch_id, status, start_ts, end_ts,
+       timestampdiff(MILLISECOND, start_ts, end_ts) AS batch_ms,
+       docs_written, error_type, error_message
 FROM <catalog>.<schema>.<table>
 WHERE record_type = 'batch_end' AND event_ts > current_timestamp() - INTERVAL 1 DAY
-ORDER BY batch_start_ts DESC;
+ORDER BY start_ts DESC;
 ```
 
 Example: batches that started but never finished (killed mid-write):
 
 ```sql
-SELECT s.config_name, s.job_run_id, s.batch_id, s.batch_start_ts
+SELECT s.config_name, s.job_run_id, s.task_run_id, s.batch_id, s.start_ts
 FROM <catalog>.<schema>.<table> s
 LEFT ANTI JOIN <catalog>.<schema>.<table> e
-  ON e.record_type = 'batch_end' AND e.job_run_id = s.job_run_id AND e.config_name = s.config_name
- AND e.batch_id = s.batch_id AND e.event_ts >= s.event_ts
+  ON e.record_type = 'batch_end' AND e.config_name = s.config_name AND e.job_run_id = s.job_run_id
+ AND e.task_run_id <=> s.task_run_id AND e.batch_id = s.batch_id AND e.event_ts >= s.event_ts
 WHERE s.record_type = 'batch_start'
-ORDER BY s.batch_start_ts DESC;
+ORDER BY s.start_ts DESC;
 ```
 
 Example: streaming backlog and 429 pressure per micro-batch:
 
 ```sql
-SELECT e.config_name, e.batch_id, e.batch_start_ts,
-       s.payload:progress.sources[0].metrics.numFilesOutstanding::bigint AS files_outstanding,
+SELECT e.config_name, e.batch_id, e.start_ts, s.files_outstanding, s.bytes_outstanding,
        e.payload:es.overall.rejected_429::bigint AS docs_429,
        e.payload:es.overall.docs_per_send::double AS docs_per_send
 FROM <catalog>.<schema>.<table> e
@@ -1030,7 +1047,7 @@ LEFT JOIN <catalog>.<schema>.<table> s
   ON s.record_type = 'batch_summary' AND s.config_name = e.config_name AND s.job_run_id = e.job_run_id
  AND s.batch_id = e.batch_id
 WHERE e.record_type = 'batch_end' AND e.status = 'success'
-ORDER BY e.batch_start_ts DESC;
+ORDER BY e.start_ts DESC;
 ```
 
 The table is **liquid-clustered** on `(config_name, event_ts)` (the columns monitoring queries filter by),
@@ -1050,10 +1067,31 @@ on demand:
 databricks bundle run log_table_prune -t <target> -p <profile>
 ```
 
-**Evolving the schema.** `_log table create` is **re-runnable**: when a newer build adds a column, re-run
-the job and it **additively** applies the new columns (`ALTER TABLE ADD COLUMNS`) and ensures clustering,
-**without** dropping or replacing the table, so existing rows are preserved. It never drops or renames a
-column (an obsolete column is warned, not removed). **Upgrading to this row model** (the `status` column
+**Evolving the schema.** `_log table create` is **re-runnable** (the logic is in
+`pipeline_lib/log_table_migration.py`). On an existing table it **additively** adds the columns a newer
+build introduced (`ALTER TABLE ADD COLUMNS`, with their comments), sets every column comment that changed
+in one `ALTER`, ensures clustering, and backfills the new columns on rows an older build wrote, **without**
+dropping or replacing the table, so existing rows are preserved. It never drops a column: a renamed one is
+kept and marked `DEPRECATED` in its comment, and any other unknown column is warned about. A re-run with
+nothing to do changes nothing (the backfill only selects rows not yet backfilled).
+
+**Upgrading to the renamed columns** (`batch_start_ts` / `batch_end_ts` / `ingest_ts` became `start_ts` /
+`end_ts` / `logged_ts`, plus `task_run_id` and the surfaced columns):
+1. Re-run `_log table create` **before** deploying the new export jobs. It adds the new columns, marks the
+   old ones `DEPRECATED`, and backfills every existing row (the run summary reports `backfilled_rows`).
+   Jobs still running the old build keep appending (their rows leave the new columns NULL). With the log
+   on, a new-build job against an un-migrated table fails its first append, before any data moves.
+2. Deploy, and restart the export jobs on the new build. New rows fill only the new columns.
+3. Re-run `_log table create` once more after **every** job runs the new build: it backfills the rows the
+   old jobs wrote between steps 1 and 2. Until then those rows have NULL `logged_ts`, so retention skips
+   them (it never deletes them early).
+
+Each schema change in step 1 is a Delta metadata commit, which can conflict with a log append that a
+running job has in flight; that fails the task once (fail-closed), and its retry policy restarts it.
+
+The backfill copies the old timestamp columns and derives the surfaced columns from the payload with the
+same rules the writer uses; `task_run_id` is filled only on old `run_start` rows (the old build kept it in
+that payload). The deprecated columns are dropped in a later release, once nothing reads them. **Upgrading from the earlier row model** (before the `status` column
 and the `run_start` ... `batch_summary` record types): re-run `_log table create` once **before** deploying
 the new export jobs, so `status` exists when they start appending (with the log on, an append into a table
 without it fails the task). Rows written by the previous model keep their old record types
@@ -1134,8 +1172,8 @@ Shared notebooks (run by the jobs, not edited per pipeline):
                                 exports to Elasticsearch via the connector - batch (bulk_write over the
                                 deployed view) or streaming (view SELECT over each source micro-batch)
     log_table_create.py         Run by the _log table create job: creates the shared monitoring Delta
-                                table (CREATE TABLE IF NOT EXISTS, idempotent + additive re-run
-                                migration; see Durable monitoring)
+                                table, or migrates an existing one (pipeline_lib.log_table_migration;
+                                see Durable monitoring)
     log_table_prune.py          Run by the _log table prune job: retention for the monitoring table
                                 (DELETE old rows, then OPTIMIZE + VACUUM; see Durable monitoring)
 
@@ -1146,11 +1184,14 @@ Shared library + tests (the config schema, used by the generator and both notebo
     monitoring_sink.py          Pure schema + row builders for the durable monitoring log (single
                                 source of truth for the table columns and row model, shared by the
                                 writer + creator)
+    log_table_migration.py      The _log table create job's create-or-migrate step (add columns,
+                                comments, clustering, backfill), unit-tested with a fake session
     stream_wait.py              The streaming wait loop (short awaitTermination slices + an isActive
                                 liveness check), so a failed stream always fails the task
   tests/
     test_config.py              Offline unit tests for pipeline_lib.config (plain pytest)
     test_monitoring_sink.py     Offline unit tests for pipeline_lib.monitoring_sink
+    test_log_table_migration.py Offline unit tests for pipeline_lib.log_table_migration (fake session)
     test_stream_wait.py         Offline unit tests for pipeline_lib.stream_wait (fake query)
 
 Generated / tooling (do not hand-edit the generated jobs):
