@@ -3,7 +3,9 @@ column set. The notebook (notebooks/log_table_create.py) resolves the table name
 logic lives here, with the Spark session passed in, so it is unit-tested with a fake session.
 
 RE-RUNNABLE and ADDITIVE: CREATE TABLE IF NOT EXISTS creates the table with every column, its comment, and the
-liquid clustering, and is a no-op on an existing table. On an existing table this then adds the columns the
+liquid clustering, and is a no-op on an existing table. Clustering is not re-applied to an existing table: every
+earlier build's create job set it (the previous one re-applied CLUSTER BY on each run), so every table already
+has it. On an existing table this then adds the columns the
 schema has and the table lacks (missing_columns: ADD COLUMNS, comments included; existing rows get NULL). That is
 the path for a column added to MONITORING_TABLE_COLUMNS later: re-run this job BEFORE deploying the build that
 writes it, because a writer fails closed on a table that lacks one of its columns. It never drops a column it
