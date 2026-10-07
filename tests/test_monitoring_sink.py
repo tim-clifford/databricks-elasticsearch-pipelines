@@ -3,8 +3,7 @@
 The load-bearing contracts:
 - The DDL (MONITORING_TABLE_COLUMNS) and the row shape (ROW_FIELDS) cannot drift: ROW_FIELDS is exactly
   the columns minus the writer-supplied logged_ts.
-- The surfaced columns are copied from the payload by ONE rule set (SURFACED_COLUMNS) that both the builders
-  and the migration's backfill_sql use, so new rows and backfilled old rows agree.
+- The surfaced columns are copied from the payload by ONE rule set (SURFACED_COLUMNS) and one strict cast rule.
 - The row vocabulary is CLOSED: RECORD_TYPES x STATUSES, with each record_type allowed only its own
   statuses, and batch rows (and only batch rows) carrying a batch id.
 - Builders FAIL CLOSED: a malformed row raises rather than being silently dropped, because with the log on
@@ -20,7 +19,6 @@ import pytest
 from pipeline_lib.monitoring_sink import (
     BATCH_MODE_BATCH_ID,
     CLUSTER_BY_COLUMNS,
-    DEPRECATED_COLUMNS,
     MAX_ERROR_MESSAGE_CHARS,
     MONITORING_TABLE_COLUMNS,
     RECORD_TYPES,
@@ -28,17 +26,12 @@ from pipeline_lib.monitoring_sink import (
     STATUSES,
     SURFACED_COLUMNS,
     alter_add_columns_sql,
-    alter_cluster_by_sql,
-    alter_column_comments_sql,
     assert_columns_consistent,
-    backfill_sql,
     batch_end_row,
     batch_start_row,
     batch_success_facts,
     batch_summary_row,
-    comment_changes,
     create_table_sql,
-    deprecated_comment,
     error_facts,
     es_counts,
     es_write_summary,
@@ -88,25 +81,9 @@ def test_table_has_expected_columns_and_types():
     }
 
 
-def test_deprecated_columns_map_old_names_to_new_ones():
-    assert DEPRECATED_COLUMNS == (("batch_start_ts", "start_ts"), ("batch_end_ts", "end_ts"),
-                                  ("ingest_ts", "logged_ts"))
-
-
 def test_every_column_has_a_sql_safe_comment():
     for name, _t, comment in MONITORING_TABLE_COLUMNS:
         assert comment and "'" not in comment and "\\" not in comment, name
-    for _old, new in DEPRECATED_COLUMNS:
-        assert deprecated_comment(new).startswith("DEPRECATED: replaced by " + new)
-
-
-@pytest.mark.parametrize("bad", [("config_name", "start_ts"), ("batch_start_ts", "no_such_column")])
-def test_assert_columns_consistent_catches_a_bad_deprecated_column(monkeypatch, bad):
-    # An old name that is still a live column, or a replacement that is not a column.
-    from pipeline_lib import monitoring_sink as ms
-    monkeypatch.setattr(ms, "DEPRECATED_COLUMNS", ms.DEPRECATED_COLUMNS + (bad,))
-    with pytest.raises(AssertionError):
-        ms.assert_columns_consistent()
 
 
 def test_assert_columns_consistent_catches_a_surfaced_column_that_is_not_a_column(monkeypatch):
@@ -397,16 +374,14 @@ def test_bigint_surfacing_takes_integers_and_digit_strings_only(value, expected)
 
 
 def test_a_value_that_does_not_cast_falls_through_to_the_next_path():
-    # Like the backfill's coalesce over the same paths.
+    # The paths are tried in order until one casts.
     row = run_end_row("c", "r", "t", "success", {"written": "lots", "rows_pushed": 34}, START, END)
     assert row["docs_written"] == 34
 
 
-# The strict cast rule, as MEASURED on a serverless SQL warehouse (2026-10-07) by running _cast_sql over each JSON
-# value: (value, bigint result, string result). The Python rule must give the same answers, so a new row and a
-# backfilled old row agree. Spark's plain variant cast differs (true -> 1, 1.5 -> 1, 5 -> "5"), which is why
-# _cast_sql checks the type first.
-MEASURED_CASTS = [
+# The strict cast rule: (value, bigint result, string result). Spark's own variant cast is looser (true -> 1,
+# 1.5 -> 1, 5 -> "5"); the surfaced columns deliberately are not.
+STRICT_CASTS = [
     (5, 5, None), (9000000000, 9000000000, None), (2 ** 63, None, None), (-2 ** 63, -2 ** 63, None),
     (True, None, None), (1.5, None, None), (5.0, None, None), ("19", 19, "19"), (" 5", None, " 5"),
     ("5\n", 5, "5\n"), ("+5", None, "+5"), ("5.5", None, "5.5"), ("", None, ""), (None, None, None),
@@ -414,22 +389,11 @@ MEASURED_CASTS = [
 ]
 
 
-@pytest.mark.parametrize("value,as_bigint,as_string", MEASURED_CASTS)
-def test_python_cast_rule_matches_the_measured_sql(value, as_bigint, as_string):
+@pytest.mark.parametrize("value,as_bigint,as_string", STRICT_CASTS)
+def test_strict_cast_rule(value, as_bigint, as_string):
     from pipeline_lib.monitoring_sink import _cast_value
     assert _cast_value(value, "bigint") == as_bigint
     assert _cast_value(value, "string") == as_string
-
-
-def test_cast_sql_checks_the_variant_type_before_casting():
-    from pipeline_lib.monitoring_sink import _cast_sql
-    assert _cast_sql("$.a", "string") == (
-        "CASE WHEN schema_of_variant(try_variant_get(payload, '$.a')) = 'STRING' "
-        "THEN try_variant_get(payload, '$.a', 'string') END")
-    assert _cast_sql("$.a", "bigint") == (
-        "CASE schema_of_variant(try_variant_get(payload, '$.a')) WHEN 'BIGINT' THEN try_variant_get(payload, '$.a', "
-        "'bigint') WHEN 'STRING' THEN CASE WHEN regexp_like(try_variant_get(payload, '$.a', 'string'), '^-?[0-9]+$') "
-        "THEN try_cast(try_variant_get(payload, '$.a', 'string') AS BIGINT) END END")
 
 
 def test_string_surfacing_rejects_non_strings():
@@ -500,8 +464,8 @@ def test_create_table_sql_is_idempotent_and_has_every_column():
     assert "USING DELTA" in sql
     for name, sql_type, comment in MONITORING_TABLE_COLUMNS:
         assert f"{name} {sql_type} COMMENT '{comment}'" in sql
-    for old, _new in DEPRECATED_COLUMNS:
-        assert old not in sql  # a fresh table never gets the deprecated columns
+    for old in ("batch_start_ts", "batch_end_ts", "ingest_ts"):
+        assert old not in sql  # the retired names
 
 
 def test_create_table_sql_validates_name():
@@ -524,21 +488,16 @@ def test_create_table_sql_has_cluster_by_before_tblproperties():
     assert sql.index("USING DELTA") < sql.index("CLUSTER BY")
 
 
-# --- additive migration: missing_columns / alter_add_columns_sql / alter_cluster_by_sql --------
-
-# The columns a table created by the previous build (#61) has.
-PREVIOUS_BUILD_COLUMNS = ["config_name", "job_run_id", "record_type", "batch_id", "event_ts", "batch_start_ts",
-                          "batch_end_ts", "payload", "ingest_ts", "status"]
-
+# --- adding a future column: missing_columns / alter_add_columns_sql ----------------------------
 
 def test_missing_columns_additive_only():
     all_names = [name for name, _t, _c in MONITORING_TABLE_COLUMNS]
     # Nothing missing when every column is present (order-insensitive).
     assert missing_columns(list(reversed(all_names))) == []
-    # The previous build's table => exactly the new columns, in schema order, with types and comments.
-    got = missing_columns(PREVIOUS_BUILD_COLUMNS)
-    assert [n for n, _t, _c in got] == ["task_run_id", "start_ts", "end_ts", "docs_written", "error_type",
-                                        "error_message", "files_outstanding", "bytes_outstanding", "logged_ts"]
+    # A table lacking columns (as one created before a column was added) => exactly those, in schema order, with
+    # their types and comments.
+    got = missing_columns([n for n in all_names if n not in ("docs_written", "logged_ts")])
+    assert [n for n, _t, _c in got] == ["docs_written", "logged_ts"]
     assert all(col in MONITORING_TABLE_COLUMNS for col in got)
     # Extra columns in the table are NEVER reported for dropping (additive allow-list).
     assert missing_columns(all_names + ["some_future_col"]) == []
@@ -555,118 +514,7 @@ def test_alter_add_columns_sql_rejects_an_unsafe_comment():
         alter_add_columns_sql("cat.sch.t", [("x", "STRING", "a'; DROP TABLE y; --")])
 
 
-# --- column comments ---------------------------------------------------------------------------
-
-def _current_comments():
-    return {name: comment for name, _t, comment in MONITORING_TABLE_COLUMNS}
-
-
-def test_comment_changes_none_when_everything_is_current():
-    current = {**_current_comments(), **{old: deprecated_comment(new) for old, new in DEPRECATED_COLUMNS}}
-    assert comment_changes(current) == []
-    assert alter_column_comments_sql("cat.sch.t", comment_changes(current)) is None
-
-
-def test_comment_changes_on_the_previous_build_table():
-    # Old columns had no comments; the new ones were just added WITH their comments.
-    existing = {n: None for n in PREVIOUS_BUILD_COLUMNS}
-    existing.update({n: c for n, c in _current_comments().items() if n not in existing})
-    changes = dict(comment_changes(existing))
-    assert set(changes) == {"config_name", "job_run_id", "record_type", "batch_id", "event_ts", "payload",
-                            "status", "batch_start_ts", "batch_end_ts", "ingest_ts"}
-    assert changes["batch_start_ts"] == deprecated_comment("start_ts")
-    assert changes["ingest_ts"] == deprecated_comment("logged_ts")
-    assert changes["payload"] == _current_comments()["payload"]
-
-
-def test_comment_changes_skips_columns_the_table_lacks():
-    assert comment_changes({"config_name": "old text"}) == [("config_name", _current_comments()["config_name"])]
-
-
-def test_alter_column_comments_sql_is_one_statement():
-    sql = alter_column_comments_sql("cat.sch.t", [("a", "x y"), ("b", "z")])
-    assert sql == "ALTER TABLE cat.sch.t ALTER COLUMN a COMMENT 'x y', b COMMENT 'z'"
-
-
-def test_alter_column_comments_sql_fail_closed():
-    with pytest.raises(ValueError):
-        alter_column_comments_sql("bad name", [("a", "x")])
-    with pytest.raises(ValueError, match="column comment"):
-        alter_column_comments_sql("cat.sch.t", [("a", "it's")])
-
-
-# --- backfill_sql ------------------------------------------------------------------------------
-
-def test_backfill_sql_previous_build_table():
-    sql = backfill_sql("cat.sch.t", PREVIOUS_BUILD_COLUMNS)
-    assert sql.startswith("UPDATE cat.sch.t SET\n")
-    assert sql.endswith("\nWHERE logged_ts IS NULL AND ingest_ts IS NOT NULL")
-    for old, new in DEPRECATED_COLUMNS:
-        assert f"  {new} = {old}," in sql
-    assert ("task_run_id = CASE WHEN record_type = 'run_start' THEN try_variant_get(payload, '$.task_run_id', "
-            "'string') END") in sql
-    from pipeline_lib.monitoring_sink import _cast_sql
-    b = lambda path: _cast_sql(path, "bigint")  # noqa: E731
-    t = lambda path: _cast_sql(path, "string")  # noqa: E731
-    assert (f"docs_written = CASE WHEN record_type IN ('batch_end', 'run_end') THEN "
-            f"coalesce({b('$.written')}, {b('$.rows_pushed')}) END") in sql
-    assert f"error_type = CASE WHEN status = 'error' THEN {t('$.exception_type')} END" in sql
-    assert f"error_message = CASE WHEN status = 'error' THEN {t('$.message')} END" in sql
-    assert (f"files_outstanding = CASE WHEN record_type IN ('batch_summary') THEN "
-            f"{b('$.progress.sources[0].metrics.numFilesOutstanding')} END") in sql
-    assert (f"bytes_outstanding = CASE WHEN record_type IN ('batch_summary') THEN "
-            f"{b('$.progress.sources[0].metrics.numBytesOutstanding')} END") in sql
-
-
-@pytest.mark.parametrize("key", ["a b", "a'b", "a.b", "$"])
-def test_variant_path_rejects_a_non_identifier_key(key):
-    from pipeline_lib.monitoring_sink import _variant_path
-    with pytest.raises(ValueError, match="not a plain identifier"):
-        _variant_path(("progress", key))
-
-
-def test_variant_path_formats_keys_and_indexes():
-    from pipeline_lib.monitoring_sink import _variant_path
-    assert _variant_path(("progress", "sources", 0, "metrics")) == "$.progress.sources[0].metrics"
-
-
-def test_surfaced_sql_without_row_constraints_is_unguarded():
-    from pipeline_lib.monitoring_sink import _cast_sql, _surfaced_sql
-    assert _surfaced_sql("col", None, None, (("x",),), "bigint") == "col = " + _cast_sql("$.x", "bigint")
-
-
-def test_surfaced_sql_combines_record_type_and_status_guards():
-    from pipeline_lib.monitoring_sink import _cast_sql, _surfaced_sql
-    assert _surfaced_sql("col", ("run_end",), "error", (("x",),), "string") == (
-        "col = CASE WHEN record_type IN ('run_end') AND status = 'error' THEN " + _cast_sql("$.x", "string") + " END")
-
-
-def test_backfill_sql_sets_every_surfaced_column():
-    sql = backfill_sql("cat.sch.t", PREVIOUS_BUILD_COLUMNS)
-    for column, *_rest in SURFACED_COLUMNS:
-        assert f"  {column} = " in sql
-
-
-def test_backfill_sql_copies_only_the_deprecated_columns_present():
-    sql = backfill_sql("cat.sch.t", [c for c in PREVIOUS_BUILD_COLUMNS if c not in ("batch_start_ts", "batch_end_ts")])
-    assert "batch_start_ts" not in sql and "batch_end_ts" not in sql
-    assert "logged_ts = ingest_ts" in sql
-
-
-def test_backfill_sql_none_on_a_table_with_no_older_rows():
-    assert backfill_sql("cat.sch.t", [n for n, _t, _c in MONITORING_TABLE_COLUMNS]) is None
-
-
-def test_backfill_sql_fail_closed_on_bad_name():
-    with pytest.raises(ValueError):
-        backfill_sql("bad name", PREVIOUS_BUILD_COLUMNS)
-
-
-def test_alter_cluster_by_sql():
-    assert alter_cluster_by_sql("cat.sch.t") == f"ALTER TABLE cat.sch.t CLUSTER BY ({', '.join(CLUSTER_BY_COLUMNS)})"
-
-
-@pytest.mark.parametrize("fn", [alter_cluster_by_sql, optimize_sql, vacuum_sql])
+@pytest.mark.parametrize("fn", [optimize_sql, vacuum_sql])
 def test_maintenance_sql_fail_closed_on_bad_name(fn):
     with pytest.raises(ValueError):
         fn("bad name")
