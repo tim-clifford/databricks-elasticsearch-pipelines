@@ -618,6 +618,29 @@ def test_backfill_sql_previous_build_table():
             f"{b('$.progress.sources[0].metrics.numBytesOutstanding')} END") in sql
 
 
+@pytest.mark.parametrize("key", ["a b", "a'b", "a.b", "$"])
+def test_variant_path_rejects_a_non_identifier_key(key):
+    from pipeline_lib.monitoring_sink import _variant_path
+    with pytest.raises(ValueError, match="not a plain identifier"):
+        _variant_path(("progress", key))
+
+
+def test_variant_path_formats_keys_and_indexes():
+    from pipeline_lib.monitoring_sink import _variant_path
+    assert _variant_path(("progress", "sources", 0, "metrics")) == "$.progress.sources[0].metrics"
+
+
+def test_surfaced_sql_without_row_constraints_is_unguarded():
+    from pipeline_lib.monitoring_sink import _cast_sql, _surfaced_sql
+    assert _surfaced_sql("col", None, None, (("x",),), "bigint") == "col = " + _cast_sql("$.x", "bigint")
+
+
+def test_surfaced_sql_combines_record_type_and_status_guards():
+    from pipeline_lib.monitoring_sink import _cast_sql, _surfaced_sql
+    assert _surfaced_sql("col", ("run_end",), "error", (("x",),), "string") == (
+        "col = CASE WHEN record_type IN ('run_end') AND status = 'error' THEN " + _cast_sql("$.x", "string") + " END")
+
+
 def test_backfill_sql_sets_every_surfaced_column():
     sql = backfill_sql("cat.sch.t", PREVIOUS_BUILD_COLUMNS)
     for column, *_rest in SURFACED_COLUMNS:

@@ -155,8 +155,15 @@ def test_table_missing_after_create_fails_closed():
 def test_backfill_count_read_failure_only_warns():
     printed = []
     summary = create_or_migrate(FakeSpark(PREVIOUS_BUILD, updated=OSError("no rows")), TABLE, printer=printed.append)
-    assert "backfilled_rows=None" in summary
+    assert "backfilled_rows=unknown" in summary
     assert any("could not read the backfilled row count" in p for p in printed)
+
+
+def test_rerun_with_an_unreadable_backfill_count_is_still_reported_as_a_migration():
+    spark = FakeSpark(PREVIOUS_BUILD)
+    create_or_migrate(spark, TABLE, printer=lambda *_: None)
+    summary = create_or_migrate(FakeSpark(spark.columns, updated=OSError("no rows")), TABLE, printer=lambda *_: None)
+    assert "outcome=MIGRATED(added=[], commented=[], backfilled_rows=unknown)" in summary
 
 
 def test_bad_table_name_fails_before_any_sql():

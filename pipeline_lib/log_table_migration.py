@@ -84,6 +84,7 @@ def _migrate(spark, table, printer):
             backfilled = result.collect()[0]["num_affected_rows"]
         except Exception as exc:  # noqa: BLE001 - the UPDATE ran; only the count read is best-effort
             printer(f"  WARNING: could not read the backfilled row count ({type(exc).__name__}: {exc})")
+            backfilled = "unknown"  # the UPDATE ran, so this is a migration, not ALREADY_EXISTS
         printer(f"  backfilled rows: {backfilled}")
 
     expected = [name for name, _type, _comment in MONITORING_TABLE_COLUMNS]
