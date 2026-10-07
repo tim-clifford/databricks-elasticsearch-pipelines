@@ -190,6 +190,19 @@ def test_a_failed_drop_warns_with_only_the_first_line_of_the_error():
     assert "DELTA_UNSUPPORTED_DROP_COLUMN.ENABLE_COLUMN_MAPPING" in warning
 
 
+def test_a_failed_drop_warning_caps_a_long_first_line():
+    class LongLine(FakeSpark):
+        def sql(self, stmt):
+            if " DROP COLUMNS " in stmt:
+                self.statements.append(stmt)
+                raise RuntimeError("E" * 1000)
+            return super().sql(stmt)
+    printed = []
+    create_or_migrate(LongLine({**_current(), **{c: None for c in RETIRED}}), TABLE, printer=printed.append)
+    warning, = [p for p in printed if p.startswith("WARNING")]
+    assert "E" * 500 in warning and "E" * 501 not in warning
+
+
 def test_drop_never_enables_column_mapping():
     spark = FakeSpark({**_current(), **{c: None for c in RETIRED}}, fail_on=f"ALTER TABLE {TABLE} DROP")
     create_or_migrate(spark, TABLE, printer=_quiet())

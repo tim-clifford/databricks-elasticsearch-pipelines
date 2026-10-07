@@ -73,7 +73,9 @@ def _drop_retired_columns(spark, table, existing_cols, printer):
 
     It drops only when no row would lose data: first it counts the rows where a retired column holds a value its
     current column lacks (a table the earlier build's backfill never ran on). Any such row, or a failed count,
-    keeps the columns. Delta allows DROP COLUMNS only with column mapping enabled on the table; this never
+    keeps the columns. The check and the drop are two statements, so run this only when no job on a build from
+    before the column rename is still appending (only those write the retired columns; in dev and stg every job
+    already runs a later build). Delta allows DROP COLUMNS only with column mapping enabled on the table; this never
     enables it (that is an irreversible table-protocol upgrade). Every failure here only WARNS: the retired
     columns are NULL on every new row and harmless, so they are left for a deliberate manual drop."""
     pairs = [(old, new) for old, new in RETIRED_COLUMNS if old in existing_cols]

@@ -1080,7 +1080,8 @@ unknown column is warned about and left alone.
 `batch_start_ts`, `batch_end_ts` and `ingest_ts`, the old names of `start_ts`, `end_ts` and `logged_ts`.
 Until that is done everywhere, `_log table create` drops them in one `ALTER TABLE ... DROP COLUMNS`, but only
 after checking that no row holds a value there that its current column lacks (a table the earlier build's
-backfill never ran on keeps them, with a warning, so no timestamp is lost). Delta allows the drop only with
+backfill never ran on keeps them, with a warning, so no timestamp is lost; run it only once no job on a build
+from before the column rename is still appending, since only those write the retired columns). Delta allows the drop only with
 column mapping enabled (`delta.columnMapping.mode = 'name'`); the job never enables it, and if the drop fails
 it only warns and leaves the columns (they are NULL on new rows and harmless). This step is removed once it
 has run in stg.
