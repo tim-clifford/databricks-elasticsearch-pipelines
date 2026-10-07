@@ -100,6 +100,15 @@ def test_every_column_has_a_sql_safe_comment():
         assert deprecated_comment(new).startswith("DEPRECATED: replaced by " + new)
 
 
+@pytest.mark.parametrize("bad", [("config_name", "start_ts"), ("batch_start_ts", "no_such_column")])
+def test_assert_columns_consistent_catches_a_bad_deprecated_column(monkeypatch, bad):
+    # An old name that is still a live column, or a replacement that is not a column.
+    from pipeline_lib import monitoring_sink as ms
+    monkeypatch.setattr(ms, "DEPRECATED_COLUMNS", ms.DEPRECATED_COLUMNS + (bad,))
+    with pytest.raises(AssertionError):
+        ms.assert_columns_consistent()
+
+
 def test_assert_columns_consistent_catches_a_surfaced_column_that_is_not_a_column(monkeypatch):
     from pipeline_lib import monitoring_sink as ms
     monkeypatch.setattr(ms, "SURFACED_COLUMNS", ms.SURFACED_COLUMNS + (("nope", None, None, (("x",),), "string"),))
@@ -380,11 +389,47 @@ def test_backlog_columns_are_fail_soft_null(sources):
     assert row["files_outstanding"] is None
 
 
-@pytest.mark.parametrize("value,expected", [(5, 5), (5.0, 5), ("5", 5), (" 5 ", 5), ("-2", -2), ("5.5", None),
-                                            (True, None), ([5], None), ({}, None)])
-def test_bigint_surfacing_accepts_integers_in_spark_forms_only(value, expected):
+@pytest.mark.parametrize("value,expected", [(5, 5), (5.0, None), ("5", 5), (" 5 ", None), ("-2", -2), ("5.5", None),
+                                            (True, None), ([5], None), ({}, None), (2 ** 63, None)])
+def test_bigint_surfacing_takes_integers_and_digit_strings_only(value, expected):
     row = batch_end_row("c", "r", "t", 0, "success", {"written": value}, START, END)
     assert row["docs_written"] == expected
+
+
+def test_a_value_that_does_not_cast_falls_through_to_the_next_path():
+    # Like the backfill's coalesce over the same paths.
+    row = run_end_row("c", "r", "t", "success", {"written": "lots", "rows_pushed": 34}, START, END)
+    assert row["docs_written"] == 34
+
+
+# The strict cast rule, as MEASURED on a serverless SQL warehouse (2026-10-07) by running _cast_sql over each JSON
+# value: (value, bigint result, string result). The Python rule must give the same answers, so a new row and a
+# backfilled old row agree. Spark's plain variant cast differs (true -> 1, 1.5 -> 1, 5 -> "5"), which is why
+# _cast_sql checks the type first.
+MEASURED_CASTS = [
+    (5, 5, None), (9000000000, 9000000000, None), (2 ** 63, None, None), (-2 ** 63, -2 ** 63, None),
+    (True, None, None), (1.5, None, None), (5.0, None, None), ("19", 19, "19"), (" 5", None, " 5"),
+    ("5\n", 5, "5\n"), ("+5", None, "+5"), ("5.5", None, "5.5"), ("", None, ""), (None, None, None),
+    ([5], None, None), ({"b": 1}, None, None), ("-2", -2, "-2"), ("9223372036854775808", None, "9223372036854775808"),
+]
+
+
+@pytest.mark.parametrize("value,as_bigint,as_string", MEASURED_CASTS)
+def test_python_cast_rule_matches_the_measured_sql(value, as_bigint, as_string):
+    from pipeline_lib.monitoring_sink import _cast_value
+    assert _cast_value(value, "bigint") == as_bigint
+    assert _cast_value(value, "string") == as_string
+
+
+def test_cast_sql_checks_the_variant_type_before_casting():
+    from pipeline_lib.monitoring_sink import _cast_sql
+    assert _cast_sql("$.a", "string") == (
+        "CASE WHEN schema_of_variant(try_variant_get(payload, '$.a')) = 'STRING' "
+        "THEN try_variant_get(payload, '$.a', 'string') END")
+    assert _cast_sql("$.a", "bigint") == (
+        "CASE schema_of_variant(try_variant_get(payload, '$.a')) WHEN 'BIGINT' THEN try_variant_get(payload, '$.a', "
+        "'bigint') WHEN 'STRING' THEN CASE WHEN regexp_like(try_variant_get(payload, '$.a', 'string'), '^-?[0-9]+$') "
+        "THEN try_cast(try_variant_get(payload, '$.a', 'string') AS BIGINT) END END")
 
 
 def test_string_surfacing_rejects_non_strings():
@@ -560,14 +605,17 @@ def test_backfill_sql_previous_build_table():
         assert f"  {new} = {old}," in sql
     assert ("task_run_id = CASE WHEN record_type = 'run_start' THEN try_variant_get(payload, '$.task_run_id', "
             "'string') END") in sql
-    assert ("docs_written = CASE WHEN record_type IN ('batch_end', 'run_end') THEN coalesce(try_variant_get("
-            "payload, '$.written', 'bigint'), try_variant_get(payload, '$.rows_pushed', 'bigint')) END") in sql
-    assert "error_type = CASE WHEN status = 'error' THEN try_variant_get(payload, '$.exception_type', 'string') END" in sql
-    assert "error_message = CASE WHEN status = 'error' THEN try_variant_get(payload, '$.message', 'string') END" in sql
-    assert ("files_outstanding = CASE WHEN record_type IN ('batch_summary') THEN try_variant_get(payload, "
-            "'$.progress.sources[0].metrics.numFilesOutstanding', 'bigint') END") in sql
-    assert ("bytes_outstanding = CASE WHEN record_type IN ('batch_summary') THEN try_variant_get(payload, "
-            "'$.progress.sources[0].metrics.numBytesOutstanding', 'bigint') END") in sql
+    from pipeline_lib.monitoring_sink import _cast_sql
+    b = lambda path: _cast_sql(path, "bigint")  # noqa: E731
+    t = lambda path: _cast_sql(path, "string")  # noqa: E731
+    assert (f"docs_written = CASE WHEN record_type IN ('batch_end', 'run_end') THEN "
+            f"coalesce({b('$.written')}, {b('$.rows_pushed')}) END") in sql
+    assert f"error_type = CASE WHEN status = 'error' THEN {t('$.exception_type')} END" in sql
+    assert f"error_message = CASE WHEN status = 'error' THEN {t('$.message')} END" in sql
+    assert (f"files_outstanding = CASE WHEN record_type IN ('batch_summary') THEN "
+            f"{b('$.progress.sources[0].metrics.numFilesOutstanding')} END") in sql
+    assert (f"bytes_outstanding = CASE WHEN record_type IN ('batch_summary') THEN "
+            f"{b('$.progress.sources[0].metrics.numBytesOutstanding')} END") in sql
 
 
 def test_backfill_sql_sets_every_surfaced_column():

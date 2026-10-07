@@ -206,10 +206,30 @@ def _json(payload):
     return json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
 
 
+# The strict cast rule shared by the Python builders (_cast_value) and the backfill SQL (_cast_sql), so the two
+# agree on every input: "bigint" takes a JSON integer, or a string of plain digits (Spark reports its metrics as
+# strings), that fits in a signed 64-bit integer; "string" takes a JSON string. Anything else (a boolean, a
+# fraction, an object, an out-of-range number) is NULL. Spark's own variant cast is looser (true -> 1, 1.5 -> 1,
+# 5 -> "5"), so the SQL checks the value's type with schema_of_variant rather than relying on it.
+_INTEGER_STRING = r"^-?[0-9]+$"
+_BIGINT_MIN, _BIGINT_MAX = -(2 ** 63), 2 ** 63 - 1
+
+
+def _cast_value(value, cast):
+    """`value` under the strict cast rule above, or None."""
+    if cast == "string":
+        return value if isinstance(value, str) else None
+    if isinstance(value, str) and re.match(_INTEGER_STRING, value):
+        value = int(value)
+    if isinstance(value, int) and not isinstance(value, bool) and _BIGINT_MIN <= value <= _BIGINT_MAX:
+        return value
+    return None
+
+
 def _payload_value(payload, paths, cast):
-    """A surfaced column's value: the first of `paths` that resolves in `payload`, cast to `cast` ("bigint": an
-    int, an integral float or an integer string, like Spark's numeric metrics; "string": a str). FAIL-SOFT like
-    every diagnostic: anything missing or of the wrong type is None (NULL), never an error."""
+    """A surfaced column's value: the first of `paths` whose value in `payload` passes the strict cast rule (like
+    the SQL coalesce over the same paths). FAIL-SOFT like every diagnostic: a missing path or a value that does
+    not cast is None (NULL), never an error."""
     for path in paths:
         value = payload
         for key in path:
@@ -217,19 +237,9 @@ def _payload_value(payload, paths, cast):
                 value = value[key] if isinstance(value, list) and len(value) > key else None
             else:
                 value = value.get(key) if isinstance(value, dict) else None
-        if value is None:
-            continue
-        if cast == "string":
-            return value if isinstance(value, str) else None
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, int):
+        value = _cast_value(value, cast)
+        if value is not None:
             return value
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
-        if isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value.strip()):
-            return int(value)
-        return None
     return None
 
 
@@ -534,10 +544,22 @@ def _variant_path(path):
     return out
 
 
+def _cast_sql(path, cast):
+    """One payload path under the strict cast rule (see _cast_value), in SQL. A missing path is NULL (try_variant_get
+    and schema_of_variant of NULL), and every cast is a try_ form, so nothing here raises."""
+    value = f"try_variant_get(payload, '{path}')"
+    if cast == "string":
+        return f"CASE WHEN schema_of_variant({value}) = 'STRING' THEN try_variant_get(payload, '{path}', 'string') END"
+    text = f"try_variant_get(payload, '{path}', 'string')"
+    return (f"CASE schema_of_variant({value}) WHEN 'BIGINT' THEN try_variant_get(payload, '{path}', 'bigint') "
+            f"WHEN 'STRING' THEN CASE WHEN regexp_like({text}, '{_INTEGER_STRING}') THEN try_cast({text} AS BIGINT) "
+            f"END END")
+
+
 def _surfaced_sql(column, record_types, only_status, paths, cast):
-    """The backfill expression for one SURFACED_COLUMNS rule: the same rows, paths and cast as _surfaced, in SQL.
-    try_variant_get is NULL (not an error) on a missing path or a failed cast, matching _payload_value."""
-    gets = [f"try_variant_get(payload, '{_variant_path(p)}', '{cast}')" for p in paths]
+    """The backfill expression for one SURFACED_COLUMNS rule: the same rows, paths and cast as _surfaced, in SQL
+    (_cast_sql per path, coalesced in order like _payload_value)."""
+    gets = [_cast_sql(_variant_path(p), cast) for p in paths]
     value = gets[0] if len(gets) == 1 else f"coalesce({', '.join(gets)})"
     conds = []
     if record_types is not None:
