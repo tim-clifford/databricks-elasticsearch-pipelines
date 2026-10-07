@@ -88,6 +88,13 @@ if not spark.catalog.tableExists(CANONICAL_TABLE):
         f"log_table_prune FAILED: table {CANONICAL_TABLE!r} does not exist; run the `_log table create` "
         f"job first (this job only prunes/optimizes an existing monitoring table)"
     )
+# Retention is on logged_ts, which `_log table create` adds when it migrates a table an older build created. Say so
+# plainly instead of failing on an unresolved column inside the DELETE.
+if "logged_ts" not in [f.name for f in spark.table(CANONICAL_TABLE).schema]:
+    raise RuntimeError(
+        f"log_table_prune FAILED: table {CANONICAL_TABLE!r} has no logged_ts column (it was created by an older "
+        f"build); run the `_log table create` job first, which migrates it, then re-run this job"
+    )
 
 DELETED_ROWS = None
 if PRUNE_SQL:
