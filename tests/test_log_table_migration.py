@@ -125,8 +125,9 @@ def test_retired_columns_are_dropped_in_one_statement():
     summary = create_or_migrate(spark, TABLE, printer=printed.append)
     assert spark.kinds() == ["CREATE", "CHECK", "DROP"]
     assert spark.statements[1] == (
-        f"SELECT count(*) AS n FROM {TABLE} WHERE (start_ts IS NULL AND batch_start_ts IS NOT NULL) OR "
-        f"(end_ts IS NULL AND batch_end_ts IS NOT NULL) OR (logged_ts IS NULL AND ingest_ts IS NOT NULL)")
+        f"SELECT count(*) AS n FROM {TABLE} WHERE (batch_start_ts IS NOT NULL AND NOT (start_ts <=> batch_start_ts)) "
+        f"OR (batch_end_ts IS NOT NULL AND NOT (end_ts <=> batch_end_ts)) "
+        f"OR (ingest_ts IS NOT NULL AND NOT (logged_ts <=> ingest_ts))")
     assert spark.statements[-1] == f"ALTER TABLE {TABLE} DROP COLUMNS (batch_start_ts, batch_end_ts, ingest_ts)"
     assert spark.columns == _current()
     assert f"outcome=MIGRATED(added=[], dropped={RETIRED})" in summary
@@ -137,7 +138,7 @@ def test_only_the_retired_columns_present_are_dropped():
     spark = FakeSpark({**_current(), "ingest_ts": None})
     create_or_migrate(spark, TABLE, printer=_quiet())
     assert spark.statements[1] == (
-        f"SELECT count(*) AS n FROM {TABLE} WHERE (logged_ts IS NULL AND ingest_ts IS NOT NULL)")
+        f"SELECT count(*) AS n FROM {TABLE} WHERE (ingest_ts IS NOT NULL AND NOT (logged_ts <=> ingest_ts))")
     assert spark.statements[-1] == f"ALTER TABLE {TABLE} DROP COLUMNS (ingest_ts)"
 
 
@@ -201,6 +202,21 @@ def test_a_failed_drop_warning_caps_a_long_first_line():
     create_or_migrate(LongLine({**_current(), **{c: None for c in RETIRED}}), TABLE, printer=printed.append)
     warning, = [p for p in printed if p.startswith("WARNING")]
     assert "E" * 500 in warning and "E" * 501 not in warning
+
+
+@pytest.mark.parametrize("message", ["", "   "])
+def test_a_failed_drop_with_an_empty_message_still_only_warns(message):
+    class Empty(FakeSpark):
+        def sql(self, stmt):
+            if " DROP COLUMNS " in stmt:
+                self.statements.append(stmt)
+                raise RuntimeError(message)
+            return super().sql(stmt)
+    spark = Empty({**_current(), **{c: None for c in RETIRED}})
+    printed = []
+    summary = create_or_migrate(spark, TABLE, printer=printed.append)
+    assert "outcome=ALREADY_EXISTS" in summary and all(c in spark.columns for c in RETIRED)
+    assert sum(p.startswith("WARNING: could not drop") for p in printed) == 1
 
 
 def test_drop_never_enables_column_mapping():

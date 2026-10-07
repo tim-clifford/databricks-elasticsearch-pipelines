@@ -72,8 +72,8 @@ def _drop_retired_columns(spark, table, existing_cols, printer):
     """TEMPORARY: drop the RETIRED_COLUMNS the table still has, in one statement, and return the names dropped.
 
     It drops only when no row would lose data: first it counts the rows where a retired column holds a value its
-    current column lacks (a table the earlier build's backfill never ran on). Any such row, or a failed count,
-    keeps the columns. The check and the drop are two statements, so run this only when no job on a build from
+    current column does not hold exactly (a table the earlier build's backfill never ran on). Any such row, or a
+    failed count, keeps the columns. The check and the drop are two statements, so run this only when no job on a build from
     before the column rename is still appending (only those write the retired columns; in dev and stg every job
     already runs a later build). Delta allows DROP COLUMNS only with column mapping enabled on the table; this never
     enables it (that is an irreversible table-protocol upgrade). Every failure here only WARNS: the retired
@@ -82,14 +82,15 @@ def _drop_retired_columns(spark, table, existing_cols, printer):
     if not pairs:
         return []
     present = [old for old, _new in pairs]
-    unbackfilled = " OR ".join(f"({new} IS NULL AND {old} IS NOT NULL)" for old, new in pairs)
+    # A retired value the current column does not hold exactly (NULL there, or different) would be lost.
+    unbackfilled = " OR ".join(f"({old} IS NOT NULL AND NOT ({new} <=> {old}))" for old, new in pairs)
     check_sql = f"SELECT count(*) AS n FROM {table} WHERE {unbackfilled}"
     drop_sql = f"ALTER TABLE {table} DROP COLUMNS ({', '.join(present)})"
     try:
         n = spark.sql(check_sql).collect()[0]["n"]
         if n:
             printer(f"WARNING: not dropping retired columns {present}: {n} row(s) hold values the current columns "
-                    f"lack (the earlier build's backfill has not run on this table). Dropping them would lose "
+                    f"do not (the earlier build's backfill has not run on this table). Dropping them would lose "
                     f"those timestamps, so they were left in place.")
             return []
         printer(f"dropping retired columns {present}")
