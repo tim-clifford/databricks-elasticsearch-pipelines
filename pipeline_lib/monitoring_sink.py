@@ -563,7 +563,8 @@ def _surfaced_sql(column, record_types, only_status, paths, cast):
     value = gets[0] if len(gets) == 1 else f"coalesce({', '.join(gets)})"
     conds = []
     if record_types is not None:
-        conds.append(f"record_type IN ({', '.join(f"'{t}'" for t in record_types)})")
+        quoted = ", ".join(f"'{t}'" for t in record_types)
+        conds.append(f"record_type IN ({quoted})")
     if only_status is not None:
         conds.append(f"status = '{only_status}'")
     return f"{column} = CASE WHEN {' AND '.join(conds)} THEN {value} END" if conds else f"{column} = {value}"
