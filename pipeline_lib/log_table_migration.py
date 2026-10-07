@@ -94,7 +94,10 @@ def _drop_retired_columns(spark, table, existing_cols, printer):
         printer(f"  {drop_sql}")
         spark.sql(drop_sql)
     except Exception as exc:  # noqa: BLE001 - deliberate safety net; see the docstring
-        printer(f"WARNING: could not drop retired columns {present} ({type(exc).__name__}: {exc}). They are "
+        # Only the first line: a Spark AnalysisException message carries the whole JVM stack trace (about 200
+        # lines, seen live); its first line names the error class.
+        reason = (str(exc).strip().splitlines() or [""])[0][:500]
+        printer(f"WARNING: could not drop retired columns {present} ({type(exc).__name__}: {reason}). They are "
                 f"harmless (NULL on new rows) and were left in place; drop them manually once the table has column "
                 f"mapping enabled (delta.columnMapping.mode = 'name').")
         return []

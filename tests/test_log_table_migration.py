@@ -174,6 +174,22 @@ def test_a_failed_drop_only_warns_and_keeps_the_columns():
     assert "delta.columnMapping.mode" in warnings[0]
 
 
+def test_a_failed_drop_warns_with_only_the_first_line_of_the_error():
+    # Seen live: Delta's AnalysisException message carries the whole JVM stack trace.
+    class MultiLine(FakeSpark):
+        def sql(self, stmt):
+            if " DROP COLUMNS " in stmt:
+                self.statements.append(stmt)
+                head = "[DELTA_UNSUPPORTED_DROP_COLUMN.ENABLE_COLUMN_MAPPING] DROP COLUMN is not supported"
+                raise RuntimeError(head + "\n" + "\n".join(f"\tat org.apache.spark.Frame{i}" for i in range(200)))
+            return super().sql(stmt)
+    printed = []
+    create_or_migrate(MultiLine({**_current(), **{c: None for c in RETIRED}}), TABLE, printer=printed.append)
+    warning, = [p for p in printed if p.startswith("WARNING")]
+    assert "\n" not in warning and "Frame" not in warning
+    assert "DELTA_UNSUPPORTED_DROP_COLUMN.ENABLE_COLUMN_MAPPING" in warning
+
+
 def test_drop_never_enables_column_mapping():
     spark = FakeSpark({**_current(), **{c: None for c in RETIRED}}, fail_on=f"ALTER TABLE {TABLE} DROP")
     create_or_migrate(spark, TABLE, printer=_quiet())
