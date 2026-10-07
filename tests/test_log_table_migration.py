@@ -152,6 +152,7 @@ def test_retired_columns_holding_unbackfilled_data_are_kept():
     assert "outcome=ALREADY_EXISTS" in summary
     warnings = [p for p in printed if p.startswith("WARNING")]
     assert len(warnings) == 1 and "7 row(s)" in warnings[0] and "not dropping" in warnings[0]
+    assert "not pruned by retention" in warnings[0]
 
 
 def test_a_failed_data_check_keeps_the_columns():

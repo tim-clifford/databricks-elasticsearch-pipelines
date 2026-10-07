@@ -91,7 +91,8 @@ def _drop_retired_columns(spark, table, existing_cols, printer):
         if n:
             printer(f"WARNING: not dropping retired columns {present}: {n} row(s) hold values the current columns "
                     f"do not (the earlier build's backfill has not run on this table). Dropping them would lose "
-                    f"those timestamps, so they were left in place.")
+                    f"those timestamps, so they were left in place. Rows with NULL logged_ts are not pruned by "
+                    f"retention until it is set.")
             return []
         printer(f"dropping retired columns {present}")
         printer(f"  {drop_sql}")
