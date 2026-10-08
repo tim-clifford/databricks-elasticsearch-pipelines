@@ -10,8 +10,7 @@
 # MAGIC What it does, in order:
 # MAGIC 1. DELETE rows older than `monitoring_log_retention_days` (by `logged_ts`, the write time). `0` DISABLES the delete
 # MAGIC    (keep ALL rows) - the job then only optimizes/vacuums.
-# MAGIC 2. OPTIMIZE the table (compacts small files and reclusters the liquid-clustered data, including a
-# MAGIC    table that only just had CLUSTER BY set by the `_log table create` migration).
+# MAGIC 2. OPTIMIZE the table (compacts small files and reclusters the liquid-clustered data).
 # MAGIC 3. VACUUM the table (reclaims storage from the files the DELETE/OPTIMIZE removed).
 # MAGIC
 # MAGIC Run identity needs `MODIFY` on the table (DELETE/OPTIMIZE/VACUUM), not `CREATE`. The job ships on a
@@ -87,14 +86,6 @@ if not spark.catalog.tableExists(CANONICAL_TABLE):
     raise RuntimeError(
         f"log_table_prune FAILED: table {CANONICAL_TABLE!r} does not exist; run the `_log table create` "
         f"job first (this job only prunes/optimizes an existing monitoring table)"
-    )
-# Retention is on logged_ts, which `_log table create` adds when it migrates a table an older build created. Say so
-# plainly instead of failing on an unresolved column inside the DELETE. Only the DELETE needs it: with retention
-# disabled, OPTIMIZE + VACUUM still run on an older-build table.
-if PRUNE_SQL and "logged_ts" not in [f.name for f in spark.table(CANONICAL_TABLE).schema]:
-    raise RuntimeError(
-        f"log_table_prune FAILED: table {CANONICAL_TABLE!r} has no logged_ts column (it was created by an older "
-        f"build); run the `_log table create` job first, which migrates it, then re-run this job"
     )
 
 DELETED_ROWS = None

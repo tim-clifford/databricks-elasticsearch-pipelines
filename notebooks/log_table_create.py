@@ -9,16 +9,16 @@
 # MAGIC can never drift.
 # MAGIC
 # MAGIC Run this ONCE per target before turning the monitoring sink on. It is idempotent and RE-RUNNABLE:
-# MAGIC `CREATE TABLE IF NOT EXISTS` makes a first run create the table and a later run a no-op, and when a
-# MAGIC newer build adds a column to the schema, re-running ADDITIVELY applies it (`ALTER TABLE ADD COLUMNS`
-# MAGIC for the missing columns only) and ensures liquid clustering, WITHOUT dropping or replacing the table,
-# MAGIC so existing rows are preserved. It NEVER drops or renames a column (an extra/renamed column is warned,
-# MAGIC not touched). It also keeps every column COMMENT current (one metadata commit, and none when nothing
-# MAGIC changed), marks a renamed column (`DEPRECATED_COLUMNS`) DEPRECATED in its comment, and backfills the
-# MAGIC new columns on rows an older build wrote (`backfill_sql`, idempotent). After an upgrade, re-run this job
-# MAGIC once every pipeline job is running the new build, to backfill the rows old jobs wrote in between. The export jobs only ever APPEND to the table, so their run identity needs only
-# MAGIC `MODIFY`; the identity that runs THIS job needs `CREATE TABLE` / `ALTER` (and `USE CATALOG`/
-# MAGIC `USE SCHEMA`) on the target schema.
+# MAGIC `CREATE TABLE IF NOT EXISTS` makes a first run create the table (every column with its comment, and
+# MAGIC liquid clustering) and a later run a no-op. When a newer build adds a column to the schema, re-running
+# MAGIC ADDITIVELY applies it (`ALTER TABLE ADD COLUMNS` for the missing columns only), WITHOUT dropping or
+# MAGIC replacing the table, so existing rows are preserved; re-run it BEFORE deploying that build (writers fail
+# MAGIC closed on a missing column). It never drops a column it does not know (an extra column is warned about).
+# MAGIC TEMPORARY: a table that still has one of the three timestamp columns an earlier build used
+# MAGIC (`pipeline_lib.log_table_migration.RETIRED_COLUMNS`) is DROPPED, and the next run creates it fresh
+# MAGIC (back it up first). The export jobs
+# MAGIC only ever APPEND to the table, so their run identity needs only `MODIFY`; the identity that runs THIS
+# MAGIC job needs `CREATE TABLE` / `ALTER` (and `USE CATALOG`/`USE SCHEMA`) on the target schema.
 # MAGIC
 # MAGIC Parameters:
 # MAGIC - `monitoring_log_table` (deploy-time base_parameter, from the `${var.monitoring_log_table}` bundle
@@ -67,10 +67,9 @@ print(CREATE_SQL)
 
 # COMMAND ----------
 # Cell 2 - CREATE + MIGRATE + VERIFY (pipeline_lib.log_table_migration.create_or_migrate, unit-tested with a fake
-# session). Creates the table, or brings an existing one to the current schema: adds missing columns, sets the
-# column comments (deprecated columns marked DEPRECATED), ensures liquid clustering, and backfills the new columns
-# on rows an older build wrote. Never drops a column. Success is the VERIFIED end state (the table exists
-# afterwards); anything else raises, so the run fails closed.
+# session). Creates the table, or adds the columns an existing one lacks. Temporarily, a table with the retired
+# timestamp columns is dropped instead (outcome DROPPED; re-run to create it). Success is the VERIFIED end state
+# (the table exists afterwards, or is gone after a drop); anything else raises, so the run fails closed.
 SUMMARY = create_or_migrate(spark, CANONICAL_TABLE)
 
 # COMMAND ----------

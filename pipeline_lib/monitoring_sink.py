@@ -4,7 +4,7 @@ and its batches into rows for one shared UC Delta table, and own that table's sc
 Why this module exists, and what it deliberately is NOT:
 - It is the SINGLE SOURCE OF TRUTH for the monitoring table's columns (MONITORING_TABLE_COLUMNS) and its
   closed row vocabulary (RECORD_TYPES x STATUSES). Both the `_log table create` job (which runs the
-  CREATE / additive migration) and the writer (run_index_pipeline.py, which appends) import that one
+  CREATE, or adds a newly introduced column) and the writer (run_index_pipeline.py, which appends) import that one
   definition, so the DDL and the rows can never drift apart.
 - It is PURE: no Spark, no dbutils, no Databricks. Every function here is unit-testable off-cluster
   (plain pytest), exactly like pipeline_lib/observability.py. The notebooks own all Spark I/O.
@@ -36,10 +36,10 @@ from datetime import datetime, timedelta, timezone
 from pipeline_lib.observability import bulk_stats_overall, bulk_stats_tail
 
 # The monitoring table's columns, in order, as (name, sql_type, comment). This ONE tuple drives the CREATE TABLE
-# statement (create_table_sql), the column comments (set at create and by the migration), the row shape
-# (ROW_FIELDS) and the writer's DataFrame schema, so the schema is defined exactly once. payload is VARIANT
-# (semi-structured, queryable with `payload:field` paths in SQL); it needs DBR 15.3+ / recent serverless, which
-# every target here runs. The comments are stored on the table, so they are written for someone reading the
+# statement (create_table_sql), the column comments (set at create, and by ADD COLUMNS for a column added later),
+# the row shape (ROW_FIELDS) and the writer's DataFrame schema, so the schema is defined exactly once. payload is
+# VARIANT (semi-structured, queryable with `payload:field` paths in SQL); it needs DBR 15.3+ / recent serverless,
+# which every target here runs. The comments are stored on the table, so they are written for someone reading the
 # table in Catalog Explorer: what the column holds and on which rows (see _COMMENT for the allowed characters).
 MONITORING_TABLE_COLUMNS = (
     ("config_name", "STRING", "Pipeline config that wrote the row."),
@@ -82,23 +82,13 @@ MONITORING_TABLE_COLUMNS = (
      "column."),
 )
 
-# Columns an older build wrote under another name, as (old_name, new_name). The migration in `_log table create`
-# never drops them (dropping data is a deliberate act): it marks each one DEPRECATED in its comment and
-# backfills the new column from it (backfill_sql). New rows leave them NULL; a later release drops them.
-DEPRECATED_COLUMNS = (
-    ("batch_start_ts", "start_ts"),
-    ("batch_end_ts", "end_ts"),
-    ("ingest_ts", "logged_ts"),
-)
-
 # Comments are interpolated into DDL as '...' literals, so they are an ALLOW-LIST of plain characters: no quote
 # or backslash can reach the SQL. The comments are our own constants; a violation is a bug and fails closed.
 _COMMENT = re.compile(r"^[A-Za-z0-9 .,:;()_{}+/-]+$")
 
-# Columns surfaced from the payload, so common questions do not need payload paths. One rule set feeds both the
-# Python builders (new rows) and backfill_sql (rows an older build wrote), so the two can never disagree:
-# (column, record_types it applies to (None = any), status it applies to (None = any), payload paths tried in
-# order (a str key or an int list index), cast). The second docs_written path is the streaming run_end's key.
+# Columns surfaced from the payload, so common questions do not need payload paths, as (column, record_types it
+# applies to (None = any), status it applies to (None = any), payload paths tried in order (a str key or an int
+# list index), cast). The second docs_written path is the streaming run_end's key.
 SURFACED_COLUMNS = (
     ("docs_written", ("batch_end", "run_end"), None, (("written",), ("rows_pushed",)), "bigint"),
     ("error_type", None, "error", (("exception_type",),), "string"),
@@ -166,13 +156,11 @@ _NAME_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def assert_columns_consistent():
     """Guard the invariant that ROW_FIELDS is exactly the table columns minus the writer-supplied
     logged_ts, so the DDL (MONITORING_TABLE_COLUMNS) and the row shape (ROW_FIELDS) can never drift, and that
-    every surfaced and deprecated column names a real column. Called by tests; cheap enough to be a plain assert."""
+    every surfaced column names a real column. Called by tests; cheap enough to be a plain assert."""
     col_names = [name for name, _type, _comment in MONITORING_TABLE_COLUMNS]
     assert col_names[-1] == "logged_ts", "logged_ts must be the last (writer-supplied) column"
     assert tuple(col_names[:-1]) == ROW_FIELDS, "ROW_FIELDS must equal table columns minus logged_ts"
     assert all(c in col_names for c, *_rest in SURFACED_COLUMNS), "every surfaced column must be a table column"
-    assert all(new in col_names and old not in col_names for old, new in DEPRECATED_COLUMNS), \
-        "a deprecated column must be replaced by a table column and not be one itself"
 
 
 def _fmt_ts(dt):
@@ -206,11 +194,9 @@ def _json(payload):
     return json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
 
 
-# The strict cast rule shared by the Python builders (_cast_value) and the backfill SQL (_cast_sql), so the two
-# agree on every input: "bigint" takes a JSON integer, or a string of plain digits (Spark reports its metrics as
-# strings), that fits in a signed 64-bit integer; "string" takes a JSON string. Anything else (a boolean, a
-# fraction, an object, an out-of-range number) is NULL. Spark's own variant cast is looser (true -> 1, 1.5 -> 1,
-# 5 -> "5"), so the SQL checks the value's type with schema_of_variant rather than relying on it.
+# The strict cast rule for the surfaced columns: "bigint" takes a JSON integer, or a string of plain digits (Spark
+# reports its metrics as strings), that fits in a signed 64-bit integer; "string" takes a JSON string. Anything
+# else (a boolean, a fraction, an object, an out-of-range number) is NULL rather than a guess.
 _INTEGER_STRING = r"^-?[0-9]+$"
 _BIGINT_MIN, _BIGINT_MAX = -(2 ** 63), 2 ** 63 - 1
 
@@ -227,8 +213,8 @@ def _cast_value(value, cast):
 
 
 def _payload_value(payload, paths, cast):
-    """A surfaced column's value: the first of `paths` whose value in `payload` passes the strict cast rule (like
-    the SQL coalesce over the same paths). FAIL-SOFT like every diagnostic: a missing path or a value that does
+    """A surfaced column's value: the first of `paths` whose value in `payload` passes the strict cast rule.
+    FAIL-SOFT like every diagnostic: a missing path or a value that does
     not cast is None (NULL), never an error."""
     for path in paths:
         value = payload
@@ -480,17 +466,12 @@ def _column_sql(name, sql_type, comment):
     return f"{name} {sql_type} COMMENT {_sql_comment(comment)}"
 
 
-def deprecated_comment(new_name):
-    """The comment the migration puts on a deprecated column (see DEPRECATED_COLUMNS)."""
-    return f"DEPRECATED: replaced by {new_name}. No longer written (NULL on new rows); dropped in a later release."
-
-
 def missing_columns(existing_names):
     """The MONITORING_TABLE_COLUMNS entries whose column name is NOT already present, as a list of
     (name, sql_type, comment). ADDITIVE allow-list and order-insensitive: it only ever reports columns to ADD, never
     considers dropping/renaming an existing one, so applying its result can never lose data. `existing_names`
-    is the current table's column names (any iterable). Drives the re-runnable schema migration in the
-    `_log table create` job: add exactly the columns a newer schema introduced."""
+    is the current table's column names (any iterable). Drives the `_log table create` job's add-missing-columns
+    step: when a future build adds a column to MONITORING_TABLE_COLUMNS, a re-run adds exactly that column."""
     have = set(existing_names)
     return [col for col in MONITORING_TABLE_COLUMNS if col[0] not in have]
 
@@ -505,102 +486,6 @@ def alter_add_columns_sql(table_name, cols):
         return None
     added = ", ".join(_column_sql(name, sql_type, comment) for name, sql_type, comment in cols)
     return f"ALTER TABLE {canonical} ADD COLUMNS ({added})"
-
-
-def comment_changes(existing_comments):
-    """The column comments the migration must set, as a list of (name, comment): every expected column whose
-    current comment differs from MONITORING_TABLE_COLUMNS, and every DEPRECATED_COLUMNS column present whose
-    comment is not yet deprecated_comment(). `existing_comments` maps each existing column name to its comment
-    (None when unset). Columns not in the table are skipped (missing_columns adds them, comment included).
-    An empty list means nothing to change, so a re-run makes no metadata commit."""
-    wanted = [(name, comment) for name, _type, comment in MONITORING_TABLE_COLUMNS]
-    wanted += [(old, deprecated_comment(new)) for old, new in DEPRECATED_COLUMNS]
-    return [(name, comment) for name, comment in wanted
-            if name in existing_comments and existing_comments[name] != comment]
-
-
-def alter_column_comments_sql(table_name, changes):
-    """ONE `ALTER TABLE <name> ALTER COLUMN a COMMENT '...', b COMMENT '...'` for the (name, comment) list from
-    comment_changes, so the migration makes a single metadata commit (multi-column ALTER COLUMN needs Databricks
-    SQL or DBR 16.3+; the create job is serverless). Validates the name and every comment fail-closed. Returns
-    None when `changes` is empty."""
-    canonical = validate_table_name(table_name)
-    if not changes:
-        return None
-    altered = ", ".join(f"{name} COMMENT {_sql_comment(comment)}" for name, comment in changes)
-    return f"ALTER TABLE {canonical} ALTER COLUMN {altered}"
-
-
-def _variant_path(path):
-    """A SURFACED_COLUMNS payload path as a try_variant_get JSON path, e.g. `$.progress.sources[0].metrics.x`."""
-    out = "$"
-    for key in path:
-        if isinstance(key, int):
-            out += f"[{key}]"
-        elif _NAME_PART.match(key):
-            out += f".{key}"
-        else:
-            raise ValueError(f"payload path key {key!r} is not a plain identifier")
-    return out
-
-
-def _cast_sql(path, cast):
-    """One payload path under the strict cast rule (see _cast_value), in SQL. A missing path is NULL (try_variant_get
-    and schema_of_variant of NULL), and every cast is a try_ form, so nothing here raises."""
-    value = f"try_variant_get(payload, '{path}')"
-    if cast == "string":
-        return f"CASE WHEN schema_of_variant({value}) = 'STRING' THEN try_variant_get(payload, '{path}', 'string') END"
-    text = f"try_variant_get(payload, '{path}', 'string')"
-    return (f"CASE schema_of_variant({value}) WHEN 'BIGINT' THEN try_variant_get(payload, '{path}', 'bigint') "
-            f"WHEN 'STRING' THEN CASE WHEN regexp_like({text}, '{_INTEGER_STRING}') THEN try_cast({text} AS BIGINT) "
-            f"END END")
-
-
-def _surfaced_sql(column, record_types, only_status, paths, cast):
-    """The backfill expression for one SURFACED_COLUMNS rule: the same rows, paths and cast as _surfaced, in SQL
-    (_cast_sql per path, coalesced in order like _payload_value)."""
-    gets = [_cast_sql(_variant_path(p), cast) for p in paths]
-    value = gets[0] if len(gets) == 1 else f"coalesce({', '.join(gets)})"
-    conds = []
-    if record_types is not None:
-        quoted = ", ".join(f"'{t}'" for t in record_types)
-        conds.append(f"record_type IN ({quoted})")
-    if only_status is not None:
-        conds.append(f"status = '{only_status}'")
-    return f"{column} = CASE WHEN {' AND '.join(conds)} THEN {value} END" if conds else f"{column} = {value}"
-
-
-def backfill_sql(table_name, existing_names):
-    """The idempotent UPDATE that fills the new columns on rows an older build wrote (they have the
-    DEPRECATED_COLUMNS set and the new columns NULL), or None when the table has no such rows to find (no
-    ingest_ts: it never held an older build's rows). The `_log table create` migration runs it, and it is re-run
-    once after every job has been restarted on the new build, to catch the rows old jobs wrote in between.
-    - start_ts / end_ts / logged_ts are copied from those of batch_start_ts / batch_end_ts / ingest_ts the
-      table has (`existing_names`: its current column names; a very old table may lack the timing columns).
-    - The SURFACED_COLUMNS are derived from the payload by the same rules the builders use (_surfaced_sql).
-    - task_run_id is known only on run_start rows (the older build kept it in that payload); NULL elsewhere.
-    The marker is `logged_ts IS NULL AND ingest_ts IS NOT NULL`: the writer always stamps logged_ts on new rows
-    (ingest_ts on old ones), so a row is selected exactly until it has been backfilled and a re-run is a no-op.
-    Validates the name fail-closed."""
-    canonical = validate_table_name(table_name)
-    have = set(existing_names)
-    if "ingest_ts" not in have:
-        return None
-    sets = [f"{new} = {old}" for old, new in DEPRECATED_COLUMNS if old in have]
-    sets.append("task_run_id = CASE WHEN record_type = 'run_start' "
-                "THEN try_variant_get(payload, '$.task_run_id', 'string') END")
-    sets += [_surfaced_sql(*rule) for rule in SURFACED_COLUMNS]
-    body = ",\n  ".join(sets)
-    return f"UPDATE {canonical} SET\n  {body}\nWHERE logged_ts IS NULL AND ingest_ts IS NOT NULL"
-
-
-def alter_cluster_by_sql(table_name):
-    """`ALTER TABLE <name> CLUSTER BY (...)` to (idempotently) set liquid-clustering columns on an existing
-    table that predates clustering. Validates the name fail-closed. Setting clustering does NOT rewrite
-    existing files; a later OPTIMIZE (see optimize_sql, run by the prune job) reclusters them."""
-    canonical = validate_table_name(table_name)
-    cluster_by = ", ".join(CLUSTER_BY_COLUMNS)
-    return f"ALTER TABLE {canonical} CLUSTER BY ({cluster_by})"
 
 
 def prune_sql(table_name, retention_days):
@@ -626,7 +511,7 @@ def prune_sql(table_name, retention_days):
 
 def optimize_sql(table_name):
     """`OPTIMIZE <name>`: compacts small files and (on a liquid-clustered table) reclusters data. Run by
-    the prune job after a retention DELETE, and to recluster a table that only just had CLUSTER BY set.
+    the prune job after a retention DELETE.
     Validates the name fail-closed."""
     canonical = validate_table_name(table_name)
     return f"OPTIMIZE {canonical}"

@@ -79,7 +79,7 @@ def spark_append(table, rows, session):
     """The Spark write behind MonitoringLog on a cluster: build a DataFrame from `rows` (payload and timestamps
     as strings), parse the payload to VARIANT, cast the timestamps, stamp logged_ts = current_timestamp() (the
     write time), and append BY NAME via writeTo().append(), so the table's physical column order does not
-    matter (a migrated table has its newer columns last, after the DEPRECATED ones, which new rows leave NULL).
+    matter (a column added to an existing table later sits last).
     The DataFrame schema is derived from MONITORING_TABLE_COLUMNS (spark_row_schema), never re-typed. Raises on
     any failure; MonitoringLog turns that into MonitoringLogError. Not unit-tested off-cluster (it is Spark
     I/O); proven live."""
