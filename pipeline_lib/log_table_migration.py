@@ -79,10 +79,24 @@ def _drop_retired_table(spark, table, printer):
     Tim (2026-10-07): back the table up first; while it is gone, jobs with the log on fail their next append
     (fail-closed), and rows appended between the backup and the drop are lost. A Unity Catalog managed table can be
     restored with UNDROP (7 days by default). A failed DROP raises (fails the job): a destructive step must not fail
-    quietly."""
-    present = [f.name for f in spark.table(table).schema if f.name in RETIRED_COLUMNS]
+    quietly.
+
+    ALLOW-LIST: it drops only a table that is unmistakably the earlier log table: every current column present,
+    and nothing else but retired columns. A table with a retired column that does not match that shape (most
+    likely monitoring_log_table pointed at the wrong table; ingest_ts is a common name) raises without changing
+    anything."""
+    cols = [f.name for f in spark.table(table).schema]
+    present = [c for c in cols if c in RETIRED_COLUMNS]
     if not present:
         return False
+    expected = [name for name, _type, _comment in MONITORING_TABLE_COLUMNS]
+    missing = [c for c in expected if c not in cols]
+    unknown = [c for c in cols if c not in expected and c not in RETIRED_COLUMNS]
+    if missing or unknown:
+        raise RuntimeError(
+            f"log_table_create FAILED: table {table!r} has the retired columns {present} but is not shaped like the "
+            f"monitoring log table (missing {missing}, unknown {unknown}); refusing to drop it. Check that "
+            f"monitoring_log_table points at the log table.")
     drop_sql = f"DROP TABLE {table}"
     printer(f"table {table!r} still has the retired columns {present}: dropping it so the next run creates it fresh")
     printer(f"  {drop_sql}")

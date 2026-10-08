@@ -138,6 +138,19 @@ def test_a_table_without_retired_columns_is_never_dropped(columns):
     assert spark.columns is not None
 
 
+@pytest.mark.parametrize("columns", [
+    {"id": None, "ingest_ts": None},                                          # an unrelated table
+    {**{n: c for n, c in _current().items() if n != "payload"}, "ingest_ts": None},  # missing a log column
+    {**_current(), "ingest_ts": None, "mystery": None},                       # an unknown extra column
+])
+def test_a_table_not_shaped_like_the_log_is_refused_and_untouched(columns):
+    spark = FakeSpark(columns)
+    with pytest.raises(RuntimeError, match="refusing to drop it"):
+        create_or_migrate(spark, TABLE, printer=_quiet())
+    assert spark.statements == []  # no DROP, no CREATE, no ALTER
+    assert spark.columns == columns
+
+
 def test_a_failed_drop_fails_the_job():
     spark = FakeSpark({**_current(), "ingest_ts": None}, fail_on="DROP TABLE")
     with pytest.raises(RuntimeError, match="DROP TABLE failed"):

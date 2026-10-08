@@ -1087,8 +1087,10 @@ this is done everywhere `_log table create` **drops the whole table** when it ha
    append (fail-closed), so do it when nothing is exporting.
 3. Run `_log table create` again: it creates the table.
 
-A table without the retired columns (every table this build creates) is never dropped. A failed drop fails the
-job. A Unity Catalog managed table can be restored with `UNDROP TABLE` for 7 days by default. This step is removed once
+A table without the retired columns (every table this build creates) is never dropped, and neither is a table
+that has one but is not shaped exactly like the log table (every current column, plus only retired ones): that
+fails the job without changing anything, in case `monitoring_log_table` points at the wrong table. A failed drop
+fails the job. A Unity Catalog managed table can be restored with `UNDROP TABLE` for 7 days by default. This step is removed once
 it has run in stg.
 
 ### Cluster log delivery
