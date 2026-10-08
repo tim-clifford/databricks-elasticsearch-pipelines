@@ -1076,23 +1076,6 @@ Delta metadata commit, which can conflict with a log append that a running job h
 task once (fail-closed), and its retry policy restarts it. The job never drops a column it does not know: an
 unknown column is warned about and left alone.
 
-**Temporary: retired columns.** Tables migrated by an earlier build (dev and stg) still carry
-`batch_start_ts`, `batch_end_ts` and `ingest_ts`, the old names of `start_ts`, `end_ts` and `logged_ts`.
-Dropping those columns in place needs column mapping on the table, which those tables do not have, so until
-this is done everywhere `_log table create` **drops the whole table** when it has any of them (outcome
-`DROPPED`), and the next run creates it fresh, exactly as on a new environment. To use it:
-1. Back the table up (for example `CREATE TABLE <backup> DEEP CLONE <table>`). Rows appended after the backup and
-   before the drop are lost.
-2. Run `_log table create`: it drops the table. While the table is gone, jobs with the log on fail their next
-   append (fail-closed), so do it when nothing is exporting.
-3. Run `_log table create` again: it creates the table.
-
-A table without the retired columns (every table this build creates) is never dropped, and neither is a table
-that has one but is not shaped exactly like the log table (every current column, plus only retired ones): that
-fails the job without changing anything, in case `monitoring_log_table` points at the wrong table. A failed drop
-fails the job. A Unity Catalog managed table can be restored with `UNDROP TABLE` for 7 days by default. This step is removed once
-it has run in stg.
-
 ### Cluster log delivery
 
 Optionally, classic **job clusters** can deliver their driver, executor, and init-script logs to a Unity
