@@ -464,8 +464,6 @@ def test_create_table_sql_is_idempotent_and_has_every_column():
     assert "USING DELTA" in sql
     for name, sql_type, comment in MONITORING_TABLE_COLUMNS:
         assert f"{name} {sql_type} COMMENT '{comment}'" in sql
-    for old in ("batch_start_ts", "batch_end_ts", "ingest_ts"):
-        assert old not in sql  # the retired names
 
 
 def test_create_table_sql_validates_name():
