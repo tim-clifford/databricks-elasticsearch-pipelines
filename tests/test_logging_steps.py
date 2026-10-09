@@ -677,3 +677,21 @@ def test_progress_recorder_first_report_drains_no_gap():
                            read_source_relay=lambda bid: asked.append(bid))
     rec(FakeQuery([[report(500)]]))  # a resumed stream: nothing below 500 belongs to this run
     assert asked == [500]
+
+
+def test_progress_recorder_gap_drain_respects_log_off_and_absent_print_relay():
+    asked_src, asked_print = [], []
+    rec = ProgressRecorder(MonitoringLog("", lambda *a: None), "cfg", "", session=None, printer=lambda *_: None,
+                           read_print_relay=lambda bid: asked_print.append(bid),
+                           read_source_relay=lambda bid: asked_src.append(bid))
+    q = FakeQuery([[report(0)], [report(3)]])
+    rec(q)
+    rec(q)
+    assert asked_print == [0, 1, 2, 3] and asked_src == []
+    ev = Events()
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked_src.append(bid))
+    q = FakeQuery([[report(0)], [report(3)]])
+    rec(q)
+    rec(q)
+    assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 3] and asked_src == [0, 1, 2, 3]
