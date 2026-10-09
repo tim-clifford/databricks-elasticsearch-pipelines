@@ -41,6 +41,7 @@ from pipeline_lib.monitoring_sink import (
     prune_sql,
     run_end_row,
     run_start_row,
+    source_latest_facts,
     validate_table_name,
     vacuum_sql,
 )
@@ -76,8 +77,9 @@ def test_table_has_expected_columns_and_types():
         "config_name": "STRING", "job_run_id": "STRING", "task_run_id": "STRING", "record_type": "STRING",
         "status": "STRING", "batch_id": "BIGINT", "event_ts": "TIMESTAMP", "start_ts": "TIMESTAMP",
         "end_ts": "TIMESTAMP", "docs_written": "BIGINT", "error_type": "STRING", "error_message": "STRING",
-        "files_outstanding": "BIGINT", "bytes_outstanding": "BIGINT", "payload": "VARIANT",
-        "logged_ts": "TIMESTAMP",
+        "files_outstanding": "BIGINT", "bytes_outstanding": "BIGINT", "source_latest_version": "BIGINT",
+        "source_latest_ts": "TIMESTAMP", "source_end_version": "BIGINT", "source_end_index": "BIGINT",
+        "payload": "VARIANT", "logged_ts": "TIMESTAMP",
     }
 
 
@@ -546,3 +548,95 @@ def test_prune_sql_fail_closed_on_bad_name_and_bad_days():
 def test_optimize_and_vacuum_sql():
     assert optimize_sql("cat.sch.t") == "OPTIMIZE cat.sch.t"
     assert vacuum_sql("cat.sch.t") == "VACUUM cat.sch.t"
+
+
+# --- source position: the newest source version at batch start, and where the batch ended ---------
+
+# A Delta source offset as Spark reports it in a progress report: a JSON STRING.
+END_OFFSET = json.dumps({"sourceVersion": 1, "reservoirId": "abc", "reservoirVersion": 11, "index": -1,
+                         "isStartingVersion": False})
+LATEST_TS = datetime(2026, 10, 9, 18, 46, 31, 250000, tzinfo=timezone.utc)
+
+
+def test_source_latest_facts_formats_the_version_and_commit_time():
+    assert source_latest_facts(9, LATEST_TS) == {"version": 9, "timestamp": "2026-10-09T18:46:31.250000"}
+
+
+def test_source_latest_facts_treats_a_naive_timestamp_as_utc():
+    naive = datetime(2026, 10, 9, 18, 46, 31)
+    assert source_latest_facts(9, naive)["timestamp"] == "2026-10-09T18:46:31.000000"
+
+
+@pytest.mark.parametrize("version,ts", [(None, LATEST_TS), (True, LATEST_TS), (-1, LATEST_TS), ("9", LATEST_TS),
+                                        (9.0, LATEST_TS), (9, None), (9, "2026-10-09")])
+def test_source_latest_facts_rejects_anything_but_a_version_and_a_datetime(version, ts):
+    with pytest.raises(ValueError):
+        source_latest_facts(version, ts)
+
+
+def test_batch_start_surfaces_the_newest_source_version():
+    row = batch_start_row("c", "r", "t", 3, {"mode": "streaming", "source_latest": source_latest_facts(9, LATEST_TS)},
+                          START)
+    assert (row["source_latest_version"], row["source_latest_ts"]) == (9, "2026-10-09T18:46:31.250000")
+    assert row["source_end_version"] is None and row["source_end_index"] is None
+
+
+def test_batch_summary_carries_the_relayed_newest_version_and_surfaces_the_end_offset():
+    progress = dict(PROGRESS, sources=[{"endOffset": END_OFFSET, "metrics": {"numFilesOutstanding": "2"}}])
+    row = batch_summary_row("c", "r", "t", 7, progress, now=FIXED, source_latest=source_latest_facts(9, LATEST_TS))
+    assert (row["source_latest_version"], row["source_latest_ts"]) == (9, "2026-10-09T18:46:31.250000")
+    assert (row["source_end_version"], row["source_end_index"]) == (11, -1)
+    payload = json.loads(row["payload"])
+    assert payload["source_latest"] == {"version": 9, "timestamp": "2026-10-09T18:46:31.250000"}
+    assert payload["progress"] == progress
+
+
+def test_batch_summary_without_a_relayed_version_keeps_the_payload_shape_and_nulls_the_columns():
+    progress = dict(PROGRESS, sources=[{"endOffset": END_OFFSET}])
+    row = batch_summary_row("c", "r", "t", 7, progress, now=FIXED)
+    assert row["source_latest_version"] is None and row["source_latest_ts"] is None
+    assert row["source_end_version"] == 11
+    assert set(json.loads(row["payload"])) == {"progress"}
+
+
+def test_end_index_mid_version_is_surfaced():
+    offset = json.dumps({"reservoirVersion": 1, "index": 9, "isStartingVersion": False})
+    row = batch_summary_row("c", "r", "t", 0, dict(PROGRESS, sources=[{"endOffset": offset}]))
+    assert (row["source_end_version"], row["source_end_index"]) == (1, 9)
+
+
+def test_end_offset_already_parsed_is_accepted():
+    row = batch_summary_row("c", "r", "t", 0, dict(PROGRESS, sources=[{"endOffset": json.loads(END_OFFSET)}]))
+    assert row["source_end_version"] == 11
+
+
+@pytest.mark.parametrize("end_offset", [None, "", "not json", "[1, 2]", "11", json.dumps({"index": -1}),
+                                        json.dumps({"reservoirVersion": "eleven", "index": -1}), 11])
+def test_end_offset_columns_are_fail_soft_null(end_offset):
+    row = batch_summary_row("c", "r", "t", 0, dict(PROGRESS, sources=[{"endOffset": end_offset}]))
+    assert row["source_end_version"] is None
+
+
+def test_source_columns_are_null_on_rows_they_do_not_apply_to():
+    facts = {"source_latest": source_latest_facts(9, LATEST_TS),
+             "progress": {"sources": [{"endOffset": END_OFFSET}]}}
+    for row in (run_start_row("c", "r", "t", facts, START), batch_end_row("c", "r", "t", 0, "success", facts, START, END),
+                run_end_row("c", "r", "t", "success", facts, START, END)):
+        assert [row[c] for c in ("source_latest_version", "source_latest_ts", "source_end_version",
+                                 "source_end_index")] == [None] * 4
+    # batch_start has no Spark progress, so no end offset even if a payload carried one
+    assert batch_start_row("c", "r", "t", 0, facts, START)["source_end_version"] is None
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("2026-10-09T18:46:31.250000", "2026-10-09T18:46:31.250000"),
+    ("2026-10-09T18:46:31", None), ("2026-10-09 18:46:31.250000", None), ("2026-13-09T18:46:31.250000", None),
+    ("2026-10-09T18:46:31.250000Z", None), ("", None), (None, None), (1760000000, None), (True, None)])
+def test_timestamp_surfacing_takes_only_the_stored_format(value, expected):
+    row = batch_start_row("c", "r", "t", 0, {"source_latest": {"version": 1, "timestamp": value}}, START)
+    assert row["source_latest_ts"] == expected
+
+
+def test_an_error_instead_of_a_version_surfaces_null():
+    row = batch_start_row("c", "r", "t", 0, {"source_latest": {"error": "OSError: blip"}}, START)
+    assert row["source_latest_version"] is None and row["source_latest_ts"] is None

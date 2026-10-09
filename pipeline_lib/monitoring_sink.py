@@ -76,6 +76,17 @@ MONITORING_TABLE_COLUMNS = (
     ("bytes_outstanding", "BIGINT",
      "batch_summary only: source bytes not yet processed after this batch (Spark numBytesOutstanding). The "
      "streaming backlog."),
+    ("source_latest_version", "BIGINT",
+     "batch_start and batch_summary: newest commit version of the source table, read at batch start. Behind when "
+     "this is at or past source_end_version and files_outstanding is above 0. NULL when the read failed."),
+    ("source_latest_ts", "TIMESTAMP",
+     "batch_start and batch_summary: commit time (UTC) of source_latest_version, from the source table history."),
+    ("source_end_version", "BIGINT",
+     "batch_summary only: reservoirVersion of the end offset Spark reports for the batch. With source_end_index "
+     "-1 every source version below this was sent; otherwise this version was sent through that file index."),
+    ("source_end_index", "BIGINT",
+     "batch_summary only: index of the end offset. -1 means the batch ended on a version boundary; 0 or more "
+     "means it stopped inside version source_end_version, after that file."),
     ("payload", "VARIANT", "Everything else the row records, by record_type (query with payload:field paths)."),
     ("logged_ts", "TIMESTAMP",
      "UTC time the row was committed to this table (set by the writer). Retention (the prune job) is on this "
@@ -86,9 +97,22 @@ MONITORING_TABLE_COLUMNS = (
 # or backslash can reach the SQL. The comments are our own constants; a violation is a bug and fails closed.
 _COMMENT = re.compile(r"^[A-Za-z0-9 .,:;()_{}+/-]+$")
 
+
+
+class _ParseJson:
+    """A payload path step: the value is a JSON string (Spark reports source offsets that way) to parse before
+    the next step. An already-parsed object passes through; anything else is a miss (NULL)."""
+
+    def __repr__(self):
+        return "PARSE_JSON"
+
+
+PARSE_JSON = _ParseJson()
+
 # Columns surfaced from the payload, so common questions do not need payload paths, as (column, record_types it
-# applies to (None = any), status it applies to (None = any), payload paths tried in order (a str key or an int
-# list index), cast). The second docs_written path is the streaming run_end's key.
+# applies to (None = any), status it applies to (None = any), payload paths tried in order (a str key, an int
+# list index, or PARSE_JSON), cast). The second docs_written path is the streaming run_end's key.
+_END_OFFSET = ("progress", "sources", 0, "endOffset", PARSE_JSON)
 SURFACED_COLUMNS = (
     ("docs_written", ("batch_end", "run_end"), None, (("written",), ("rows_pushed",)), "bigint"),
     ("error_type", None, "error", (("exception_type",),), "string"),
@@ -97,6 +121,10 @@ SURFACED_COLUMNS = (
      (("progress", "sources", 0, "metrics", "numFilesOutstanding"),), "bigint"),
     ("bytes_outstanding", ("batch_summary",), None,
      (("progress", "sources", 0, "metrics", "numBytesOutstanding"),), "bigint"),
+    ("source_latest_version", ("batch_start", "batch_summary"), None, (("source_latest", "version"),), "bigint"),
+    ("source_latest_ts", ("batch_start", "batch_summary"), None, (("source_latest", "timestamp"),), "timestamp"),
+    ("source_end_version", ("batch_summary",), None, ((*_END_OFFSET, "reservoirVersion"),), "bigint"),
+    ("source_end_index", ("batch_summary",), None, ((*_END_OFFSET, "index"),), "bigint"),
 )
 
 # The allow-list of record_type values (see THE ROW MODEL above). A row builder only ever emits one of
@@ -137,7 +165,8 @@ MAX_ERROR_MESSAGE_CHARS = 16000
 # cannot drift.
 ROW_FIELDS = ("config_name", "job_run_id", "task_run_id", "record_type", "status", "batch_id", "event_ts",
               "start_ts", "end_ts", "docs_written", "error_type", "error_message", "files_outstanding",
-              "bytes_outstanding", "payload")
+              "bytes_outstanding", "source_latest_version", "source_latest_ts", "source_end_version",
+              "source_end_index", "payload")
 
 # Liquid-clustering columns for the monitoring table. Every monitoring query filters by WHICH pipeline
 # (config_name) and a TIME window (event_ts), so clustering on these two gives data skipping as the table
@@ -170,7 +199,7 @@ def _fmt_ts(dt):
     try:
         if dt.tzinfo is not None:
             dt = dt.astimezone(timezone.utc)
-        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        return dt.strftime(_TS_FORMAT)
     except Exception:
         return None
 
@@ -195,16 +224,27 @@ def _json(payload):
 
 
 # The strict cast rule for the surfaced columns: "bigint" takes a JSON integer, or a string of plain digits (Spark
-# reports its metrics as strings), that fits in a signed 64-bit integer; "string" takes a JSON string. Anything
-# else (a boolean, a fraction, an object, an out-of-range number) is NULL rather than a guess.
+# reports its metrics as strings), that fits in a signed 64-bit integer; "string" takes a JSON string;
+# "timestamp" takes a string in the stored format _fmt_ts writes (a real date and time). Anything else (a
+# boolean, a fraction, an object, an out-of-range number, another date format) is NULL rather than a guess.
 _INTEGER_STRING = r"^-?[0-9]+$"
 _BIGINT_MIN, _BIGINT_MAX = -(2 ** 63), 2 ** 63 - 1
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
+_TS_STRING = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{6}$"
 
 
 def _cast_value(value, cast):
     """`value` under the strict cast rule above, or None."""
     if cast == "string":
         return value if isinstance(value, str) else None
+    if cast == "timestamp":
+        if not isinstance(value, str) or not re.match(_TS_STRING, value):
+            return None
+        try:
+            datetime.strptime(value, _TS_FORMAT)
+        except ValueError:
+            return None
+        return value
     if isinstance(value, str) and re.match(_INTEGER_STRING, value):
         value = int(value)
     if isinstance(value, int) and not isinstance(value, bool) and _BIGINT_MIN <= value <= _BIGINT_MAX:
@@ -219,7 +259,9 @@ def _payload_value(payload, paths, cast):
     for path in paths:
         value = payload
         for key in path:
-            if isinstance(key, int):
+            if key is PARSE_JSON:
+                value = _parse_json(value)
+            elif isinstance(key, int):
                 value = value[key] if isinstance(value, list) and len(value) > key else None
             else:
                 value = value.get(key) if isinstance(value, dict) else None
@@ -227,6 +269,19 @@ def _payload_value(payload, paths, cast):
         if value is not None:
             return value
     return None
+
+
+def _parse_json(value):
+    """A PARSE_JSON step: a JSON string parsed, an already-parsed dict or list as is, anything else (or a string
+    that is not JSON) None. FAIL-SOFT like every surfaced value."""
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return json.loads(value)
+    except ValueError:
+        return None
 
 
 def _surfaced(record_type, status, payload):
@@ -332,16 +387,32 @@ def batch_end_row(config_name, job_run_id, task_run_id, batch_id, status, facts,
     return _row(config_name, job_run_id, task_run_id, "batch_end", status, batch_id, facts, now, start=start, end=end)
 
 
-def batch_summary_row(config_name, job_run_id, task_run_id, batch_id, progress, now=None):
+def batch_summary_row(config_name, job_run_id, task_run_id, batch_id, progress, now=None, source_latest=None):
     """The `batch_summary` row (streaming only): Spark's StreamingQueryProgress dict for the batch, stored
     WHOLE (backlog, step durations, rates, offsets, nothing the runtime reports is dropped).
     start_ts / end_ts are Spark's trigger timestamp and trigger + batchDuration (Spark's view of the batch;
-    the batch's own wall clock is on its batch_start / batch_end rows)."""
+    the batch's own wall clock is on its batch_start / batch_end rows). `source_latest` is the batch's
+    source_latest facts relayed from its batch_start (None when the relay had nothing), stored beside the
+    progress so the newest version at batch start and the end offset sit on one row."""
     if not isinstance(progress, dict):
         raise ValueError(f"batch_summary progress must be a dict, got {type(progress).__name__}")
     start, end = _progress_bounds(progress)
-    return _row(config_name, job_run_id, task_run_id, "batch_summary", "success", batch_id, {"progress": progress}, now,
+    payload = {"progress": progress}
+    if source_latest is not None:
+        payload["source_latest"] = source_latest
+    return _row(config_name, job_run_id, task_run_id, "batch_summary", "success", batch_id, payload, now,
                 start=start, end=end)
+
+
+def source_latest_facts(version, timestamp):
+    """The `source_latest` payload field: the source table's newest commit `version` (a non-negative int) and that
+    commit's `timestamp` (a datetime; naive means UTC), read at batch start. Raises ValueError on anything else, so
+    a caller that cannot read a usable version records the error instead of a wrong number."""
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise ValueError(f"source version must be a non-negative int, got {version!r}")
+    if not isinstance(timestamp, datetime):
+        raise ValueError(f"source commit timestamp must be a datetime, got {type(timestamp).__name__}")
+    return {"version": version, "timestamp": _fmt_ts(timestamp)}
 
 
 def batch_success_facts(result, wall_ms=None):
