@@ -8,6 +8,9 @@ recorded (monitoring_sink.progress_batch_ids: a high-water mark, idle triggers s
   foreachBatch when read_source_relay returns it). FAIL-CLOSED like every log append: a failure raises, and
   await_stream stops the query and fails the task. A missing relay only leaves `source_latest` off the row.
 A failed progress READ only warns: the report stays in Spark's buffer and the next slice reads it again.
+When a batch is recorded, the relays of the batch ids it skipped over (batches whose report was lost) are
+drained too (read and discarded, at most MAX_RELAY_GAP_DRAIN of them), so a long-running stream does not
+accumulate relay files. Anything older is cleared at the next run start.
 
 Spark's progress is best-effort by nature (published asynchronously after the batch commits, kept only in
 memory), so a batch whose report is lost (a cancel moments after it committed) has batch_start / batch_end but
@@ -18,6 +21,10 @@ import time
 
 from pipeline_lib.monitoring_sink import batch_summary_row, progress_batch_ids
 from pipeline_lib.observability import PROGRESS_TAG, format_progress
+
+# How many skipped batch ids (reports lost between two recorded batches) have their relays drained. Spark's ids
+# are consecutive, so a gap means lost reports; it is normally 0, and the bound keeps a pathological gap cheap.
+MAX_RELAY_GAP_DRAIN = 100
 
 
 class ProgressRecorder:
@@ -52,6 +59,8 @@ class ProgressRecorder:
             return
         for report in progress_batch_ids(reports, self.last_batch_id):
             batch_id = report["batchId"]
+            if self.last_batch_id is not None:
+                self._drain_relays(range(max(self.last_batch_id + 1, batch_id - MAX_RELAY_GAP_DRAIN), batch_id))
             self.printer(format_progress(report))
             if self.read_print_relay is not None:
                 line = self.read_print_relay(batch_id)
@@ -62,6 +71,14 @@ class ProgressRecorder:
             self.log.append([batch_summary_row(self.config_name, self.job_run_id, self.task_run_id, batch_id,
                                                 report, source_latest=latest)], self.session)
             self.last_batch_id = batch_id
+
+    def _drain_relays(self, batch_ids):
+        """Read and discard the relays of batches whose report was lost (best-effort; the readers never raise)."""
+        for batch_id in batch_ids:
+            if self.read_print_relay is not None:
+                self.read_print_relay(batch_id)
+            if self.log.active and self.read_source_relay is not None:
+                self.read_source_relay(batch_id)
 
     def catch_up(self, query, through_batch_id, attempts=5, sleep=time.sleep, pause_seconds=2):
         """After a drain-and-stop run ends, wait briefly for the report of its last batch (`through_batch_id`):

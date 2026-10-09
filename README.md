@@ -1088,7 +1088,8 @@ Example: caught up or behind per streaming batch, from `batch_summary` alone:
 SELECT config_name, batch_id, start_ts, files_outstanding, source_latest_version, source_end_version,
        source_end_index,
        CASE WHEN files_outstanding = 0 THEN 'caught_up'
-            WHEN source_latest_version IS NULL OR source_end_version IS NULL THEN 'unknown'
+            WHEN files_outstanding IS NULL OR source_latest_version IS NULL OR source_end_version IS NULL
+              THEN 'unknown'
             WHEN source_latest_version >= source_end_version THEN 'behind'
             ELSE 'caught_up' END AS backlog_state
 FROM <catalog>.<schema>.<table>

@@ -77,7 +77,8 @@ class MonitoringLog:
 
 def spark_append(table, rows, session):
     """The Spark write behind MonitoringLog on a cluster: build a DataFrame from `rows` (payload and timestamps
-    as strings), parse the payload to VARIANT, cast the timestamps, stamp logged_ts = current_timestamp() (the
+    as strings), parse the payload to VARIANT, cast the timestamps (the builders' strings are UTC with no offset,
+    so a `Z` is appended first: a plain cast would read them in the session time zone), stamp logged_ts = current_timestamp() (the
     write time), and append BY NAME via writeTo().append(), so the table's physical column order does not
     matter (a column added to an existing table later sits last).
     The DataFrame schema is derived from MONITORING_TABLE_COLUMNS (spark_row_schema), never re-typed. Raises on
@@ -90,7 +91,7 @@ def spark_append(table, rows, session):
         if name not in ROW_FIELDS:
             continue
         if sql_type == "TIMESTAMP":
-            df = df.withColumn(name, F.col(name).cast("timestamp"))
+            df = df.withColumn(name, F.concat(F.col(name), F.lit("Z")).cast("timestamp"))
         elif sql_type == "VARIANT":
             df = df.withColumn(name, F.expr(f"parse_json({name})"))
     df = df.withColumn("logged_ts", F.current_timestamp())

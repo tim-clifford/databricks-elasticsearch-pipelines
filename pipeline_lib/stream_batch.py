@@ -51,8 +51,10 @@ def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name,
     - write_metrics(session, batch_id, written): persist the batch's written count (the drain summary reads it).
     - write_print_relay(session, batch_id, text) or None: hand the BULK_STATS line to the notebook's progress
       recorder; None when bulk_stats is off.
-    - read_source_latest(session) -> (version, commit datetime) or None: the source table's newest commit.
-    - write_source_relay(session, batch_id, facts) or None: hand `source_latest` to the progress recorder.
+    - read_source_latest(session) -> (version, commit datetime): the source table's newest commit. Pass None to
+      skip the read (batch_start then carries no source_latest). Anything it raises or returns that is not a
+      usable (version, datetime) pair is recorded as source_latest {"error": ...}.
+    - write_source_relay(session, batch_id, facts), or None: hand `source_latest` to the progress recorder.
     """
     clock = clock or (lambda: datetime.now(timezone.utc))
 

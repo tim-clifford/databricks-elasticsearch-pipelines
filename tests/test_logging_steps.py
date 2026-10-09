@@ -644,3 +644,36 @@ def test_progress_recorder_does_not_read_the_source_relay_when_the_log_is_off():
                            read_source_relay=lambda bid: asked.append(bid))
     rec(FakeQuery([[report(0)]]))
     assert asked == [] and rec.last_batch_id == 0
+
+
+def test_progress_recorder_drains_the_relays_of_batches_whose_report_was_lost():
+    ev = Events()
+    asked_src, asked_print, printed = [], [], []
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=printed.append,
+                           read_print_relay=lambda bid: asked_print.append(bid) or f"BULK_STATS batch_id={bid}",
+                           read_source_relay=lambda bid: asked_src.append(bid) or LATEST_FACTS)
+    q = FakeQuery([[report(0)], [report(3)]])  # the reports of batches 1 and 2 were lost
+    rec(q)
+    rec(q)
+    assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 3]
+    assert asked_src == [0, 1, 2, 3] and asked_print == [0, 1, 2, 3]
+    assert not any("batch_id=1" in p or "batch_id=2" in p for p in printed)  # drained, not printed
+
+
+def test_progress_recorder_gap_drain_is_bounded():
+    asked = []
+    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked.append(bid))
+    rec(FakeQuery([[report(0)]]))
+    rec(FakeQuery([[report(10_000)]]))
+    from pipeline_lib.stream_progress import MAX_RELAY_GAP_DRAIN
+    assert len(asked) == 1 + MAX_RELAY_GAP_DRAIN + 1 and asked[-1] == 10_000
+    assert asked[1] == 10_000 - MAX_RELAY_GAP_DRAIN
+
+
+def test_progress_recorder_first_report_drains_no_gap():
+    asked = []
+    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked.append(bid))
+    rec(FakeQuery([[report(500)]]))  # a resumed stream: nothing below 500 belongs to this run
+    assert asked == [500]
