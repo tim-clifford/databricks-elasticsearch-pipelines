@@ -663,18 +663,20 @@ def test_progress_recorder_prunes_relays_once_when_reports_were_lost():
     q = FakeQuery([[report(0)], [report(1)], [report(4)]])  # the reports of batches 2 and 3 were lost
     rec(q)
     rec(q)
-    assert pruned == []  # consecutive ids: nothing was skipped
+    assert pruned == [0]  # the first recorded batch; then consecutive ids, nothing was skipped
     rec(q)
-    assert pruned == [4] and asked == [0, 1, 4]
+    assert pruned == [0, 4] and asked == [0, 1, 4]
     assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 1, 4]
 
 
-def test_progress_recorder_first_report_prunes_nothing():
+def test_progress_recorder_first_report_prunes_below_it_once():
     pruned = []
     rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
                            prune_relays=pruned.append)
-    rec(FakeQuery([[report(500)]]))  # a resumed stream: ids below 500 are not this run's gap
-    assert pruned == []
+    q = FakeQuery([[report(500)], [report(500), report(501)]])
+    rec(q)  # run start cleared the relay dirs, so anything below the first recorded id was a lost report
+    rec(q)
+    assert pruned == [500]
 
 
 def test_progress_recorder_prune_failure_only_warns_and_still_records():

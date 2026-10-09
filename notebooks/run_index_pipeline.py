@@ -687,7 +687,7 @@ if PIPELINE_MODE == "streaming":
             return row["version"], _EPOCH + timedelta(microseconds=row["ts_us"])
 
         def _prune_relays(below_batch_id):
-            # Delete every batch's relay below `below_batch_id` (their reports were lost), one listing per dir.
+            # Delete every batch's relay below `below_batch_id` (reports that were lost), one listing per dir.
             prune_relay_dirs((print_relay_dir, source_relay_dir), below_batch_id, ls=dbutils.fs.ls,
                              rm=lambda path: dbutils.fs.rm(path, recurse=True))
 
