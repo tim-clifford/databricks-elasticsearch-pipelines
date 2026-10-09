@@ -1070,7 +1070,9 @@ source_latest_version >= source_end_version AND files_outstanding > 0
 and otherwise it was caught up (anything outstanding arrived while it ran). How to read the end offset: with
 `source_end_index = -1` every source version **below** `source_end_version` was sent (five commits v1 to v5
 end at version 6, index -1); with an index of 0 or more the batch stopped inside version `source_end_version`
-after that file (a cap that split one large commit), which the `>=` also counts as behind. Table maintenance
+after that file (a cap that split one large commit), which the `>=` also counts as behind. A fully sent version is always
+reported as the next version with index -1, including an initial snapshot that a cap ends on exactly (seen in
+every case on DBR 17.3; Delta never writes its internal end-of-version index into an offset). Table maintenance
 (OPTIMIZE, VACUUM, property changes) commits new versions without data: the Delta source moves its end offset
 past them, before or during a batch (a commit during a batch gets a 0-row batch of its own), and they add
 nothing to `files_outstanding`, so they do not read as behind (all proven live on DBR 17.3). The
