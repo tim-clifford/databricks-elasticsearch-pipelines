@@ -1,0 +1,69 @@
+resources:
+  jobs:
+    feed_status:
+      name: "[${bundle.target}] ${var.job_name_prefix}: _feed status"
+      description: >-
+        A serverless job that refreshes the feed status table (${var.feed_status_table}): one row per
+        pipeline config saying whether its export is CAUGHT_UP, IN_PROGRESS, PENDING, BEHIND or UNKNOWN,
+        for a caught-up/behind dashboard. Reads the pipeline configs, the generated job definitions, each
+        streaming checkpoint, DESCRIBE HISTORY on each distinct streaming source, and the monitoring log
+        table (${var.monitoring_log_table}); it never touches Elasticsearch. Creates the status table IF NOT
+        EXISTS on its first run, so its identity needs CREATE TABLE + MODIFY on the status table's schema,
+        SELECT on the monitoring log and source tables, and READ VOLUME on the checkpoints. No cluster
+        block => serverless notebook task.
+
+      # Never run two copies at once (two MERGEs would race), consistent with every other job.
+      max_concurrent_runs: 1
+
+      # Skip, don't queue: a tick landing while a slow run is still going is dropped rather than queued, so
+      # runs can never pile up behind each other (the next tick refreshes everything anyway).
+      queue:
+        enabled: false
+
+      # Every 5 minutes, PAUSED by default (${var.schedule_pause_status}): dev/stg deploy the schedule but
+      # never fire it; prd (schedule_pause_status=UNPAUSED) refreshes the table continuously. On-demand runs
+      # work regardless of pause_status.
+      schedule:
+        quartz_cron_expression: 0 */5 * * * ?
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
+
+      # Notify the target's support recipients on a run failure (empty list in dev/stg = off). A run fails
+      # only when the monitor itself is broken (configs unreadable, log table query or status MERGE failed);
+      # a feed that cannot be evaluated is recorded as UNKNOWN instead. Matches every other job.
+      email_notifications:
+        on_failure: ${var.support_email}
+      notification_settings:
+        no_alert_for_skipped_runs: true
+        no_alert_for_canceled_runs: true
+
+      # Global job tags from databricks.yml (empty {} => omitted). Matches every other job.
+      tags: ${var.global_job_tags}
+
+      tasks:
+        - task_key: feed_status
+          notebook_task:
+            notebook_path: ../notebooks/feed_status.py
+            # All deploy-time values. schedule_pause_status resolves the generated jobs' pause state and
+            # pipeline_mode the mode of configs that omit it; checkpoint_base_path and environment must
+            # match what the export jobs use.
+            base_parameters:
+              feed_status_table: ${var.feed_status_table}
+              monitoring_log_table: ${var.monitoring_log_table}
+              checkpoint_base_path: ${var.checkpoint_base_path}
+              environment: ${var.environment}
+              schedule_pause_status: ${var.schedule_pause_status}
+              pipeline_mode: ${var.pipeline_mode}
+              behind_threshold_minutes: ${var.feed_status_behind_threshold_minutes}
+          # Per-task failure notifications, mirroring every other job (see scripts/gen_jobs.py _build_task).
+          email_notifications:
+            on_failure: ${var.support_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: false
+
+      # CAN_MANAGE_RUN so any teammate in `users` can trigger a refresh, matching the other maintenance jobs.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          group_name: users

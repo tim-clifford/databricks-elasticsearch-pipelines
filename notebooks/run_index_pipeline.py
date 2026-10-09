@@ -240,6 +240,7 @@ from pipeline_lib.observability import PROGRESS_TAG  # noqa: E402
 # off-cluster). Decides seed-vs-resume for streaming_start=new; fail-closed so an existing checkpoint is
 # never misread as a first run (which would drain over an un-exported backlog).
 from pipeline_lib.checkpoint import EMPTY, HAS_OFFSET, checkpoint_offsets_state  # noqa: E402
+from pipeline_lib.checkpoint import checkpoint_location as checkpoint_location_for  # noqa: E402
 # The streaming wait loop (pure, duck-typed query; unit-tested off-cluster with a fake query).
 from pipeline_lib.stream_wait import await_stream as _await_stream  # noqa: E402
 
@@ -479,7 +480,7 @@ RECORDER.start({
     "connector_version": _connector_version, "filter_condition": FILTER_CONDITION,
     "write_overrides": write_overrides, "write_repartition": WRITE_REPARTITION,
     "streaming_start": STREAMING_START if PIPELINE_MODE == "streaming" else None,
-    "checkpoint": f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}" if PIPELINE_MODE == "streaming" else None,
+    "checkpoint": checkpoint_location_for(CHECKPOINT_BASE_PATH, CONFIG_NAME) if PIPELINE_MODE == "streaming" else None,
 }, spark)
 
 # Set by whichever mode cell below runs, and read by the summary/exit cell. Initialized to None so the backstop
@@ -574,7 +575,7 @@ if PIPELINE_MODE == "streaming":
         # checkpoint_base_path was validated non-empty at the validation stage above (streaming only).
         # Per-stream subfolder keyed by config_name (stable + unique + filesystem-safe), so each stream's
         # checkpoint is isolated and survives across runs.
-        checkpoint_location = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}"
+        checkpoint_location = checkpoint_location_for(CHECKPOINT_BASE_PATH, CONFIG_NAME)
 
         # The view's SELECT body, with ${source} bound to the per-batch temp view and ${ref_*} left as the
         # real reference tables. Extracted + rendered from the SAME .sql the deployed view uses (shared

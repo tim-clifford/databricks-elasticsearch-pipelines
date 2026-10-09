@@ -24,6 +24,13 @@ UNKNOWN = "unknown"        # cannot positively confirm absence => caller uses th
 _DEFAULT_MAX_CLIMB = 8
 
 
+def checkpoint_location(checkpoint_base_path, config_name):
+    """The streaming checkpoint directory for one pipeline config: `<checkpoint_base_path>/<config_name>`.
+    Keyed by config_name (stable, unique, filesystem-safe) so each stream's checkpoint is isolated and
+    survives across runs. The runner writes it and the feed status job reads it, so both build it here."""
+    return f"{checkpoint_base_path.rstrip('/')}/{config_name}"
+
+
 def _child_name(path):
     """Basename of a path (no trailing slash), e.g. '/a/b/offsets' -> 'offsets'."""
     return path.rstrip("/").rsplit("/", 1)[-1]
