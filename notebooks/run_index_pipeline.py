@@ -235,6 +235,7 @@ from pipeline_lib.stream_progress import ProgressRecorder  # noqa: E402
 # Log-line tag for this notebook's own streaming status lines.
 import json  # noqa: E402
 import uuid  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
 from pipeline_lib.observability import PROGRESS_TAG  # noqa: E402
 # Streaming checkpoint offsets-state classifier (pure Python, dependency-injected ls; unit-tested
 # off-cluster). Decides seed-vs-resume for streaming_start=new; fail-closed so an existing checkpoint is
@@ -621,6 +622,17 @@ if PIPELINE_MODE == "streaming":
         # cell and deletes it. BEST-EFFORT and nothing else: no log row depends on it. Cleared at run start.
         print_relay_dir = f"{checkpoint_location}/_bulk_stats_relay"
         dbutils.fs.rm(print_relay_dir, recurse=True)
+
+        # Per-batch SOURCE VERSION RELAY (log on only), the same mechanism: foreachBatch reads the source table's
+        # newest commit (version + commit time) at batch start, records it on batch_start, and writes it to
+        # `{source_relay_dir}/{batch_id}`; the progress recorder adds it to that batch's batch_summary and deletes
+        # it. With the end offset on batch_summary it tells "caught up, new files arrived during the batch" from
+        # "behind, available files were left for the next batch". BEST-EFFORT on batch_summary (batch_start always
+        # has it). COST: one `DESCRIBE HISTORY ... LIMIT 1` per batch on the batch's critical path (0.6 to 2.2 s
+        # per read in a live probe on DBR 17.3). It is skipped when the log is off; a knob to skip it with the log
+        # on could gate `read_source_latest` below. Cleared at run start.
+        source_relay_dir = f"{checkpoint_location}/_source_version_relay"
+        dbutils.fs.rm(source_relay_dir, recurse=True)
         dbutils.fs.rm(f"{checkpoint_location}/_batch_relay", recurse=True)  # a previous build's relay; unused now
         _BULK_STATS_ON = BULK_STATS.strip().lower() == "true"
 
@@ -639,13 +651,13 @@ if PIPELINE_MODE == "streaming":
             session.createDataFrame([(int(batch_id), int(written))], "batch_id bigint, written bigint") \
                 .coalesce(1).write.mode("append").json(metrics_dir)
 
-        def _write_print_relay(session, batch_id, text):
+        def _write_relay(relay_dir, session, batch_id, text):
             session.createDataFrame([(text,)], "line string") \
-                .coalesce(1).write.mode("overwrite").text(f"{print_relay_dir}/{int(batch_id)}")
+                .coalesce(1).write.mode("overwrite").text(f"{relay_dir}/{int(batch_id)}")
 
-        def _read_print_relay(batch_id):
-            """Return and delete the relayed BULK_STATS line for `batch_id` (best-effort; None if absent)."""
-            d = f"{print_relay_dir}/{int(batch_id)}"
+        def _read_relay(relay_dir, batch_id):
+            """Return and delete the relayed line for `batch_id` (best-effort; None if absent)."""
+            d = f"{relay_dir}/{int(batch_id)}"
             line = None
             try:
                 for f in dbutils.fs.ls(d):
@@ -657,17 +669,44 @@ if PIPELINE_MODE == "streaming":
                 pass
             return line
 
-        # The foreachBatch function (pipeline_lib.stream_batch): transform -> batch_start -> bulk_write -> metrics
-        # -> batch_end (+ ES diagnostics) -> print relay. Its order and failure handling are unit-tested.
+        def _write_print_relay(session, batch_id, text):
+            _write_relay(print_relay_dir, session, batch_id, text)
+
+        def _read_print_relay(batch_id):
+            return _read_relay(print_relay_dir, batch_id)
+
+        def _read_source_latest(session):
+            # The newest commit is the LIMIT 1 row (history is newest-first). The commit time is read as epoch
+            # microseconds so the session time zone cannot shift it.
+            row = session.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1") \
+                .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect()[0]
+            return row["version"], datetime.fromtimestamp(row["ts_us"] / 1_000_000, tz=timezone.utc)
+
+        def _write_source_relay(session, batch_id, facts):
+            _write_relay(source_relay_dir, session, batch_id, json.dumps(facts))
+
+        def _read_source_relay(batch_id):
+            """The relayed source_latest facts for `batch_id` (best-effort; None if absent or unreadable)."""
+            line = _read_relay(source_relay_dir, batch_id)
+            try:
+                facts = json.loads(line) if line else None
+            except ValueError:
+                return None
+            return facts if isinstance(facts, dict) else None
+
+        # The foreachBatch function (pipeline_lib.stream_batch): newest source version -> transform -> batch_start
+        # -> bulk_write -> metrics -> batch_end (+ ES diagnostics) -> source version relay -> print relay. Its order
+        # and failure handling are unit-tested.
         foreach_batch = make_foreach_batch(
             transform=_transform, bulk_write=bulk_write, write_config=es_write_config, log=MONITORING_LOG,
             config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID, task_run_id=TASK_RUN_ID, write_metrics=_write_metrics,
-            write_print_relay=_write_print_relay if _BULK_STATS_ON else None)
+            write_print_relay=_write_print_relay if _BULK_STATS_ON else None,
+            read_source_latest=_read_source_latest, write_source_relay=_write_source_relay)
         # Records each batch's Spark progress report (STREAM_PROGRESS line + batch_summary row) between the wait
         # loop's slices (pipeline_lib.stream_progress).
         PROGRESS = ProgressRecorder(MONITORING_LOG, CONFIG_NAME, JOB_RUN_ID, spark,
                                     read_print_relay=_read_print_relay if _BULK_STATS_ON else None,
-                                    task_run_id=TASK_RUN_ID)
+                                    task_run_id=TASK_RUN_ID, read_source_relay=_read_source_relay)
         # How often the wait loop (pipeline_lib.stream_wait) checks the stream between waits.
         POLL_SECONDS = 10
 

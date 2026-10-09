@@ -514,3 +514,133 @@ def test_spark_row_schema_matches_row_fields_and_types():
     assert types["batch_id"] == types["docs_written"] == types["files_outstanding"] == "bigint"
     assert types["start_ts"] == types["event_ts"] == types["payload"] == "string"  # cast by spark_append
     assert "logged_ts" not in types  # stamped by the writer
+
+
+# --- source position: newest source version read at batch start, relayed to batch_summary ---------
+
+LATEST = (9, datetime(2026, 10, 9, 18, 46, 31, tzinfo=timezone.utc))
+LATEST_FACTS = {"version": 9, "timestamp": "2026-10-09T18:46:31.000000"}
+
+
+def _fb_src(ev, read=None, relay=None, log=None, bulk_write=None, printed=None):
+    def default_read(session):
+        assert session == "SESSION"
+        ev.items.append(("read_latest",))
+        return LATEST
+
+    def default_relay(session, batch_id, facts):
+        ev.items.append(("source_relay", batch_id, facts))
+
+    def default_write(df, cfg, raise_on_error):
+        ev.items.append(("send", df))
+        return dict(RESULT)
+
+    return make_foreach_batch(
+        transform=lambda batch_df, session: ev.items.append(("transform",)) or "T",
+        bulk_write=bulk_write or default_write, write_config=WriteConfig(), log=log or make_log(ev),
+        config_name="cfg", job_run_id="run1", write_metrics=lambda s, b, w: ev.items.append(("metrics",)),
+        read_source_latest=default_read if read is None else read,
+        write_source_relay=default_relay if relay is None else relay,
+        printer=(printed.append if printed is not None else (lambda *_: None)), clock=Clock())
+
+
+def test_foreach_batch_reads_the_newest_version_first_and_records_it_on_batch_start():
+    ev = Events()
+    _fb_src(ev)(FakeBatchDF(), 4)
+    assert ev.types() == ["read_latest", "transform", "batch_start", "send", "metrics", "batch_end", "source_relay"]
+    start, = rows_of(ev, "batch_start")
+    assert json.loads(start["payload"]) == {"mode": "streaming", "source_latest": LATEST_FACTS}
+    assert start["source_latest_version"] == 9
+    assert ev.items[-1] == ("source_relay", 4, LATEST_FACTS)
+
+
+def test_foreach_batch_read_failure_is_recorded_not_raised():
+    ev = Events()
+    printed = []
+
+    def bad_read(session):
+        raise OSError("history unavailable")
+    _fb_src(ev, read=bad_read, printed=printed)(FakeBatchDF(), 2)
+    start, = rows_of(ev, "batch_start")
+    assert json.loads(start["payload"])["source_latest"] == {"error": "OSError: history unavailable"}
+    assert start["source_latest_version"] is None
+    assert rows_of(ev, "batch_end")[0]["status"] == "success"
+    assert ev.items[-1] == ("source_relay", 2, {"error": "OSError: history unavailable"})
+    assert any("could not read the newest source version" in p for p in printed)
+
+
+def test_foreach_batch_unusable_version_is_recorded_as_an_error():
+    ev = Events()
+    _fb_src(ev, read=lambda session: (None, LATEST[1]))(FakeBatchDF(), 2)
+    facts = json.loads(rows_of(ev, "batch_start")[0]["payload"])["source_latest"]
+    assert set(facts) == {"error"} and facts["error"].startswith("ValueError: source version")
+
+
+def test_foreach_batch_read_error_message_is_capped():
+    ev = Events()
+
+    def bad_read(session):
+        raise RuntimeError("x" * 5000)
+    _fb_src(ev, read=bad_read)(FakeBatchDF(), 2)
+    facts = json.loads(rows_of(ev, "batch_start")[0]["payload"])["source_latest"]
+    assert len(facts["error"]) <= 1000
+
+
+def test_foreach_batch_source_relay_failure_is_swallowed():
+    ev = Events()
+
+    def bad_relay(session, batch_id, facts):
+        raise OSError("volume blip")
+    _fb_src(ev, relay=bad_relay)(FakeBatchDF(), 3)
+    assert rows_of(ev, "batch_end")[0]["status"] == "success"
+
+
+def test_foreach_batch_no_source_relay_when_the_batch_fails():
+    ev = Events()
+
+    def failing_write(df, cfg, raise_on_error):
+        raise ConnectionError("ES down")
+    with pytest.raises(ConnectionError):
+        _fb_src(ev, bulk_write=failing_write)(FakeBatchDF(), 5)
+    assert "source_relay" not in ev.types()
+
+
+def test_foreach_batch_skips_the_read_and_relay_when_the_log_is_off():
+    ev = Events()
+    _fb_src(ev, log=MonitoringLog("", lambda *a: None))(FakeBatchDF(), 8)
+    assert "read_latest" not in ev.types() and "source_relay" not in ev.types()
+
+
+def test_foreach_batch_without_a_reader_keeps_the_old_batch_start_payload():
+    ev = Events()
+    _fb(ev)(FakeBatchDF(), 1)
+    assert json.loads(rows_of(ev, "batch_start")[0]["payload"]) == {"mode": "streaming"}
+
+
+def test_progress_recorder_adds_the_relayed_source_version_to_batch_summary():
+    ev = Events()
+    asked = []
+    rep = dict(report(5), sources=[{"endOffset": json.dumps({"reservoirVersion": 10, "index": -1})}])
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked.append(bid) or LATEST_FACTS)
+    rec(FakeQuery([[rep]]))
+    row, = rows_of(ev, "batch_summary")
+    assert asked == [5]
+    assert (row["source_latest_version"], row["source_end_version"], row["source_end_index"]) == (9, 10, -1)
+
+
+def test_progress_recorder_without_a_relayed_version_still_records_the_summary():
+    ev = Events()
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: None)
+    rec(FakeQuery([[report(0)]]))
+    row, = rows_of(ev, "batch_summary")
+    assert row["source_latest_version"] is None and "source_latest" not in json.loads(row["payload"])
+
+
+def test_progress_recorder_does_not_read_the_source_relay_when_the_log_is_off():
+    asked = []
+    rec = ProgressRecorder(MonitoringLog("", lambda *a: None), "cfg", "", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked.append(bid))
+    rec(FakeQuery([[report(0)]]))
+    assert asked == [] and rec.last_batch_id == 0

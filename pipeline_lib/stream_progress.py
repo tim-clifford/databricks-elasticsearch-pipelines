@@ -4,8 +4,9 @@ Between wait slices, ProgressRecorder reads query.recentProgress (a short reques
 spark.sql.streaming.numRecentProgressUpdates reports, default 100) and, for every batch newer than the last one
 recorded (monitoring_sink.progress_batch_ids: a high-water mark, idle triggers skipped):
 - prints its STREAM_PROGRESS line, plus the batch's relayed BULK_STATS line when bulk_stats is on;
-- appends its batch_summary (Spark's whole progress report). FAIL-CLOSED like every log append: a failure
-  raises, and await_stream stops the query and fails the task.
+- appends its batch_summary (Spark's whole progress report, plus the batch's `source_latest` relayed from
+  foreachBatch when read_source_relay returns it). FAIL-CLOSED like every log append: a failure raises, and
+  await_stream stops the query and fails the task. A missing relay only leaves `source_latest` off the row.
 A failed progress READ only warns: the report stays in Spark's buffer and the next slice reads it again.
 
 Spark's progress is best-effort by nature (published asynchronously after the batch commits, kept only in
@@ -26,16 +27,19 @@ class ProgressRecorder:
     - task_run_id: this attempt's {{task.run_id}} ("" on an interactive run).
     - read_print_relay(batch_id) -> str | None, or None when bulk_stats is off: return and delete the batch's
       relayed BULK_STATS line (best-effort; never raises).
+    - read_source_relay(batch_id) -> dict | None, or None: return and delete the batch's relayed source_latest
+      facts (best-effort; never raises). Read only when the log is on.
     """
 
     def __init__(self, log, config_name, job_run_id, session, read_print_relay=None, printer=print,
-                 task_run_id=""):
+                 task_run_id="", read_source_relay=None):
         self.log = log
         self.config_name = config_name
         self.job_run_id = job_run_id
         self.task_run_id = task_run_id
         self.session = session
         self.read_print_relay = read_print_relay
+        self.read_source_relay = read_source_relay
         self.printer = printer
         self.last_batch_id = None
 
@@ -53,8 +57,10 @@ class ProgressRecorder:
                 line = self.read_print_relay(batch_id)
                 if line:
                     self.printer(line)
+            latest = (self.read_source_relay(batch_id)
+                      if self.log.active and self.read_source_relay is not None else None)
             self.log.append([batch_summary_row(self.config_name, self.job_run_id, self.task_run_id, batch_id,
-                                                report)], self.session)
+                                                report, source_latest=latest)], self.session)
             self.last_batch_id = batch_id
 
     def catch_up(self, query, through_batch_id, attempts=5, sleep=time.sleep, pause_seconds=2):
