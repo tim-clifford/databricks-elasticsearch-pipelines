@@ -1083,6 +1083,10 @@ arrives while the batch runs (so `files_outstanding > 0`), a caught-up batch rea
 direction, and the next batch corrects it. A NULL `source_latest_version` (the read failed, or the relay to
 `batch_summary` was lost; `batch_start` still has it) leaves the batch unclassified.
 
+**Upgrading an existing log table:** re-run `_log table create` **before** deploying a build with these
+four columns (the "Adding a column later" step below); it adds them in place. A build that
+writes them to a table without them fails its first append (`run_start`), before any data moves.
+
 Cost: the read is one `DESCRIBE HISTORY <source> LIMIT 1` per batch, on the batch's critical path before its
 data is sent (0.6 to 2.2 s per read in a live probe on DBR 17.3). It runs only for streaming with the log on.
 There is no knob to skip it with the log on; one could be added by gating `read_source_latest` in

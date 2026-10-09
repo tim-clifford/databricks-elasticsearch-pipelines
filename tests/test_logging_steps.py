@@ -808,3 +808,13 @@ def test_progress_recorder_also_prunes_periodically():
     for bid in range(n):  # consecutive ids: no gap
         rec(FakeQuery([[report(bid)]]))
     assert pruned == [0, PRUNE_EVERY_RECORDED_BATCHES, 2 * PRUNE_EVERY_RECORDED_BATCHES]
+
+
+def test_progress_recorder_periodic_interval_restarts_after_a_gap_prune():
+    from pipeline_lib.stream_progress import PRUNE_EVERY_RECORDED_BATCHES as N
+    pruned = []
+    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
+                           prune_relays=pruned.append)
+    for bid in list(range(10)) + list(range(20, 20 + N + 1)):  # a gap from 9 to 20
+        rec(FakeQuery([[report(bid)]]))
+    assert pruned == [0, 20, 20 + N]

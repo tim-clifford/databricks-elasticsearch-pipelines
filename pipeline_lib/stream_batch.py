@@ -8,7 +8,9 @@ make_foreach_batch builds it from injected pieces, so its ORDER and failure hand
   tells a batch that left available files behind (behind) from one whose outstanding files arrived while it ran
   (caught up). Read only when the log is on (nothing would record it otherwise). FAIL-SOFT: a failed read is
   recorded as {"error": ...} and printed, never raised, because it is a diagnostic and must not stop the export.
-  It costs one source history read per batch (0.6 to 2.2 s per read in a live probe on DBR 17.3).
+  It costs one source history read per batch (0.6 to 2.2 s per read in a live probe on DBR 17.3). It has no
+  timeout of its own on purpose: it reads the same Delta log and metastore the batch has just read from, so a
+  hang there stalls the export regardless, and a thread-based timeout inside foreachBatch adds risk for no gain.
 - batch_start is written BEFORE any of the batch's data is sent, so a log outage fails the micro-batch (and the
   task) before the data moves.
 - Any failure from the write onward (the write itself, or the metrics file) records batch_end status error,
