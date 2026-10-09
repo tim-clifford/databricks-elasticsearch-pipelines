@@ -233,11 +233,11 @@ from pipeline_lib.batch_export import run_batch_export  # noqa: E402
 from pipeline_lib.monitoring_writer import MonitoringLog, resolve_log_table, spark_append  # noqa: E402
 from pipeline_lib.run_record import RunRecorder  # noqa: E402
 from pipeline_lib.stream_batch import make_foreach_batch  # noqa: E402
-from pipeline_lib.stream_progress import ProgressRecorder  # noqa: E402
+from pipeline_lib.stream_progress import ProgressRecorder, prune_relay_dirs  # noqa: E402
 # Log-line tag for this notebook's own streaming status lines.
 import json  # noqa: E402
 import uuid  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
 from pipeline_lib.observability import PROGRESS_TAG  # noqa: E402
 # Streaming checkpoint offsets-state classifier (pure Python, dependency-injected ls; unit-tested
 # off-cluster). Decides seed-vs-resume for streaming_start=new; fail-closed so an existing checkpoint is
@@ -677,12 +677,19 @@ if PIPELINE_MODE == "streaming":
         def _read_print_relay(batch_id):
             return _read_relay(print_relay_dir, batch_id)
 
+        _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
         def _read_source_latest(session):
             # The newest commit is the LIMIT 1 row (history is newest-first). The commit time is read as epoch
             # microseconds so the session time zone cannot shift it.
             row = session.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1") \
                 .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect()[0]
-            return row["version"], datetime.fromtimestamp(row["ts_us"] / 1_000_000, tz=timezone.utc)
+            return row["version"], _EPOCH + timedelta(microseconds=row["ts_us"])
+
+        def _prune_relays(below_batch_id):
+            # Delete every batch's relay below `below_batch_id` (their reports were lost), one listing per dir.
+            prune_relay_dirs((print_relay_dir, source_relay_dir), below_batch_id, ls=dbutils.fs.ls,
+                             rm=lambda path: dbutils.fs.rm(path, recurse=True))
 
         def _write_source_relay(session, batch_id, facts):
             _write_relay(source_relay_dir, session, batch_id, json.dumps(facts))
@@ -708,7 +715,8 @@ if PIPELINE_MODE == "streaming":
         # loop's slices (pipeline_lib.stream_progress).
         PROGRESS = ProgressRecorder(MONITORING_LOG, CONFIG_NAME, JOB_RUN_ID, spark,
                                     read_print_relay=_read_print_relay if _BULK_STATS_ON else None,
-                                    task_run_id=TASK_RUN_ID, read_source_relay=_read_source_relay)
+                                    task_run_id=TASK_RUN_ID, read_source_relay=_read_source_relay,
+                                    prune_relays=_prune_relays)
         # How often the wait loop (pipeline_lib.stream_wait) checks the stream between waits.
         POLL_SECONDS = 10
 

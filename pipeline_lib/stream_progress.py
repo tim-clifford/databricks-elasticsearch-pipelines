@@ -8,9 +8,9 @@ recorded (monitoring_sink.progress_batch_ids: a high-water mark, idle triggers s
   foreachBatch when read_source_relay returns it). FAIL-CLOSED like every log append: a failure raises, and
   await_stream stops the query and fails the task. A missing relay only leaves `source_latest` off the row.
 A failed progress READ only warns: the report stays in Spark's buffer and the next slice reads it again.
-When a batch is recorded, the relays of the batch ids it skipped over (batches whose report was lost) are
-drained too (read and discarded, at most MAX_RELAY_GAP_DRAIN of them), so a long-running stream does not
-accumulate relay files. Anything older is cleared at the next run start.
+When a recorded batch skips over batch ids (batches whose report was lost), prune_relays deletes every relay
+below it, ONE call per gap (best-effort), so a long-running stream does not accumulate relay files. A last
+batch whose report is lost leaves its relays until the next run start clears them.
 
 Spark's progress is best-effort by nature (published asynchronously after the batch commits, kept only in
 memory), so a batch whose report is lost (a cancel moments after it committed) has batch_start / batch_end but
@@ -22,10 +22,6 @@ import time
 from pipeline_lib.monitoring_sink import batch_summary_row, progress_batch_ids
 from pipeline_lib.observability import PROGRESS_TAG, format_progress
 
-# How many skipped batch ids (reports lost between two recorded batches) have their relays drained. Spark's ids
-# are consecutive, so a gap means lost reports; it is normally 0, and the bound keeps a pathological gap cheap.
-MAX_RELAY_GAP_DRAIN = 100
-
 
 class ProgressRecorder:
     """Callable(query): record newly executed batches (see the module docstring).
@@ -36,10 +32,12 @@ class ProgressRecorder:
       relayed BULK_STATS line (best-effort; never raises).
     - read_source_relay(batch_id) -> dict | None, or None: return and delete the batch's relayed source_latest
       facts (best-effort; never raises). Read only when the log is on.
+    - prune_relays(below_batch_id), or None: delete every relay for a batch id below `below_batch_id`. Called once
+      when a recorded batch skipped over ids (their reports were lost). A failure only warns.
     """
 
     def __init__(self, log, config_name, job_run_id, session, read_print_relay=None, printer=print,
-                 task_run_id="", read_source_relay=None):
+                 task_run_id="", read_source_relay=None, prune_relays=None):
         self.log = log
         self.config_name = config_name
         self.job_run_id = job_run_id
@@ -47,6 +45,7 @@ class ProgressRecorder:
         self.session = session
         self.read_print_relay = read_print_relay
         self.read_source_relay = read_source_relay
+        self.prune_relays = prune_relays
         self.printer = printer
         self.last_batch_id = None
 
@@ -59,8 +58,12 @@ class ProgressRecorder:
             return
         for report in progress_batch_ids(reports, self.last_batch_id):
             batch_id = report["batchId"]
-            if self.last_batch_id is not None:
-                self._drain_relays(range(max(self.last_batch_id + 1, batch_id - MAX_RELAY_GAP_DRAIN), batch_id))
+            if self.prune_relays is not None and self.last_batch_id is not None and batch_id > self.last_batch_id + 1:
+                try:
+                    self.prune_relays(batch_id)
+                except Exception as exc:
+                    self.printer(f"WARNING: {PROGRESS_TAG} could not prune relays below batch {batch_id} "
+                                 f"({type(exc).__name__}: {exc})")
             self.printer(format_progress(report))
             if self.read_print_relay is not None:
                 line = self.read_print_relay(batch_id)
@@ -72,14 +75,6 @@ class ProgressRecorder:
                                                 report, source_latest=latest)], self.session)
             self.last_batch_id = batch_id
 
-    def _drain_relays(self, batch_ids):
-        """Read and discard the relays of batches whose report was lost (best-effort; the readers never raise)."""
-        for batch_id in batch_ids:
-            if self.read_print_relay is not None:
-                self.read_print_relay(batch_id)
-            if self.log.active and self.read_source_relay is not None:
-                self.read_source_relay(batch_id)
-
     def catch_up(self, query, through_batch_id, attempts=5, sleep=time.sleep, pause_seconds=2):
         """After a drain-and-stop run ends, wait briefly for the report of its last batch (`through_batch_id`):
         Spark can publish it just after the query terminates. Polls up to `attempts` times; whatever is still
@@ -89,3 +84,22 @@ class ProgressRecorder:
                 return
             sleep(pause_seconds)
             self(query)
+
+
+def prune_relay_dirs(relay_dirs, below_batch_id, ls, rm):
+    """Delete every per-batch relay entry (a directory named by its batch id) below `below_batch_id`, with ONE
+    listing per relay dir: the notebook's prune_relays. ls(dir) -> entries with .name and .path (dbutils.fs.ls);
+    rm(path) deletes one. Best-effort: a missing dir, an entry that is not a batch id, or a failed delete is
+    skipped, never raised."""
+    for relay_dir in relay_dirs:
+        try:
+            entries = ls(relay_dir)
+        except Exception:
+            continue
+        for entry in entries:
+            name = entry.name.rstrip("/")
+            if name.isdigit() and int(name) < below_batch_id:
+                try:
+                    rm(entry.path)
+                except Exception:
+                    pass

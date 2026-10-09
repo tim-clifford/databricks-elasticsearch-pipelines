@@ -586,13 +586,22 @@ def test_foreach_batch_read_error_message_is_capped():
     assert len(facts["error"]) <= 1000
 
 
-def test_foreach_batch_source_relay_failure_is_swallowed():
+def test_foreach_batch_source_relay_failure_is_swallowed_warns_and_the_print_relay_still_runs():
     ev = Events()
+    printed = []
 
     def bad_relay(session, batch_id, facts):
         raise OSError("volume blip")
-    _fb_src(ev, relay=bad_relay)(FakeBatchDF(), 3)
+    fb = make_foreach_batch(
+        transform=lambda b, s: "T", bulk_write=lambda df, cfg, raise_on_error: dict(RESULT, bulk_stats=[{}]),
+        write_config=WriteConfig(), log=make_log(ev), config_name="cfg", job_run_id="run1",
+        write_metrics=lambda s, b, w: None, read_source_latest=lambda s: LATEST, write_source_relay=bad_relay,
+        write_print_relay=lambda s, b, text: ev.items.append(("relay", b, text)),
+        printer=printed.append, clock=Clock())
+    fb(FakeBatchDF(), 3)  # does not raise
     assert rows_of(ev, "batch_end")[0]["status"] == "success"
+    assert any("could not relay batch 3's source version" in p for p in printed)
+    assert [e[:2] for e in ev.items if e[0] == "relay"] == [("relay", 3)]
 
 
 def test_foreach_batch_no_source_relay_when_the_batch_fails():
@@ -646,52 +655,79 @@ def test_progress_recorder_does_not_read_the_source_relay_when_the_log_is_off():
     assert asked == [] and rec.last_batch_id == 0
 
 
-def test_progress_recorder_drains_the_relays_of_batches_whose_report_was_lost():
+def test_progress_recorder_prunes_relays_once_when_reports_were_lost():
     ev = Events()
-    asked_src, asked_print, printed = [], [], []
+    pruned, asked = [], []
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked.append(bid) or LATEST_FACTS, prune_relays=pruned.append)
+    q = FakeQuery([[report(0)], [report(1)], [report(4)]])  # the reports of batches 2 and 3 were lost
+    rec(q)
+    rec(q)
+    assert pruned == []  # consecutive ids: nothing was skipped
+    rec(q)
+    assert pruned == [4] and asked == [0, 1, 4]
+    assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 1, 4]
+
+
+def test_progress_recorder_first_report_prunes_nothing():
+    pruned = []
+    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
+                           prune_relays=pruned.append)
+    rec(FakeQuery([[report(500)]]))  # a resumed stream: ids below 500 are not this run's gap
+    assert pruned == []
+
+
+def test_progress_recorder_prune_failure_only_warns_and_still_records():
+    ev = Events()
+    printed = []
+
+    def bad_prune(below):
+        raise OSError("volume blip")
     rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=printed.append,
-                           read_print_relay=lambda bid: asked_print.append(bid) or f"BULK_STATS batch_id={bid}",
-                           read_source_relay=lambda bid: asked_src.append(bid) or LATEST_FACTS)
-    q = FakeQuery([[report(0)], [report(3)]])  # the reports of batches 1 and 2 were lost
+                           prune_relays=bad_prune)
+    q = FakeQuery([[report(0)], [report(3)]])
+    rec(q)
+    rec(q)
+    assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 3] and rec.last_batch_id == 3
+    assert any("could not prune relays below batch 3" in p for p in printed)
+
+
+def test_progress_recorder_without_a_pruner_tolerates_a_gap():
+    ev = Events()
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None)
+    q = FakeQuery([[report(0)], [report(3)]])
     rec(q)
     rec(q)
     assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 3]
-    assert asked_src == [0, 1, 2, 3] and asked_print == [0, 1, 2, 3]
-    assert not any("batch_id=1" in p or "batch_id=2" in p for p in printed)  # drained, not printed
 
 
-def test_progress_recorder_gap_drain_is_bounded():
-    asked = []
-    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
-                           read_source_relay=lambda bid: asked.append(bid))
-    rec(FakeQuery([[report(0)]]))
-    rec(FakeQuery([[report(10_000)]]))
-    from pipeline_lib.stream_progress import MAX_RELAY_GAP_DRAIN
-    assert len(asked) == 1 + MAX_RELAY_GAP_DRAIN + 1 and asked[-1] == 10_000
-    assert asked[1] == 10_000 - MAX_RELAY_GAP_DRAIN
+class FileInfo:
+    def __init__(self, path):
+        self.path = path
+        self.name = path.rstrip("/").rsplit("/", 1)[-1] + ("/" if path.endswith("/") else "")
 
 
-def test_progress_recorder_first_report_drains_no_gap():
-    asked = []
-    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
-                           read_source_relay=lambda bid: asked.append(bid))
-    rec(FakeQuery([[report(500)]]))  # a resumed stream: nothing below 500 belongs to this run
-    assert asked == [500]
+def test_prune_relay_dirs_deletes_only_numeric_entries_below_the_batch():
+    from pipeline_lib.stream_progress import prune_relay_dirs
+    listing = {"/r/a": [FileInfo("/r/a/1/"), FileInfo("/r/a/2/"), FileInfo("/r/a/3/"), FileInfo("/r/a/x/")],
+               "/r/b": [FileInfo("/r/b/0/"), FileInfo("/r/b/12/")]}
+    removed = []
+    prune_relay_dirs(("/r/a", "/r/b"), 3, ls=lambda d: listing[d], rm=removed.append)
+    assert removed == ["/r/a/1/", "/r/a/2/", "/r/b/0/"]
 
 
-def test_progress_recorder_gap_drain_respects_log_off_and_absent_print_relay():
-    asked_src, asked_print = [], []
-    rec = ProgressRecorder(MonitoringLog("", lambda *a: None), "cfg", "", session=None, printer=lambda *_: None,
-                           read_print_relay=lambda bid: asked_print.append(bid),
-                           read_source_relay=lambda bid: asked_src.append(bid))
-    q = FakeQuery([[report(0)], [report(3)]])
-    rec(q)
-    rec(q)
-    assert asked_print == [0, 1, 2, 3] and asked_src == []
-    ev = Events()
-    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None,
-                           read_source_relay=lambda bid: asked_src.append(bid))
-    q = FakeQuery([[report(0)], [report(3)]])
-    rec(q)
-    rec(q)
-    assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 3] and asked_src == [0, 1, 2, 3]
+def test_prune_relay_dirs_skips_a_missing_dir_and_a_failed_delete():
+    from pipeline_lib.stream_progress import prune_relay_dirs
+    removed = []
+
+    def ls(d):
+        if d == "/missing":
+            raise FileNotFoundError(d)
+        return [FileInfo("/r/1/"), FileInfo("/r/2/")]
+
+    def rm(path):
+        if path == "/r/1/":
+            raise OSError("blip")
+        removed.append(path)
+    prune_relay_dirs(("/missing", "/r"), 5, ls=ls, rm=rm)  # does not raise
+    assert removed == ["/r/2/"]
