@@ -753,3 +753,15 @@ def test_prune_relay_dirs_skips_non_ascii_digit_names():
     entries = [FileInfo("/r/²/"), FileInfo("/r/٣/"), FileInfo("/r/1/")]
     prune_relay_dirs(("/r",), 5, ls=lambda d: entries, rm=removed.append)
     assert removed == ["/r/1/"]
+
+
+@pytest.mark.parametrize("line", [None, "", "not json", "[1]", "9", '"s"', "null", "{", "[" * 200000])
+def test_parse_source_relay_rejects_anything_but_a_json_object(line):
+    from pipeline_lib.stream_progress import parse_source_relay
+    assert parse_source_relay(line) is None
+
+
+def test_parse_source_relay_round_trips_the_facts():
+    from pipeline_lib.stream_progress import parse_source_relay
+    assert parse_source_relay(json.dumps(LATEST_FACTS)) == LATEST_FACTS
+    assert parse_source_relay('{"error": "OSError: blip"}') == {"error": "OSError: blip"}

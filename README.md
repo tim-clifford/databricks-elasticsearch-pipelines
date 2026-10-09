@@ -993,7 +993,10 @@ later, best-effort by nature. A `batch_end` with no `batch_summary` is a streami
 **job cancel is not that**: it interrupts the notebook itself (seen live), so a cancelled run leaves
 `run_start` with no `run_end`, exactly like a killed run.
 `start_ts`/`end_ts` carry the run's or batch's wall clock (for `batch_summary`, Spark's trigger
-timestamp + `batchDuration`).
+timestamp + `batchDuration`). Every timestamp column holds a UTC instant whatever the session time zone.
+Builds before the `source_*` columns read the writer's UTC strings in the Spark session time zone, so on a
+cluster whose `spark.sql.session.timeZone` was not UTC (the Databricks default is UTC) rows logged by those
+builds are shifted by that zone's offset relative to newer rows.
 
 **Reading the gaps.** A `batch_start` with no `batch_end` is a batch that never finished (the task was
 killed, or the driver died mid-write); a `run_start` with no `run_end` is a run that was killed

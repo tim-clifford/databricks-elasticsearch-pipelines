@@ -87,6 +87,18 @@ class ProgressRecorder:
             self(query)
 
 
+def parse_source_relay(line):
+    """The source_latest facts from a relayed line (json.dumps of a dict), or None for anything else: no line, not
+    JSON, nested too deep, or JSON that is not an object. Best-effort: never raises."""
+    if not line:
+        return None
+    try:
+        facts = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    return facts if isinstance(facts, dict) else None
+
+
 def prune_relay_dirs(relay_dirs, below_batch_id, ls, rm):
     """Delete every per-batch relay entry (a directory named by its batch id) below `below_batch_id`, with ONE
     listing per relay dir: the notebook's prune_relays. ls(dir) -> entries with .name and .path (dbutils.fs.ls);

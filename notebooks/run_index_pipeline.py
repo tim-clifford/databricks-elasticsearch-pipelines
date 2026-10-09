@@ -233,7 +233,7 @@ from pipeline_lib.batch_export import run_batch_export  # noqa: E402
 from pipeline_lib.monitoring_writer import MonitoringLog, resolve_log_table, spark_append  # noqa: E402
 from pipeline_lib.run_record import RunRecorder  # noqa: E402
 from pipeline_lib.stream_batch import make_foreach_batch  # noqa: E402
-from pipeline_lib.stream_progress import ProgressRecorder, prune_relay_dirs  # noqa: E402
+from pipeline_lib.stream_progress import ProgressRecorder, parse_source_relay, prune_relay_dirs  # noqa: E402
 # Log-line tag for this notebook's own streaming status lines.
 import json  # noqa: E402
 import uuid  # noqa: E402
@@ -696,12 +696,7 @@ if PIPELINE_MODE == "streaming":
 
         def _read_source_relay(batch_id):
             """The relayed source_latest facts for `batch_id` (best-effort; None if absent or unreadable)."""
-            line = _read_relay(source_relay_dir, batch_id)
-            try:
-                facts = json.loads(line) if line else None
-            except ValueError:
-                return None
-            return facts if isinstance(facts, dict) else None
+            return parse_source_relay(_read_relay(source_relay_dir, batch_id))
 
         # The foreachBatch function (pipeline_lib.stream_batch): newest source version -> transform -> batch_start
         # -> bulk_write -> metrics -> batch_end (+ ES diagnostics) -> source version relay -> print relay. Its order
