@@ -90,12 +90,22 @@ def spark_append(table, rows, session):
     for name, sql_type, _comment in MONITORING_TABLE_COLUMNS:
         if name not in ROW_FIELDS:
             continue
-        if sql_type == "TIMESTAMP":
-            df = df.withColumn(name, F.concat(F.col(name), F.lit("Z")).cast("timestamp"))
-        elif sql_type == "VARIANT":
-            df = df.withColumn(name, F.expr(f"parse_json({name})"))
+        cast = column_cast_sql(name, sql_type)
+        if cast is not None:
+            df = df.withColumn(name, F.expr(cast))
     df = df.withColumn("logged_ts", F.current_timestamp())
     df.writeTo(table).append()
+
+
+def column_cast_sql(name, sql_type):
+    """The SQL expression spark_append applies to a builder column, or None when the column is used as built. A
+    TIMESTAMP string (UTC, no offset) gets a `Z` before the cast, so the session time zone cannot shift it; a
+    VARIANT string is parsed. Pure, so the cast is unit-tested; spark_append itself is proven live."""
+    if sql_type == "TIMESTAMP":
+        return f"CAST(concat({name}, 'Z') AS TIMESTAMP)"
+    if sql_type == "VARIANT":
+        return f"parse_json({name})"
+    return None
 
 
 def spark_row_schema():

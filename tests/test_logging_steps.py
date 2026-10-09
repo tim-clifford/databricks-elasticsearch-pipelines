@@ -767,3 +767,17 @@ def test_parse_source_relay_round_trips_the_facts():
     from pipeline_lib.stream_progress import parse_source_relay
     assert parse_source_relay(json.dumps(LATEST_FACTS)) == LATEST_FACTS
     assert parse_source_relay('{"error": "OSError: blip"}') == {"error": "OSError: blip"}
+
+
+def test_writer_casts_every_timestamp_column_as_utc_and_parses_the_payload():
+    from pipeline_lib.monitoring_sink import MONITORING_TABLE_COLUMNS, ROW_FIELDS
+    from pipeline_lib.monitoring_writer import column_cast_sql
+    types = {name: sql_type for name, sql_type, _c in MONITORING_TABLE_COLUMNS}
+    casts = {name: column_cast_sql(name, types[name]) for name in ROW_FIELDS}
+    timestamps = [n for n in ROW_FIELDS if types[n] == "TIMESTAMP"]
+    assert timestamps == ["event_ts", "start_ts", "end_ts", "source_latest_ts"]
+    for name in timestamps:
+        # The builders' strings are UTC with no offset: the Z makes the cast independent of the session time zone.
+        assert casts[name] == f"CAST(concat({name}, 'Z') AS TIMESTAMP)"
+    assert casts["payload"] == "parse_json(payload)"
+    assert all(casts[n] is None for n in ROW_FIELDS if types[n] not in ("TIMESTAMP", "VARIANT"))
