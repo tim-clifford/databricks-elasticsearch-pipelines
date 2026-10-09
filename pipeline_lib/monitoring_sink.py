@@ -113,6 +113,9 @@ PARSE_JSON = _ParseJson()
 # Columns surfaced from the payload, so common questions do not need payload paths, as (column, record_types it
 # applies to (None = any), status it applies to (None = any), payload paths tried in order (a str key, an int
 # list index, or PARSE_JSON), cast). The second docs_written path is the streaming run_end's key.
+# sources[0] is THE source: a pipeline streams exactly one table (its config's `source`; reference tables are
+# static reads inside the batch's SELECT), so the progress report has one source entry. files_outstanding and
+# bytes_outstanding rely on the same fact.
 _END_OFFSET = ("progress", "sources", 0, "endOffset", PARSE_JSON)
 SURFACED_COLUMNS = (
     ("docs_written", ("batch_end", "run_end"), None, (("written",), ("rows_pushed",)), "bigint"),

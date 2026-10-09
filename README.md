@@ -1077,10 +1077,13 @@ sends nothing for (table maintenance such as OPTIMIZE, VACUUM and property chang
 commits `skipChangeCommits` skips) do not read as behind: the Delta source moves its end offset past them,
 before or during a batch (a commit during a batch gets a 0-row batch of its own), and their files add nothing
 to `files_outstanding` (all proven live on DBR 17.3, as is the initial snapshot of `streaming_start: full`).
-**The one window that misreads:** the newest version is read just after Spark plans the batch, so a commit
-landing in that sub-second gap counts as available. If it carries data, or if it carries none but other data
-arrives while the batch runs (so `files_outstanding > 0`), a caught-up batch reads as behind. That is the safe
-direction, and the next batch corrects it. A NULL `source_latest_version` (the read failed, or the relay to
+**Where it misreads (always toward behind, and the next batch corrects it):** the newest version is read
+when the batch starts running, after Spark planned it. Commits landing between the two count as available, so
+if one carries data, or carries none while other data arrives during the batch (`files_outstanding > 0`), a
+caught-up batch reads as behind. Normally that gap is sub-second. It is longer for a batch **replayed after a
+restart**: Spark re-runs the last planned, uncommitted batch with its original end offset, but the read happens
+at replay time, so anything committed during the downtime counts. A replay shows as a second `batch_start` for
+the same `batch_id` (under the new attempt's `task_run_id`). A NULL `source_latest_version` (the read failed, or the relay to
 `batch_summary` was lost; `batch_start` still has it) leaves the batch unclassified.
 
 **Upgrading an existing log table:** re-run `_log table create` **before** deploying a build with these
