@@ -415,7 +415,10 @@ def source_latest_facts(version, timestamp):
         raise ValueError(f"source version must be a non-negative int, got {version!r}")
     if not isinstance(timestamp, datetime):
         raise ValueError(f"source commit timestamp must be a datetime, got {type(timestamp).__name__}")
-    return {"version": version, "timestamp": _fmt_ts(timestamp)}
+    formatted = _fmt_ts(timestamp)
+    if formatted is None:
+        raise ValueError(f"source commit timestamp cannot be formatted as UTC: {timestamp!r}")
+    return {"version": version, "timestamp": formatted}
 
 
 def batch_success_facts(result, wall_ms=None):

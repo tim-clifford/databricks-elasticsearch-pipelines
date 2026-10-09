@@ -1072,15 +1072,16 @@ and otherwise it was caught up (anything outstanding arrived while it ran). How 
 end at version 6, index -1); with an index of 0 or more the batch stopped inside version `source_end_version`
 after that file (a cap that split one large commit), which the `>=` also counts as behind. A fully sent version is always
 reported as the next version with index -1, including an initial snapshot that a cap ends on exactly (seen in
-every case on DBR 17.3; Delta never writes its internal end-of-version index into an offset). Table maintenance
-(OPTIMIZE, VACUUM, property changes) commits new versions without data: the Delta source moves its end offset
-past them, before or during a batch (a commit during a batch gets a 0-row batch of its own), and they add
-nothing to `files_outstanding`, so they do not read as behind (all proven live on DBR 17.3). The
-`files_outstanding > 0` term covers a maintenance commit that lands between Spark planning the batch and the
-read. A data commit landing in that same sub-second window reads as behind, the safe direction, and the next
-batch corrects it. A NULL `source_latest_version` (the read failed, or the relay to `batch_summary` was lost;
-`batch_start` still has it) leaves the batch unclassified. Not yet proven live: commits the reader skips
-(UPDATE / DELETE under `skipChangeCommits`) and the initial snapshot of `streaming_start: full`.
+every case on DBR 17.3; Delta never writes its internal end-of-version index into an offset). Commits the reader
+sends nothing for (table maintenance such as OPTIMIZE, VACUUM and property changes, and the UPDATE / DELETE
+commits `skipChangeCommits` skips) do not read as behind: the Delta source moves its end offset past them,
+before or during a batch (a commit during a batch gets a 0-row batch of its own), and their files add nothing
+to `files_outstanding` (all proven live on DBR 17.3, as is the initial snapshot of `streaming_start: full`).
+**The one window that misreads:** the newest version is read just after Spark plans the batch, so a commit
+landing in that sub-second gap counts as available. If it carries data, or if it carries none but other data
+arrives while the batch runs (so `files_outstanding > 0`), a caught-up batch reads as behind. That is the safe
+direction, and the next batch corrects it. A NULL `source_latest_version` (the read failed, or the relay to
+`batch_summary` was lost; `batch_start` still has it) leaves the batch unclassified.
 
 Cost: the read is one `DESCRIBE HISTORY <source> LIMIT 1` per batch, on the batch's critical path before its
 data is sent (0.6 to 2.2 s per read in a live probe on DBR 17.3). It runs only for streaming with the log on.

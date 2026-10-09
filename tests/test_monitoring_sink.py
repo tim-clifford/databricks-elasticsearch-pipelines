@@ -651,3 +651,10 @@ def test_source_latest_facts_zero_pads_an_early_year():
     facts = source_latest_facts(1, datetime(999, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
     assert facts["timestamp"] == "0999-01-02T03:04:05.000000"
     assert batch_start_row("c", "r", "t", 0, {"source_latest": facts}, START)["source_latest_ts"] == facts["timestamp"]
+
+
+def test_source_latest_facts_raises_when_the_timestamp_cannot_be_formatted():
+    # An aware datetime at the edge of the range overflows when converted to UTC; _fmt_ts then yields None.
+    edge = datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=1)))
+    with pytest.raises(ValueError):
+        source_latest_facts(1, edge)
