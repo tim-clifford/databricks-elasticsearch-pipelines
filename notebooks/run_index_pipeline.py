@@ -52,7 +52,9 @@
 # MAGIC   empty => off). When true, the run ALSO appends rows to `monitoring_log_table`: `run_start` and
 # MAGIC   `run_end` for the run, `batch_start` / `batch_end` for every batch (one batch in batch mode, one per
 # MAGIC   micro-batch in streaming), and per streaming batch a `batch_summary` (Spark's progress report). See
-# MAGIC   pipeline_lib/monitoring_sink.py for the row model.
+# MAGIC   pipeline_lib/monitoring_sink.py for the row model. Streaming batches also read the source table's
+# MAGIC   newest version at batch start (one `DESCRIBE HISTORY ... LIMIT 1` per batch, skipped when the log is
+# MAGIC   off), so the log can tell a batch that was behind from one whose backlog arrived while it ran.
 # MAGIC   When ON the log is part of the contract, not best-effort: an unset/malformed/unwritable table or
 # MAGIC   ANY failed append FAILS the task (so support is notified and no further data is sent unlogged).
 # MAGIC   A batch's `batch_start` row is written before its data is sent, so a log outage stops the export

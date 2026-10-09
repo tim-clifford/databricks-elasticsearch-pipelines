@@ -18,7 +18,8 @@ THE ROW MODEL. Two levels, each with a start and an end, plus Spark's report for
   (ES counts + `es`, the write rollup from es_write_summary) or error (the error, plus counts/diagnostics
   when the write returned). A batch_start with no batch_end is a batch that never finished.
 - batch_summary (streaming only): Spark's StreamingQueryProgress for the batch, recorded when the notebook's
-  wait loop sees it. Spark publishes it only after the batch commits, asynchronously, and keeps only the
+  wait loop sees it, plus the newest source version its batch_start read (source_latest), so caught up versus
+  behind is answerable from this one row (see source_latest_facts and the source_* columns). Spark publishes it only after the batch commits, asynchronously, and keeps only the
   last few in memory, so it is best-effort by nature: a batch_end with no batch_summary is a batch whose
   report was lost (e.g. a cancel moments after it committed). Batch mode has no Spark progress, so no
   batch_summary.
