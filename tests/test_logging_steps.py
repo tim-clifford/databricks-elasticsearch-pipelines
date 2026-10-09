@@ -781,3 +781,30 @@ def test_writer_casts_every_timestamp_column_as_utc_and_parses_the_payload():
         assert casts[name] == f"CAST(concat({name}, 'Z') AS TIMESTAMP)"
     assert casts["payload"] == "parse_json(payload)"
     assert all(casts[n] is None for n in ROW_FIELDS if types[n] not in ("TIMESTAMP", "VARIANT"))
+
+
+def test_source_latest_from_row_converts_epoch_micros_to_utc():
+    from pipeline_lib.monitoring_sink import source_latest_facts
+    from pipeline_lib.stream_batch import source_latest_from_row
+    version, ts = source_latest_from_row({"version": 9, "ts_us": 1791571591250000})
+    assert (version, ts) == (9, datetime(2026, 10, 9, 18, 46, 31, 250000, tzinfo=timezone.utc))
+    assert source_latest_facts(version, ts)["timestamp"] == "2026-10-09T18:46:31.250000"
+
+
+@pytest.mark.parametrize("row", [{"version": 9}, {"ts_us": 1}, {"version": 9, "ts_us": None}, {"version": 9, "ts_us": "1"},
+                                 {"version": 9, "ts_us": True}, {"version": 9, "ts_us": 1.5}])
+def test_source_latest_from_row_rejects_a_row_without_usable_fields(row):
+    from pipeline_lib.stream_batch import source_latest_from_row
+    with pytest.raises((KeyError, TypeError, ValueError)):
+        source_latest_from_row(row)
+
+
+def test_progress_recorder_also_prunes_periodically():
+    from pipeline_lib.stream_progress import PRUNE_EVERY_RECORDED_BATCHES
+    pruned = []
+    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
+                           prune_relays=pruned.append)
+    n = 2 * PRUNE_EVERY_RECORDED_BATCHES + 1
+    for bid in range(n):  # consecutive ids: no gap
+        rec(FakeQuery([[report(bid)]]))
+    assert pruned == [0, PRUNE_EVERY_RECORDED_BATCHES, 2 * PRUNE_EVERY_RECORDED_BATCHES]

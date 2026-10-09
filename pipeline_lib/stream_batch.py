@@ -27,11 +27,24 @@ Spark Connect ships this function to the cluster, so it must not capture a Spark
 uses the micro-batch's own session (batch_df.sparkSession), and the injected writers take it as an argument.
 """
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pipeline_lib.monitoring_sink import (batch_end_row, batch_start_row, batch_success_facts, error_facts,
                                          source_latest_facts)
 from pipeline_lib.observability import bulk_stats_relay_line, format_bulk_stats
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def source_latest_from_row(row):
+    """(version, commit datetime in UTC) from the newest-commit row the notebook reads: `version` and `ts_us`, the
+    commit time as epoch microseconds (unix_micros, so the session time zone cannot shift it). Integer arithmetic,
+    no float rounding. Raises on a missing or non-integer field; the caller records that as the read's error."""
+    version, ts_us = row["version"], row["ts_us"]
+    if isinstance(ts_us, bool) or not isinstance(ts_us, int):
+        raise TypeError(f"ts_us must be an integer (epoch microseconds), got {ts_us!r}")
+    return version, _EPOCH + timedelta(microseconds=ts_us)
 
 
 # A failed newest-version read is recorded as its exception type and message, capped (a diagnostic, not the

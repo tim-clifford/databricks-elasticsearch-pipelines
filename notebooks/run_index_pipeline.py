@@ -232,12 +232,11 @@ from pipeline_lib.config import (  # noqa: E402
 from pipeline_lib.batch_export import run_batch_export  # noqa: E402
 from pipeline_lib.monitoring_writer import MonitoringLog, resolve_log_table, spark_append  # noqa: E402
 from pipeline_lib.run_record import RunRecorder  # noqa: E402
-from pipeline_lib.stream_batch import make_foreach_batch  # noqa: E402
+from pipeline_lib.stream_batch import make_foreach_batch, source_latest_from_row  # noqa: E402
 from pipeline_lib.stream_progress import ProgressRecorder, parse_source_relay, prune_relay_dirs  # noqa: E402
 # Log-line tag for this notebook's own streaming status lines.
 import json  # noqa: E402
 import uuid  # noqa: E402
-from datetime import datetime, timedelta, timezone  # noqa: E402
 from pipeline_lib.observability import PROGRESS_TAG  # noqa: E402
 # Streaming checkpoint offsets-state classifier (pure Python, dependency-injected ls; unit-tested
 # off-cluster). Decides seed-vs-resume for streaming_start=new; fail-closed so an existing checkpoint is
@@ -677,14 +676,11 @@ if PIPELINE_MODE == "streaming":
         def _read_print_relay(batch_id):
             return _read_relay(print_relay_dir, batch_id)
 
-        _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
         def _read_source_latest(session):
             # The newest commit is the LIMIT 1 row (history is newest-first). The commit time is read as epoch
             # microseconds so the session time zone cannot shift it.
-            row = session.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1") \
-                .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect()[0]
-            return row["version"], _EPOCH + timedelta(microseconds=row["ts_us"])
+            return source_latest_from_row(session.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1")
+                                          .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect()[0])
 
         def _prune_relays(below_batch_id):
             # Delete every batch's relay below `below_batch_id` (reports that were lost), one listing per dir.

@@ -8,9 +8,9 @@ recorded (monitoring_sink.progress_batch_ids: a high-water mark, idle triggers s
   foreachBatch when read_source_relay returns it). FAIL-CLOSED like every log append: a failure raises, and
   await_stream stops the query and fails the task. A missing relay only leaves `source_latest` off the row.
 A failed progress READ only warns: the report stays in Spark's buffer and the next slice reads it again.
-On the first recorded batch, and whenever a recorded batch skips over batch ids (batches whose report was lost),
-prune_relays deletes every relay below it, ONE call each time (best-effort), so a long-running stream does not
-accumulate relay files. That is safe on the first batch because run start cleared the relay dirs, so anything
+On the first recorded batch, whenever a recorded batch skips over batch ids (batches whose report was lost), and
+every PRUNE_EVERY_RECORDED_BATCHES recorded batches (a relay whose delete failed), prune_relays deletes every relay
+below it, ONE call each time (best-effort), so a long-running stream does not accumulate relay files. That is safe on the first batch because run start cleared the relay dirs, so anything
 below it is this run's lost report. A last batch whose report is lost leaves its relays until the next run
 start clears them.
 
@@ -25,6 +25,10 @@ import time
 from pipeline_lib.monitoring_sink import batch_summary_row, progress_batch_ids
 from pipeline_lib.observability import PROGRESS_TAG, format_progress
 
+# Recorded batches between periodic prunes: catches relays whose delete failed (no gap would reach them). Two
+# directory listings per this many batches.
+PRUNE_EVERY_RECORDED_BATCHES = 100
+
 
 class ProgressRecorder:
     """Callable(query): record newly executed batches (see the module docstring).
@@ -36,7 +40,8 @@ class ProgressRecorder:
     - read_source_relay(batch_id) -> dict | None, or None: return and delete the batch's relayed source_latest
       facts (best-effort; never raises). Read only when the log is on.
     - prune_relays(below_batch_id), or None: delete every relay for a batch id below `below_batch_id`. Called on
-      the first recorded batch and when a recorded batch skipped over ids (lost reports). A failure only warns.
+      the first recorded batch, when a recorded batch skipped over ids (lost reports), and every
+      PRUNE_EVERY_RECORDED_BATCHES recorded batches. A failure only warns.
     """
 
     def __init__(self, log, config_name, job_run_id, session, read_print_relay=None, printer=print,
@@ -49,6 +54,7 @@ class ProgressRecorder:
         self.read_print_relay = read_print_relay
         self.read_source_relay = read_source_relay
         self.prune_relays = prune_relays
+        self._recorded_since_prune = 0
         self.printer = printer
         self.last_batch_id = None
 
@@ -61,7 +67,10 @@ class ProgressRecorder:
             return
         for report in progress_batch_ids(reports, self.last_batch_id):
             batch_id = report["batchId"]
-            if self.prune_relays is not None and (self.last_batch_id is None or batch_id > self.last_batch_id + 1):
+            self._recorded_since_prune += 1
+            if self.prune_relays is not None and (self.last_batch_id is None or batch_id > self.last_batch_id + 1
+                                                  or self._recorded_since_prune > PRUNE_EVERY_RECORDED_BATCHES):
+                self._recorded_since_prune = 1
                 try:
                     self.prune_relays(batch_id)
                 except Exception as exc:
