@@ -200,7 +200,8 @@ def _fmt_ts(dt):
     try:
         if dt.tzinfo is not None:
             dt = dt.astimezone(timezone.utc)
-        return dt.strftime(_TS_FORMAT)
+        # The year is formatted by hand: strftime's %Y is not zero-padded below 1000 on every platform (glibc).
+        return f"{dt.year:04d}" + dt.strftime(_TS_FORMAT_AFTER_YEAR)
     except Exception:
         return None
 
@@ -231,6 +232,7 @@ def _json(payload):
 _INTEGER_STRING = r"^-?[0-9]+$"
 _BIGINT_MIN, _BIGINT_MAX = -(2 ** 63), 2 ** 63 - 1
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
+_TS_FORMAT_AFTER_YEAR = "-%m-%dT%H:%M:%S.%f"  # _fmt_ts writes the year itself, then this
 _TS_STRING = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{6}$"
 
 
@@ -281,7 +283,7 @@ def _parse_json(value):
         return None
     try:
         return json.loads(value)
-    except ValueError:
+    except (ValueError, RecursionError):  # not JSON, or nested too deep to parse
         return None
 
 

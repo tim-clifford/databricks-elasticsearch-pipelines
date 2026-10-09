@@ -731,3 +731,25 @@ def test_prune_relay_dirs_skips_a_missing_dir_and_a_failed_delete():
         removed.append(path)
     prune_relay_dirs(("/missing", "/r"), 5, ls=ls, rm=rm)  # does not raise
     assert removed == ["/r/2/"]
+
+
+def test_foreach_batch_reads_without_a_relay_writer():
+    ev = Events()
+    printed = []
+    fb = make_foreach_batch(
+        transform=lambda b, s: "T", bulk_write=lambda df, cfg, raise_on_error: dict(RESULT),
+        write_config=WriteConfig(), log=make_log(ev), config_name="cfg", job_run_id="run1",
+        write_metrics=lambda s, b, w: None, read_source_latest=lambda s: LATEST, write_source_relay=None,
+        printer=printed.append, clock=Clock())
+    fb(FakeBatchDF(), 2)
+    assert json.loads(rows_of(ev, "batch_start")[0]["payload"])["source_latest"] == LATEST_FACTS
+    assert rows_of(ev, "batch_end")[0]["status"] == "success"
+    assert not any("could not relay" in p for p in printed)
+
+
+def test_prune_relay_dirs_skips_non_ascii_digit_names():
+    from pipeline_lib.stream_progress import prune_relay_dirs
+    removed = []
+    entries = [FileInfo("/r/²/"), FileInfo("/r/٣/"), FileInfo("/r/1/")]
+    prune_relay_dirs(("/r",), 5, ls=lambda d: entries, rm=removed.append)
+    assert removed == ["/r/1/"]

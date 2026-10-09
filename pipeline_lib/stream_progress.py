@@ -17,6 +17,7 @@ memory), so a batch whose report is lost (a cancel moments after it committed) h
 no batch_summary. Nothing here tries to reconstruct it.
 """
 import json
+import re
 import time
 
 from pipeline_lib.monitoring_sink import batch_summary_row, progress_batch_ids
@@ -98,7 +99,7 @@ def prune_relay_dirs(relay_dirs, below_batch_id, ls, rm):
             continue
         for entry in entries:
             name = entry.name.rstrip("/")
-            if name.isdigit() and int(name) < below_batch_id:
+            if re.fullmatch(r"[0-9]+", name) and int(name) < below_batch_id:
                 try:
                     rm(entry.path)
                 except Exception:

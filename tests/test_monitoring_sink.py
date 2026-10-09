@@ -640,3 +640,14 @@ def test_timestamp_surfacing_takes_only_the_stored_format(value, expected):
 def test_an_error_instead_of_a_version_surfaces_null():
     row = batch_start_row("c", "r", "t", 0, {"source_latest": {"error": "OSError: blip"}}, START)
     assert row["source_latest_version"] is None and row["source_latest_ts"] is None
+
+
+def test_end_offset_nested_too_deep_is_fail_soft_null():
+    row = batch_summary_row("c", "r", "t", 0, dict(PROGRESS, sources=[{"endOffset": "[" * 200000}]))
+    assert row["source_end_version"] is None
+
+
+def test_source_latest_facts_zero_pads_an_early_year():
+    facts = source_latest_facts(1, datetime(999, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
+    assert facts["timestamp"] == "0999-01-02T03:04:05.000000"
+    assert batch_start_row("c", "r", "t", 0, {"source_latest": facts}, START)["source_latest_ts"] == facts["timestamp"]
