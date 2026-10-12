@@ -262,9 +262,16 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
     doc = doc if doc is not None else _read_bundle_doc(path)
     var = _ES_HOST_CONFIGS_JSON_VAR
     spec = (doc.get("variables") or {}).get(var)
+    if spec is None:
+        raise ValueError(
+            f"{var} is not declared in databricks.yml; declare it under "
+            f"`variables:` next to the es_host_* host configs (see the README \"Configuring Elasticsearch "
+            f"host connections\")"
+        )
     if not isinstance(spec, dict) or spec.get("type") is not None or not isinstance(spec.get("default"), str):
         raise ValueError(
-            f"{var} is not declared in databricks.yml as a plain string variable; declare it under "
+            f"{var} (databricks.yml) must be declared as a string variable with a `default:` (no `type:`), "
+            f"like the shipped declaration; declare it under "
             f"`variables:` next to the es_host_* host configs (see the README \"Configuring Elasticsearch "
             f"host connections\")"
         )
@@ -1193,7 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true", help="verify generated files are up to date")
     args = parser.parse_args(argv)
 
-    config_paths = discover_configs()
+    # The upgrade check runs first, so its message isn't hidden behind a config error.
     if old_root_resources_dir():
         print(
             "the old layout's root resources/ folder still exists; delete it (the fixed jobs now live in "
@@ -1202,6 +1209,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    config_paths = discover_configs()
 
     # Parse databricks.yml once, then extract each set from the same parsed doc (single read per run).
     # The declared ES host configs (single source of truth: databricks.yml), the default host config a

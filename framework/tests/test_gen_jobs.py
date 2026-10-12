@@ -1671,10 +1671,10 @@ def test_es_host_configs_json_shipped_databricks_yml_matches_declared_hosts():
 
 
 @pytest.mark.parametrize("doc, match", [
-    ({"variables": {}}, "not declared in databricks.yml as a plain string variable"),
-    ({"variables": {"es_host_configs_json": "x"}}, "plain string variable"),
-    (_hosts_doc({}, spec_extra={"type": "complex"}), "plain string variable"),
-    ({"variables": {"es_host_configs_json": {"default": {"es_host_default": {}}}}}, "plain string variable"),
+    ({"variables": {}}, "es_host_configs_json is not declared in databricks.yml;"),
+    ({"variables": {"es_host_configs_json": "x"}}, "must be declared as a string variable with a `default:`"),
+    (_hosts_doc({}, spec_extra={"type": "complex"}), "must be declared as a string variable"),
+    ({"variables": {"es_host_configs_json": {"default": {"es_host_default": {}}}}}, "must be declared as a string variable"),
     (_hosts_doc({}, raw='{"es_host_default": '), "not valid JSON"),
     (_hosts_doc({}, raw='["es_host_default"]'), "must be a JSON object"),
     (_hosts_doc({}), "missing: es_host_default"),
@@ -1955,3 +1955,12 @@ def test_bundle_shape_null_blocks_read_as_empty():
     gen_jobs.require_bundle_shape(yaml.safe_load("targets:\n  dev:\n    variables:\n  prd:\n"))
     gen_jobs.require_default_es_host_config(
         "es_host_default", {"es_host_default"}, yaml.safe_load("targets:\n  dev:\n    variables:\n"))
+
+
+def test_old_root_resources_message_comes_before_config_errors(tmp_path, monkeypatch, capsys):
+    # A tree still mid-upgrade gets the upgrade instruction even when a config is also broken.
+    _temp_tree(tmp_path, monkeypatch)
+    (tmp_path / "_pipelines" / "pipeline_configs" / "bad.name.yml").write_text("es_index_name: x\n")
+    (tmp_path / "resources").mkdir()
+    assert gen_jobs.main(["--check"]) == 1
+    assert "root resources/ folder still exists" in capsys.readouterr().err
