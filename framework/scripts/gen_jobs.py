@@ -296,8 +296,9 @@ def _reject_target_overrides(var: str, doc: dict, why: str, path: str | None = N
     """Fail closed if any declared target sets `var`: under its `variables:` in databricks.yml, or in the
     git-ignored .databricks/bundle/<target>/variable-overrides.json next to databricks.yml. For variables
     the generator reads only at their top-level default, where a per-target value would go unchecked or
-    split what the generated jobs bake from what deploy-time references resolve. (A --var on the deploy
-    command line can't be seen here; the README says not to use one for these.)"""
+    split what the generated jobs bake from what deploy-time references resolve. A BUNDLE_VAR_<var>
+    environment variable in the generator's own environment is rejected too. (A --var or BUNDLE_VAR_<var>
+    on the deploy side can't be seen here; the README says not to use either for these.)"""
     targets = doc.get("targets") or {}
     overridden = [
         f"target {target}"
@@ -305,6 +306,8 @@ def _reject_target_overrides(var: str, doc: dict, why: str, path: str | None = N
         if isinstance(tspec, dict) and var in (tspec.get("variables") or {})
     ]
     # Next to the databricks.yml that was parsed (`path`, else the module's bundle file).
+    if f"BUNDLE_VAR_{var}" in os.environ:
+        overridden.append(f"environment variable BUNDLE_VAR_{var}")
     bundle_root = os.path.dirname(path if path is not None else _DATABRICKS_YML)
     for target in sorted(targets):
         overrides_path = os.path.join(bundle_root, ".databricks", "bundle", str(target), "variable-overrides.json")
@@ -1122,7 +1125,7 @@ def legacy_root_job_files() -> list[str]:
     framework/ and regenerated copies under the same resource keys, or deploy stale definitions, so
     generation and --check refuse to run until they are removed (your own jobs belong in
     _pipelines/resources/, where the generator leaves files without its marker alone)."""
-    return sorted(glob.glob(os.path.join(_REPO_ROOT, "resources", "*.yml")))
+    return sorted(p for ext in ("*.yml", "*.yaml") for p in glob.glob(os.path.join(_REPO_ROOT, "resources", ext)))
 
 
 # The two include globs databricks.yml must carry: the fixed framework jobs and the _pipelines/ jobs.
@@ -1140,7 +1143,7 @@ def require_bundle_includes(path: str | None = None, doc: dict | None = None) ->
     # Compare normalized globs, so an equivalent spelling like ./framework/resources/*.yml counts.
     normalized = [posixpath.normpath(p) for p in include]
     missing = [p for p in _REQUIRED_INCLUDES if p not in normalized]
-    old = [p for p, n in zip(include, normalized) if n.startswith("resources/")]
+    old = [p for p, n in zip(include, normalized) if n == "resources" or n.startswith("resources/")]
     if missing or old:
         raise ValueError(
             "include (databricks.yml) must list " + " and ".join(_REQUIRED_INCLUDES)

@@ -1981,3 +1981,23 @@ def test_override_scan_sits_next_to_the_parsed_databricks_yml(tmp_path, monkeypa
             path=str(bundle_yml),
             doc=dict(doc, variables={"es_host_configs_json": {"default": json.dumps({"es_host_default": entry})}}),
         )
+
+
+@pytest.mark.parametrize("var", ["es_host_configs_json", "default_es_host_config"])
+def test_bundle_var_environment_override_rejected(tmp_path, monkeypatch, var):
+    _temp_tree(tmp_path, monkeypatch)
+    monkeypatch.setenv(f"BUNDLE_VAR_{var}", "x")
+    with pytest.raises(ValueError, match=f"{var} is overridden in environment variable BUNDLE_VAR_{var}"):
+        gen_jobs.main(["--check"])
+
+
+def test_bare_resources_include_and_yaml_leftover_rejected(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="remove the old-layout resources"):
+        gen_jobs.require_bundle_includes(doc={"include": [
+            "framework/resources/*.yml", "_pipelines/resources/*.yml", "resources"]})
+    _temp_tree(tmp_path, monkeypatch)
+    old = tmp_path / "resources"
+    old.mkdir()
+    (old / "legacy.job.yaml").write_text("resources: {}\n")
+    assert gen_jobs.legacy_root_job_files() == [str(old / "legacy.job.yaml")]
+    assert gen_jobs.main(["--check"]) == 1
