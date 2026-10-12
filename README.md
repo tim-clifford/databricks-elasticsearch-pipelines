@@ -25,8 +25,8 @@ The bundle deploys:
   [Sharing a view across pipelines](#sharing-a-view-across-pipelines)) - it is created once, and the
   sharing pipelines must agree on the view definition.
 - **One job per index** (`index_pipeline_<config_name>`): all run the same shared notebook
-  [`notebooks/run_index_pipeline.py`](notebooks/run_index_pipeline.py) with that index's config. These
-  job resources are **generated** by [`scripts/gen_jobs.py`](scripts/gen_jobs.py) from the config
+  [`framework/notebooks/run_index_pipeline.py`](framework/notebooks/run_index_pipeline.py) with that index's config. These
+  job resources are **generated** by [`framework/scripts/gen_jobs.py`](framework/scripts/gen_jobs.py) from the config
   files (see [Adding a new pipeline for an ES index](#adding-a-new-pipeline-for-an-es-index)).
   Configs can instead be merged into a single multi-task job via [Job groups](#job-groups) (e.g. to
   share one cluster).
@@ -44,14 +44,14 @@ The bundle deploys:
 1. Add `_pipelines/pipeline_views/<view_name>.sql`.
 2. Add `_pipelines/pipeline_configs/<config_name>.yml` (see the schema under [Configuration](#configuration)).
    The view's filename must match the config's `view.name`.
-3. Regenerate the job resources: `python scripts/gen_jobs.py`.
+3. Regenerate the job resources: `python framework/scripts/gen_jobs.py`.
 4. Deploy.
 
 The config's filename stem becomes the job's resource key (`index_pipeline_<stem>`), so it must
 contain only letters, digits, `_`, and `-` (the generator rejects anything else, e.g. a dotted name).
 
-Step 3 writes one `resources/<config_name>.job.yml` per config, keeping the generated jobs in sync. If you
-run it, you're covered. `python scripts/gen_jobs.py --check` is the separate verification that step 3
+Step 3 writes one `_pipelines/resources/<config_name>.job.yml` per config, keeping the generated jobs in sync. If you
+run it, you're covered. `python framework/scripts/gen_jobs.py --check` is the separate verification that step 3
 was actually run: it makes no changes and fails if any generated file is missing, stale, or orphaned
 (left behind by a deleted or renamed config). Run it in CI to catch a commit that edited a config but
 forgot to regenerate.
@@ -298,7 +298,7 @@ A pipeline whose host config is left empty for the target it deploys to **fails 
 **To add another host config** (e.g. to route some pipelines to a second cluster): declare a second
 complex variable (`es_host_secondary`, same three fields), give it per-target values, and point a
 pipeline at it with `es_host_config: es_host_secondary`. A pipeline referencing a host config that
-isn't declared in `databricks.yml` fails **at generation** (`scripts/gen_jobs.py`), before deploy — as
+isn't declared in `databricks.yml` fails **at generation** (`framework/scripts/gen_jobs.py`), before deploy — as
 does a pipeline that omits `es_host_config` when no `default_es_host_config` is declared. (The default
 is read from the variable's `default:` at generation time, so it can't vary per target or by `--var`;
 the default host config's *values* are still per target.)
@@ -338,7 +338,7 @@ values). The generator emits `existing_cluster_id: ${var.<name>.cluster_id}` and
 right cluster id per target at deploy. This mirrors `es_host_config` exactly: a workspace-specific value
 is a shape-tagged per-target variable, never a literal baked into the config. A `cluster_config` that
 doesn't name a declared cluster config (a complex variable with a `cluster_id` field) fails **at
-generation** (`scripts/gen_jobs.py`), before deploy, so a typo or a reference to some other variable
+generation** (`framework/scripts/gen_jobs.py`), before deploy, so a typo or a reference to some other variable
 (e.g. `wheel_path`) is caught up front. See the commented `interactive_primary` example in
 `databricks.yml`.
 
@@ -525,7 +525,7 @@ stream fails. That is not automatic: a blocking `awaitTermination()` was reprodu
 STANDARD, a two-task continuous group) **never returning** after its query failed. The Spark UI showed the
 query FAILED, yet the task sat `RUNNING` with no work for over an hour, so the job never saw a failure and
 never retried it, while the sibling task ran on. The runner therefore waits on a stream in short slices
-(`pipeline_lib/stream_wait.py`) and, between them, asks the query directly whether it is still active; a
+(`framework/pipeline_lib/stream_wait.py`) and, between them, asks the query directly whether it is still active; a
 stream that has ended is noticed within about 10 seconds even if the wait call misses it, and its error
 fails the task, so the retry above applies.
 
@@ -561,7 +561,7 @@ member config as an independent task (no inter-task dependencies):
 job_group: ecs_streams
 ```
 
-The generator emits a single `resources/group_<job_group>.job.yml` (resource key
+The generator emits a single `_pipelines/resources/group_<job_group>.job.yml` (resource key
 `index_pipeline_group_<job_group>`) with one task per member (`index_pipeline_<config_name>`, unchanged).
 The main reason to group is **compute sharing**: members that name the **same** `job_cluster_config`
 land on **one** physical job cluster (the generator deduplicates the `job_clusters` block), so N
@@ -773,7 +773,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
     `max_partition_bytes` splits them further, but repartitioning also fixes it). Applies to **both** modes.
 
 ```bash
-python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
+python framework/scripts/gen_jobs.py   # regenerate _pipelines/resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
 # Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, ca_certs,
 # the per-target global default for every run-time knob, and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
@@ -849,7 +849,7 @@ Key behaviors:
 
 When a stream's checkpoint is stale (say the index was wiped, or you want to re-stream from a fresh
 `streaming_start`), clear it with the dedicated `_checkpoint clear` job (a serverless maintenance job,
-`resources/_checkpoint_clear.job.yml`):
+`framework/resources/_checkpoint_clear.job.yml`):
 
 ```bash
 databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>
@@ -875,7 +875,7 @@ pipeline's stream is running: stop the stream first, as above.
 ### Diagnosing a congested Elasticsearch host
 
 When a host looks backed up (writes slowing down, requests timing out), run the read-only `es_diagnostics`
-job (a serverless maintenance job, `resources/_es_diagnostics.job.yml`) to collect an outside view of what
+job (a serverless maintenance job, `framework/resources/_es_diagnostics.job.yml`) to collect an outside view of what
 the cluster is doing:
 
 ```bash
@@ -941,7 +941,7 @@ databricks bundle run log_table_create -t <target> -p <profile>
 ```
 
 It runs `CREATE TABLE IF NOT EXISTS` with the log's schema (from
-`pipeline_lib/monitoring_sink.py`, the single source of truth shared with the writer) and is idempotent
+`framework/pipeline_lib/monitoring_sink.py`, the single source of truth shared with the writer) and is idempotent
 (safe to re-run). The identity that runs **this** job needs `CREATE TABLE` (and `USE CATALOG`/`USE
 SCHEMA`) on the target schema; the export jobs only ever **append**, so their run identity needs only
 `MODIFY` on the table. If a name is blank or not a three-part identifier it fails closed.
@@ -952,7 +952,7 @@ three-layer precedence as every knob).
 
 **What lands in the table: the row model.** One append-only table. Every column carries a `COMMENT`
 describing it (`DESCRIBE TABLE <table>` or Catalog Explorer shows them), defined next to the column in
-`pipeline_lib/monitoring_sink.py`:
+`framework/pipeline_lib/monitoring_sink.py`:
 
 | Column | Holds |
 |---|---|
@@ -1130,7 +1130,7 @@ databricks bundle run log_table_prune -t <target> -p <profile>
 ```
 
 **Adding a column later.** `_log table create` is **re-runnable** (the logic is in
-`pipeline_lib/log_table_migration.py`). On an existing table it adds any column the schema has and the table
+`framework/pipeline_lib/log_table_migration.py`). On an existing table it adds any column the schema has and the table
 lacks (`ALTER TABLE ADD COLUMNS`, with its comment), **without** dropping or replacing the table, so existing
 rows are preserved and get NULL for the new column. To add a field: add it to `MONITORING_TABLE_COLUMNS`,
 then re-run `_log table create` **before** deploying the build that writes it (with the log on, a job whose
@@ -1148,7 +1148,7 @@ post-mortem on a continuous stream). It is **opt-in per job cluster config**, in
 1. Set the `cluster_log_volume_path` variable to the destination in **every** target the config deploys
    to (a simple string, so per target or `--var`), e.g. `/Volumes/<catalog>/<schema>/<volume>/cluster_logs`.
 2. In the job cluster config (`_pipelines/job_cluster_configs/<key>.yml`), add the block (the example in
-   `standard_batch.yml` is commented out), then re-run `scripts/gen_jobs.py`:
+   `standard_batch.yml` is commented out), then re-run `framework/scripts/gen_jobs.py`:
 
 ```yaml
 cluster_log_conf:
@@ -1182,17 +1182,21 @@ Things to know:
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
-Running the generator needs `pyyaml`, pinned in `requirements.txt` (`pip install -r requirements.txt`).
+Running the generator needs `pyyaml`, pinned in `framework/requirements.txt`
+(`pip install -r framework/requirements.txt`).
 The pin matters because `--check` byte-compares against `yaml.safe_dump` output, whose formatting can
 drift across pyyaml versions.
 
 ## Layout
 
-```
-databricks.yml                  Bundle definition: variables + targets
-requirements.txt                Off-cluster tooling deps (pinned pyyaml for the generator)
+The repo has two halves. `_pipelines/` holds what you edit for your own pipelines (plus the job resources
+generated from it); `framework/` holds the shared code that runs them and is not edited per pipeline.
+`databricks.yml` at the root carries your environment's variables and targets.
 
-You edit these, one pair per pipeline (all under _pipelines/, the pipeline-configuration folder):
+```
+databricks.yml                  Bundle definition: variables + targets (edit for your environment)
+
+You edit these, one pair per pipeline:
   _pipelines/
     pipeline_views/
       <view_name>.sql           The view: what gets exported (filename == view.name)
@@ -1203,53 +1207,69 @@ You edit these, one pair per pipeline (all under _pipelines/, the pipeline-confi
     job_cluster_configs/
       <key>.yml                 OPTIONAL reusable new_cluster specs, referenced by key from a
                                 config's compute.job_cluster_config (see Compute)
+    resources/
+      <config_name>.job.yml     GENERATED per-index job (one per pipeline_configs config; do not
+                                hand-edit, rerun the generator)
+      group_<job_group>.job.yml GENERATED job for a job_group
 
-Shared notebooks (run by the jobs, not edited per pipeline):
-  notebooks/
-    deploy_views.py             Renders each view's parameters from its config (folding in the
+Shared framework (not edited per pipeline):
+  framework/
+    requirements.txt            Off-cluster tooling deps (pinned pyyaml for the generator)
+    notebooks/
+      deploy_views.py           Renders each view's parameters from its config (folding in the
                                 environment), then runs CREATE OR REPLACE
-    run_index_pipeline.py       Run by every per-index job: installs the connector wheel (verifying
+      run_index_pipeline.py     Run by every per-index job: installs the connector wheel (verifying
                                 the import), loads its config by name, resolves the environment, and
                                 exports to Elasticsearch via the connector - batch (bulk_write over the
                                 deployed view) or streaming (view SELECT over each source micro-batch)
-    log_table_create.py         Run by the _log table create job: creates the shared monitoring Delta
+      log_table_create.py       Run by the _log table create job: creates the shared monitoring Delta
                                 table, or adds a newly introduced column (pipeline_lib.log_table_migration;
                                 see Durable monitoring)
-    log_table_prune.py          Run by the _log table prune job: retention for the monitoring table
+      log_table_prune.py        Run by the _log table prune job: retention for the monitoring table
                                 (DELETE old rows, then OPTIMIZE + VACUUM; see Durable monitoring)
-
-Shared library + tests (the config schema, used by the generator and both notebooks):
-  pipeline_lib/
-    config.py                   Loads/validates a pipeline definition; resolves ${environment} and
+      ...                       plus build_wheel, checkpoint_clear and es_diagnostics for their jobs
+    pipeline_lib/               The shared library (used by the generator and the notebooks)
+      config.py                 Loads/validates a pipeline definition; resolves ${environment} and
                                 derives view substitutions + job parameters (single source of truth)
-    monitoring_sink.py          Pure schema + row builders for the durable monitoring log (single
+      monitoring_sink.py        Pure schema + row builders for the durable monitoring log (single
                                 source of truth for the table columns and row model, shared by the
                                 writer + creator)
-    log_table_migration.py      The _log table create job's create-or-add-columns step, unit-tested
+      log_table_migration.py    The _log table create job's create-or-add-columns step, unit-tested
                                 with a fake session
-    stream_wait.py              The streaming wait loop (short awaitTermination slices + an isActive
+      stream_wait.py            The streaming wait loop (short awaitTermination slices + an isActive
                                 liveness check), so a failed stream always fails the task
-  tests/
-    test_config.py              Offline unit tests for pipeline_lib.config (plain pytest)
-    test_monitoring_sink.py     Offline unit tests for pipeline_lib.monitoring_sink
-    test_log_table_migration.py Offline unit tests for pipeline_lib.log_table_migration (fake session)
-    test_stream_wait.py         Offline unit tests for pipeline_lib.stream_wait (fake query)
+    scripts/
+      gen_jobs.py               Generates _pipelines/resources/*.job.yml from the configs (--check
+                                guards drift)
+    resources/                  The fixed maintenance jobs (hand-authored):
+      _build_wheel.job.yml        build_wheel
+      _checkpoint_clear.job.yml   _checkpoint clear
+      _deploy_views.job.yml       deploy_views
+      _es_diagnostics.job.yml     _es diagnostics
+      _log_table_create.job.yml   _log table create
+      _log_table_prune.job.yml    _log table prune (daily, paused by default)
+    tests/                      Offline unit tests (plain pytest):
+                                python -m pytest framework/tests
 
-Generated / tooling (do not hand-edit the generated jobs):
-  scripts/
-    gen_jobs.py                 Generates resources/<config_name>.job.yml from the configs (--check guards drift)
-  resources/
-    _build_wheel.job.yml        The build_wheel job (hand-authored)
-    _checkpoint_clear.job.yml   The _checkpoint clear job (hand-authored)
-    _deploy_views.job.yml       The deploy_views job (hand-authored)
-    _es_diagnostics.job.yml     The _es diagnostics job (hand-authored)
-    _log_table_create.job.yml   The _log table create job (hand-authored)
-    _log_table_prune.job.yml    The _log table prune job (hand-authored; daily, paused by default)
-    <config_name>.job.yml       GENERATED per-index job (one per pipeline_configs config)
-
-Hand-authored resource files (starting with `_`) are visually separate from generated ones. Config names
-and job_group names may not start with `_` (checked at generation) to prevent conflicts.
+Config names and job_group names may not start with `_` (checked at generation), so they never collide
+with the `_`-prefixed fixed jobs.
 ```
+
+### Upgrading from the single-folder layout
+
+Earlier builds kept `notebooks/`, `pipeline_lib/`, `scripts/`, `tests/`, `requirements.txt` and every job
+resource (fixed and generated) at the repo root. To move an existing copy to this layout:
+
+1. Replace those root folders with `framework/` from this build. `_pipelines/pipeline_configs/`,
+   `_pipelines/pipeline_views/` and `_pipelines/job_cluster_configs/` carry over unchanged.
+2. In `databricks.yml`, replace the `resources/*.yml` include with the two lines this build ships:
+   `framework/resources/*.yml` and `_pipelines/resources/*.yml`.
+3. Delete the old root `resources/` folder and run `python framework/scripts/gen_jobs.py`, which writes the
+   per-index jobs into `_pipelines/resources/`. (Generated files you moved there yourself are recognized
+   and regenerated.) `--check` should then report every generated file up to date.
+4. Deploy. Job resource keys are unchanged, so each job is updated in place (same job id, same run
+   history) and only its notebook path changes. Streaming checkpoints live under `checkpoint_base_path`,
+   not in the repo, so a streaming pipeline resumes where it left off.
 
 ## License & Attribution
 

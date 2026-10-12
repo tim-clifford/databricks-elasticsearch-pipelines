@@ -1,5 +1,5 @@
 # Job-group example, member A of 2. Demonstrates `job_group`: this config and ecs_dns_group_b.yml share
-# the same `job_group`, so scripts/gen_jobs.py merges them into ONE Databricks job
+# the same `job_group`, so framework/scripts/gen_jobs.py merges them into ONE Databricks job
 # (index_pipeline_group_ecs_dns_group) with one independent task each (no dependencies). Because BOTH
 # members name the same job cluster (compute.job_cluster_config: standard_batch), they run on ONE shared
 # job cluster instead of two - the resource-saving point of grouping. See the README "Job groups" section.

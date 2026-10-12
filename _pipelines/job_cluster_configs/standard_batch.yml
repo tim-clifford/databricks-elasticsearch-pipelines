@@ -1,7 +1,7 @@
 # Reusable job-cluster spec for the job-cluster example pipeline (ecs_dns_activity_jobcluster).
 #
 # The file's contents are a Databricks `new_cluster` spec, inlined VERBATIM into the generated job's
-# job_clusters block by scripts/gen_jobs.py. The generator additionally injects
+# job_clusters block by framework/scripts/gen_jobs.py. The generator additionally injects
 #   policy_id: ${var.cluster_policy_id}
 # so this cluster inherits the target's single cluster policy at deploy - do NOT put a policy_id here
 # (the environment binds it, and the injected value would override a hardcoded one anyway).
