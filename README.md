@@ -317,11 +317,12 @@ A pipeline whose host config is left empty for the target it deploys to **fails 
    host's fields, and no target overrides it.
 3. Point a pipeline at it with `es_host_config: es_host_secondary`.
 
-A pipeline referencing a host config that
-isn't declared in `databricks.yml` fails **at generation** (`framework/scripts/gen_jobs.py`), before deploy — as
-does a pipeline that omits `es_host_config` when no `default_es_host_config` is declared. (The default
-is read from the variable's `default:` at generation time, so it can't vary per target or by `--var`;
-the default host config's *values* are still per target.)
+A pipeline referencing a host config that isn't declared in `databricks.yml` fails **at generation**
+(`framework/scripts/gen_jobs.py`), before deploy. So does a `default_es_host_config` that is missing, names
+an undeclared host config, or is overridden in a target: both the pipelines that omit `es_host_config` and
+the `es_diagnostics` job default to it, and the generator reads only its top-level `default:`, so it can't
+vary per target (don't override it with `--var` either). The default host config's *values* are still
+per target.
 
 (Don't want to commit even placeholder endpoints? Put the per-target maps in the git-ignored
 `.databricks/bundle/<target>/variable-overrides.json` instead; the rest works identically.)

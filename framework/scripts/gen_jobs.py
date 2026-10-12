@@ -206,7 +206,7 @@ def load_default_es_host_config(path: str | None = None, doc: dict | None = None
     Read at GENERATION time from the variable's static `default:`; per-target and --var overrides are
     deploy-time and deliberately not visible here (the default host-config NAME is a repo-level choice,
     while its per-environment VALUES live on the host config itself). The value is returned as-is; whether
-    it names a real declared host config is enforced by require_es_host_config once a pipeline resolves to it.
+    it names a real declared host config is enforced by require_default_es_host_config (see main).
     """
     if doc is None:
         doc = _read_bundle_doc(path)
@@ -287,6 +287,14 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
                 f"{var} (databricks.yml) entry {name!r} must be exactly "
                 f"{json.dumps(dict(sorted(want.items())))}, got {json.dumps(entries[name])}"
             )
+    _reject_target_overrides(
+        var, doc, "each target's host values flow in through the ${var.<name>.<field>} references")
+
+
+def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
+    """Fail closed if any target in databricks.yml sets `var` under its `variables:`. For variables the
+    generator reads only at their top-level default, where a per-target value would go unchecked or split
+    what the generated jobs bake from what deploy-time references resolve."""
     overridden = sorted(
         target for target, tspec in (doc.get("targets") or {}).items()
         if isinstance(tspec, dict) and var in (tspec.get("variables") or {})
@@ -294,8 +302,34 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
     if overridden:
         raise ValueError(
             f"{var} is overridden in target(s) {', '.join(overridden)}; set it only once under `variables:` "
-            f"(each target's host values flow in through the ${{var.<name>.<field>}} references)"
+            f"({why})"
         )
+
+
+def require_default_es_host_config(default, declared: set, doc: dict) -> None:
+    """Fail closed at GENERATION unless databricks.yml declares a default_es_host_config naming a declared
+    host config, set only at the top level.
+
+    Two consumers read it. A pipeline that omits es_host_config gets this name baked in at generation, and
+    the `_es diagnostics` job defaults its es_host_config parameter to ${var.default_es_host_config},
+    resolved at deploy. So it is checked whether or not any pipeline omits es_host_config (a stale name
+    would otherwise pass generation and break only a parameterless diagnostics run), and a per-target
+    override is rejected (diagnostics would default to a different host than the pipelines write to).
+    """
+    if default is None:
+        raise ValueError(
+            "default_es_host_config is not declared in databricks.yml; declare it under `variables:` with a "
+            "default naming one of the es_host_* host configs (the _es diagnostics job's default host, and "
+            "the host a pipeline that omits es_host_config writes to)"
+        )
+    if default not in declared:
+        raise ValueError(
+            f"default_es_host_config (databricks.yml) names '{default}', which is not a declared host config "
+            f"(declared host configs: {', '.join(sorted(declared)) or '<none>'})"
+        )
+    _reject_target_overrides(
+        "default_es_host_config", doc,
+        "the generated jobs bake its top-level default, so a per-target value would split the default host")
 
 
 def load_cluster_configs(path: str | None = None, doc: dict | None = None) -> set:
@@ -1105,6 +1139,7 @@ def main(argv: list[str] | None = None) -> int:
     es_host_configs = load_es_host_configs(doc=bundle_doc)
     require_es_host_configs_json(es_host_configs, doc=bundle_doc)
     default_es_host_config = load_default_es_host_config(doc=bundle_doc)
+    require_default_es_host_config(default_es_host_config, es_host_configs, bundle_doc)
     cluster_configs = load_cluster_configs(doc=bundle_doc)
     global_job_tags = load_global_job_tags(doc=bundle_doc)
 
@@ -1117,13 +1152,9 @@ def main(argv: list[str] | None = None) -> int:
     for path in config_paths:
         name = _config_name(path)
         cfg = load_config(path)  # raises on any invalid config (fail closed)
-        # Resolve the host config (pipeline's own, else the bundle default) and validate it is declared.
+        # Resolve the host config (pipeline's own, else the bundle default, already checked above) and
+        # validate it is declared.
         hc = cfg["es_host_config"] or default_es_host_config
-        if not hc:
-            raise ValueError(
-                f"pipeline '{name}' omits es_host_config and no default_es_host_config is declared in "
-                f"databricks.yml; set es_host_config in the pipeline, or declare a default_es_host_config"
-            )
         cfg["es_host_config"] = hc
         require_es_host_config(hc, es_host_configs)
         # Resolve/validate compute references now (same all-or-nothing guarantee as an invalid config).

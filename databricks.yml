@@ -184,7 +184,9 @@ variables:
   # run can pick any host by name (es_host_config). One entry per es_host_* variable, each field the
   # reference ${var.<name>.<field>}: the references resolve per target at deploy, so set this ONCE here
   # and never per target. framework/scripts/gen_jobs.py fails closed unless the entries match the declared
-  # host configs exactly. To add es_host_secondary, append its entry inside the outer braces:
+  # host configs exactly. The references are substituted as raw text, so a host value containing a quote
+  # or backslash breaks the JSON and the diagnostics run fails closed (scope/key names can't contain
+  # either). To add es_host_secondary, append its entry inside the outer braces:
   #   , "es_host_secondary": {"es_host_url": "${var.es_host_secondary.es_host_url}",
   #   "secret_scope_name": "${var.es_host_secondary.secret_scope_name}",
   #   "secret_key_name": "${var.es_host_secondary.secret_key_name}"}
@@ -202,7 +204,8 @@ variables:
   # repo-level choice; its per-environment VALUES still live on the host config itself, above). Rename it
   # or point it at your own default host config; a pipeline that omits es_host_config AND has no default
   # declared here fails closed at generation. The `_es diagnostics` job also uses it, as the default of its
-  # es_host_config parameter (resolved at deploy), so keep it set only here so both agree.
+  # es_host_config parameter (resolved at deploy), so the generator requires it to name a declared host
+  # config and rejects a per-target override (both would otherwise split the default host).
   default_es_host_config:
     description: "Host config a pipeline uses when it omits es_host_config (must name an es_host_* complex variable). Read at generation time."
     default: es_host_default

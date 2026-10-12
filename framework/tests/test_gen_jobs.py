@@ -1,6 +1,7 @@
 """Offline unit tests for framework/scripts/gen_jobs.py: the compute-aware job rendering and the reusable
 job-cluster spec loader. No cluster, no bundle: render to YAML text and assert the parsed structure.
 """
+import glob
 import json
 import os
 import re
@@ -1731,3 +1732,87 @@ def test_generation_fails_when_es_host_configs_json_misses_a_host(tmp_path, monk
         with pytest.raises(ValueError, match="missing: es_host_extra"):
             gen_jobs.main(argv)
     assert not list(resources_dir.iterdir())
+
+
+# ---------------------------------------------------------------- default_es_host_config (always checked)
+def test_default_es_host_config_accepted():
+    gen_jobs.require_default_es_host_config("es_host_default", {"es_host_default"}, {"targets": {"dev": {}}})
+
+
+@pytest.mark.parametrize("default, doc, match", [
+    (None, {}, "default_es_host_config is not declared"),
+    ("es_host_primary", {}, "names 'es_host_primary', which is not a declared host config"),
+    ("es_host_default", {"targets": {"stg": {"variables": {"default_es_host_config": "es_host_default"}}}},
+     r"default_es_host_config is overridden in target\(s\) stg;"),
+])
+def test_default_es_host_config_rejects(default, doc, match):
+    with pytest.raises(ValueError, match=match):
+        gen_jobs.require_default_es_host_config(default, {"es_host_default"}, doc)
+
+
+def test_generation_fails_on_stale_default_even_when_every_pipeline_names_its_host(tmp_path, monkeypatch):
+    # A pipeline that names its host explicitly never falls back to the default, but the es_diagnostics job
+    # always does: a default left pointing at a removed host must still fail generation.
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    (config_dir / "explicit.yml").write_text(
+        "es_index_name: explicit-index\n"
+        "pipeline_mode: batch\n"
+        "es_host_config: es_host_default\n"
+        "view: {catalog: c, schema: s, name: v}\n"
+        "source: {catalog: c, schema: s, table: t}\n"
+    )
+    resources_dir = tmp_path / "_pipelines" / "resources"
+    resources_dir.mkdir()
+    dab_yml = _write_bundle_variables(tmp_path)
+    doc = yaml.safe_load(dab_yml.read_text())
+    doc["variables"]["default_es_host_config"]["default"] = "es_host_gone"
+    dab_yml.write_text(yaml.safe_dump(doc))
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    with pytest.raises(ValueError, match="names 'es_host_gone', which is not a declared host config"):
+        gen_jobs.main(["--check"])
+
+
+# ---------------------------------------------------------------- notebook paths resolve from each job file
+def _shipped_job_files():
+    return sorted(glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml"))
+                  + glob.glob(os.path.join(_REPO_ROOT, "_pipelines", "resources", "*.job.yml")))
+
+
+def test_shipped_job_files_found():
+    names = [os.path.relpath(p, _REPO_ROOT) for p in _shipped_job_files()]
+    assert "framework/resources/_es_diagnostics.job.yml" in names
+    assert "_pipelines/resources/ecs_dns_activity.job.yml" in names
+    assert len(names) == 11  # 6 fixed + 5 generated on main
+
+
+@pytest.mark.parametrize("path", _shipped_job_files(), ids=lambda p: os.path.relpath(p, _REPO_ROOT))
+def test_every_task_notebook_path_resolves_from_its_job_file(path):
+    # A bundle resolves a relative notebook_path against the directory of the file that declares it, so
+    # each task's path must reach a real notebook from there (e.g. ../../framework/notebooks/... from
+    # _pipelines/resources/, ../notebooks/... from framework/resources/).
+    with open(path) as fh:
+        jobs = yaml.safe_load(fh)["resources"]["jobs"]
+    tasks = [t for job in jobs.values() for t in job["tasks"]]
+    assert tasks
+    for task in tasks:
+        rel = task["notebook_task"]["notebook_path"]
+        target = os.path.normpath(os.path.join(os.path.dirname(path), rel))
+        assert os.path.isfile(target), f"{task['task_key']}: {rel} -> {target} does not exist"
+        assert os.path.dirname(target) == os.path.join(_FRAMEWORK_ROOT, "notebooks")
+
+
+def test_generated_notebook_path_resolves_from_the_output_dir():
+    # What the generator emits (not just the committed files) must resolve from the folder it writes to.
+    cfg = validate_config({
+        "es_index_name": "ecs-dns-activity", "es_id_field": "dsl_id", "es_host_config": "es_host_default",
+        "pipeline_mode": "batch", "view": {"catalog": "c", "schema": "s", "name": "v"},
+        "source": {"catalog": "c", "schema": "s", "table": "t"},
+    })
+    rel = _render_job(cfg)["tasks"][0]["notebook_task"]["notebook_path"]
+    target = os.path.normpath(os.path.join(gen_jobs._RESOURCES_DIR, rel))
+    assert target == os.path.join(_FRAMEWORK_ROOT, "notebooks", "run_index_pipeline.py")
+    assert os.path.isfile(target)

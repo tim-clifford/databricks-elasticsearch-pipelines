@@ -78,7 +78,7 @@ from pipeline_lib.es_diagnostics import (  # noqa: E402
 )
 
 dbutils.widgets.text("es_host_config", "", "Which host config to hit (a name from databricks.yml; the job defaults it to default_es_host_config)")
-dbutils.widgets.text("es_host_configs_json", "{}", "Deploy-time JSON map of configured host configs -> {es_host_url, secret_scope_name, secret_key_name}")
+dbutils.widgets.text("es_host_configs_json", "", "Deploy-time JSON map of configured host configs -> {es_host_url, secret_scope_name, secret_key_name}")
 dbutils.widgets.text("ca_certs", "", "UC Volume path to a CA bundle (PEM) verifying the ES TLS cert (empty => system CAs)")
 dbutils.widgets.text("verify_certs", "true", "Verify TLS certs: true|false (false for self-signed; ignored when ca_certs set)")
 dbutils.widgets.text("index_name", "", "Optional index to deep-dive (empty => cluster/node level only)")
@@ -99,8 +99,11 @@ REQUEST_TIMEOUT_SECS = dbutils.widgets.get("request_timeout_secs").strip()
 # the notebook picks by name from this carried-in map rather than indexing a var by name at run time.
 if not ES_HOST_CONFIG:
     raise ValueError("missing required parameter: es_host_config (name of a host config in databricks.yml)")
+if not ES_HOST_CONFIGS_JSON:
+    raise ValueError("missing required parameter: es_host_configs_json (the job carries it from the "
+                     "databricks.yml variable of that name; it is not set on this run)")
 try:
-    _HOST_CONFIGS = json.loads(ES_HOST_CONFIGS_JSON or "{}")
+    _HOST_CONFIGS = json.loads(ES_HOST_CONFIGS_JSON)
 except ValueError as exc:
     raise ValueError(f"es_host_configs_json is not valid JSON: {exc}")
 ES_HOST_URL, SECRET_SCOPE_NAME, SECRET_KEY_NAME = resolve_es_host_config(ES_HOST_CONFIG, _HOST_CONFIGS)
