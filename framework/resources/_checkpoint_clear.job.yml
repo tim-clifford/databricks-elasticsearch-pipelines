@@ -1,0 +1,69 @@
+resources:
+  jobs:
+    checkpoint_clear:
+      name: "[${bundle.target}] ${var.job_name_prefix}: _checkpoint clear"
+      description: >-
+        A serverless maintenance job that DELETES the Structured Streaming checkpoint directory for a
+        single pipeline config, so that pipeline's next streaming run starts fresh. Takes one required
+        job parameter, config_name; the target is {checkpoint_base_path}/{config_name}, composed the same
+        way framework/notebooks/run_index_pipeline.py composes checkpoint_location, so it can only clear the
+        checkpoint that pipeline would resume from. This is the sole way to clear a checkpoint. No
+        cluster block => serverless notebook task.
+
+      # config_name is REQUIRED: the run-time parameter naming the pipeline whose checkpoint to clear.
+      # Default is blank; the notebook fails closed on a blank value (never a no-target delete). Override
+      # per run with `--params config_name=<name>` (or set it in the Run dialog).
+      parameters:
+        - name: config_name
+          default: ""
+
+      # CONCURRENT runs allowed (the one job here that does not cap at 1): each run clears ONE config's
+      # checkpoint, named by its config_name parameter, so clears for different pipelines can run side by side
+      # (e.g. resetting several streams at once). Two runs for the SAME config are harmless: the second finds
+      # nothing and reports NOT_PRESENT. What concurrency does not change: clearing a checkpoint while that
+      # config's stream is running is unsafe, so stop the stream first, exactly as with a single run.
+      max_concurrent_runs: 20
+
+      # Skip, don't queue: a trigger landing while all 20 run slots are busy is dropped
+      # (MAX_CONCURRENT_RUNS_EXCEEDED) rather than queued, matching every generated job and _deploy_views.
+      queue:
+        enabled: false
+
+      # Notify the target's support recipients on a run failure. ${var.support_email} is a complex LIST
+      # var: an empty list in dev/stg (no recipients = off) and a real address in prd. on_failure
+      # references the whole var so the empty case is [] (not [""]). notification_settings suppress
+      # SKIPPED (queue disabled => an overlapping trigger is skipped, not failed) and CANCELED runs, so
+      # recipients are paged only on a genuine failure. Matches every other job (see framework/scripts/gen_jobs.py).
+      email_notifications:
+        on_failure: ${var.support_email}
+      notification_settings:
+        no_alert_for_skipped_runs: true
+        no_alert_for_canceled_runs: true
+
+      # Global job tags from databricks.yml (empty {} => omitted). Applied to every job; serverless, so
+      # these are job-level tags (no cluster to forward onto). Matches every other job.
+      tags: ${var.global_job_tags}
+
+      tasks:
+        - task_key: checkpoint_clear
+          notebook_task:
+            notebook_path: ../notebooks/checkpoint_clear.py
+            # checkpoint_base_path is the deploy-time bundle variable (the UC Volume streaming base); the
+            # notebook appends /<config_name>. config_name arrives as a job parameter (above), not here.
+            base_parameters:
+              checkpoint_base_path: ${var.checkpoint_base_path}
+          # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
+          # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
+          # plus alert_on_last_attempt: false so every failed attempt pages. See framework/scripts/gen_jobs.py _build_task.
+          email_notifications:
+            on_failure: ${var.support_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: false
+
+      # On-demand: invoke via `databricks bundle run checkpoint_clear --params config_name=<name>`.
+      # CAN_MANAGE_RUN so any teammate in `users` can trigger it, matching deploy_views.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          group_name: users

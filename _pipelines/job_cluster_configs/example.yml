@@ -7,7 +7,7 @@
 #     job_cluster_config: <your_key>     # this file's name without the .yml extension
 #
 # The file's contents are a Databricks `new_cluster` spec, passed through verbatim into the generated
-# job's job_clusters block (scripts/gen_jobs.py inlines it). Any valid new_cluster field is allowed;
+# job's job_clusters block (framework/scripts/gen_jobs.py inlines it). Any valid new_cluster field is allowed;
 # `databricks bundle validate` checks the actual field values at deploy. Defining it once here means
 # several pipelines can share the same spec by key instead of repeating it. (Each job run still spins
 # up its own ephemeral job cluster from this spec; for a genuinely shared always-on cluster, use

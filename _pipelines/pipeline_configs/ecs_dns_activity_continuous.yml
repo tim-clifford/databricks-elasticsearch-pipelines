@@ -11,7 +11,7 @@
 # See ecs_dns_activity.yml for the full field reference. ${environment} folding works the same here.
 es_index_name: ecs-dns-activity-continuous   # own ES index (separate from the other dns pipelines)
 es_id_field: dsl_id                          # OPTIONAL: view output column used as the ES document _id (idempotent upserts). Strongly recommended for streaming: restarts/retries are routine, so a deterministic _id keeps replays idempotent
-es_host_config: es_host_primary              # ES host config (endpoint + secret scope/key); declared in databricks.yml
+es_host_config: es_host_default              # ES host config (endpoint + secret scope/key); declared in databricks.yml
 pipeline_mode: streaming                     # continuous requires streaming (an always-on run only applies to a stream)
 
 # max_files_per_trigger: 1000                # OPTIONAL streaming read rate-limit: max Delta files per micro-batch (empty => Spark default 1000). Useful to throttle a streaming_start=full backfill or a large post-restart catch-up

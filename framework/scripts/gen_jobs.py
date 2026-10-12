@@ -1,0 +1,1349 @@
+#!/usr/bin/env python3
+"""Generate one per-index job resource from each _pipelines/pipeline_configs/<name>.yml config.
+
+Adding an Elasticsearch index to the framework is: add _pipelines/pipeline_configs/<name>.yml (and its
+_pipelines/pipeline_views/<view_name>.sql), then rerun this generator. It writes _pipelines/resources/<name>.job.yml,
+one per config, all pointing at the shared notebook framework/notebooks/run_index_pipeline.py.
+
+Usage:
+  python framework/scripts/gen_jobs.py            # (re)generate _pipelines/resources/<name>.job.yml files
+  python framework/scripts/gen_jobs.py --check    # exit non-zero if any generated file is missing/stale/orphaned
+
+--check is the drift guard: run it in CI (or before deploy) so a config edit that was not
+regenerated - or a generated job left behind by a deleted/renamed config - fails loudly instead of
+deploying a stale job set.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import posixpath
+import re
+import sys
+
+import yaml
+
+# This script lives at <repo>/framework/scripts/gen_jobs.py. The framework root holds pipeline_lib; the
+# repo (bundle) root holds databricks.yml and the _pipelines/ tree.
+_FRAMEWORK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(_FRAMEWORK_ROOT)
+# Import the shared config schema from the framework root, so validation is not re-implemented here.
+sys.path.insert(0, _FRAMEWORK_ROOT)
+from pipeline_lib.config import (  # noqa: E402
+    _RUNTIME_KNOBS,
+    PipelineConfigError,
+    _require_identifier,
+    job_base_parameters,
+    job_parameters,
+    load_config,
+    runtime_knob_global_refs,
+)
+
+# The DEFAULT the generator bakes for every run-time job parameter that a config OMITS: the knob's
+# target-wide ${var.<name>} global reference (resolved per target at deploy), so an omitted knob defers to
+# that target's global default. A config that SETS the knob overrides this with its literal value. This is
+# ONE dict for all run-time knobs, derived from the pipeline_lib.config._RUNTIME_KNOBS registry (the single
+# source of truth for the knob set/order), so adding a knob there wires its global fallback here with no
+# edit. Mirrors how ca_certs / checkpoint_base_path are threaded as ${var.*} references (see
+# job_base_parameters); require_runtime_knobs_declared fails closed at generation if any variable is missing.
+_RUNTIME_KNOB_GLOBAL_REFS = runtime_knob_global_refs()
+
+_CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "pipeline_configs")
+_RESOURCES_DIR = os.path.join(_REPO_ROOT, "_pipelines", "resources")
+# Reusable job-cluster specs referenced by a config's compute.job_cluster_config key (see load_job_cluster_spec).
+_JOB_CLUSTER_CONFIG_DIR = os.path.join(_REPO_ROOT, "_pipelines", "job_cluster_configs")
+# Bundle root; the Elasticsearch host configs are declared here (see load_es_host_configs).
+_DATABRICKS_YML = os.path.join(_REPO_ROOT, "databricks.yml")
+
+# The three fields every Elasticsearch host config carries. A host config is declared in databricks.yml
+# as a `type: complex` variable whose default mapping has exactly these keys (see the variables block there).
+_ES_HOST_CONFIG_FIELDS = frozenset({"es_host_url", "secret_scope_name", "secret_key_name"})
+
+# The field a cluster config carries. Like a host config, a cluster config is a `type: complex` variable
+# whose default mapping has exactly this key: an existing_cluster pipeline names one via
+# compute.cluster_config, and the generator emits existing_cluster_id: ${var.<name>.cluster_id}.
+_CLUSTER_CONFIG_FIELDS = frozenset({"cluster_id"})
+
+# The tag key the generator computes and adds to every generated job (a distinct, sorted, SPACE-separated
+# list of the es_index_name(s) the job writes). Reserved: global_job_tags must not define it (the
+# generator owns it). Space-separated because the Jobs API tag-value regex rejects a comma (see _build_job_tags).
+_ES_INDEX_LIST_TAG = "es_index_list"
+
+# Databricks forwards job tags to cluster tags, whose value length is bounded by the CLOUD PROVIDER
+# (AWS tag value 255, Azure 256, GCP labels only 63). To keep a large job_group DEPLOYABLE, the
+# generator-owned es_index_list is TRUNCATED to fit this conservative bound (the AWS/Azure practical
+# limit) rather than blocking the whole job's deploy on one oversized tag: whole index names are kept in
+# sorted order until the next would not fit, then a ` ...+N` marker names how many were dropped. The
+# GLOBAL tags are independent tag values and are never touched by this. (GCP's 63-char label limit is
+# tighter than this cap; a GCP deployment with many indices may still need fewer indices per group.)
+_TAG_VALUE_MAX_LEN = 255
+
+# The Jobs API restricts a tag KEY/VALUE to this character set (verified live: a comma is rejected at
+# deploy with "must match the regular expression ^[\d \w+\-=.:/@]*$"). A LITERAL global tag key/value is
+# validated against it at generation so a bad character fails closed HERE, not at deploy - the same
+# fail-closed-at-generation contract es_index_list follows. re.ASCII so \w matches ONLY [A-Za-z0-9_]
+# (the server regex is ASCII; Python's default \w would let a non-ASCII letter pass generation and then
+# be rejected at deploy). Only the LITERAL text is checked: _BUNDLE_REF_RE strips ${...} spans first
+# (their deploy-resolved form differs from the reference text), so a value mixing a literal and a
+# reference (e.g. "a,b${var.x}") still has its literal part validated.
+_TAG_CHAR_RE = re.compile(r"[\d \w+\-=.:/@]*", re.ASCII)
+_BUNDLE_REF_RE = re.compile(r"\$\{[^}]*\}")
+
+# Databricks caps a job at 25 tags. The generator adds es_index_list to EVERY generated job, so at most
+# _JOB_TAG_LIMIT - 1 global tags leave room for it; a larger global_job_tags fails closed at generation
+# rather than at deploy. (Development mode adds its own `dev` tag at deploy on top of these, so keep the
+# global set well under the cap in dev - documented in the README.)
+_JOB_TAG_LIMIT = 25
+
+# Config files may use either extension; both are treated identically.
+_CONFIG_GLOBS = ("*.yml", "*.yaml")
+
+# A config's stem becomes the Databricks bundle resource key `index_pipeline_<stem>`, which must be
+# [A-Za-z0-9_-]+. A dotted name like `foo.bar.yml` (splitext strips only `.yml`) would yield the key
+# `index_pipeline_foo.bar` - invalid, and it fails at DEPLOY, not generation. Enforce it here so a
+# bad name fails loudly at generation instead.
+_VALID_STEM = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# First line of every generated file. Doubles as the marker that identifies OUR files in
+# _pipelines/resources/ (so a hand-authored resource there is never touched or flagged as an orphan).
+_GENERATED_MARKER = "# GENERATED by framework/scripts/gen_jobs.py"
+# The marker files generated before the framework/ move carry (the generator lived at scripts/gen_jobs.py).
+# Still recognized, so generated files moved into _pipelines/resources/ are regenerated or flagged as
+# orphans rather than refused as hand-authored.
+_LEGACY_GENERATED_MARKERS = ("# GENERATED by scripts/gen_jobs.py",)
+_GENERATED_HEADER = (
+    _GENERATED_MARKER + " from _pipelines/pipeline_configs/{config}. DO NOT EDIT BY HAND.\n"
+    "# To change this job: edit the config or the generator template, then rerun the generator.\n"
+)
+# Header for a job_group's file (one job, one task per member). Starts with the same marker, so
+# is_generated / orphan detection treat it identically to a singleton file.
+_GENERATED_GROUP_HEADER = (
+    _GENERATED_MARKER + " from job_group '{group}' (members: {configs}). DO NOT EDIT BY HAND.\n"
+    "# To change this job: edit the member configs or the generator template, then rerun the generator.\n"
+)
+
+
+def _config_name(path: str) -> str:
+    """The stem used for the job key and generated filename (extension-agnostic)."""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def load_job_cluster_spec(key: str) -> dict:
+    """Load and lightly validate the reusable new_cluster spec named `key`. Fail closed.
+
+    Looks for _pipelines/job_cluster_configs/<key>.yml (or .yaml). The file's contents are a Databricks
+    `new_cluster` spec, passed through VERBATIM into the generated job's job_clusters block; the bundle
+    (and the Jobs API at deploy) validate the spec's own fields, so we only enforce here that it exists
+    and parses to a NON-EMPTY MAPPING. A missing file or a non-mapping/empty body raises, so a bad
+    compute.job_cluster_config reference aborts generation rather than emitting a job with no/blank
+    cluster. `key` is already charset-restricted by config validation, so it maps to one file safely.
+    """
+    path = next(
+        (p for ext in (".yml", ".yaml") if os.path.exists(p := os.path.join(_JOB_CLUSTER_CONFIG_DIR, f"{key}{ext}"))),
+        None,
+    )
+    if path is None:
+        raise ValueError(
+            f"compute.job_cluster_config '{key}' not found: expected "
+            f"_pipelines/job_cluster_configs/{key}.yml (or .yaml)"
+        )
+    with open(path) as fh:
+        spec = yaml.safe_load(fh)
+    if not isinstance(spec, dict) or not spec:
+        raise ValueError(
+            f"_pipelines/job_cluster_configs/{key}: must be a non-empty mapping (a Databricks "
+            f"new_cluster spec), got {type(spec).__name__}"
+        )
+    return spec
+
+
+def _read_bundle_doc(path: str | None = None) -> dict:
+    """Parse databricks.yml once. main() reads several things from it, so it parses once here and passes
+    the parsed doc to the loaders below (their `doc=` argument), opening the file a single time per run.
+    The loaders keep a path default so each is still independently callable (and unit-testable) on its own.
+    `path=None` means _DATABRICKS_YML, looked up at CALL time (a `path=_DATABRICKS_YML` default would be
+    bound once at import, so a test that points the module at another databricks.yml would still read
+    the real one).
+    """
+    with open(path if path is not None else _DATABRICKS_YML) as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _load_complex_configs(fields: frozenset, path: str | None = None, doc: dict | None = None) -> set:
+    """Names of databricks.yml `type: complex` variables whose default mapping's keys are EXACTLY `fields`.
+
+    The shared scan behind load_es_host_configs and load_cluster_configs (they differ only in the field
+    set), so the "complex var with an exact key set" logic lives in one place. A complex variable with a
+    different key set, and any plain (non-complex) variable, are ignored - so a config name can only ever
+    resolve to a variable of the intended shape, never an unrelated one.
+    """
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
+    return {
+        name for name, spec in variables.items()
+        if isinstance(spec, dict) and spec.get("type") == "complex"
+        and isinstance(spec.get("default"), dict) and set(spec["default"]) == fields
+    }
+
+
+def load_es_host_configs(path: str | None = None, doc: dict | None = None) -> set:
+    """The set of declared Elasticsearch host-config names, read from databricks.yml. Fail closed.
+
+    A host config is a bundle variable with `type: complex` whose default mapping's keys are exactly
+    _ES_HOST_CONFIG_FIELDS (es_host_url + secret_scope_name + secret_key_name). This is the SINGLE
+    SOURCE OF TRUTH for which host configs exist: a pipeline's `es_host_config` must name one of these
+    (enforced by require_es_host_config), and the generated job references ${var.<name>.<field>}, which
+    the bundle resolves per target at deploy. A complex variable whose default has a DIFFERENT key set is
+    not a host config and is ignored, so unrelated complex variables never collide with this scan.
+    """
+    return _load_complex_configs(_ES_HOST_CONFIG_FIELDS, path, doc)
+
+
+def load_default_es_host_config(path: str | None = None, doc: dict | None = None):
+    """The bundle's default host-config name, from databricks.yml `variables.default_es_host_config.default`
+    (or None if not declared). A pipeline that OMITS es_host_config falls back to this (see main).
+
+    Read at GENERATION time from the variable's static `default:`; per-target and --var overrides are
+    deploy-time and deliberately not visible here (the default host-config NAME is a repo-level choice,
+    while its per-environment VALUES live on the host config itself). The value is returned as-is; whether
+    it names a real declared host config is enforced by require_default_es_host_config (see main).
+    """
+    if doc is None:
+        doc = _read_bundle_doc(path)
+    spec = (doc.get("variables") or {}).get("default_es_host_config")
+    if not isinstance(spec, dict):
+        return None
+    default = spec.get("default")
+    if not (isinstance(default, str) and default):
+        return None
+    # A pipeline that omits es_host_config falls back to this name, which the generator emits as
+    # ${var.<name>.es_host_url}. Hold it to the SAME identifier rule as a pipeline's own es_host_config
+    # (config.py _require_identifier), so a malformed default (e.g. a hyphen) fails here with a clear
+    # message rather than a confusing "not declared" error or a broken ${var.bad-name.*} ref downstream.
+    _require_identifier(default, "default_es_host_config (databricks.yml)")
+    return default
+
+
+def require_es_host_config(name: str, declared: set) -> None:
+    """Fail closed if a pipeline's es_host_config `name` is not declared in databricks.yml.
+
+    Mirrors load_job_cluster_spec's role for job_cluster_config: a reference to a host config that was
+    never declared (a typo, or one removed from databricks.yml) aborts generation with a clear message,
+    rather than emitting a job whose ${var.<name>.*} references would fail only later, at deploy.
+    """
+    if name not in declared:
+        raise ValueError(
+            f"es_host_config '{name}' is not declared in databricks.yml "
+            f"(declared host configs: {', '.join(sorted(declared)) or '<none>'}); add it as a "
+            f"`type: complex` variable with es_host_url/secret_scope_name/secret_key_name fields, "
+            f"or fix the pipeline's es_host_config"
+        )
+
+
+# The string variable carrying every host config to the `_es diagnostics` job (a fixed file,
+# framework/resources/_es_diagnostics.job.yml): a JSON object, written in databricks.yml next to the host
+# declarations, mapping each host-config name to its three fields as ${var.<name>.<field>} references.
+_ES_HOST_CONFIGS_JSON_VAR = "es_host_configs_json"
+
+
+def require_es_host_configs_json(declared: set, path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION unless databricks.yml's es_host_configs_json lists EXACTLY the declared
+    host configs, each entry wired to its OWN host's fields.
+
+    The diagnostics notebook resolves a host by name from this map at run time; bundle references resolve
+    only at deploy, so the map is spelled out in databricks.yml with one entry per declared host config
+    (load_es_host_configs) and every field the exact reference ${var.<name>.<field>}. Anything else is
+    rejected: a missing entry (that host could not be diagnosed), an extra entry (a name no pipeline can
+    use, whose reference fails at deploy), another host's reference (diagnostics would hit the wrong
+    host), a literal value, a default that is not a JSON object string, or a per-target override (the
+    generator reads only the top-level default, so an override would go unchecked).
+    """
+    doc = doc if doc is not None else _read_bundle_doc(path)
+    var = _ES_HOST_CONFIGS_JSON_VAR
+    variables = doc.get("variables") or {}
+    spec = variables.get(var)
+    if var not in variables:
+        raise ValueError(
+            f"{var} is not declared in databricks.yml; declare it under "
+            f"`variables:` next to the es_host_* host configs (see the README \"Configuring Elasticsearch "
+            f"host connections\")"
+        )
+    if not isinstance(spec, dict) or spec.get("type") is not None or not isinstance(spec.get("default"), str):
+        raise ValueError(
+            f"{var} (databricks.yml) must be declared as a string variable with a `default:` (no `type:`), "
+            f"like the shipped declaration; declare it under "
+            f"`variables:` next to the es_host_* host configs (see the README \"Configuring Elasticsearch "
+            f"host connections\")"
+        )
+    try:
+        entries = json.loads(spec["default"])
+    except ValueError as exc:
+        raise ValueError(f"{var} (databricks.yml) default is not valid JSON: {exc}") from None
+    if not isinstance(entries, dict):
+        raise ValueError(f"{var} (databricks.yml) default must be a JSON object of host-config name -> fields")
+    missing, extra = sorted(declared - set(entries)), sorted(set(entries) - declared)
+    if missing or extra:
+        raise ValueError(
+            f"{var} (databricks.yml) must list exactly the declared host configs "
+            f"({', '.join(sorted(declared)) or '<none>'}); missing: {', '.join(missing) or '<none>'}; "
+            f"not declared: {', '.join(extra) or '<none>'}"
+        )
+    for name in sorted(entries):
+        want = {field: f"${{var.{name}.{field}}}" for field in _ES_HOST_CONFIG_FIELDS}
+        if entries[name] != want:
+            raise ValueError(
+                f"{var} (databricks.yml) entry {name!r} must be exactly "
+                f"{json.dumps(dict(sorted(want.items())))}, got {json.dumps(entries[name])}"
+            )
+    _reject_target_overrides(
+        var, doc, "each target's host values flow in through the ${var.<name>.<field>} references")
+
+
+def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
+    """Fail closed if any target in databricks.yml sets `var` under its `variables:`. For variables the
+    generator reads only at their top-level default, where a per-target value would go unchecked or split
+    what the generated jobs bake from what deploy-time references resolve. Only databricks.yml is checked:
+    a variable-overrides.json, --var or BUNDLE_VAR_ override can't be seen here, and the README says not
+    to use one for these."""
+    require_bundle_shape(doc)
+    overridden = [
+        target for target, tspec in sorted(_block(doc, "targets", dict).items())
+        if var in _block(tspec or {}, "variables", dict)
+    ]
+    if overridden:
+        raise ValueError(
+            f"{var} is overridden in target(s) {', '.join(overridden)}; set it only once under `variables:` "
+            f"in databricks.yml ({why})"
+        )
+
+
+def require_default_es_host_config(default, declared: set, doc: dict) -> None:
+    """Fail closed at GENERATION unless databricks.yml declares a default_es_host_config naming a declared
+    host config, set only at the top level.
+
+    Two consumers read it. A pipeline that omits es_host_config gets this name baked in at generation, and
+    the `_es diagnostics` job defaults its es_host_config parameter to ${var.default_es_host_config},
+    resolved at deploy. So it is checked whether or not any pipeline omits es_host_config (a stale name
+    would otherwise pass generation and break only a parameterless diagnostics run), and a per-target
+    override is rejected (diagnostics would default to a different host than the pipelines write to).
+    """
+    if default is None:
+        declared_var = isinstance((doc.get("variables") or {}).get("default_es_host_config"), dict)
+        raise ValueError(
+            ("default_es_host_config (databricks.yml) has an empty or non-string default; set it to"
+             if declared_var else
+             "default_es_host_config is not declared in databricks.yml; declare it under `variables:` with")
+            + " a default naming one of the es_host_* host configs (the _es diagnostics job's default host, "
+            "and the host a pipeline that omits es_host_config writes to)"
+        )
+    if default not in declared:
+        raise ValueError(
+            f"default_es_host_config (databricks.yml) names '{default}', which is not a declared host config "
+            f"(declared host configs: {', '.join(sorted(declared)) or '<none>'})"
+        )
+    _reject_target_overrides(
+        "default_es_host_config", doc,
+        "the generated jobs bake its top-level default, so a per-target value would split the default host")
+
+
+def load_cluster_configs(path: str | None = None, doc: dict | None = None) -> set:
+    """The set of declared cluster-config names, read from databricks.yml. Fail closed.
+
+    A cluster config is a bundle variable with `type: complex` whose default mapping's keys are exactly
+    _CLUSTER_CONFIG_FIELDS ({cluster_id}). This is the SINGLE SOURCE OF TRUTH for which cluster configs
+    exist: an existing_cluster pipeline's `cluster_config` must name one of these (enforced by
+    require_cluster_config), and the generated job references ${var.<name>.cluster_id}, resolved per target
+    at deploy. Exactly like load_es_host_configs: a complex variable with a DIFFERENT key set (e.g. a host
+    config) or a plain string variable (wheel_path, environment, ...) is NOT a cluster config and is
+    ignored, so cluster_config can only ever name a real, purpose-shaped cluster-id variable.
+    """
+    return _load_complex_configs(_CLUSTER_CONFIG_FIELDS, path, doc)
+
+
+def require_cluster_config(name: str, declared: set) -> None:
+    """Fail closed if an existing_cluster pipeline's cluster_config `name` is not a declared cluster config
+    in databricks.yml. Mirrors require_es_host_config: a reference that is a typo, left commented out, or
+    points at a variable that is NOT a cluster-id config (a host config, wheel_path, ...) aborts generation
+    with a clear message, rather than emitting a job whose ${var.<name>.cluster_id} would fail at deploy.
+    """
+    if name not in declared:
+        raise ValueError(
+            f"cluster_config '{name}' is not declared as a cluster config in databricks.yml "
+            f"(declared cluster configs: {', '.join(sorted(declared)) or '<none>'}); add it as a "
+            f"`type: complex` variable with a single cluster_id field (with per-target values), "
+            f"or fix the pipeline's cluster_config"
+        )
+
+
+def require_job_name_prefix_declared(path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION if databricks.yml declares no `job_name_prefix` variable.
+
+    Every generated job name embeds ${var.job_name_prefix} (the branding prefix, default
+    'databricks-elasticsearch-pipelines'), resolved by the bundle per target at deploy. If the variable
+    is not declared, that reference would fail only at deploy with a confusing error, so require its
+    declaration here (mirrors require_es_host_config). We check declaration, not value: the value is a
+    deploy-time choice (per-target / --var overridable), so its actual string is deliberately not read here.
+    """
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
+    if "job_name_prefix" not in variables:
+        raise ValueError(
+            "job_name_prefix is not declared in databricks.yml; add it under `variables:` with a default "
+            "(e.g. 'databricks-elasticsearch-pipelines'). The generator emits ${var.job_name_prefix} into "
+            "every job name, so the bundle needs the variable to resolve it at deploy."
+        )
+
+
+def _require_global_var_declared(name: str, validator, path: str | None = None,
+                                 doc: dict | None = None) -> None:
+    """Fail closed at GENERATION if databricks.yml declares no `<name>` variable, or its static default
+    fails `validator` (the SAME require_* helper the runner applies to the effective value).
+
+    A config that OMITS a globally-defaulted knob (bulk_stats, request_timeout, transport_max_retries)
+    has its job-parameter default baked as ${var.<name>}. If the variable is not declared that reference
+    would fail only at deploy with a confusing error, so require its declaration here (mirrors
+    require_job_name_prefix_declared). Validating the declared default with the runner's own validator
+    means a mistyped global default ('on', 'abc', -1) fails at generation rather than at every run.
+    Per-target/--var overrides are deploy-time and not visible here; the runner re-validates the
+    effective value, so a bad per-target value still fails closed at run.
+    """
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
+    if name not in variables:
+        raise ValueError(
+            f"{name} is not declared in databricks.yml; add it under `variables:` with an empty default "
+            f"(e.g. {name}: {{default: \"\"}}). The generator bakes ${{var.{name}}} as the default of the "
+            f"{name} job parameter for any pipeline that omits {name}, so the bundle needs the "
+            f"variable to resolve it at deploy."
+        )
+    # DAB accepts BOTH the full form (<name>: {default: <v>}) and the scalar shorthand (<name>: <v>,
+    # which IS the default). Read the default from whichever shape was used, so a bad shorthand default
+    # is validated too rather than silently treated as "".
+    spec = variables[name]
+    default = spec.get("default") if isinstance(spec, dict) else spec
+    # Validate the declared default with the runner's own validator. It raises PipelineConfigError on
+    # anything illegal; re-raise as ValueError to match this module's generation errors (main treats a
+    # bad config/reference uniformly).
+    try:
+        validator(default if default is not None else "", f"{name} (databricks.yml) default")
+    except PipelineConfigError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def require_runtime_knobs_declared(path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at generation unless databricks.yml declares a legal global default for EVERY run-time
+    knob (pipeline_lib.config._RUNTIME_KNOBS).
+
+    Each run-time job parameter's default is baked as ${var.<name>} for any pipeline that OMITS the knob
+    (see _RUNTIME_KNOB_GLOBAL_REFS / job_parameters), so the bundle must declare each variable AND its
+    static default must pass that knob's own validator - the SAME require_* helper the runner applies to
+    the effective value. One loop over the registry (each entry carries its name and validator), so a knob
+    added to _RUNTIME_KNOBS is gated here automatically, with no per-knob function to add. Delegates each
+    knob to _require_global_var_declared (which validates declaration + default, and whose message tells
+    the operator to add the missing variable). Per-target/--var overrides are deploy-time and not visible
+    here; the runner re-validates the effective value, so a bad per-target value still fails closed at run.
+    """
+    bundle_doc = doc if doc is not None else _read_bundle_doc(path)
+    for knob in _RUNTIME_KNOBS:
+        _require_global_var_declared(knob.name, knob.validator, path, bundle_doc)
+
+
+def require_support_email_declared(path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION if databricks.yml declares no `support_email` variable.
+
+    Every generated job emits email_notifications.on_failure: ${var.support_email}, so the bundle needs
+    the variable to resolve it per target at deploy; if it is not declared that reference fails only at
+    deploy with a confusing error. Mirrors require_job_name_prefix_declared: we check DECLARATION, not
+    value (the recipients are a per-target deploy-time choice, and an EMPTY list is valid = failure emails
+    off for that target, so there is nothing to validate about the contents here)."""
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
+    if "support_email" not in variables:
+        raise ValueError(
+            "support_email is not declared in databricks.yml; add it under `variables:` as a `type: "
+            "complex` variable with an empty-list default (support_email: {type: complex, default: []}). "
+            "The generator emits email_notifications.on_failure: ${var.support_email} into every job, so "
+            "the bundle needs the variable to resolve it at deploy (empty list = failure emails off)."
+        )
+
+
+def require_global_job_tags_declared(path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION if databricks.yml declares no `global_job_tags` variable.
+
+    Every job carries the global tags: the hand-authored fixed jobs reference ${var.global_job_tags} (so
+    an undeclared variable fails their deploy), and generated jobs bake this variable's default. Require
+    the DECLARATION here (mirrors require_support_email_declared); the value is a deploy-time choice and an
+    empty map is valid (= no tags), so there is nothing to validate about the contents at this point. The
+    shape of a NON-empty default is validated by load_global_job_tags."""
+    variables = (doc if doc is not None else _read_bundle_doc(path)).get("variables") or {}
+    if "global_job_tags" not in variables:
+        raise ValueError(
+            "global_job_tags is not declared in databricks.yml; add it under `variables:` as a `type: "
+            "complex` variable with an empty-map default (global_job_tags: {type: complex, default: {}}). "
+            "Every job carries these tags: the fixed jobs reference ${var.global_job_tags} and generated "
+            "jobs bake its default, so the bundle needs the variable to resolve it (empty {} = no tags)."
+        )
+
+
+def load_global_job_tags(path: str | None = None, doc: dict | None = None) -> dict:
+    """The global job tags map, read from databricks.yml `variables.global_job_tags.default`. Fail closed.
+
+    Returns {} when the variable is absent or its default is empty/None (= no tags). A NON-empty default
+    must be a flat MAPPING of string key -> string value (Databricks tags are string->string): a non-dict
+    default, a non-string key, a non-string value (YAML would read `true`/`2026` as bool/int, so require
+    the operator to quote them), or the reserved `es_index_list` key (the generator owns it) each abort
+    generation with a clear message rather than emitting a malformed or surprising tag. Read at GENERATION
+    time from the static default (like default_es_host_config): per-target/--var overrides are deploy-time
+    and deliberately not seen here, so the generated jobs' tag KEY SET is this top-level default. Values
+    may be bundle references (e.g. "${var.environment}"), baked in verbatim to resolve per target at deploy.
+    """
+    if doc is None:
+        doc = _read_bundle_doc(path)
+    spec = (doc.get("variables") or {}).get("global_job_tags")
+    if not isinstance(spec, dict):
+        return {}
+    default = spec.get("default")
+    if default is None or default == {}:
+        return {}
+    if not isinstance(default, dict):
+        raise ValueError(
+            f"global_job_tags default (databricks.yml) must be a mapping of tag key -> value, got "
+            f"{type(default).__name__}"
+        )
+    # Per-key checks run FIRST (before the total-count check below) so the specific reserved/type/char
+    # error wins over the generic count message when both apply (e.g. es_index_list among 25 keys).
+    for key, value in default.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag key {key!r} must be a non-empty string"
+            )
+        if key == _ES_INDEX_LIST_TAG:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): {_ES_INDEX_LIST_TAG!r} is reserved (the generator adds "
+                f"it to every generated job); remove it from global_job_tags"
+            )
+        if not isinstance(value, str):
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag {key!r} value must be a string (got "
+                f"{type(value).__name__}); quote it, e.g. {key}: \"{value}\""
+            )
+        # Validate against the Jobs API tag regex so a disallowed character (e.g. a comma) fails closed at
+        # generation, not at deploy. A KEY is a literal (references belong in values, per the databricks.yml
+        # docs), so it is checked whole - a ${...}-shaped key is rejected rather than reduced to '' and
+        # baked verbatim. A VALUE may embed a ${...} bundle reference (its deploy-resolved form differs from
+        # the reference text), so strip those spans first and check the literal remainder - a mixed value
+        # like "a,b${var.x}" still has its literal "a,b" caught.
+        if _TAG_CHAR_RE.fullmatch(key) is None:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag key {key!r} contains a character Databricks rejects "
+                f"in a tag (allowed: ASCII letters, digits, space, and + - = . : / @ _); a comma is NOT "
+                f"allowed, and a key must be a literal (put ${{var...}} references in the value, not the key)."
+            )
+        if _TAG_CHAR_RE.fullmatch(_BUNDLE_REF_RE.sub("", value)) is None:
+            raise ValueError(
+                f"global_job_tags (databricks.yml): tag {key!r} value {value!r} contains a character "
+                f"Databricks rejects in a tag (allowed: ASCII letters, digits, space, and + - = . : / @ _); "
+                f"a comma is NOT allowed. Fix the value."
+            )
+    # Every generated job also carries the generator-owned es_index_list tag, so the global set must leave
+    # room for it under Databricks' 25-tag-per-job cap (fail closed here, not at deploy). NOTE: a
+    # `mode: development` target ALSO adds its own `dev` tag at deploy, so in dev the effective headroom is
+    # one lower; the generator is target-agnostic and cannot know the mode, so that stays a documented
+    # limitation (lowering the cap to 23 would wrongly reject a legitimate 24-tag prod config).
+    if len(default) > _JOB_TAG_LIMIT - 1:
+        raise ValueError(
+            f"global_job_tags (databricks.yml) has {len(default)} tags; Databricks caps a job at "
+            f"{_JOB_TAG_LIMIT} tags and the generator adds {_ES_INDEX_LIST_TAG!r} to every generated job, "
+            f"so at most {_JOB_TAG_LIMIT - 1} global tags are allowed. Remove some."
+        )
+    return default
+
+
+def _build_job_tags(global_job_tags: dict, index_names: list, label: str) -> dict:
+    """The `tags:` map for a generated job: the global tags (in declared order) plus the generator-owned
+    es_index_list (a distinct, sorted, space-separated list of the job's es_index_name(s)), emitted last. `label` names the
+    job/group only for the length warning. Built as a copy so the caller's loaded global tags are never
+    mutated. es_index_list is always present (a job always writes at least one index), so a generated
+    job's tags map is never empty even when global_job_tags is {}."""
+    tags = dict(global_job_tags)
+    value, dropped = _es_index_list_value(index_names)
+    if dropped:
+        print(
+            f"WARNING: job '{label}' {_ES_INDEX_LIST_TAG} was truncated to fit the {_TAG_VALUE_MAX_LEN}-char "
+            f"tag-value cap: {dropped} of {len(set(index_names))} index name(s) dropped (a ' ...+N' marker "
+            f"records the count). The global tags are unaffected. Consider fewer indices per job_group if "
+            f"you need the full list in the tag.",
+            file=sys.stderr,
+        )
+    tags[_ES_INDEX_LIST_TAG] = value
+    return tags
+
+
+def _es_index_list_value(index_names: list) -> tuple:
+    """The es_index_list tag VALUE and how many names were dropped. Distinct + sorted + SPACE-joined
+    (space, not comma: the Jobs API tag-value regex rejects a comma - verified live; ES index names never
+    contain a space, so it is unambiguous). Truncated to _TAG_VALUE_MAX_LEN so a large job_group stays
+    deployable: whole names are kept in sorted order until the next would not fit within the budget left
+    after reserving room for a ` ...+N` marker, then the marker (N = names dropped) is appended. Returns
+    (value, dropped). The reserved marker width is derived from the MAX possible count (len(names)), so
+    the actual marker (dropped <= len(names)) always fits and the value is <= the cap BY CONSTRUCTION -
+    no blind final slice, and the count digits can never be cut. If a single name alone exceeds the
+    budget (pathological; an ES index name is short in practice) nothing is kept and the value is just
+    the marker."""
+    names = sorted(set(index_names))
+    full = " ".join(names)
+    if len(full) <= _TAG_VALUE_MAX_LEN:
+        return full, 0
+    # Reserve exactly the marker's MAX possible width (the most that can be dropped is every name), so
+    # budget + actual marker <= cap holds with no slicing and the count digits are never cut.
+    budget = max(0, _TAG_VALUE_MAX_LEN - len(f" ...+{len(names)}"))
+    kept: list = []
+    length = 0
+    for name in names:
+        add = len(name) + (1 if kept else 0)  # + the joining space once past the first
+        if length + add > budget:
+            break
+        kept.append(name)
+        length += add
+    dropped = len(names) - len(kept)
+    return ((" ".join(kept) + f" ...+{dropped}") if kept else f"...+{dropped}"), dropped
+
+
+def _job_display_name(postfix: str) -> str:
+    """The job display name: `[<target>] <prefix>: <postfix>`.
+
+    The prefix is the ${var.job_name_prefix} bundle variable (declared in databricks.yml, default
+    'databricks-elasticsearch-pipelines'), so a deployment can rebrand every job name per target without
+    regenerating. ${bundle.target} and ${var.job_name_prefix} are resolved by the bundle at deploy; the
+    postfix is a literal - a config name (singleton) or group name (group) by default, or a
+    config's/group's job_name_postfix override.
+    """
+    return f"[${{bundle.target}}] ${{var.job_name_prefix}}: {postfix}"
+
+
+def _compute_desc(cfg: dict) -> str:
+    """One phrase describing WHERE a member's task runs, for the job description."""
+    compute = cfg["compute"]
+    ctype = compute["type"]
+    if ctype == "serverless":
+        return "No cluster block => serverless notebook task."
+    if ctype == "existing_cluster":
+        return f"Runs on existing cluster ${{var.{compute['cluster_config']}.cluster_id}}."
+    return (
+        f"Runs on job cluster '{compute['job_cluster_config']}' "
+        "(new_cluster spec from _pipelines/job_cluster_configs/)."
+    )
+
+
+# The target-wide pause_status global. A trigger inherits it (pause_status: ${var.schedule_pause_status})
+# unless the pipeline config sets its own pause_status, in which case that literal wins (two-layer
+# pattern: target-wide default < per-pipeline override). See _pause_status_ref.
+_SCHEDULE_PAUSE_STATUS_REF = "${var.schedule_pause_status}"
+
+
+def _pause_status_ref(pause_status: str) -> str:
+    """Resolve a trigger's pause_status field: the pipeline's own literal (PAUSED|UNPAUSED) if it set
+    one, else the target-wide ${var.schedule_pause_status} global. The config layer stores "" when a
+    pipeline omits pause_status, so `pause_status or <global>` reaches the global exactly like the
+    run-time knobs' `cfg[name] or ref` fallback."""
+    return pause_status or _SCHEDULE_PAUSE_STATUS_REF
+
+
+def _continuous_block(pause_status: str = "") -> dict:
+    """The job-level `continuous` trigger body (one perpetual, auto-restarting run). pause_status is the
+    pipeline's own PAUSED|UNPAUSED override when set, else binds schedule_pause_status (default PAUSED)
+    so dev/stg deploy-but-paused and only prd runs the stream.
+
+    task_retry_mode is PINNED to ON_FAILURE, and this matters most for a multi-task continuous group.
+    A continuous job's per-task recovery is governed ONLY by this field (per-task max_retries is not
+    usable in a continuous job); its API/bundle DEFAULT WHEN OMITTED IS `NEVER` (a failed task is never
+    retried), even though the Jobs UI defaults it to ON_FAILURE. Under NEVER, a task whose stream fails
+    just sits FAILED: in a multi-task group the sibling tasks keep streaming forever, so the run never
+    reaches a terminal state and the continuous trigger never restarts it either - the failed task is
+    stuck with no recovery. ON_FAILURE instead retries the failed task while at least one sibling is
+    still running (recover the one stream without disturbing the others), and when that no longer holds
+    or the retry limit is reached, the whole run is cancelled and a fresh one started. That two-tier
+    behavior - retry the task, else restart the job - is exactly what an always-on pipeline needs, so it
+    is the framework default rather than an opt-in knob."""
+    return {"pause_status": _pause_status_ref(pause_status), "task_retry_mode": "ON_FAILURE"}
+
+
+def _schedule_block(cron: str, pause_status: str = "") -> dict:
+    """The job-level `schedule` body for a Quartz cron. Timezone always UTC; pause_status is the
+    pipeline's own PAUSED|UNPAUSED override when set, else binds schedule_pause_status (default PAUSED),
+    the same fail-safe pause model as continuous."""
+    return {
+        "quartz_cron_expression": cron,
+        "timezone_id": "UTC",
+        "pause_status": _pause_status_ref(pause_status),
+    }
+
+
+def _trigger_block(schedule: dict | None, continuous: dict | None, pause_status: str = "") -> dict | None:
+    """The single-key trigger dict for a standalone config: {"continuous": ...}, {"schedule": ...}, or
+    None (on-demand). Mirrors the config invariant that schedule and continuous are mutually exclusive.
+    pause_status is the config's per-pipeline override ("" => inherit the target-wide global)."""
+    if continuous is not None:
+        return {"continuous": _continuous_block(pause_status)}
+    if schedule is not None:
+        return {"schedule": _schedule_block(schedule["quartz_cron_expression"], pause_status)}
+    return None
+
+
+def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_run_time_knobs: bool) -> dict:
+    """Build the notebook-task dict for one config/member. Shared by singleton and grouped rendering.
+
+    `streaming_trigger_interval` is the EFFECTIVE ProcessingTime cadence for THIS task ("" => the notebook
+    uses Trigger.availableNow). For a singleton it is the config's own continuous interval; for a grouped
+    continuous job it is the group's single resolved interval, propagated to every member (so a member
+    that omitted its own continuous block still runs always-on rather than draining and stopping under
+    availableNow while the continuous job restarts it).
+
+    include_run_time_knobs selects the parameter model (see job_parameters and the module docstring):
+    - False (singleton): the run-time knobs live in the JOB's `parameters:` block (--params-overridable),
+      so this task's base_parameters carry only the deploy-time values.
+    - True (grouped): a single job can't hold per-member `parameters` defaults, so each grouped task
+      carries the run-time knobs in its OWN base_parameters instead (fixed at deploy). The notebook reads
+      them as the same widget names either way, so this needs no notebook change; the only difference is
+      grouped knobs are not per-run --params-overridable. Defaults come from job_parameters (the single
+      source of truth for the knob set), so the grouped knob set can never drift from the singleton one.
+
+    The ES connection references the pipeline's es_host_config complex variable's fields
+    (${var.<hc>.es_host_url} etc.), resolved per target at deploy. main() has already resolved an omitted
+    es_host_config to the bundle default and validated the name is declared, so it is safe here; fail
+    closed if still unset (a caller bug) rather than emit a ${var.None.*} ref.
+    """
+    compute = cfg["compute"]
+    ctype = compute["type"]
+
+    # Defense in depth: an always-on stream (non-empty ProcessingTime interval) needs a trigger serverless
+    # cannot provide, so it is classic-compute only. validate_config rejects continuous+serverless at load
+    # and the group resolver re-checks every continuous member, but re-check here on the EFFECTIVE interval
+    # so no task is ever emitted as a serverless always-on stream even if those guards were bypassed.
+    if streaming_trigger_interval and ctype not in ("job_cluster", "existing_cluster"):
+        raise ValueError(
+            f"continuous pipeline '{name}' requires classic compute (job_cluster or existing_cluster), "
+            f"not '{ctype}': serverless supports only Trigger.availableNow, not the ProcessingTime "
+            f"trigger an always-on stream needs"
+        )
+
+    # Build the task, inserting the cluster reference (if any) between task_key and notebook_task.
+    task: dict = {"task_key": f"index_pipeline_{name}"}
+    if ctype == "existing_cluster":
+        task["existing_cluster_id"] = f"${{var.{compute['cluster_config']}.cluster_id}}"
+    elif ctype == "job_cluster":
+        task["job_cluster_key"] = compute["job_cluster_config"]
+
+    hc = cfg["es_host_config"]
+    if not hc:
+        raise ValueError(
+            f"es_host_config for '{name}' is unset; the caller must resolve the default "
+            f"(default_es_host_config) before rendering"
+        )
+    base_parameters = job_base_parameters(
+        name,
+        "${var.environment}",
+        "${var.wheel_path}",
+        f"${{var.{hc}.es_host_url}}",
+        f"${{var.{hc}.secret_scope_name}}",
+        f"${{var.{hc}.secret_key_name}}",
+        "${var.checkpoint_base_path}",
+        "${var.ca_certs}",
+        "${var.monitoring_log_table}",
+        streaming_trigger_interval,
+    )
+    if include_run_time_knobs:
+        for p in job_parameters(cfg, _RUNTIME_KNOB_GLOBAL_REFS):
+            base_parameters[p["name"]] = p["default"]
+    task["notebook_task"] = {
+        "notebook_path": "../../framework/notebooks/run_index_pipeline.py",
+        "base_parameters": base_parameters,
+    }
+    # Per-TASK failure notifications. The job-level email_notifications (see _assemble_job) fires only
+    # when the whole run reaches terminal FAILED, so it MISSES a task that fails and is retried: a task
+    # that fails-then-succeeds leaves the run SUCCESSFUL, and in a continuous group a crashed task is
+    # retried in place (task_retry_mode ON_FAILURE, see _continuous_block) while siblings keep the job
+    # RUNNING - the run never reaches FAILED. Most client pipelines run as tasks in a group, so without
+    # this the critical per-task crash/restart goes unmonitored. Mirrors the job-level ${var.support_email}
+    # reference (whole complex LIST var, empty => [] = off). notification_settings mirror the job block
+    # PLUS alert_on_last_attempt: False - a continuous ON_FAILURE retry has no bounded "last attempt", so
+    # True would suppress the alert forever; False pages on every failed attempt/restart.
+    task["email_notifications"] = {"on_failure": "${var.support_email}"}
+    task["notification_settings"] = {
+        "no_alert_for_skipped_runs": True,
+        "no_alert_for_canceled_runs": True,
+        "alert_on_last_attempt": False,
+    }
+    return task
+
+
+def _job_clusters_for(members: list) -> list | None:
+    """Build the job_clusters list from members, DEDUPED by job_cluster_config key so members that name
+    the same key share ONE physical job cluster (the resource saving). members: list of (name, cfg, spec),
+    spec being the loaded new_cluster spec (required for a job_cluster member, unused otherwise).
+
+    Each job cluster gets the per-environment policy injected (policy_id bound to the cluster_policy_id
+    variable, authoritative over any policy_id in the spec file, plus apply_policy_default_values: true so
+    the policy's own defaults fill omitted attrs). Built as a COPY so the caller's loaded spec is never
+    mutated; custom_tags and all other spec fields pass through verbatim. Same key always resolves to the
+    same spec file, so dedup is safe. Returns None when no member uses job_cluster compute
+    (serverless/existing_cluster jobs have no block). Emitted sorted by key for deterministic --check.
+    """
+    by_key: dict = {}
+    for name, cfg, spec in members:
+        if cfg["compute"]["type"] != "job_cluster":
+            continue
+        key = cfg["compute"]["job_cluster_config"]
+        if spec is None:
+            raise ValueError(
+                f"job_cluster compute for '{name}' requires a loaded new_cluster spec "
+                f"(job_cluster_config '{key}'); none was provided"
+            )
+        by_key[key] = {
+            "job_cluster_key": key,
+            "new_cluster": {**spec, "policy_id": "${var.cluster_policy_id}", "apply_policy_default_values": True},
+        }
+    return [by_key[k] for k in sorted(by_key)] or None
+
+
+def _assemble_job(display_name: str, description: str, job_params: list | None,
+                  trigger: dict | None, job_clusters: list | None, tasks: list,
+                  tags: dict | None = None) -> dict:
+    """Assemble one job dict with deterministic key order: name, description, max_concurrent_runs,
+    queue, email_notifications, notification_settings, [tags], [parameters], [schedule|continuous],
+    [job_clusters], tasks, permissions.
+
+    tags: the job-level `tags:` map (global tags + es_index_list, see _build_job_tags), or None/empty to
+    omit the block. Emitted right after notification_settings so --check stays byte-stable.
+
+    job_params: the job-level `parameters:` list (singleton) or None to omit it (a grouped job carries
+    the run-time knobs in each task's base_parameters instead - job parameters can't hold per-member
+    defaults). trigger: a single-key {"schedule"|"continuous": ...} dict, or None (on-demand).
+    job_clusters: the list or None. max_concurrent_runs is fixed at 1 for every job (no double-write /
+    checkpoint contention; a group's members write different indices, so one shared serial run is still
+    correct). `queue: {enabled: false}` pairs with it so a trigger that fires while a run is active is
+    SKIPPED (MAX_CONCURRENT_RUNS_EXCEEDED), not queued: the Jobs API defaults queue.enabled to true, so
+    without this a scheduled tick landing on a still-running drain would pile up (queued up to 48h)
+    instead of being dropped. Skipping loses no data - a streaming tick's next availableNow run drains
+    the full backlog since the last checkpoint, and a batch tick re-exports the whole view. On-demand
+    CAN_MANAGE_RUN to `users`, consistent across the bundle. sort_keys=False keeps this insertion order
+    so --check compares byte-for-byte.
+    """
+    job_def: dict = {
+        "name": display_name,
+        "description": description,
+        "max_concurrent_runs": 1,
+        "queue": {"enabled": False},
+        # Notify the target's support recipients on a run failure. ${var.support_email} is a complex LIST
+        # variable: an EMPTY list in dev/stg (unambiguously no recipients = off) and a real address in prd.
+        # on_failure references the whole variable (not [${var.support_email}]) so the empty case is [] -
+        # a valid empty list - rather than [""], which would depend on the platform dropping an invalid
+        # empty-recipient entry. The paired notification_settings suppress SKIPPED runs (queue disabled
+        # above => an overlapping trigger is skipped, not failed) and CANCELED runs (a continuous job's
+        # ON_FAILURE retry cancels-and-restarts), so recipients are paged only on a genuine failure.
+        # Emitted on every generated job; the hand-authored framework/resources/*.job.yml carry the same block.
+        "email_notifications": {"on_failure": "${var.support_email}"},
+        "notification_settings": {
+            "no_alert_for_skipped_runs": True,
+            "no_alert_for_canceled_runs": True,
+        },
+    }
+    if tags:
+        job_def["tags"] = tags
+    if job_params is not None:
+        job_def["parameters"] = job_params
+    if trigger:
+        job_def.update(trigger)  # the single schedule/continuous key, after parameters
+    if job_clusters:
+        job_def["job_clusters"] = job_clusters
+    job_def["tasks"] = tasks
+    job_def["permissions"] = [{"level": "CAN_MANAGE_RUN", "group_name": "users"}]
+    return job_def
+
+
+def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec: dict | None = None,
+                    global_job_tags: dict | None = None) -> str:
+    """Render the _pipelines/resources/<name>.job.yml content for one STANDALONE (ungrouped) index config.
+
+    Built as a dict and serialized with yaml.safe_dump (the writer escapes special characters, so a
+    value with a quote/colon/brace can never produce malformed YAML). The run-time knobs stay in the
+    job-level `parameters:` block (--params-overridable per run) - this is the 1:1 config-to-job default,
+    unchanged except that the name prefix is now the ${var.job_name_prefix} variable and an optional
+    job_name_postfix can override the trailing display segment. Compute/schedule/continuous behave as
+    before; see _build_task, _trigger_block, _job_clusters_for, and _assemble_job for the shared logic
+    (also used by render_group_job_yaml). A job_cluster compute REQUIRES job_cluster_spec (loaded by the
+    caller via load_job_cluster_spec); it is unused otherwise and a job_cluster compute without it fails
+    closed.
+    """
+    streaming_trigger_interval = cfg["continuous"]["trigger_interval"] if cfg["continuous"] else ""
+    task = _build_task(name, cfg, streaming_trigger_interval, include_run_time_knobs=False)
+    description = (
+        f"Export pipeline for the {cfg['es_index_name']} Elasticsearch index. Runs the shared "
+        f"notebook framework/notebooks/run_index_pipeline.py with this index's config. {_compute_desc(cfg)}"
+        + (
+            f" Runs ALWAYS-ON (continuous trigger; ProcessingTime {streaming_trigger_interval})."
+            if cfg["continuous"] is not None else ""
+        )
+    )
+    # Display postfix: the config's job_name_postfix override, else the config name (the resource-key
+    # stem), so a job still lines up with the config you edit/deploy. es_index_name is named in the description.
+    postfix = cfg["job_name_postfix"] or name
+    job_def = _assemble_job(
+        _job_display_name(postfix),
+        description,
+        job_parameters(cfg, _RUNTIME_KNOB_GLOBAL_REFS),
+        _trigger_block(cfg["schedule"], cfg["continuous"], cfg["pause_status"]),
+        _job_clusters_for([(name, cfg, job_cluster_spec)]),
+        [task],
+        _build_job_tags(global_job_tags or {}, [cfg["es_index_name"]], name),
+    )
+    job = {"resources": {"jobs": {f"index_pipeline_{name}": job_def}}}
+    body = yaml.safe_dump(job, sort_keys=False, default_flow_style=False, width=100, allow_unicode=True)
+    return _GENERATED_HEADER.format(config=config_filename) + body
+
+
+def _resolve_group_trigger(group_name: str, members: list, pause_status: str = "") -> tuple:
+    """Resolve a group's single job-level trigger from its members (define-once / conflict-fails).
+
+    pause_status is the group's already-resolved per-pipeline pause override (see
+    _resolve_group_pause_status), threaded into the emitted trigger block; "" => inherit the target-wide
+    global. A non-empty pause_status on an on-demand group (no member declares a trigger) is rejected
+    fail-closed, since there is no trigger for it to apply to.
+
+    Returns (trigger_block_or_None, effective_streaming_interval). Each member contributes its declared
+    trigger signature - ('continuous', interval), ('schedule', cron), or nothing (on-demand => inherits):
+    - no member declares one           => on-demand; effective interval "".
+    - exactly one DISTINCT signature    => the group adopts it. For continuous, the interval propagates to
+      EVERY task (effective interval = that interval) and every member must be a streaming pipeline on
+      classic compute (re-checked here, fail closed - a member that omitted continuous would otherwise
+      inherit always-on but drain-and-stop under availableNow). For schedule, effective interval is ""
+      (each task streams via availableNow, or runs batch, on the shared cron).
+    - two or more distinct signatures   => a genuine conflict; fail closed (a Databricks job has ONE trigger).
+    """
+    sigs: dict = {}
+    for _, name, cfg, _ in members:
+        if cfg["continuous"] is not None:
+            sig = ("continuous", cfg["continuous"]["trigger_interval"])
+        elif cfg["schedule"] is not None:
+            sig = ("schedule", cfg["schedule"]["quartz_cron_expression"])
+        else:
+            continue  # on-demand / unspecified: inherits the group's resolved trigger
+        sigs.setdefault(sig, []).append(name)
+
+    if not sigs:
+        if pause_status:
+            raise ValueError(
+                f"job_group '{group_name}' sets pause_status={pause_status!r} but has no trigger "
+                f"(no member declares a schedule or continuous block), so pause_status would have no "
+                f"effect. Add a schedule/continuous trigger to a member, or remove pause_status."
+            )
+        return None, ""
+    if len(sigs) > 1:
+        detail = "; ".join(
+            f"{kind} {value!r} (member(s): {', '.join(sorted(ns))})"
+            for (kind, value), ns in sorted(sigs.items())
+        )
+        raise ValueError(
+            f"job_group '{group_name}' has conflicting triggers: {detail}. A Databricks job has exactly "
+            f"one trigger, so members that declare a schedule/continuous must all declare the SAME one "
+            f"(other members may omit it and inherit)."
+        )
+    kind, value = next(iter(sigs))
+    if kind == "continuous":
+        for _, name, cfg, _ in members:
+            if cfg["pipeline_mode"] != "streaming" or cfg["compute"]["type"] not in ("job_cluster", "existing_cluster"):
+                raise ValueError(
+                    f"job_group '{group_name}' is continuous (always-on), so every member must be a "
+                    f"streaming pipeline on classic compute; member '{name}' is "
+                    f"pipeline_mode={cfg['pipeline_mode']!r}, compute={cfg['compute']['type']!r}. Make it "
+                    f"streaming on job_cluster/existing_cluster, or move it to its own job."
+                )
+        return {"continuous": _continuous_block(pause_status)}, value
+    return {"schedule": _schedule_block(value, pause_status)}, ""
+
+
+def _resolve_group_pause_status(group_name: str, members: list) -> str:
+    """The group job's per-pipeline pause_status override (define-once / conflict-fails). Members that
+    omit pause_status ("") are ignored; if none set it, return "" (inherit the target-wide
+    ${var.schedule_pause_status} global); if members set the SAME value, adopt it; if members set
+    DIFFERENT values, fail closed (a group is one job with one trigger, so one pause state)."""
+    declared: dict = {}
+    for _, name, cfg, _ in members:
+        ps = cfg["pause_status"]
+        if ps:
+            declared.setdefault(ps, []).append(name)
+    if not declared:
+        return ""
+    if len(declared) > 1:
+        detail = "; ".join(f"{ps!r} (member(s): {', '.join(sorted(ns))})" for ps, ns in sorted(declared.items()))
+        raise ValueError(
+            f"job_group '{group_name}' has conflicting pause_status values: {detail}. Members must "
+            f"declare the same pause_status (others may omit it and inherit)."
+        )
+    return next(iter(declared))
+
+
+def _resolve_group_postfix(group_name: str, members: list) -> str:
+    """The group job's display postfix (define-once / conflict-fails). Members that omit job_name_postfix
+    are ignored; if none set it, default to the group name; if members set DIFFERENT values, fail closed."""
+    declared: dict = {}
+    for _, name, cfg, _ in members:
+        pf = cfg["job_name_postfix"]
+        if pf:
+            declared.setdefault(pf, []).append(name)
+    if not declared:
+        return group_name
+    if len(declared) > 1:
+        detail = "; ".join(f"{pf!r} (member(s): {', '.join(sorted(ns))})" for pf, ns in sorted(declared.items()))
+        raise ValueError(
+            f"job_group '{group_name}' has conflicting job_name_postfix values: {detail}. Members must "
+            f"declare the same postfix (others may omit it and inherit)."
+        )
+    return next(iter(declared))
+
+
+def _group_description(group_name: str, members: list, effective_interval: str) -> str:
+    indices = ", ".join(sorted(cfg["es_index_name"] for _, _, cfg, _ in members))
+    desc = (
+        f"Job group '{group_name}': exports {len(members)} Elasticsearch index(es) ({indices}) as "
+        f"independent tasks (no inter-task dependencies) in one job, each running the shared notebook "
+        f"framework/notebooks/run_index_pipeline.py with its own config. Members naming the same job_cluster_config "
+        f"share one job cluster."
+    )
+    if effective_interval:
+        desc += f" Runs ALWAYS-ON (continuous trigger; ProcessingTime {effective_interval})."
+    return desc
+
+
+def render_group_job_yaml(group_name: str, members: list, global_job_tags: dict | None = None) -> str:
+    """Render _pipelines/resources/group_<group>.job.yml for one job_group: ONE job, one independent task per member.
+
+    members: list of (config_filename, name, cfg, job_cluster_spec) sharing this job_group. Option A
+    parameter model - the job has NO job-level `parameters:` block; each task holds the run-time knobs in
+    its own base_parameters (see _build_task). Trigger, display postfix, and job-cluster sharing are
+    resolved across members (see the resolvers). Tasks are emitted sorted by config name for deterministic
+    output; task keys stay index_pipeline_<member> (unique per member). The job resource key is
+    index_pipeline_group_<group>.
+    """
+    pause_status = _resolve_group_pause_status(group_name, members)
+    trigger, effective_interval = _resolve_group_trigger(group_name, members, pause_status)
+    postfix = _resolve_group_postfix(group_name, members)
+    ordered = sorted(members, key=lambda m: m[1])  # by config name
+
+    # WARN (do NOT fail) on members that write the SAME es_index_name. This is now ALLOWED: a common
+    # pattern is two tasks writing one index with disjoint filter_condition subsets (or the same view
+    # fanned to one index from different sources). But it stays a real hazard to flag, because grouped
+    # members run as CONCURRENT tasks within one job run and max_concurrent_runs=1 only serializes job
+    # *runs*, not the tasks inside a run - so two tasks writing one index write it concurrently. That is
+    # fine for DISJOINT subsets, but overlapping rows either duplicate (ES auto-ids) or race on upserts
+    # (a shared es_id_field). So warn loudly with the mitigation and let generation proceed. (Checkpoints
+    # are unaffected - each is keyed by config_name.)
+    by_index: dict = {}
+    for _, name, cfg, _ in ordered:
+        by_index.setdefault(cfg["es_index_name"], []).append(name)
+    dupes = {idx: ns for idx, ns in by_index.items() if len(ns) > 1}
+    if dupes:
+        detail = "; ".join(f"{idx!r} (member(s): {', '.join(sorted(ns))})" for idx, ns in sorted(dupes.items()))
+        print(
+            f"WARNING: job_group '{group_name}' has members writing the SAME es_index_name: {detail}. "
+            f"Grouped members run as concurrent tasks in one run (max_concurrent_runs=1 guards concurrent "
+            f"job runs, not concurrent tasks), so they write that index concurrently. Ensure they cover "
+            f"DISJOINT rows (a distinct filter_condition per member) and set es_id_field for idempotent "
+            f"upserts; otherwise overlapping rows will duplicate or race.",
+            file=sys.stderr,
+        )
+    tasks = [
+        _build_task(name, cfg, effective_interval, include_run_time_knobs=True)
+        for _, name, cfg, _ in ordered
+    ]
+    job_clusters = _job_clusters_for([(name, cfg, spec) for _, name, cfg, spec in ordered])
+    job_def = _assemble_job(
+        _job_display_name(postfix),
+        _group_description(group_name, ordered, effective_interval),
+        None,  # grouped jobs carry no job-level parameters block (knobs live in each task)
+        trigger,
+        job_clusters,
+        tasks,
+        _build_job_tags(global_job_tags or {}, [cfg["es_index_name"] for _, _, cfg, _ in ordered], group_name),
+    )
+    job = {"resources": {"jobs": {f"index_pipeline_group_{group_name}": job_def}}}
+    body = yaml.safe_dump(job, sort_keys=False, default_flow_style=False, width=100, allow_unicode=True)
+    header = _GENERATED_GROUP_HEADER.format(
+        group=group_name, configs=", ".join(sorted(m[0] for m in members))
+    )
+    return header + body
+
+
+def generated_path(name: str) -> str:
+    return os.path.join(_RESOURCES_DIR, f"{name}.job.yml")
+
+
+def group_generated_path(group_name: str) -> str:
+    """The output file for a job_group: _pipelines/resources/group_<group>.job.yml. The `group_` prefix keeps a
+    group's file (and its resource key index_pipeline_group_<group>) in a separate namespace from a
+    singleton config's file (<name>.job.yml); an actual clash (a config literally named group_<g>) is
+    caught by the collision guard in main()."""
+    return os.path.join(_RESOURCES_DIR, f"group_{group_name}.job.yml")
+
+
+def is_generated(path: str) -> bool:
+    """True if the file at `path` carries our generated-marker header (so we own it)."""
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        return fh.readline().startswith((_GENERATED_MARKER,) + _LEGACY_GENERATED_MARKERS)
+
+
+def existing_generated_files() -> list[str]:
+    """Every _pipelines/resources/*.job.yml this generator authored, identified by the marker header.
+
+    Used to spot orphans: a generated file whose config was deleted or renamed. Hand-authored
+    resources (no marker) are excluded, so they are never removed or flagged.
+    """
+    return [
+        path
+        for path in sorted(glob.glob(os.path.join(_RESOURCES_DIR, "*.job.yml")))
+        if is_generated(path)
+    ]
+
+
+def require_bundle_shape(doc) -> None:
+    """Fail closed at GENERATION unless the parts of databricks.yml the generator reads have the shapes it
+    relies on: the file is a mapping; `include`, when present, a list of strings; `variables` a mapping;
+    `targets` a mapping whose every target is a mapping with `variables`, when present, a mapping. A key
+    present with no value (YAML null, e.g. a block whose entries are all commented out) counts as empty.
+    Checked once, up front, so the readers after it can rely on those shapes (via _block)."""
+    if not isinstance(doc, dict):
+        raise ValueError(f"databricks.yml must be a mapping, got {type(doc).__name__}")
+    include = _block(doc, "include", list)
+    if not isinstance(include, list) or not all(isinstance(p, str) for p in include):
+        raise ValueError("include (databricks.yml) must be a list of path globs")
+    if not isinstance(_block(doc, "variables", dict), dict):
+        raise ValueError("variables (databricks.yml) must be a mapping of variable name -> declaration")
+    targets = _block(doc, "targets", dict)
+    if not isinstance(targets, dict):
+        raise ValueError(f"targets (databricks.yml) must be a mapping of target name -> settings, got "
+                         f"{type(targets).__name__}")
+    for name, tspec in targets.items():
+        if tspec is not None and not isinstance(tspec, dict):
+            raise ValueError(f"targets.{name} (databricks.yml) must be a mapping, got {type(tspec).__name__}")
+        if not isinstance(_block(tspec or {}, "variables", dict), dict):
+            raise ValueError(f"targets.{name}.variables (databricks.yml) must be a mapping")
+
+
+def _block(mapping: dict, key: str, kind: type):
+    """mapping[key], with a missing key or a YAML null both read as an empty `kind` (list or dict)."""
+    value = mapping.get(key)
+    return kind() if value is None else value
+
+
+def old_root_resources_dir() -> str | None:
+    """The repo-root resources/ folder, if it still exists. Before the framework/ move every job (fixed and
+    generated) lived there; anything left in it would deploy stale definitions, or duplicate the
+    framework/ and regenerated jobs under the same resource keys, so generation and --check refuse to run
+    while the folder exists at all (jobs of your own belong in _pipelines/resources/)."""
+    path = os.path.join(_REPO_ROOT, "resources")
+    return path if os.path.lexists(path) else None
+
+
+# The two include globs databricks.yml must carry: the fixed framework jobs and the _pipelines/ jobs.
+_REQUIRED_INCLUDES = ("framework/resources/*.yml", "_pipelines/resources/*.yml")
+
+
+def require_bundle_includes(path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION unless databricks.yml's `include:` lists both resource folders
+    (_REQUIRED_INCLUDES) and nothing under the old root resources/ folder. Without the first the bundle
+    silently deploys none of those jobs; the second is the pre-framework/ layout's include."""
+    doc = doc if doc is not None else _read_bundle_doc(path)
+    require_bundle_shape(doc)
+    include = _block(doc, "include", list)
+    # Compare normalized globs, so an equivalent spelling like ./framework/resources/*.yml counts.
+    normalized = [posixpath.normpath(p) for p in include]
+    missing = [p for p in _REQUIRED_INCLUDES if p not in normalized]
+    old = [p for p, n in zip(include, normalized) if n == "resources" or n.startswith("resources/")]
+    if missing or old:
+        raise ValueError(
+            "include (databricks.yml) must list " + " and ".join(_REQUIRED_INCLUDES)
+            + (f"; missing: {', '.join(missing)}" if missing else "")
+            + (f"; remove the old-layout {', '.join(old)}" if old else "")
+        )
+
+
+def discover_configs() -> list[str]:
+    """All config paths across the supported extensions, sorted, with collisions rejected."""
+    paths: list[str] = []
+    for pattern in _CONFIG_GLOBS:
+        paths.extend(glob.glob(os.path.join(_CONFIG_DIR, pattern)))
+    paths = sorted(paths)
+
+    seen: dict[str, str] = {}
+    for path in paths:
+        name = _config_name(path)
+        if not _VALID_STEM.match(name):
+            raise ValueError(
+                f"{os.path.basename(path)}: config name '{name}' is not a valid resource key; "
+                f"use only letters, digits, '_' and '-' (no dots or other characters)"
+            )
+        if name.startswith("_"):
+            raise ValueError(
+                f"{os.path.basename(path)}: config name '{name}' must not start with '_' "
+                f"(reserved for hand-authored resource files)"
+            )
+        if name in seen:
+            raise ValueError(
+                f"config name collision: {os.path.basename(seen[name])} and "
+                f"{os.path.basename(path)} both map to '{name}'"
+            )
+        seen[name] = path
+    return paths
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="verify generated files are up to date")
+    args = parser.parse_args(argv)
+
+    # The upgrade check runs first, so its message isn't hidden behind a config error.
+    if old_root_resources_dir():
+        print(
+            "the old layout's root resources/ folder (or a file of that name) still exists; delete it "
+            "(the fixed jobs now live in "
+            "framework/resources/, generated ones in _pipelines/resources/; move any job of your own to "
+            "_pipelines/resources/) and see the README upgrade steps",
+            file=sys.stderr,
+        )
+        return 1
+    config_paths = discover_configs()
+
+    # Parse databricks.yml once, then extract each set from the same parsed doc (single read per run).
+    # The declared ES host configs (single source of truth: databricks.yml), the default host config a
+    # pipeline falls back to when it omits es_host_config, and the declared cluster configs (for an
+    # existing_cluster pipeline's cluster_config). require_job_name_prefix_declared fails closed if the
+    # job_name_prefix variable is missing (every generated name references ${var.job_name_prefix}).
+    bundle_doc = _read_bundle_doc()
+    require_bundle_includes(doc=bundle_doc)  # also checks the file's shape (require_bundle_shape)
+    require_job_name_prefix_declared(doc=bundle_doc)
+    require_support_email_declared(doc=bundle_doc)
+    require_global_job_tags_declared(doc=bundle_doc)
+    require_runtime_knobs_declared(doc=bundle_doc)
+    es_host_configs = load_es_host_configs(doc=bundle_doc)
+    require_es_host_configs_json(es_host_configs, doc=bundle_doc)
+    default_es_host_config = load_default_es_host_config(doc=bundle_doc)
+    require_default_es_host_config(default_es_host_config, es_host_configs, bundle_doc)
+    cluster_configs = load_cluster_configs(doc=bundle_doc)
+    global_job_tags = load_global_job_tags(doc=bundle_doc)
+
+    # Validate every config and partition into standalone (singleton) jobs and job groups, all BEFORE
+    # touching disk so generation is all-or-nothing: an invalid config, a bad host/cluster reference, or
+    # an illegal group aborts here with nothing written. A config with a job_group joins that group; one
+    # without renders as its own standalone job (the 1:1 default).
+    singletons: dict = {}   # name -> (config_filename, cfg, job_cluster_spec)
+    groups: dict = {}       # group_name -> [(config_filename, name, cfg, job_cluster_spec), ...]
+    for path in config_paths:
+        name = _config_name(path)
+        cfg = load_config(path)  # raises on any invalid config (fail closed)
+        # Resolve the host config (pipeline's own, else the bundle default, already checked above) and
+        # validate it is declared.
+        hc = cfg["es_host_config"] or default_es_host_config
+        cfg["es_host_config"] = hc
+        require_es_host_config(hc, es_host_configs)
+        # Resolve/validate compute references now (same all-or-nothing guarantee as an invalid config).
+        spec = None
+        if cfg["compute"]["type"] == "job_cluster":
+            spec = load_job_cluster_spec(cfg["compute"]["job_cluster_config"])
+        if cfg["compute"]["type"] == "existing_cluster":
+            require_cluster_config(cfg["compute"]["cluster_config"], cluster_configs)
+        if cfg["job_group"]:
+            groups.setdefault(cfg["job_group"], []).append((os.path.basename(path), name, cfg, spec))
+        else:
+            singletons[name] = (os.path.basename(path), cfg, spec)
+
+    # The intended output file for each job. Detect output collisions up front: a config literally named
+    # 'group_<g>' would target the same _pipelines/resources/group_<g>.job.yml as job_group '<g>'. Fail closed.
+    intended: dict = {}  # out_path -> human descriptor for the collision message
+    for name in singletons:
+        intended[generated_path(name)] = f"config '{name}'"
+    for group_name in groups:
+        out_path = group_generated_path(group_name)
+        if out_path in intended:
+            raise ValueError(
+                f"output collision: job_group '{group_name}' and {intended[out_path]} both map to "
+                f"{os.path.relpath(out_path, _REPO_ROOT)}; rename the group or the config"
+            )
+        intended[out_path] = f"job_group '{group_name}'"
+
+    # Orphans: any file we previously generated whose config/group is now gone (deleted, renamed, or
+    # moved into/out of a group). Computed against the intended output set.
+    orphans = [p for p in existing_generated_files() if p not in intended]
+
+    # An empty config dir is only an error if there is also no orphan cleanup to do - otherwise we still
+    # need to run so a deleted last config's stale generated job gets removed/flagged.
+    if not config_paths and not orphans:
+        print(f"no index configs found in {_CONFIG_DIR}", file=sys.stderr)
+        return 1
+
+    # Render into out_path -> content. Refuse up front to write over a hand-authored resource (no
+    # generated marker) - the symmetric guard to orphan deletion.
+    rendered: dict = {}
+    collisions = []
+    for name, (config_filename, cfg, spec) in singletons.items():
+        out_path = generated_path(name)
+        if os.path.exists(out_path) and not is_generated(out_path):
+            collisions.append(os.path.relpath(out_path, _REPO_ROOT))
+            continue
+        rendered[out_path] = render_job_yaml(config_filename, name, cfg, spec, global_job_tags)
+    for group_name, gmembers in groups.items():
+        out_path = group_generated_path(group_name)
+        if os.path.exists(out_path) and not is_generated(out_path):
+            collisions.append(os.path.relpath(out_path, _REPO_ROOT))
+            continue
+        rendered[out_path] = render_group_job_yaml(group_name, gmembers, global_job_tags)
+    if collisions:
+        for rel in collisions:
+            print(
+                f"refusing to overwrite hand-authored {rel} (no generated marker); rename the config/group",
+                file=sys.stderr,
+            )
+        return 1
+
+    if args.check:
+        stale = []
+        for out_path, content in rendered.items():
+            existing = None
+            if os.path.exists(out_path):
+                with open(out_path) as fh:
+                    existing = fh.read()
+            if existing != content:
+                stale.append(os.path.relpath(out_path, _REPO_ROOT))
+
+        problem = False
+        if stale:
+            print("stale/missing generated job file(s): " + ", ".join(sorted(stale)), file=sys.stderr)
+            problem = True
+        if orphans:
+            print(
+                "orphaned generated job file(s) with no matching config/group: "
+                + ", ".join(os.path.relpath(p, _REPO_ROOT) for p in orphans),
+                file=sys.stderr,
+            )
+            problem = True
+        if problem:
+            print("run: python framework/scripts/gen_jobs.py", file=sys.stderr)
+            return 1
+        print(f"all {len(rendered)} generated job file(s) up to date; no orphans")
+        return 0
+
+    # Write pass: everything already validated and rendered, so this cannot abort partway on a bad config.
+    # The output folder may not exist yet (a fresh _pipelines/ tree, or one upgraded from the old layout).
+    os.makedirs(_RESOURCES_DIR, exist_ok=True)
+    for out_path, content in rendered.items():
+        with open(out_path, "w") as fh:
+            fh.write(content)
+        print(f"wrote {os.path.relpath(out_path, _REPO_ROOT)}")
+    for path in orphans:
+        os.remove(path)
+        print(f"removed orphaned {os.path.relpath(path, _REPO_ROOT)}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -25,8 +25,8 @@ The bundle deploys:
   [Sharing a view across pipelines](#sharing-a-view-across-pipelines)) - it is created once, and the
   sharing pipelines must agree on the view definition.
 - **One job per index** (`index_pipeline_<config_name>`): all run the same shared notebook
-  [`notebooks/run_index_pipeline.py`](notebooks/run_index_pipeline.py) with that index's config. These
-  job resources are **generated** by [`scripts/gen_jobs.py`](scripts/gen_jobs.py) from the config
+  [`framework/notebooks/run_index_pipeline.py`](framework/notebooks/run_index_pipeline.py) with that index's config. These
+  job resources are **generated** by [`framework/scripts/gen_jobs.py`](framework/scripts/gen_jobs.py) from the config
   files (see [Adding a new pipeline for an ES index](#adding-a-new-pipeline-for-an-es-index)).
   Configs can instead be merged into a single multi-task job via [Job groups](#job-groups) (e.g. to
   share one cluster).
@@ -44,14 +44,14 @@ The bundle deploys:
 1. Add `_pipelines/pipeline_views/<view_name>.sql`.
 2. Add `_pipelines/pipeline_configs/<config_name>.yml` (see the schema under [Configuration](#configuration)).
    The view's filename must match the config's `view.name`.
-3. Regenerate the job resources: `python scripts/gen_jobs.py`.
+3. Regenerate the job resources: `python framework/scripts/gen_jobs.py`.
 4. Deploy.
 
 The config's filename stem becomes the job's resource key (`index_pipeline_<stem>`), so it must
 contain only letters, digits, `_`, and `-` (the generator rejects anything else, e.g. a dotted name).
 
-Step 3 writes one `resources/<config_name>.job.yml` per config, keeping the generated jobs in sync. If you
-run it, you're covered. `python scripts/gen_jobs.py --check` is the separate verification that step 3
+Step 3 writes one `_pipelines/resources/<config_name>.job.yml` per config, keeping the generated jobs in sync. If you
+run it, you're covered. `python framework/scripts/gen_jobs.py --check` is the separate verification that step 3
 was actually run: it makes no changes and fails if any generated file is missing, stale, or orphaned
 (left behind by a deleted or renamed config). Run it in CI to catch a commit that edited a config but
 forgot to regenerate.
@@ -136,7 +136,7 @@ value fails closed wherever the value is required. The bundle variables are:
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Set per target (empty on `main`). Required for a streaming run (fails closed if empty); unused by batch and `deploy_views`. The `dev` target shows how to append `${workspace.current_user.short_name}` to isolate each developer's checkpoints (see [Streaming](#streaming)) |
 | `cluster_policy_id` | workspace-specific cluster policy id injected into every job cluster (see [Compute](#compute)). Set per target (empty on `main`); required only when a pipeline uses `job_cluster` compute |
 | `ca_certs` | UC Volume path to a CA bundle (PEM) the connector uses to verify the ES server's TLS certificate. One global bundle shared by every host config. Set per target (empty on `main`); empty means fall back to the system CA store. Incompatible with `verify_certs: false` (the connector rejects that combination at run). Per-endpoint CA pinning is not supported (would need `ca_certs` moved onto the `es_host_*` complex variables) |
-| `default_es_host_config` | name of the ES **host config** a pipeline writes to when it omits `es_host_config` (out of the box `es_host_primary`); must name one of the `es_host_*` complex variables. Read at **generation** time, so it is a repo-level choice: per-target and `--var` overrides are not seen by the generator (its per-environment values live on the host config itself). See [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections) |
+| `default_es_host_config` | name of the ES **host config** a pipeline writes to when it omits `es_host_config` (out of the box `es_host_default`); must name one of the `es_host_*` complex variables. Read at **generation** time, so it is a repo-level choice: per-target and `--var` overrides are not seen by the generator (its per-environment values live on the host config itself). See [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections) |
 | `schedule_pause_status` | target-wide default `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. A pipeline config's own top-level `pause_status` overrides this for that one job's trigger. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
 | `support_email` | email recipients (a **list**) notified on any job/task run **failure** in the target. Every job (generated index/group jobs plus the hand-authored `deploy_views`, `checkpoint_clear`, `build_wheel`) emits `email_notifications.on_failure: ${var.support_email}` with `notification_settings` that suppress SKIPPED and CANCELED runs, so the address is paged only on a genuine failure. A `type: complex` LIST var: the empty list `[]` turns notifications **off** (an unambiguous "no recipients", unlike a single empty string). Set per target (empty `[]` on `main`, `dev`, `stg`; set a real address, e.g. `["es-oncall@yourco.com"]`, only in `prd`). Because it is complex it **cannot** be set via `--var`; override `dev` through the git-ignored `.databricks/bundle/<target>/variable-overrides.json` |
 | `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
@@ -163,7 +163,7 @@ its `.sql` filename):
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # OPTIONAL: view output column passed to the connector as the ES document _id (idempotent upserts). Omit to let ES auto-generate _ids (replays may duplicate; see below)
-es_host_config: es_host_primary   # OPTIONAL: which ES host config to write to; declared in databricks.yml (see below). Omit to use the bundle default
+es_host_config: es_host_default   # OPTIONAL: which ES host config to write to; declared in databricks.yml (see below). Omit to use the bundle default
 pipeline_mode: batch              # OPTIONAL default export mode: batch | streaming. Omit to defer to the global ${var.pipeline_mode} default (batch), or set here; override per run. A continuous pipeline must set streaming explicitly (can't inherit the global)
 filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL); omit for no filter
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
@@ -253,7 +253,7 @@ defined "last" row. Ensure the column is unique across the input when you need a
 Each pipeline writes to one **host config**: a named group of the three connection settings the
 connector needs, declared once in `databricks.yml` and referenced by name from the pipeline
 (`es_host_config: <name>`). `es_host_config` is **optional**: a pipeline that omits it falls back to
-the bundle's `default_es_host_config` (a `databricks.yml` variable, `es_host_primary` out of the box —
+the bundle's `default_es_host_config` (a `databricks.yml` variable, `es_host_default` out of the box;
 rename it or point it at your own default). A host config is:
 
 | Field | What it is |
@@ -273,20 +273,20 @@ A host config is a `type: complex` bundle variable. On `main` the per-target val
 ```yaml
 # databricks.yml
 variables:
-  es_host_primary:
+  es_host_default:
     type: complex
     default: {es_host_url: "", secret_scope_name: "", secret_key_name: ""}   # empty = fail-closed
 
 targets:
   dev:
     variables:
-      es_host_primary:
+      es_host_default:
         es_host_url: "https://your-dev-es-host:9200"
         secret_scope_name: "es_dev"
         secret_key_name: "api_key"
   prd:
     variables:
-      es_host_primary:
+      es_host_default:
         es_host_url: "https://your-prd-es-host:9200"
         secret_scope_name: "es_prd"
         secret_key_name: "api_key"
@@ -295,13 +295,37 @@ targets:
 A pipeline whose host config is left empty for the target it deploys to **fails closed** at run
 (`missing required parameter: es_host_url`) rather than writing nowhere.
 
-**To add another host config** (e.g. to route some pipelines to a second cluster): declare a second
-complex variable (`es_host_secondary`, same three fields), give it per-target values, and point a
-pipeline at it with `es_host_config: es_host_secondary`. A pipeline referencing a host config that
-isn't declared in `databricks.yml` fails **at generation** (`scripts/gen_jobs.py`), before deploy — as
-does a pipeline that omits `es_host_config` when no `default_es_host_config` is declared. (The default
-is read from the variable's `default:` at generation time, so it can't vary per target or by `--var`;
-the default host config's *values* are still per target.)
+**To add another host config** (e.g. to route some pipelines to a second cluster), all in `databricks.yml`:
+
+1. Declare a second complex variable (`es_host_secondary`, same three fields) and give it per-target values.
+2. Add its entry to `es_host_configs_json`, the variable just below the host configs. It lists every
+   host config for the `es_diagnostics` job (see
+   [Diagnosing a congested Elasticsearch host](#diagnosing-a-congested-elasticsearch-host)); the entry is
+   the three fields as references (the commented example in `databricks.yml` shows it):
+   ```yaml
+   es_host_configs_json:
+     default: >-
+       {"es_host_default": {"es_host_url": "${var.es_host_default.es_host_url}",
+       "secret_scope_name": "${var.es_host_default.secret_scope_name}",
+       "secret_key_name": "${var.es_host_default.secret_key_name}"},
+       "es_host_secondary": {"es_host_url": "${var.es_host_secondary.es_host_url}",
+       "secret_scope_name": "${var.es_host_secondary.secret_scope_name}",
+       "secret_key_name": "${var.es_host_secondary.secret_key_name}"}}
+   ```
+   Set it once, at the top level: the references pick up each target's values at deploy. The generator
+   fails closed unless the map lists exactly the declared host configs, each entry referencing its own
+   host's fields, and no target in `databricks.yml` overrides it. Don't override it in a
+   `variable-overrides.json`, with `--var` or with a `BUNDLE_VAR_` environment variable either: the
+   generator can't see those.
+3. Point a pipeline at it with `es_host_config: es_host_secondary`.
+
+A pipeline referencing a host config that isn't declared in `databricks.yml` fails **at generation**
+(`framework/scripts/gen_jobs.py`), before deploy. So does a `default_es_host_config` that is missing, names
+an undeclared host config, or is overridden in a target: both the pipelines that omit `es_host_config` and
+the `es_diagnostics` job default to it, and the generator reads only its top-level `default:`, so it can't
+vary per target (a target override in `databricks.yml` fails generation; don't override it in a
+`variable-overrides.json`, with `--var` or with a `BUNDLE_VAR_` environment variable either, which the
+generator can't see). The default host config's *values* are still per target.
 
 (Don't want to commit even placeholder endpoints? Put the per-target maps in the git-ignored
 `.databricks/bundle/<target>/variable-overrides.json` instead; the rest works identically.)
@@ -338,7 +362,7 @@ values). The generator emits `existing_cluster_id: ${var.<name>.cluster_id}` and
 right cluster id per target at deploy. This mirrors `es_host_config` exactly: a workspace-specific value
 is a shape-tagged per-target variable, never a literal baked into the config. A `cluster_config` that
 doesn't name a declared cluster config (a complex variable with a `cluster_id` field) fails **at
-generation** (`scripts/gen_jobs.py`), before deploy, so a typo or a reference to some other variable
+generation** (`framework/scripts/gen_jobs.py`), before deploy, so a typo or a reference to some other variable
 (e.g. `wheel_path`) is caught up front. See the commented `interactive_primary` example in
 `databricks.yml`.
 
@@ -525,7 +549,7 @@ stream fails. That is not automatic: a blocking `awaitTermination()` was reprodu
 STANDARD, a two-task continuous group) **never returning** after its query failed. The Spark UI showed the
 query FAILED, yet the task sat `RUNNING` with no work for over an hour, so the job never saw a failure and
 never retried it, while the sibling task ran on. The runner therefore waits on a stream in short slices
-(`pipeline_lib/stream_wait.py`) and, between them, asks the query directly whether it is still active; a
+(`framework/pipeline_lib/stream_wait.py`) and, between them, asks the query directly whether it is still active; a
 stream that has ended is noticed within about 10 seconds even if the wait call misses it, and its error
 fails the task, so the retry above applies.
 
@@ -561,7 +585,7 @@ member config as an independent task (no inter-task dependencies):
 job_group: ecs_streams
 ```
 
-The generator emits a single `resources/group_<job_group>.job.yml` (resource key
+The generator emits a single `_pipelines/resources/group_<job_group>.job.yml` (resource key
 `index_pipeline_group_<job_group>`) with one task per member (`index_pipeline_<config_name>`, unchanged).
 The main reason to group is **compute sharing**: members that name the **same** `job_cluster_config`
 land on **one** physical job cluster (the generator deduplicates the `job_clusters` block), so N
@@ -773,7 +797,7 @@ Two different mechanisms carry values into a job, and they resolve at different 
     `max_partition_bytes` splits them further, but repartitioning also fixes it). Applies to **both** modes.
 
 ```bash
-python scripts/gen_jobs.py   # regenerate resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
+python framework/scripts/gen_jobs.py   # regenerate _pipelines/resources/<config_name>.job.yml from _pipelines/pipeline_configs/*.yml
 
 # Environment-specific values (environment, wheel_path, checkpoint_base_path, cluster_policy_id, ca_certs,
 # the per-target global default for every run-time knob, and the ES host config) come from this target's variables block in databricks.yml. Fill in the target you
@@ -849,7 +873,7 @@ Key behaviors:
 
 When a stream's checkpoint is stale (say the index was wiped, or you want to re-stream from a fresh
 `streaming_start`), clear it with the dedicated `_checkpoint clear` job (a serverless maintenance job,
-`resources/_checkpoint_clear.job.yml`):
+`framework/resources/_checkpoint_clear.job.yml`):
 
 ```bash
 databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>
@@ -875,21 +899,24 @@ pipeline's stream is running: stop the stream first, as above.
 ### Diagnosing a congested Elasticsearch host
 
 When a host looks backed up (writes slowing down, requests timing out), run the read-only `es_diagnostics`
-job (a serverless maintenance job, `resources/_es_diagnostics.job.yml`) to collect an outside view of what
+job (a serverless maintenance job, `framework/resources/_es_diagnostics.job.yml`) to collect an outside view of what
 the cluster is doing:
 
 ```bash
-databricks bundle run es_diagnostics -t <target> -p <profile>                              # es_host_primary, cluster/node level
+databricks bundle run es_diagnostics -t <target> -p <profile>                              # default host config, cluster/node level
 databricks bundle run es_diagnostics -t <target> -p <profile> --params index_name=<index>  # + deep-dive one index
 databricks bundle run es_diagnostics -t <target> -p <profile> --params es_host_config=es_host_secondary  # hit a different host config
 ```
 
 It only issues `GET` requests (it never writes a document or reads the ES secret for anything but the
-`Authorization` header) and connects to the host config named by the `es_host_config` parameter (default
-`es_host_primary`), the same endpoints and `api_key` secrets the pipelines use — so testing a different
-configured host is a `--params es_host_config=<name>`, not a YAML edit (the job carries every configured
-host's url + secret scope/key, and the notebook resolves the chosen name, failing closed on an unknown
-one). It gathers: write thread-pool saturation and rejections, indexing pressure,
+`Authorization` header) and connects to the host config named by the `es_host_config` parameter (default:
+the bundle's `default_es_host_config`), the same endpoints and `api_key` secrets the pipelines use, so
+testing a different configured host is a `--params es_host_config=<name>`, not a YAML edit. The job carries
+every configured host's url + secret scope/key from the `es_host_configs_json` variable in `databricks.yml`
+(see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)), and the
+notebook resolves the chosen name, failing closed on an unknown one. The job file itself names no host
+config, so adding or renaming one never touches it. The host is picked only by name: the job takes no
+run-time URL or secret, so someone who can run it can't point it, and the `api_key`, at another endpoint. It gathers: write thread-pool saturation and rejections, indexing pressure,
 circuit breakers, node heap/GC, cluster health and pending tasks, in-flight bulk tasks, hot threads, and
 (when `index_name` is set) that index's `_stats`/`_settings`/`_count`/shard placement. It samples the
 counter endpoints **twice** (`sample_interval_secs` apart, default 5s) so rejection/GC rates reflect the
@@ -941,7 +968,7 @@ databricks bundle run log_table_create -t <target> -p <profile>
 ```
 
 It runs `CREATE TABLE IF NOT EXISTS` with the log's schema (from
-`pipeline_lib/monitoring_sink.py`, the single source of truth shared with the writer) and is idempotent
+`framework/pipeline_lib/monitoring_sink.py`, the single source of truth shared with the writer) and is idempotent
 (safe to re-run). The identity that runs **this** job needs `CREATE TABLE` (and `USE CATALOG`/`USE
 SCHEMA`) on the target schema; the export jobs only ever **append**, so their run identity needs only
 `MODIFY` on the table. If a name is blank or not a three-part identifier it fails closed.
@@ -952,7 +979,7 @@ three-layer precedence as every knob).
 
 **What lands in the table: the row model.** One append-only table. Every column carries a `COMMENT`
 describing it (`DESCRIBE TABLE <table>` or Catalog Explorer shows them), defined next to the column in
-`pipeline_lib/monitoring_sink.py`:
+`framework/pipeline_lib/monitoring_sink.py`:
 
 | Column | Holds |
 |---|---|
@@ -1130,7 +1157,7 @@ databricks bundle run log_table_prune -t <target> -p <profile>
 ```
 
 **Adding a column later.** `_log table create` is **re-runnable** (the logic is in
-`pipeline_lib/log_table_migration.py`). On an existing table it adds any column the schema has and the table
+`framework/pipeline_lib/log_table_migration.py`). On an existing table it adds any column the schema has and the table
 lacks (`ALTER TABLE ADD COLUMNS`, with its comment), **without** dropping or replacing the table, so existing
 rows are preserved and get NULL for the new column. To add a field: add it to `MONITORING_TABLE_COLUMNS`,
 then re-run `_log table create` **before** deploying the build that writes it (with the log on, a job whose
@@ -1148,7 +1175,7 @@ post-mortem on a continuous stream). It is **opt-in per job cluster config**, in
 1. Set the `cluster_log_volume_path` variable to the destination in **every** target the config deploys
    to (a simple string, so per target or `--var`), e.g. `/Volumes/<catalog>/<schema>/<volume>/cluster_logs`.
 2. In the job cluster config (`_pipelines/job_cluster_configs/<key>.yml`), add the block (the example in
-   `standard_batch.yml` is commented out), then re-run `scripts/gen_jobs.py`:
+   `standard_batch.yml` is commented out), then re-run `framework/scripts/gen_jobs.py`:
 
 ```yaml
 cluster_log_conf:
@@ -1188,11 +1215,15 @@ drift across pyyaml versions.
 
 ## Layout
 
+The repo has two halves. `_pipelines/` holds what you edit for your own pipelines (plus the job resources
+generated from it); `framework/` holds the shared code that runs them and is not edited per pipeline.
+`databricks.yml` at the root carries your environment's variables and targets.
+
 ```
-databricks.yml                  Bundle definition: variables + targets
+databricks.yml                  Bundle definition: variables + targets (edit for your environment)
 requirements.txt                Off-cluster tooling deps (pinned pyyaml for the generator)
 
-You edit these, one pair per pipeline (all under _pipelines/, the pipeline-configuration folder):
+You edit these, one pair per pipeline:
   _pipelines/
     pipeline_views/
       <view_name>.sql           The view: what gets exported (filename == view.name)
@@ -1203,53 +1234,84 @@ You edit these, one pair per pipeline (all under _pipelines/, the pipeline-confi
     job_cluster_configs/
       <key>.yml                 OPTIONAL reusable new_cluster specs, referenced by key from a
                                 config's compute.job_cluster_config (see Compute)
+    resources/
+      <config_name>.job.yml     GENERATED per-index job (one per pipeline_configs config; do not
+                                hand-edit, rerun the generator)
+      group_<job_group>.job.yml GENERATED job for a job_group
 
-Shared notebooks (run by the jobs, not edited per pipeline):
-  notebooks/
-    deploy_views.py             Renders each view's parameters from its config (folding in the
+Shared framework (not edited per pipeline):
+  framework/
+    notebooks/
+      deploy_views.py           Renders each view's parameters from its config (folding in the
                                 environment), then runs CREATE OR REPLACE
-    run_index_pipeline.py       Run by every per-index job: installs the connector wheel (verifying
+      run_index_pipeline.py     Run by every per-index job: installs the connector wheel (verifying
                                 the import), loads its config by name, resolves the environment, and
                                 exports to Elasticsearch via the connector - batch (bulk_write over the
                                 deployed view) or streaming (view SELECT over each source micro-batch)
-    log_table_create.py         Run by the _log table create job: creates the shared monitoring Delta
+      log_table_create.py       Run by the _log table create job: creates the shared monitoring Delta
                                 table, or adds a newly introduced column (pipeline_lib.log_table_migration;
                                 see Durable monitoring)
-    log_table_prune.py          Run by the _log table prune job: retention for the monitoring table
+      log_table_prune.py        Run by the _log table prune job: retention for the monitoring table
                                 (DELETE old rows, then OPTIMIZE + VACUUM; see Durable monitoring)
-
-Shared library + tests (the config schema, used by the generator and both notebooks):
-  pipeline_lib/
-    config.py                   Loads/validates a pipeline definition; resolves ${environment} and
+      ...                       plus build_wheel, checkpoint_clear and es_diagnostics for their jobs
+    pipeline_lib/               The shared library (used by the generator and the notebooks)
+      config.py                 Loads/validates a pipeline definition; resolves ${environment} and
                                 derives view substitutions + job parameters (single source of truth)
-    monitoring_sink.py          Pure schema + row builders for the durable monitoring log (single
+      monitoring_sink.py        Pure schema + row builders for the durable monitoring log (single
                                 source of truth for the table columns and row model, shared by the
                                 writer + creator)
-    log_table_migration.py      The _log table create job's create-or-add-columns step, unit-tested
+      log_table_migration.py    The _log table create job's create-or-add-columns step, unit-tested
                                 with a fake session
-    stream_wait.py              The streaming wait loop (short awaitTermination slices + an isActive
+      stream_wait.py            The streaming wait loop (short awaitTermination slices + an isActive
                                 liveness check), so a failed stream always fails the task
-  tests/
-    test_config.py              Offline unit tests for pipeline_lib.config (plain pytest)
-    test_monitoring_sink.py     Offline unit tests for pipeline_lib.monitoring_sink
-    test_log_table_migration.py Offline unit tests for pipeline_lib.log_table_migration (fake session)
-    test_stream_wait.py         Offline unit tests for pipeline_lib.stream_wait (fake query)
+    scripts/
+      gen_jobs.py               Generates _pipelines/resources/*.job.yml from the configs (--check
+                                guards drift)
+    resources/                  The fixed maintenance jobs (hand-authored):
+      _build_wheel.job.yml        build_wheel
+      _checkpoint_clear.job.yml   _checkpoint clear
+      _deploy_views.job.yml       deploy_views
+      _es_diagnostics.job.yml     _es diagnostics
+      _log_table_create.job.yml   _log table create
+      _log_table_prune.job.yml    _log table prune (daily, paused by default)
+    tests/                      Offline unit tests (plain pytest):
+                                python -m pytest framework/tests
 
-Generated / tooling (do not hand-edit the generated jobs):
-  scripts/
-    gen_jobs.py                 Generates resources/<config_name>.job.yml from the configs (--check guards drift)
-  resources/
-    _build_wheel.job.yml        The build_wheel job (hand-authored)
-    _checkpoint_clear.job.yml   The _checkpoint clear job (hand-authored)
-    _deploy_views.job.yml       The deploy_views job (hand-authored)
-    _es_diagnostics.job.yml     The _es diagnostics job (hand-authored)
-    _log_table_create.job.yml   The _log table create job (hand-authored)
-    _log_table_prune.job.yml    The _log table prune job (hand-authored; daily, paused by default)
-    <config_name>.job.yml       GENERATED per-index job (one per pipeline_configs config)
-
-Hand-authored resource files (starting with `_`) are visually separate from generated ones. Config names
-and job_group names may not start with `_` (checked at generation) to prevent conflicts.
+Config names and job_group names may not start with `_` (checked at generation), so they never collide
+with the `_`-prefixed fixed jobs.
 ```
+
+Declare variables and targets in `databricks.yml`, not in the included resource files: the generator reads
+them from `databricks.yml` only, so its checks wouldn't see one declared elsewhere.
+
+### Upgrading from earlier builds
+
+Earlier builds kept `notebooks/`, `pipeline_lib/`, `scripts/`, `tests/` and every job resource (fixed and
+generated) at the repo root, named the shipped host config `es_host_primary`, and
+listed the hosts for the `es_diagnostics` job inside its job file. To move an existing copy to this build:
+
+1. Replace those root folders with `framework/` from this build. `_pipelines/pipeline_configs/`,
+   `_pipelines/pipeline_views/` and `_pipelines/job_cluster_configs/` carry over unchanged.
+2. In `databricks.yml`, replace the `resources/*.yml` include with the two lines this build ships:
+   `framework/resources/*.yml` and `_pipelines/resources/*.yml` (the generator fails closed until both are
+   listed and the old one is gone).
+3. Rename the host config `es_host_primary` to `es_host_default` everywhere you set it: its declaration
+   and each target's values in `databricks.yml`, the top-level `default_es_host_config` value, the host
+   config's key in any `.databricks/bundle/<target>/variable-overrides.json` (where only the host
+   values belong, never `default_es_host_config` or `es_host_configs_json`), and every pipeline config
+   with `es_host_config: es_host_primary`. (Or keep your own name: the shipped one is only a default.)
+   Then add the `es_host_configs_json` variable this build ships, with one entry per host config you
+   declare (see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)).
+   Within `databricks.yml` the generator fails closed on a pipeline naming an undeclared host, a stale
+   `default_es_host_config` and a map that doesn't match the declared hosts; it doesn't read
+   `variable-overrides.json`, so check that file yourself.
+4. Delete the old root `resources/` folder (the generator refuses to run while it exists; move a job of
+   your own to `_pipelines/resources/`, where the generator leaves it alone) and run `python framework/scripts/gen_jobs.py`, which writes the per-index jobs into
+   `_pipelines/resources/`, creating the folder if needed. (Generated files you moved there yourself are recognized
+   and regenerated.) `--check` should then report every generated file up to date.
+5. Deploy. Job resource keys are unchanged, so each job is updated in place (same job id, same run
+   history) and only its notebook path changes. Streaming checkpoints live under `checkpoint_base_path`,
+   not in the repo, so a streaming pipeline resumes where it left off.
 
 ## License & Attribution
 
