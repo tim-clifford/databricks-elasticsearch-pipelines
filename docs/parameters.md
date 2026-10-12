@@ -467,8 +467,9 @@ With `bulk_stats` on, the cost shows as `timeout_sends` and `timeout_wait_ms`. R
 
 ### `op_type`
 
-The bulk action: `index` (overwrite by `_id`) or `create` (append only). Default empty, which means the
-connector default, `index`.
+The bulk action: `index` (overwrite by `_id`) or `create` (append only). The global `${var.op_type}`
+ships empty, which means the connector default, `index`, so a feed opts into `create` in its own config
+unless a target sets the global.
 
 With `create`, re-sending an existing `_id` returns a 409 the connector treats as already written, so
 the document is neither overwritten nor duplicated. Use it only for feeds that never legitimately update
