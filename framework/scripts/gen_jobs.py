@@ -19,6 +19,7 @@ import argparse
 import glob
 import json
 import os
+import posixpath
 import re
 import sys
 
@@ -288,10 +289,10 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
                 f"{json.dumps(dict(sorted(want.items())))}, got {json.dumps(entries[name])}"
             )
     _reject_target_overrides(
-        var, doc, "each target's host values flow in through the ${var.<name>.<field>} references")
+        var, doc, "each target's host values flow in through the ${var.<name>.<field>} references", path)
 
 
-def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
+def _reject_target_overrides(var: str, doc: dict, why: str, path: str | None = None) -> None:
     """Fail closed if any declared target sets `var`: under its `variables:` in databricks.yml, or in the
     git-ignored .databricks/bundle/<target>/variable-overrides.json next to databricks.yml. For variables
     the generator reads only at their top-level default, where a per-target value would go unchecked or
@@ -303,14 +304,15 @@ def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
         for target, tspec in sorted(targets.items())
         if isinstance(tspec, dict) and var in (tspec.get("variables") or {})
     ]
-    bundle_root = os.path.dirname(_DATABRICKS_YML)
+    # Next to the databricks.yml that was parsed (`path`, else the module's bundle file).
+    bundle_root = os.path.dirname(path if path is not None else _DATABRICKS_YML)
     for target in sorted(targets):
-        path = os.path.join(bundle_root, ".databricks", "bundle", str(target), "variable-overrides.json")
-        if not os.path.exists(path):
+        overrides_path = os.path.join(bundle_root, ".databricks", "bundle", str(target), "variable-overrides.json")
+        if not os.path.exists(overrides_path):
             continue
-        rel = os.path.relpath(path, bundle_root)
+        rel = os.path.relpath(overrides_path, bundle_root)
         try:
-            with open(path) as fh:
+            with open(overrides_path) as fh:
                 overrides = json.load(fh)
         except (OSError, ValueError) as exc:
             raise ValueError(f"{rel}: cannot read it as JSON ({exc})") from None
@@ -326,7 +328,7 @@ def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
         )
 
 
-def require_default_es_host_config(default, declared: set, doc: dict) -> None:
+def require_default_es_host_config(default, declared: set, doc: dict, path: str | None = None) -> None:
     """Fail closed at GENERATION unless databricks.yml declares a default_es_host_config naming a declared
     host config, set only at the top level.
 
@@ -352,7 +354,8 @@ def require_default_es_host_config(default, declared: set, doc: dict) -> None:
         )
     _reject_target_overrides(
         "default_es_host_config", doc,
-        "the generated jobs bake its top-level default, so a per-target value would split the default host")
+        "the generated jobs bake its top-level default, so a per-target value would split the default host",
+        path)
 
 
 def load_cluster_configs(path: str | None = None, doc: dict | None = None) -> set:
@@ -1134,8 +1137,10 @@ def require_bundle_includes(path: str | None = None, doc: dict | None = None) ->
     include = doc.get("include") or []
     if not isinstance(include, list) or not all(isinstance(p, str) for p in include):
         raise ValueError("include (databricks.yml) must be a list of path globs")
-    missing = [p for p in _REQUIRED_INCLUDES if p not in include]
-    old = [p for p in include if p.startswith(("resources/", "./resources/"))]
+    # Compare normalized globs, so an equivalent spelling like ./framework/resources/*.yml counts.
+    normalized = [posixpath.normpath(p) for p in include]
+    missing = [p for p in _REQUIRED_INCLUDES if p not in normalized]
+    old = [p for p, n in zip(include, normalized) if n.startswith("resources/")]
     if missing or old:
         raise ValueError(
             "include (databricks.yml) must list " + " and ".join(_REQUIRED_INCLUDES)

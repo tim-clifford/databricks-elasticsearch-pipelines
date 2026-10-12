@@ -1882,7 +1882,7 @@ def test_old_root_resources_job_files_block_generation(tmp_path, monkeypatch):
     resources_dir = _temp_tree(tmp_path, monkeypatch)
     old = tmp_path / "resources"
     old.mkdir()
-    for leftover in ("_es_diagnostics.job.yml", "one.job.yml"):
+    for leftover in ("_es_diagnostics.job.yml", "one.job.yml", "custom.yml"):
         (old / leftover).write_text("resources: {}\n")
         for argv in (["--check"], []):
             assert gen_jobs.main(argv) == 1
@@ -1898,6 +1898,9 @@ def test_old_root_resources_job_files_block_generation(tmp_path, monkeypatch):
     (["resources/*.yml"], "remove the old-layout resources/\\*.yml"),
     (["framework/resources/*.yml", "_pipelines/resources/*.yml", "resources/*.yml"], "remove the old-layout"),
     ("framework/resources/*.yml", "must be a list"),
+    (["framework/resources/*.yml", 3], "must be a list"),
+    (["framework/resources/*.yml", "_pipelines/resources/*.yml", "./resources/*.yml"],
+     r"remove the old-layout \./resources/\*\.yml"),
 ])
 def test_bundle_includes_rejected(include, match):
     doc = {} if include is None else {"include": include}
@@ -1908,6 +1911,8 @@ def test_bundle_includes_rejected(include, match):
 def test_bundle_includes_accepted_with_extras():
     gen_jobs.require_bundle_includes(doc={"include": [
         "framework/resources/*.yml", "_pipelines/resources/*.yml", "extra/*.yml"]})
+    # Equivalent spellings of the required globs count.
+    gen_jobs.require_bundle_includes(doc={"include": ["./framework/resources/*.yml", "_pipelines//resources/*.yml"]})
     gen_jobs.require_bundle_includes()  # the shipped databricks.yml
 
 
@@ -1951,3 +1956,28 @@ def test_generation_fails_without_the_new_includes(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="remove the old-layout resources/"):
             gen_jobs.main(argv)
     assert not list(resources_dir.iterdir())
+
+
+def test_override_scan_sits_next_to_the_parsed_databricks_yml(tmp_path, monkeypatch):
+    # The overrides that matter are the ones next to the databricks.yml being checked (the bundle root),
+    # wherever that is: an override there is caught, one elsewhere (here: the repo root) is not read.
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    bundle_yml = tmp_path / "bundle" / "databricks.yml"
+    doc = {"targets": {"dev": {}}}
+    elsewhere = tmp_path / ".databricks" / "bundle" / "dev" / "variable-overrides.json"
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_text(json.dumps({"default_es_host_config": "es_host_default"}))
+    gen_jobs.require_default_es_host_config("es_host_default", {"es_host_default"}, doc, path=str(bundle_yml))
+    beside = tmp_path / "bundle" / ".databricks" / "bundle" / "dev" / "variable-overrides.json"
+    beside.parent.mkdir(parents=True)
+    beside.write_text(json.dumps({"default_es_host_config": "es_host_default"}))
+    with pytest.raises(ValueError, match="overridden in .databricks/bundle/dev/variable-overrides.json"):
+        gen_jobs.require_default_es_host_config("es_host_default", {"es_host_default"}, doc, path=str(bundle_yml))
+    entry = {f: f"${{var.es_host_default.{f}}}" for f in ("es_host_url", "secret_scope_name", "secret_key_name")}
+    beside.write_text(json.dumps({"es_host_configs_json": "{}"}))
+    with pytest.raises(ValueError, match="es_host_configs_json is overridden in"):
+        gen_jobs.require_es_host_configs_json(
+            {"es_host_default"},
+            path=str(bundle_yml),
+            doc=dict(doc, variables={"es_host_configs_json": {"default": json.dumps({"es_host_default": entry})}}),
+        )
