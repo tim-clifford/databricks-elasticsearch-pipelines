@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import sys
 
 import pytest
@@ -1875,23 +1876,6 @@ def test_empty_default_es_host_config_has_its_own_message():
         gen_jobs.require_default_es_host_config(None, {"es_host_default"}, doc)
 
 
-def test_old_root_resources_job_files_block_generation(tmp_path, monkeypatch):
-    # Any job file left in the old root resources/ (generated or one of the old fixed jobs) would deploy
-    # beside the framework/ and regenerated copies under the same keys, or deploy a stale definition, so
-    # both modes refuse and write nothing until the folder is removed.
-    resources_dir = _temp_tree(tmp_path, monkeypatch)
-    old = tmp_path / "resources"
-    old.mkdir()
-    for leftover in ("_es_diagnostics.job.yml", "one.job.yml", "custom.yml"):
-        (old / leftover).write_text("resources: {}\n")
-        for argv in (["--check"], []):
-            assert gen_jobs.main(argv) == 1
-        assert not list(resources_dir.iterdir())
-        assert gen_jobs.legacy_root_job_files() == [str(old / leftover)]
-        (old / leftover).unlink()
-    assert gen_jobs.main([]) == 0
-
-
 @pytest.mark.parametrize("include, match", [
     (None, "missing: framework/resources/\\*.yml, _pipelines/resources/\\*.yml"),
     (["framework/resources/*.yml"], "missing: _pipelines/resources/\\*.yml"),
@@ -1991,20 +1975,75 @@ def test_bundle_var_environment_override_rejected(tmp_path, monkeypatch, var):
         gen_jobs.main(["--check"])
 
 
-def test_bare_resources_include_and_yaml_leftover_rejected(tmp_path, monkeypatch):
-    with pytest.raises(ValueError, match="remove the old-layout resources"):
-        gen_jobs.require_bundle_includes(doc={"include": [
-            "framework/resources/*.yml", "_pipelines/resources/*.yml", "resources"]})
-    _temp_tree(tmp_path, monkeypatch)
-    old = tmp_path / "resources"
-    old.mkdir()
-    (old / "legacy.job.yaml").write_text("resources: {}\n")
-    assert gen_jobs.legacy_root_job_files() == [str(old / "legacy.job.yaml")]
-    assert gen_jobs.main(["--check"]) == 1
-
-
-
 @pytest.mark.parametrize("targets", [["dev"], "dev"])
 def test_malformed_targets_fails_closed(targets):
     with pytest.raises(ValueError, match="targets \\(databricks.yml\\) must be a mapping"):
         gen_jobs.require_default_es_host_config("es_host_default", {"es_host_default"}, {"targets": targets})
+
+
+def test_old_root_resources_folder_blocks_generation(tmp_path, monkeypatch):
+    # The old layout's root resources/ folder must be gone before generating: anything in it (generated,
+    # an old fixed job, any extension, nested or not) would deploy stale or duplicate jobs. Even an empty
+    # folder blocks, so the rule never depends on what is inside.
+    resources_dir = _temp_tree(tmp_path, monkeypatch)
+    old = tmp_path / "resources"
+    for leftover in (None, "_es_diagnostics.job.yml", "nested/one.job.yaml"):
+        old.mkdir(exist_ok=True)
+        if leftover:
+            (old / leftover).parent.mkdir(parents=True, exist_ok=True)
+            (old / leftover).write_text("resources: {}\n")
+        for argv in (["--check"], []):
+            assert gen_jobs.main(argv) == 1
+        assert not list(resources_dir.iterdir())
+        assert gen_jobs.old_root_resources_dir() == str(old)
+        shutil.rmtree(old)
+    assert gen_jobs.old_root_resources_dir() is None
+    assert gen_jobs.main([]) == 0
+
+
+def test_bare_resources_include_rejected():
+    with pytest.raises(ValueError, match="remove the old-layout resources"):
+        gen_jobs.require_bundle_includes(doc={"include": [
+            "framework/resources/*.yml", "_pipelines/resources/*.yml", "resources"]})
+
+
+@pytest.mark.parametrize("doc, match", [
+    (["include"], "databricks.yml must be a mapping, got list"),
+    ({"include": "framework/resources/*.yml"}, "include .* must be a list"),
+    ({"include": ["framework/resources/*.yml", 3]}, "include .* must be a list"),
+    ({"variables": ["x"]}, "variables .* must be a mapping"),
+    ({"targets": []}, "targets .* must be a mapping .* got list"),
+    ({"targets": ""}, "targets .* must be a mapping .* got str"),
+    ({"targets": {"dev": "x"}}, "targets.dev .* must be a mapping, got str"),
+    ({"targets": {"dev": {"variables": "x"}}}, "targets.dev.variables .* must be a mapping"),
+    ({"targets": {"dev": {"variables": ["default_es_host_config"]}}}, "targets.dev.variables .* must be a mapping"),
+])
+def test_bundle_shape_rejected(doc, match):
+    with pytest.raises(ValueError, match=match):
+        gen_jobs.require_bundle_shape(doc)
+
+
+def test_bundle_shape_accepted():
+    gen_jobs.require_bundle_shape({})
+    gen_jobs.require_bundle_shape({"targets": {"dev": None, "prd": {}, "stg": {"variables": {}}}})
+    with open(os.path.join(_REPO_ROOT, "databricks.yml")) as fh:
+        gen_jobs.require_bundle_shape(yaml.safe_load(fh))
+
+
+def test_shipped_included_files_hold_only_resources():
+    # Run against the real repo (not the conftest copy, whose folder holds no included files).
+    gen_jobs.require_bundle_includes(path=os.path.join(_REPO_ROOT, "databricks.yml"))
+
+
+@pytest.mark.parametrize("content, match", [
+    ("targets:\n  dev:\n    variables: {default_es_host_config: x}\n", r"may hold only a `resources:` block, got \['targets'\]"),
+    ("variables:\n  es_host_extra: {type: complex, default: {}}\n", r"got \['variables'\]"),
+    ("resources: {}\nvariables: {}\n", r"got \['resources', 'variables'\]"),
+    ("- a\n- b\n", "got list"),
+    ("resources: [\n", "cannot read it as YAML"),
+])
+def test_included_file_with_other_declarations_blocks_generation(tmp_path, monkeypatch, content, match):
+    _temp_tree(tmp_path, monkeypatch)
+    (tmp_path / "_pipelines" / "resources" / "_custom.job.yml").write_text(content)
+    with pytest.raises(ValueError, match=match):
+        gen_jobs.main(["--check"])

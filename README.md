@@ -1281,6 +1281,9 @@ Config names and job_group names may not start with `_` (checked at generation),
 with the `_`-prefixed fixed jobs.
 ```
 
+Every file the `include:` globs match may hold only a `resources:` block: declare variables and targets in
+`databricks.yml`, the one file the generator reads them from (it fails closed otherwise).
+
 ### Upgrading from earlier builds
 
 Earlier builds kept `notebooks/`, `pipeline_lib/`, `scripts/`, `tests/`, `requirements.txt` and every job
@@ -1300,8 +1303,8 @@ listed the hosts for the `es_diagnostics` job inside its job file. To move an ex
    (see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). The
    generator fails closed on a pipeline naming an undeclared host and on a map that doesn't match the
    declared hosts, so nothing half-renamed deploys.
-4. Delete the old root `resources/` folder (the generator refuses to run while any job file remains
-   there; move a job of your own to `_pipelines/resources/`, where the generator leaves it alone) and run `python framework/scripts/gen_jobs.py`, which writes the per-index jobs into
+4. Delete the old root `resources/` folder (the generator refuses to run while it exists; move a job of
+   your own to `_pipelines/resources/`, where the generator leaves it alone) and run `python framework/scripts/gen_jobs.py`, which writes the per-index jobs into
    `_pipelines/resources/`, creating the folder if needed. (Generated files you moved there yourself are recognized
    and regenerated.) `--check` should then report every generated file up to date.
 5. Deploy. Job resource keys are unchanged, so each job is updated in place (same job id, same run

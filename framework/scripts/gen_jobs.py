@@ -299,14 +299,12 @@ def _reject_target_overrides(var: str, doc: dict, why: str, path: str | None = N
     split what the generated jobs bake from what deploy-time references resolve. A BUNDLE_VAR_<var>
     environment variable in the generator's own environment is rejected too. (A --var or BUNDLE_VAR_<var>
     on the deploy side can't be seen here; the README says not to use either for these.)"""
-    targets = doc.get("targets") or {}
-    if not isinstance(targets, dict):
-        raise ValueError(f"targets (databricks.yml) must be a mapping of target name -> settings, got "
-                         f"{type(targets).__name__}")
+    require_bundle_shape(doc)
+    targets = doc.get("targets", {})
     overridden = [
         f"target {target}"
         for target, tspec in sorted(targets.items())
-        if isinstance(tspec, dict) and var in (tspec.get("variables") or {})
+        if var in (tspec or {}).get("variables", {})
     ]
     # Next to the databricks.yml that was parsed (`path`, else the module's bundle file).
     if f"BUNDLE_VAR_{var}" in os.environ:
@@ -1122,27 +1120,55 @@ def existing_generated_files() -> list[str]:
     ]
 
 
-def legacy_root_job_files() -> list[str]:
-    """Job files left in the repo-root resources/ folder, where every job (fixed and generated) lived
-    before the framework/ move. Left in place with the old include line they would deploy beside the
-    framework/ and regenerated copies under the same resource keys, or deploy stale definitions, so
-    generation and --check refuse to run until they are removed (your own jobs belong in
-    _pipelines/resources/, where the generator leaves files without its marker alone)."""
-    return sorted(p for ext in ("*.yml", "*.yaml") for p in glob.glob(os.path.join(_REPO_ROOT, "resources", ext)))
+def require_bundle_shape(doc) -> None:
+    """Fail closed at GENERATION unless the parts of databricks.yml the generator reads have the shapes it
+    relies on: the file is a mapping; `include`, when present, a list of strings; `variables` a mapping;
+    `targets` a mapping whose every target is a mapping (or empty) with `variables`, when present, a
+    mapping. Checked once, up front, so the readers after it can rely on those shapes."""
+    if not isinstance(doc, dict):
+        raise ValueError(f"databricks.yml must be a mapping, got {type(doc).__name__}")
+    include = doc.get("include", [])
+    if not isinstance(include, list) or not all(isinstance(p, str) for p in include):
+        raise ValueError("include (databricks.yml) must be a list of path globs")
+    if not isinstance(doc.get("variables", {}), dict):
+        raise ValueError("variables (databricks.yml) must be a mapping of variable name -> declaration")
+    targets = doc.get("targets", {})
+    if not isinstance(targets, dict):
+        raise ValueError(f"targets (databricks.yml) must be a mapping of target name -> settings, got "
+                         f"{type(targets).__name__}")
+    for name, tspec in targets.items():
+        if tspec is not None and not isinstance(tspec, dict):
+            raise ValueError(f"targets.{name} (databricks.yml) must be a mapping, got {type(tspec).__name__}")
+        if not isinstance((tspec or {}).get("variables", {}), dict):
+            raise ValueError(f"targets.{name}.variables (databricks.yml) must be a mapping")
+
+
+def old_root_resources_dir() -> str | None:
+    """The repo-root resources/ folder, if it still exists. Before the framework/ move every job (fixed and
+    generated) lived there; anything left in it would deploy stale definitions, or duplicate the
+    framework/ and regenerated jobs under the same resource keys, so generation and --check refuse to run
+    while the folder exists at all (jobs of your own belong in _pipelines/resources/)."""
+    path = os.path.join(_REPO_ROOT, "resources")
+    return path if os.path.exists(path) else None
 
 
 # The two include globs databricks.yml must carry: the fixed framework jobs and the _pipelines/ jobs.
 _REQUIRED_INCLUDES = ("framework/resources/*.yml", "_pipelines/resources/*.yml")
+# The only top-level key an included file may hold. The generator reads variables and targets from
+# databricks.yml alone, so one declared in an included file would escape every check here.
+_INCLUDED_FILE_KEYS = frozenset({"resources"})
 
 
 def require_bundle_includes(path: str | None = None, doc: dict | None = None) -> None:
     """Fail closed at GENERATION unless databricks.yml's `include:` lists both resource folders
-    (_REQUIRED_INCLUDES) and nothing under the old root resources/ folder. Without the first the bundle
-    silently deploys none of those jobs; the second is the pre-framework/ layout's include."""
-    doc = doc if doc is not None else _read_bundle_doc(path)
-    include = doc.get("include") or []
-    if not isinstance(include, list) or not all(isinstance(p, str) for p in include):
-        raise ValueError("include (databricks.yml) must be a list of path globs")
+    (_REQUIRED_INCLUDES) and nothing under the old root resources/ folder, and every file the includes
+    match holds only a `resources:` block. Without the first the bundle silently deploys none of those
+    jobs; the second is the pre-framework/ layout's include; the third keeps every variable and target
+    in databricks.yml, where the generator's checks can see them."""
+    bundle_path = path if path is not None else _DATABRICKS_YML
+    doc = doc if doc is not None else _read_bundle_doc(bundle_path)
+    require_bundle_shape(doc)
+    include = doc.get("include", [])
     # Compare normalized globs, so an equivalent spelling like ./framework/resources/*.yml counts.
     normalized = [posixpath.normpath(p) for p in include]
     missing = [p for p in _REQUIRED_INCLUDES if p not in normalized]
@@ -1153,6 +1179,21 @@ def require_bundle_includes(path: str | None = None, doc: dict | None = None) ->
             + (f"; missing: {', '.join(missing)}" if missing else "")
             + (f"; remove the old-layout {', '.join(old)}" if old else "")
         )
+    bundle_root = os.path.dirname(bundle_path)
+    for pattern in normalized:
+        for file_path in sorted(glob.glob(os.path.join(bundle_root, pattern), recursive=True)):
+            rel = os.path.relpath(file_path, bundle_root)
+            try:
+                with open(file_path) as fh:
+                    included = yaml.safe_load(fh)
+            except (OSError, yaml.YAMLError) as exc:
+                raise ValueError(f"{rel} (included by databricks.yml): cannot read it as YAML ({exc})") from None
+            if not isinstance(included, dict) or not set(included) <= _INCLUDED_FILE_KEYS:
+                keys = sorted(included) if isinstance(included, dict) else type(included).__name__
+                raise ValueError(
+                    f"{rel} (included by databricks.yml) may hold only a `resources:` block, got {keys}; "
+                    f"declare variables and targets in databricks.yml"
+                )
 
 
 def discover_configs() -> list[str]:
@@ -1190,14 +1231,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config_paths = discover_configs()
-    legacy = legacy_root_job_files()
-    if legacy:
+    if old_root_resources_dir():
         print(
-            "job file(s) from the old layout are still in the root resources/ folder: "
-            + ", ".join(os.path.relpath(p, _REPO_ROOT) for p in legacy)
-            + "; delete that folder (the fixed jobs now live in framework/resources/, generated ones in "
-            "_pipelines/resources/; move any job of your own to _pipelines/resources/) and see the README "
-            "upgrade steps",
+            "the old layout's root resources/ folder still exists; delete it (the fixed jobs now live in "
+            "framework/resources/, generated ones in _pipelines/resources/; move any job of your own to "
+            "_pipelines/resources/) and see the README upgrade steps",
             file=sys.stderr,
         )
         return 1
@@ -1208,7 +1246,7 @@ def main(argv: list[str] | None = None) -> int:
     # existing_cluster pipeline's cluster_config). require_job_name_prefix_declared fails closed if the
     # job_name_prefix variable is missing (every generated name references ${var.job_name_prefix}).
     bundle_doc = _read_bundle_doc()
-    require_bundle_includes(doc=bundle_doc)
+    require_bundle_includes(doc=bundle_doc)  # also checks the file's shape (require_bundle_shape)
     require_job_name_prefix_declared(doc=bundle_doc)
     require_support_email_declared(doc=bundle_doc)
     require_global_job_tags_declared(doc=bundle_doc)
