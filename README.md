@@ -1209,8 +1209,7 @@ Things to know:
 The workspace deployed to is whichever one `-p <profile>` (or `DATABRICKS_HOST`) points at.
 All jobs are granted `CAN_MANAGE_RUN` to the `users` group, so teammates can trigger them on demand.
 
-Running the generator needs `pyyaml`, pinned in `framework/requirements.txt`
-(`pip install -r framework/requirements.txt`).
+Running the generator needs `pyyaml`, pinned in `requirements.txt` (`pip install -r requirements.txt`).
 The pin matters because `--check` byte-compares against `yaml.safe_dump` output, whose formatting can
 drift across pyyaml versions.
 
@@ -1222,6 +1221,7 @@ generated from it); `framework/` holds the shared code that runs them and is not
 
 ```
 databricks.yml                  Bundle definition: variables + targets (edit for your environment)
+requirements.txt                Off-cluster tooling deps (pinned pyyaml for the generator)
 
 You edit these, one pair per pipeline:
   _pipelines/
@@ -1241,7 +1241,6 @@ You edit these, one pair per pipeline:
 
 Shared framework (not edited per pipeline):
   framework/
-    requirements.txt            Off-cluster tooling deps (pinned pyyaml for the generator)
     notebooks/
       deploy_views.py           Renders each view's parameters from its config (folding in the
                                 environment), then runs CREATE OR REPLACE
@@ -1287,8 +1286,8 @@ them from `databricks.yml` only, so its checks wouldn't see one declared elsewhe
 
 ### Upgrading from earlier builds
 
-Earlier builds kept `notebooks/`, `pipeline_lib/`, `scripts/`, `tests/`, `requirements.txt` and every job
-resource (fixed and generated) at the repo root, named the shipped host config `es_host_primary`, and
+Earlier builds kept `notebooks/`, `pipeline_lib/`, `scripts/`, `tests/` and every job resource (fixed and
+generated) at the repo root, named the shipped host config `es_host_primary`, and
 listed the hosts for the `es_diagnostics` job inside its job file. To move an existing copy to this build:
 
 1. Replace those root folders with `framework/` from this build. `_pipelines/pipeline_configs/`,
