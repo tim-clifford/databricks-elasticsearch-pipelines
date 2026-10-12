@@ -1297,13 +1297,15 @@ listed the hosts for the `es_diagnostics` job inside its job file. To move an ex
    `framework/resources/*.yml` and `_pipelines/resources/*.yml` (the generator fails closed until both are
    listed and the old one is gone).
 3. Rename the host config `es_host_primary` to `es_host_default` everywhere you set it: its declaration
-   and each target's values in `databricks.yml`, `default_es_host_config`, any
-   `.databricks/bundle/<target>/variable-overrides.json`, and every pipeline config with
-   `es_host_config: es_host_primary`. (Or keep your own name: the shipped one is only a default.) Then
-   add the `es_host_configs_json` variable this build ships, with one entry per host config you declare
-   (see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). The
-   generator fails closed on a pipeline naming an undeclared host and on a map that doesn't match the
-   declared hosts, so nothing half-renamed deploys.
+   and each target's values in `databricks.yml`, the top-level `default_es_host_config` value, the host
+   config's key in any `.databricks/bundle/<target>/variable-overrides.json` (where only the host
+   values belong, never `default_es_host_config` or `es_host_configs_json`), and every pipeline config
+   with `es_host_config: es_host_primary`. (Or keep your own name: the shipped one is only a default.)
+   Then add the `es_host_configs_json` variable this build ships, with one entry per host config you
+   declare (see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)).
+   Within `databricks.yml` the generator fails closed on a pipeline naming an undeclared host, a stale
+   `default_es_host_config` and a map that doesn't match the declared hosts; it doesn't read
+   `variable-overrides.json`, so check that file yourself.
 4. Delete the old root `resources/` folder (the generator refuses to run while it exists; move a job of
    your own to `_pipelines/resources/`, where the generator leaves it alone) and run `python framework/scripts/gen_jobs.py`, which writes the per-index jobs into
    `_pipelines/resources/`, creating the folder if needed. (Generated files you moved there yourself are recognized
