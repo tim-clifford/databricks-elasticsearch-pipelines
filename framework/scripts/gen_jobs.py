@@ -300,11 +300,11 @@ def _reject_target_overrides(var: str, doc: dict, why: str, path: str | None = N
     environment variable in the generator's own environment is rejected too. (A --var or BUNDLE_VAR_<var>
     on the deploy side can't be seen here; the README says not to use either for these.)"""
     require_bundle_shape(doc)
-    targets = doc.get("targets", {})
+    targets = _block(doc, "targets", dict)
     overridden = [
         f"target {target}"
         for target, tspec in sorted(targets.items())
-        if var in (tspec or {}).get("variables", {})
+        if var in _block(tspec or {}, "variables", dict)
     ]
     # Next to the databricks.yml that was parsed (`path`, else the module's bundle file).
     if f"BUNDLE_VAR_{var}" in os.environ:
@@ -1123,24 +1123,31 @@ def existing_generated_files() -> list[str]:
 def require_bundle_shape(doc) -> None:
     """Fail closed at GENERATION unless the parts of databricks.yml the generator reads have the shapes it
     relies on: the file is a mapping; `include`, when present, a list of strings; `variables` a mapping;
-    `targets` a mapping whose every target is a mapping (or empty) with `variables`, when present, a
-    mapping. Checked once, up front, so the readers after it can rely on those shapes."""
+    `targets` a mapping whose every target is a mapping with `variables`, when present, a mapping. A key
+    present with no value (YAML null, e.g. a block whose entries are all commented out) counts as empty.
+    Checked once, up front, so the readers after it can rely on those shapes (via _block)."""
     if not isinstance(doc, dict):
         raise ValueError(f"databricks.yml must be a mapping, got {type(doc).__name__}")
-    include = doc.get("include", [])
+    include = _block(doc, "include", list)
     if not isinstance(include, list) or not all(isinstance(p, str) for p in include):
         raise ValueError("include (databricks.yml) must be a list of path globs")
-    if not isinstance(doc.get("variables", {}), dict):
+    if not isinstance(_block(doc, "variables", dict), dict):
         raise ValueError("variables (databricks.yml) must be a mapping of variable name -> declaration")
-    targets = doc.get("targets", {})
+    targets = _block(doc, "targets", dict)
     if not isinstance(targets, dict):
         raise ValueError(f"targets (databricks.yml) must be a mapping of target name -> settings, got "
                          f"{type(targets).__name__}")
     for name, tspec in targets.items():
         if tspec is not None and not isinstance(tspec, dict):
             raise ValueError(f"targets.{name} (databricks.yml) must be a mapping, got {type(tspec).__name__}")
-        if not isinstance((tspec or {}).get("variables", {}), dict):
+        if not isinstance(_block(tspec or {}, "variables", dict), dict):
             raise ValueError(f"targets.{name}.variables (databricks.yml) must be a mapping")
+
+
+def _block(mapping: dict, key: str, kind: type):
+    """mapping[key], with a missing key or a YAML null both read as an empty `kind` (list or dict)."""
+    value = mapping.get(key)
+    return kind() if value is None else value
 
 
 def old_root_resources_dir() -> str | None:
@@ -1168,7 +1175,7 @@ def require_bundle_includes(path: str | None = None, doc: dict | None = None) ->
     bundle_path = path if path is not None else _DATABRICKS_YML
     doc = doc if doc is not None else _read_bundle_doc(bundle_path)
     require_bundle_shape(doc)
-    include = doc.get("include", [])
+    include = _block(doc, "include", list)
     # Compare normalized globs, so an equivalent spelling like ./framework/resources/*.yml counts.
     normalized = [posixpath.normpath(p) for p in include]
     missing = [p for p in _REQUIRED_INCLUDES if p not in normalized]
@@ -1182,12 +1189,16 @@ def require_bundle_includes(path: str | None = None, doc: dict | None = None) ->
     bundle_root = os.path.dirname(bundle_path)
     for pattern in normalized:
         for file_path in sorted(glob.glob(os.path.join(bundle_root, pattern), recursive=True)):
+            if os.path.samefile(file_path, bundle_path):
+                continue  # a broad glob (e.g. *.yml) matching databricks.yml itself
             rel = os.path.relpath(file_path, bundle_root)
             try:
                 with open(file_path) as fh:
                     included = yaml.safe_load(fh)
             except (OSError, yaml.YAMLError) as exc:
                 raise ValueError(f"{rel} (included by databricks.yml): cannot read it as YAML ({exc})") from None
+            if included is None:
+                continue  # empty or comment-only: declares nothing
             if not isinstance(included, dict) or not set(included) <= _INCLUDED_FILE_KEYS:
                 keys = sorted(included) if isinstance(included, dict) else type(included).__name__
                 raise ValueError(

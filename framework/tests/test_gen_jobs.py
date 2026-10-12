@@ -1897,7 +1897,6 @@ def test_bundle_includes_accepted_with_extras():
         "framework/resources/*.yml", "_pipelines/resources/*.yml", "extra/*.yml"]})
     # Equivalent spellings of the required globs count.
     gen_jobs.require_bundle_includes(doc={"include": ["./framework/resources/*.yml", "_pipelines//resources/*.yml"]})
-    gen_jobs.require_bundle_includes()  # the shipped databricks.yml
 
 
 def test_benign_variable_overrides_json_allowed(tmp_path, monkeypatch):
@@ -2046,4 +2045,41 @@ def test_included_file_with_other_declarations_blocks_generation(tmp_path, monke
     _temp_tree(tmp_path, monkeypatch)
     (tmp_path / "_pipelines" / "resources" / "_custom.job.yml").write_text(content)
     with pytest.raises(ValueError, match=match):
+        gen_jobs.main(["--check"])
+
+
+def test_bundle_shape_null_blocks_read_as_empty():
+    # A key present with no value (YAML null, e.g. a block with every entry commented out) is valid.
+    gen_jobs.require_bundle_shape(yaml.safe_load("include:\nvariables:\ntargets:\n"))
+    gen_jobs.require_bundle_shape(yaml.safe_load("targets:\n  dev:\n    variables:\n  prd:\n"))
+    gen_jobs.require_default_es_host_config(
+        "es_host_default", {"es_host_default"}, yaml.safe_load("targets:\n  dev:\n    variables:\n"))
+
+
+@pytest.mark.parametrize("content", ["", "# a placeholder job file, all commented out\n"])
+def test_empty_included_file_is_allowed(tmp_path, monkeypatch, content):
+    resources_dir = _temp_tree(tmp_path, monkeypatch)
+    (resources_dir / "_placeholder.job.yml").write_text(content)
+    assert gen_jobs.main([]) == 0
+
+
+def test_broad_include_matching_databricks_yml_is_not_scanned_as_included(tmp_path, monkeypatch):
+    _temp_tree(tmp_path, monkeypatch)
+    dab_yml = tmp_path / "databricks.yml"
+    doc = yaml.safe_load(dab_yml.read_text())
+    doc["include"] = doc["include"] + ["*.yml"]
+    dab_yml.write_text(yaml.safe_dump(doc))
+    assert gen_jobs.main([]) == 0
+
+
+def test_override_scan_covers_a_null_bodied_target(tmp_path, monkeypatch):
+    _temp_tree(tmp_path, monkeypatch)
+    dab_yml = tmp_path / "databricks.yml"
+    doc = yaml.safe_load(dab_yml.read_text())
+    doc["targets"]["dev"] = None
+    dab_yml.write_text(yaml.safe_dump(doc))
+    overrides = tmp_path / ".databricks" / "bundle" / "dev" / "variable-overrides.json"
+    overrides.parent.mkdir(parents=True)
+    overrides.write_text(json.dumps({"default_es_host_config": "es_host_default"}))
+    with pytest.raises(ValueError, match="default_es_host_config is overridden in .databricks/bundle/dev/"):
         gen_jobs.main(["--check"])
