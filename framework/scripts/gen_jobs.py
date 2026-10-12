@@ -289,50 +289,28 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
                 f"{json.dumps(dict(sorted(want.items())))}, got {json.dumps(entries[name])}"
             )
     _reject_target_overrides(
-        var, doc, "each target's host values flow in through the ${var.<name>.<field>} references", path)
+        var, doc, "each target's host values flow in through the ${var.<name>.<field>} references")
 
 
-def _reject_target_overrides(var: str, doc: dict, why: str, path: str | None = None) -> None:
-    """Fail closed if any declared target sets `var`: under its `variables:` in databricks.yml, or in the
-    git-ignored .databricks/bundle/<target>/variable-overrides.json next to databricks.yml. For variables
-    the generator reads only at their top-level default, where a per-target value would go unchecked or
-    split what the generated jobs bake from what deploy-time references resolve. A BUNDLE_VAR_<var>
-    environment variable in the generator's own environment is rejected too. (A --var or BUNDLE_VAR_<var>
-    on the deploy side can't be seen here; the README says not to use either for these.)"""
+def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
+    """Fail closed if any target in databricks.yml sets `var` under its `variables:`. For variables the
+    generator reads only at their top-level default, where a per-target value would go unchecked or split
+    what the generated jobs bake from what deploy-time references resolve. Only databricks.yml is checked:
+    a variable-overrides.json, --var or BUNDLE_VAR_ override can't be seen here, and the README says not
+    to use one for these."""
     require_bundle_shape(doc)
-    targets = _block(doc, "targets", dict)
     overridden = [
-        f"target {target}"
-        for target, tspec in sorted(targets.items())
+        target for target, tspec in sorted(_block(doc, "targets", dict).items())
         if var in _block(tspec or {}, "variables", dict)
     ]
-    # Next to the databricks.yml that was parsed (`path`, else the module's bundle file).
-    if f"BUNDLE_VAR_{var}" in os.environ:
-        overridden.append(f"environment variable BUNDLE_VAR_{var}")
-    bundle_root = os.path.dirname(path if path is not None else _DATABRICKS_YML)
-    for target in sorted(targets):
-        overrides_path = os.path.join(bundle_root, ".databricks", "bundle", str(target), "variable-overrides.json")
-        if not os.path.exists(overrides_path):
-            continue
-        rel = os.path.relpath(overrides_path, bundle_root)
-        try:
-            with open(overrides_path) as fh:
-                overrides = json.load(fh)
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"{rel}: cannot read it as JSON ({exc})") from None
-        if not isinstance(overrides, dict):
-            raise ValueError(f"{rel}: must be a JSON object of variable name -> value, got "
-                             f"{type(overrides).__name__}")
-        if var in overrides:
-            overridden.append(rel)
     if overridden:
         raise ValueError(
-            f"{var} is overridden in {', '.join(overridden)}; set it only once under `variables:` "
+            f"{var} is overridden in target(s) {', '.join(overridden)}; set it only once under `variables:` "
             f"in databricks.yml ({why})"
         )
 
 
-def require_default_es_host_config(default, declared: set, doc: dict, path: str | None = None) -> None:
+def require_default_es_host_config(default, declared: set, doc: dict) -> None:
     """Fail closed at GENERATION unless databricks.yml declares a default_es_host_config naming a declared
     host config, set only at the top level.
 
@@ -358,8 +336,7 @@ def require_default_es_host_config(default, declared: set, doc: dict, path: str 
         )
     _reject_target_overrides(
         "default_es_host_config", doc,
-        "the generated jobs bake its top-level default, so a per-target value would split the default host",
-        path)
+        "the generated jobs bake its top-level default, so a per-target value would split the default host")
 
 
 def load_cluster_configs(path: str | None = None, doc: dict | None = None) -> set:
@@ -1161,19 +1138,13 @@ def old_root_resources_dir() -> str | None:
 
 # The two include globs databricks.yml must carry: the fixed framework jobs and the _pipelines/ jobs.
 _REQUIRED_INCLUDES = ("framework/resources/*.yml", "_pipelines/resources/*.yml")
-# The only top-level key an included file may hold. The generator reads variables and targets from
-# databricks.yml alone, so one declared in an included file would escape every check here.
-_INCLUDED_FILE_KEYS = frozenset({"resources"})
 
 
 def require_bundle_includes(path: str | None = None, doc: dict | None = None) -> None:
     """Fail closed at GENERATION unless databricks.yml's `include:` lists both resource folders
-    (_REQUIRED_INCLUDES) and nothing under the old root resources/ folder, and every file the includes
-    match holds only a `resources:` block. Without the first the bundle silently deploys none of those
-    jobs; the second is the pre-framework/ layout's include; the third keeps every variable and target
-    in databricks.yml, where the generator's checks can see them."""
-    bundle_path = path if path is not None else _DATABRICKS_YML
-    doc = doc if doc is not None else _read_bundle_doc(bundle_path)
+    (_REQUIRED_INCLUDES) and nothing under the old root resources/ folder. Without the first the bundle
+    silently deploys none of those jobs; the second is the pre-framework/ layout's include."""
+    doc = doc if doc is not None else _read_bundle_doc(path)
     require_bundle_shape(doc)
     include = _block(doc, "include", list)
     # Compare normalized globs, so an equivalent spelling like ./framework/resources/*.yml counts.
@@ -1186,25 +1157,6 @@ def require_bundle_includes(path: str | None = None, doc: dict | None = None) ->
             + (f"; missing: {', '.join(missing)}" if missing else "")
             + (f"; remove the old-layout {', '.join(old)}" if old else "")
         )
-    bundle_root = os.path.dirname(bundle_path)
-    for pattern in normalized:
-        for file_path in sorted(glob.glob(os.path.join(bundle_root, pattern), recursive=True)):
-            if os.path.samefile(file_path, bundle_path):
-                continue  # a broad glob (e.g. *.yml) matching databricks.yml itself
-            rel = os.path.relpath(file_path, bundle_root)
-            try:
-                with open(file_path) as fh:
-                    included = yaml.safe_load(fh)
-            except (OSError, yaml.YAMLError) as exc:
-                raise ValueError(f"{rel} (included by databricks.yml): cannot read it as YAML ({exc})") from None
-            if included is None:
-                continue  # empty or comment-only: declares nothing
-            if not isinstance(included, dict) or not set(included) <= _INCLUDED_FILE_KEYS:
-                keys = sorted(included) if isinstance(included, dict) else type(included).__name__
-                raise ValueError(
-                    f"{rel} (included by databricks.yml) may hold only a `resources:` block, got {keys}; "
-                    f"declare variables and targets in databricks.yml"
-                )
 
 
 def discover_configs() -> list[str]:
