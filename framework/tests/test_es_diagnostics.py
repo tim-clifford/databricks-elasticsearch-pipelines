@@ -547,3 +547,9 @@ def test_resolve_es_host_config_unresolved_reference_fails_closed(field):
     entry = dict(_HOSTS["es_host_default"], **{field: "${var.es_host_default." + field + "}"})
     with pytest.raises(ValueError, match=f"unresolved bundle reference in {field}"):
         resolve_es_host_config("es_host_default", {"es_host_default": entry})
+
+
+@pytest.mark.parametrize("entry", ["x", [], None, 3])
+def test_resolve_es_host_config_non_object_entry_fails_closed(entry):
+    with pytest.raises(ValueError, match="empty es_host_url"):
+        resolve_es_host_config("es_host_default", {"es_host_default": entry})

@@ -292,25 +292,33 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
 
 
 def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
-    """Fail closed if any target sets `var`: under its `variables:` in databricks.yml, or in a git-ignored
-    .databricks/bundle/<target>/variable-overrides.json next to it. For variables the generator reads only
-    at their top-level default, where a per-target value would go unchecked or split what the generated
-    jobs bake from what deploy-time references resolve. (A --var on the deploy command line can't be seen
-    here; the README says not to use one for these.)"""
+    """Fail closed if any declared target sets `var`: under its `variables:` in databricks.yml, or in the
+    git-ignored .databricks/bundle/<target>/variable-overrides.json next to databricks.yml. For variables
+    the generator reads only at their top-level default, where a per-target value would go unchecked or
+    split what the generated jobs bake from what deploy-time references resolve. (A --var on the deploy
+    command line can't be seen here; the README says not to use one for these.)"""
+    targets = doc.get("targets") or {}
     overridden = [
         f"target {target}"
-        for target, tspec in sorted((doc.get("targets") or {}).items())
+        for target, tspec in sorted(targets.items())
         if isinstance(tspec, dict) and var in (tspec.get("variables") or {})
     ]
-    pattern = os.path.join(_REPO_ROOT, ".databricks", "bundle", "*", "variable-overrides.json")
-    for path in sorted(glob.glob(pattern)):
+    bundle_root = os.path.dirname(_DATABRICKS_YML)
+    for target in sorted(targets):
+        path = os.path.join(bundle_root, ".databricks", "bundle", str(target), "variable-overrides.json")
+        if not os.path.exists(path):
+            continue
+        rel = os.path.relpath(path, bundle_root)
         try:
             with open(path) as fh:
                 overrides = json.load(fh)
         except (OSError, ValueError) as exc:
-            raise ValueError(f"{os.path.relpath(path, _REPO_ROOT)}: cannot read it as JSON ({exc})") from None
-        if isinstance(overrides, dict) and var in overrides:
-            overridden.append(os.path.relpath(path, _REPO_ROOT))
+            raise ValueError(f"{rel}: cannot read it as JSON ({exc})") from None
+        if not isinstance(overrides, dict):
+            raise ValueError(f"{rel}: must be a JSON object of variable name -> value, got "
+                             f"{type(overrides).__name__}")
+        if var in overrides:
+            overridden.append(rel)
     if overridden:
         raise ValueError(
             f"{var} is overridden in {', '.join(overridden)}; set it only once under `variables:` "
@@ -1105,15 +1113,35 @@ def existing_generated_files() -> list[str]:
     ]
 
 
-def legacy_root_generated_files() -> list[str]:
-    """Generated job files left in the repo-root resources/ folder, where the generator wrote before the
-    framework/ move. Left in place (with the old include line) they would deploy alongside the regenerated
-    copies under the same resource keys, so generation and --check refuse to run until they are removed."""
-    return [
-        path
-        for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "resources", "*.job.yml")))
-        if is_generated(path)
-    ]
+def legacy_root_job_files() -> list[str]:
+    """Job files left in the repo-root resources/ folder, where every job (fixed and generated) lived
+    before the framework/ move. Left in place with the old include line they would deploy beside the
+    framework/ and regenerated copies under the same resource keys, or deploy stale definitions, so
+    generation and --check refuse to run until they are removed (your own jobs belong in
+    _pipelines/resources/, where the generator leaves files without its marker alone)."""
+    return sorted(glob.glob(os.path.join(_REPO_ROOT, "resources", "*.yml")))
+
+
+# The two include globs databricks.yml must carry: the fixed framework jobs and the _pipelines/ jobs.
+_REQUIRED_INCLUDES = ("framework/resources/*.yml", "_pipelines/resources/*.yml")
+
+
+def require_bundle_includes(path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION unless databricks.yml's `include:` lists both resource folders
+    (_REQUIRED_INCLUDES) and nothing under the old root resources/ folder. Without the first the bundle
+    silently deploys none of those jobs; the second is the pre-framework/ layout's include."""
+    doc = doc if doc is not None else _read_bundle_doc(path)
+    include = doc.get("include") or []
+    if not isinstance(include, list) or not all(isinstance(p, str) for p in include):
+        raise ValueError("include (databricks.yml) must be a list of path globs")
+    missing = [p for p in _REQUIRED_INCLUDES if p not in include]
+    old = [p for p in include if p.startswith(("resources/", "./resources/"))]
+    if missing or old:
+        raise ValueError(
+            "include (databricks.yml) must list " + " and ".join(_REQUIRED_INCLUDES)
+            + (f"; missing: {', '.join(missing)}" if missing else "")
+            + (f"; remove the old-layout {', '.join(old)}" if old else "")
+        )
 
 
 def discover_configs() -> list[str]:
@@ -1151,13 +1179,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config_paths = discover_configs()
-    legacy = legacy_root_generated_files()
+    legacy = legacy_root_job_files()
     if legacy:
         print(
-            "generated job file(s) from the old layout are still in the root resources/ folder: "
+            "job file(s) from the old layout are still in the root resources/ folder: "
             + ", ".join(os.path.relpath(p, _REPO_ROOT) for p in legacy)
-            + "; delete that folder (the generator now writes to _pipelines/resources/) and replace the "
-            "`resources/*.yml` include in databricks.yml (see the README upgrade steps)",
+            + "; delete that folder (the fixed jobs now live in framework/resources/, generated ones in "
+            "_pipelines/resources/; move any job of your own to _pipelines/resources/) and see the README "
+            "upgrade steps",
             file=sys.stderr,
         )
         return 1
@@ -1168,6 +1197,7 @@ def main(argv: list[str] | None = None) -> int:
     # existing_cluster pipeline's cluster_config). require_job_name_prefix_declared fails closed if the
     # job_name_prefix variable is missing (every generated name references ${var.job_name_prefix}).
     bundle_doc = _read_bundle_doc()
+    require_bundle_includes(doc=bundle_doc)
     require_job_name_prefix_declared(doc=bundle_doc)
     require_support_email_declared(doc=bundle_doc)
     require_global_job_tags_declared(doc=bundle_doc)

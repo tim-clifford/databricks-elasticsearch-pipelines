@@ -253,7 +253,7 @@ defined "last" row. Ensure the column is unique across the input when you need a
 Each pipeline writes to one **host config**: a named group of the three connection settings the
 connector needs, declared once in `databricks.yml` and referenced by name from the pipeline
 (`es_host_config: <name>`). `es_host_config` is **optional**: a pipeline that omits it falls back to
-the bundle's `default_es_host_config` (a `databricks.yml` variable, `es_host_default` out of the box —
+the bundle's `default_es_host_config` (a `databricks.yml` variable, `es_host_default` out of the box;
 rename it or point it at your own default). A host config is:
 
 | Field | What it is |
@@ -909,7 +909,7 @@ databricks bundle run es_diagnostics -t <target> -p <profile> --params es_host_c
 
 It only issues `GET` requests (it never writes a document or reads the ES secret for anything but the
 `Authorization` header) and connects to the host config named by the `es_host_config` parameter (default:
-the bundle's `default_es_host_config`), the same endpoints and `api_key` secrets the pipelines use — so
+the bundle's `default_es_host_config`), the same endpoints and `api_key` secrets the pipelines use, so
 testing a different configured host is a `--params es_host_config=<name>`, not a YAML edit. The job carries
 every configured host's url + secret scope/key from the `es_host_configs_json` variable in `databricks.yml`
 (see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)), and the
@@ -1290,7 +1290,8 @@ listed the hosts for the `es_diagnostics` job inside its job file. To move an ex
 1. Replace those root folders with `framework/` from this build. `_pipelines/pipeline_configs/`,
    `_pipelines/pipeline_views/` and `_pipelines/job_cluster_configs/` carry over unchanged.
 2. In `databricks.yml`, replace the `resources/*.yml` include with the two lines this build ships:
-   `framework/resources/*.yml` and `_pipelines/resources/*.yml`.
+   `framework/resources/*.yml` and `_pipelines/resources/*.yml` (the generator fails closed until both are
+   listed and the old one is gone).
 3. Rename the host config `es_host_primary` to `es_host_default` everywhere you set it: its declaration
    and each target's values in `databricks.yml`, `default_es_host_config`, any
    `.databricks/bundle/<target>/variable-overrides.json`, and every pipeline config with
@@ -1299,8 +1300,8 @@ listed the hosts for the `es_diagnostics` job inside its job file. To move an ex
    (see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). The
    generator fails closed on a pipeline naming an undeclared host and on a map that doesn't match the
    declared hosts, so nothing half-renamed deploys.
-4. Delete the old root `resources/` folder (the generator refuses to run while generated files remain
-   there) and run `python framework/scripts/gen_jobs.py`, which writes the per-index jobs into
+4. Delete the old root `resources/` folder (the generator refuses to run while any job file remains
+   there; move a job of your own to `_pipelines/resources/`, where the generator leaves it alone) and run `python framework/scripts/gen_jobs.py`, which writes the per-index jobs into
    `_pipelines/resources/`, creating the folder if needed. (Generated files you moved there yourself are recognized
    and regenerated.) `--check` should then report every generated file up to date.
 5. Deploy. Job resource keys are unchanged, so each job is updated in place (same job id, same run
