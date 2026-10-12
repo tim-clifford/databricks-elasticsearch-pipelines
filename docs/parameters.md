@@ -417,8 +417,8 @@ same documents.
 
 Documents per bulk request. A positive integer. Connector default `500`.
 
-Larger chunks mean fewer, larger requests: each takes longer and a failure re-sends more. The client
-also caps a request by size, so documents that are large reach that cap before the count.
+Larger chunks mean fewer, larger requests: each takes longer and a failure re-sends more. A request
+also can't hold more rows than one Spark Arrow batch, so beyond that size raising it changes nothing.
 See [Throughput Tuning](throughput.md#chunk_size).
 
 ### `write_concurrency`
