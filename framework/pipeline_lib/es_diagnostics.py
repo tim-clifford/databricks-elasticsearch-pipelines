@@ -132,7 +132,10 @@ def resolve_es_host_config(name, configs):
     if name not in configs:
         available = ", ".join(sorted(configs)) if configs else "(none configured)"
         raise ValueError(f"unknown es_host_config {name!r}; configured host configs: {available}")
-    entry = configs[name] if isinstance(configs.get(name), dict) else {}
+    entry = configs[name]
+    if not isinstance(entry, dict):
+        raise ValueError(f"es_host_config {name!r} must be a JSON object of es_host_url / secret_scope_name / "
+                         f"secret_key_name, got {type(entry).__name__}")
     for field in ("es_host_url", "secret_scope_name", "secret_key_name"):
         if entry.get(field) is not None and not isinstance(entry[field], str):
             raise ValueError(f"es_host_config {name!r} field {field} must be a string, got "

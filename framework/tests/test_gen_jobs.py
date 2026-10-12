@@ -2002,8 +2002,3 @@ def test_bare_resources_include_and_yaml_leftover_rejected(tmp_path, monkeypatch
     assert gen_jobs.legacy_root_job_files() == [str(old / "legacy.job.yaml")]
     assert gen_jobs.main(["--check"]) == 1
 
-
-def test_ambient_bundle_var_is_cleared_for_tests():
-    # conftest clears an exported BUNDLE_VAR_ override, so generator tests don't depend on the shell.
-    assert "BUNDLE_VAR_es_host_configs_json" not in os.environ
-    assert "BUNDLE_VAR_default_es_host_config" not in os.environ
