@@ -966,18 +966,20 @@ describing it (`DESCRIBE TABLE <table>` or Catalog Explorer shows them), defined
 | `docs_written` | documents written by the batch (`batch_end`) or the whole run (`run_end`) |
 | `error_type`, `error_message` | the exception on status `error` rows |
 | `files_outstanding`, `bytes_outstanding` | `batch_summary` only: the streaming backlog left after the batch (Spark's `numFilesOutstanding` / `numBytesOutstanding`) |
+| `source_latest_version`, `source_latest_ts` | streaming `batch_start` and `batch_summary`: the source table's newest commit version, and its commit time, read at batch start (see [Caught up or behind](#caught-up-or-behind)) |
+| `source_end_version`, `source_end_index` | `batch_summary` only: where the batch ended in the source, from Spark's end offset (`reservoirVersion`, `index`) |
 | `payload` | `VARIANT`: everything else the row records |
 | `logged_ts` | when the row was committed to the table (retention is on this) |
 
-The surfaced columns (`docs_written` through `bytes_outstanding`) are copies of payload fields, NULL on the
+The surfaced columns (`docs_written` through `source_end_index`) are copies of payload fields, NULL on the
 rows they don't apply to. There are two levels, each with a start and an end:
 
 | `record_type` | When it is written | `status` | `payload` |
 |---|---|---|---|
 | `run_start` | once per run, before anything else | `started` | mode, es_index, view, source, trigger, connector version, effective write settings |
-| `batch_start` | immediately **before** a batch's data is sent to ES | `started` | mode |
+| `batch_start` | immediately **before** a batch's data is sent to ES | `started` | mode; streaming with the log on also `source_latest` (`version`, `timestamp`, or `error` when the read failed) |
 | `batch_end` | when the batch's write finishes | `success` / `error` | ES counts (`written`, `errors`, ...) plus `es`, the write diagnostics (`collect_ms`, `bulk_write_wall_ms`, and with `bulk_stats` on the `overall` totals and `tail` straggler facts); on error `exception_type` / `message` / `elapsed_ms` (plus the counts when the write returned) |
-| `batch_summary` | streaming only: when the notebook sees Spark's progress report for the batch | `success` | `progress`: Spark's whole `StreamingQueryProgress` (backlog, step durations, rates, source offsets) |
+| `batch_summary` | streaming only: when the notebook sees Spark's progress report for the batch | `success` | `progress`: Spark's whole `StreamingQueryProgress` (backlog, step durations, rates, source offsets); `source_latest` relayed from the batch's `batch_start` (absent if the relay was lost) |
 | `run_end` | when the run ends in-process | `success` / `error` / `stopped` | totals (batches, rows) or the error |
 
 A **batch-mode** run is exactly one batch (`batch_id` 0); a **streaming** run has one set of batch rows per
@@ -991,7 +993,10 @@ later, best-effort by nature. A `batch_end` with no `batch_summary` is a streami
 **job cancel is not that**: it interrupts the notebook itself (seen live), so a cancelled run leaves
 `run_start` with no `run_end`, exactly like a killed run.
 `start_ts`/`end_ts` carry the run's or batch's wall clock (for `batch_summary`, Spark's trigger
-timestamp + `batchDuration`).
+timestamp + `batchDuration`). Every timestamp column holds a UTC instant whatever the session time zone.
+Builds before the `source_*` columns read the writer's UTC strings in the Spark session time zone, so on a
+cluster whose `spark.sql.session.timeZone` was not UTC (the Databricks default is UTC) rows logged by those
+builds are shifted by that zone's offset relative to newer rows.
 
 **Reading the gaps.** A `batch_start` with no `batch_end` is a batch that never finished (the task was
 killed, or the driver died mid-write); a `run_start` with no `run_end` is a run that was killed
@@ -1048,6 +1053,64 @@ LEFT JOIN <catalog>.<schema>.<table> s
  AND s.batch_id = e.batch_id
 WHERE e.record_type = 'batch_end' AND e.status = 'success'
 ORDER BY e.start_ts DESC;
+```
+
+<a id="caught-up-or-behind"></a>**Caught up or behind.** `files_outstanding` / `bytes_outstanding` at zero
+means caught up, but a non-zero backlog is ambiguous: Spark measures it **after** the batch, against the table
+as it is then, so files that landed while the batch ran count too. Spark's own `latestOffset` would settle it,
+but the Delta source always reports it as null (seen live on DBR 17.3). So each streaming batch reads the
+source's newest commit at its start (`source_latest_version`), and `batch_summary` carries both that and where
+the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** (it left files that were
+already there for the next batch) when
+
+```text
+source_latest_version >= source_end_version AND files_outstanding > 0
+```
+
+and otherwise it was caught up (anything outstanding arrived while it ran). How to read the end offset: with
+`source_end_index = -1` every source version **below** `source_end_version` was sent (five commits v1 to v5
+end at version 6, index -1); with an index of 0 or more the batch stopped inside version `source_end_version`
+after that file (a cap that split one large commit), which the `>=` also counts as behind. A fully sent version is always
+reported as the next version with index -1, including an initial snapshot that a cap ends on exactly (seen in
+every case on DBR 17.3; Delta never writes its internal end-of-version index into an offset). Commits the reader
+sends nothing for (table maintenance such as OPTIMIZE, VACUUM and property changes, and the UPDATE / DELETE
+commits `skipChangeCommits` skips) do not read as behind: the Delta source moves its end offset past them,
+before or during a batch (a commit during a batch gets a 0-row batch of its own), and their files add nothing
+to `files_outstanding` (all proven live on DBR 17.3, as is the initial snapshot of `streaming_start: full`).
+**Where it misreads (always toward behind, and the next batch corrects it):** the newest version is read
+when the batch starts running, after Spark planned it. Commits landing between the two count as available, so
+if one carries data, or carries none while other data arrives during the batch (`files_outstanding > 0`), a
+caught-up batch reads as behind. Normally that gap is sub-second. It is longer for a batch **replayed after a
+restart**: Spark re-runs the last planned, uncommitted batch with its original end offset, but the read happens
+at replay time, so anything committed during the downtime counts. A replay shows as a second `batch_start` for
+the same `batch_id` (under the new attempt's `task_run_id`). A NULL `source_latest_version` (the read failed, or the relay to
+`batch_summary` was lost; `batch_start` still has it) leaves the batch unclassified.
+
+**Upgrading an existing log table:** re-run `_log table create` **before** deploying a build with these
+four columns (the "Adding a column later" step below); it adds them in place. A build that
+writes them to a table without them fails its first append (`run_start`), before any data moves.
+
+Cost: two steps per batch, both inside the batch before its checkpoint commits, about 1.6 s per batch at the
+median (live probes on DBR 17.3, standard-mode job cluster): the `DESCRIBE HISTORY <source> LIMIT 1` read before
+the data is sent (median 0.7 s, first call on a cluster about 3.7 s) and the relay write that hands the value to
+`batch_summary`, one small text write to the checkpoint Volume after `batch_end` (median 0.9 s, p90 1.1 s, first
+write about 10 s). Both run only for streaming with the log on. There is no knob to skip them with the log on; one
+could be added by gating `read_source_latest` in `run_index_pipeline.py` (the code already handles a batch
+without it, and then writes no relay).
+
+Example: caught up or behind per streaming batch, from `batch_summary` alone:
+
+```sql
+SELECT config_name, batch_id, start_ts, files_outstanding, source_latest_version, source_end_version,
+       source_end_index,
+       CASE WHEN files_outstanding = 0 THEN 'caught_up'
+            WHEN files_outstanding IS NULL OR source_latest_version IS NULL OR source_end_version IS NULL
+              THEN 'unknown'
+            WHEN source_latest_version >= source_end_version THEN 'behind'
+            ELSE 'caught_up' END AS backlog_state
+FROM <catalog>.<schema>.<table>
+WHERE record_type = 'batch_summary' AND event_ts > current_timestamp() - INTERVAL 1 DAY
+ORDER BY config_name, batch_id DESC;
 ```
 
 The table is **liquid-clustered** on `(config_name, event_ts)` (the columns monitoring queries filter by),

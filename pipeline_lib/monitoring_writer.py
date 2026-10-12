@@ -77,7 +77,8 @@ class MonitoringLog:
 
 def spark_append(table, rows, session):
     """The Spark write behind MonitoringLog on a cluster: build a DataFrame from `rows` (payload and timestamps
-    as strings), parse the payload to VARIANT, cast the timestamps, stamp logged_ts = current_timestamp() (the
+    as strings), parse the payload to VARIANT, cast the timestamps (the builders' strings are UTC with no offset,
+    so a `Z` is appended first: a plain cast would read them in the session time zone), stamp logged_ts = current_timestamp() (the
     write time), and append BY NAME via writeTo().append(), so the table's physical column order does not
     matter (a column added to an existing table later sits last).
     The DataFrame schema is derived from MONITORING_TABLE_COLUMNS (spark_row_schema), never re-typed. Raises on
@@ -89,12 +90,22 @@ def spark_append(table, rows, session):
     for name, sql_type, _comment in MONITORING_TABLE_COLUMNS:
         if name not in ROW_FIELDS:
             continue
-        if sql_type == "TIMESTAMP":
-            df = df.withColumn(name, F.col(name).cast("timestamp"))
-        elif sql_type == "VARIANT":
-            df = df.withColumn(name, F.expr(f"parse_json({name})"))
+        cast = column_cast_sql(name, sql_type)
+        if cast is not None:
+            df = df.withColumn(name, F.expr(cast))
     df = df.withColumn("logged_ts", F.current_timestamp())
     df.writeTo(table).append()
+
+
+def column_cast_sql(name, sql_type):
+    """The SQL expression spark_append applies to a builder column, or None when the column is used as built. A
+    TIMESTAMP string (UTC, no offset) gets a `Z` before the cast, so the session time zone cannot shift it; a
+    VARIANT string is parsed. Pure, so the cast is unit-tested; spark_append itself is proven live."""
+    if sql_type == "TIMESTAMP":
+        return f"CAST(concat({name}, 'Z') AS TIMESTAMP)"
+    if sql_type == "VARIANT":
+        return f"parse_json({name})"
+    return None
 
 
 def spark_row_schema():

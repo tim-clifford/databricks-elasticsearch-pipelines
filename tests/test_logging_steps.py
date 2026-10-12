@@ -514,3 +514,307 @@ def test_spark_row_schema_matches_row_fields_and_types():
     assert types["batch_id"] == types["docs_written"] == types["files_outstanding"] == "bigint"
     assert types["start_ts"] == types["event_ts"] == types["payload"] == "string"  # cast by spark_append
     assert "logged_ts" not in types  # stamped by the writer
+
+
+# --- source position: newest source version read at batch start, relayed to batch_summary ---------
+
+LATEST = (9, datetime(2026, 10, 9, 18, 46, 31, tzinfo=timezone.utc))
+LATEST_FACTS = {"version": 9, "timestamp": "2026-10-09T18:46:31.000000"}
+
+
+def _fb_src(ev, read=None, relay=None, log=None, bulk_write=None, printed=None):
+    def default_read(session):
+        assert session == "SESSION"
+        ev.items.append(("read_latest",))
+        return LATEST
+
+    def default_relay(session, batch_id, facts):
+        ev.items.append(("source_relay", batch_id, facts))
+
+    def default_write(df, cfg, raise_on_error):
+        ev.items.append(("send", df))
+        return dict(RESULT)
+
+    return make_foreach_batch(
+        transform=lambda batch_df, session: ev.items.append(("transform",)) or "T",
+        bulk_write=bulk_write or default_write, write_config=WriteConfig(), log=log or make_log(ev),
+        config_name="cfg", job_run_id="run1", write_metrics=lambda s, b, w: ev.items.append(("metrics",)),
+        read_source_latest=default_read if read is None else read,
+        write_source_relay=default_relay if relay is None else relay,
+        printer=(printed.append if printed is not None else (lambda *_: None)), clock=Clock())
+
+
+def test_foreach_batch_reads_the_newest_version_first_and_records_it_on_batch_start():
+    ev = Events()
+    _fb_src(ev)(FakeBatchDF(), 4)
+    assert ev.types() == ["read_latest", "transform", "batch_start", "send", "metrics", "batch_end", "source_relay"]
+    start, = rows_of(ev, "batch_start")
+    assert json.loads(start["payload"]) == {"mode": "streaming", "source_latest": LATEST_FACTS}
+    assert start["source_latest_version"] == 9
+    assert ev.items[-1] == ("source_relay", 4, LATEST_FACTS)
+
+
+def test_foreach_batch_read_failure_is_recorded_not_raised():
+    ev = Events()
+    printed = []
+
+    def bad_read(session):
+        raise OSError("history unavailable")
+    _fb_src(ev, read=bad_read, printed=printed)(FakeBatchDF(), 2)
+    start, = rows_of(ev, "batch_start")
+    assert json.loads(start["payload"])["source_latest"] == {"error": "OSError: history unavailable"}
+    assert start["source_latest_version"] is None
+    assert rows_of(ev, "batch_end")[0]["status"] == "success"
+    assert ev.items[-1] == ("source_relay", 2, {"error": "OSError: history unavailable"})
+    assert any("could not read the newest source version" in p for p in printed)
+
+
+def test_foreach_batch_unusable_version_is_recorded_as_an_error():
+    ev = Events()
+    _fb_src(ev, read=lambda session: (None, LATEST[1]))(FakeBatchDF(), 2)
+    facts = json.loads(rows_of(ev, "batch_start")[0]["payload"])["source_latest"]
+    assert set(facts) == {"error"} and facts["error"].startswith("ValueError: source version")
+
+
+def test_foreach_batch_read_error_message_is_capped():
+    ev = Events()
+
+    def bad_read(session):
+        raise RuntimeError("x" * 5000)
+    _fb_src(ev, read=bad_read)(FakeBatchDF(), 2)
+    facts = json.loads(rows_of(ev, "batch_start")[0]["payload"])["source_latest"]
+    assert len(facts["error"]) <= 1000
+
+
+def test_foreach_batch_source_relay_failure_is_swallowed_warns_and_the_print_relay_still_runs():
+    ev = Events()
+    printed = []
+
+    def bad_relay(session, batch_id, facts):
+        raise OSError("volume blip")
+    fb = make_foreach_batch(
+        transform=lambda b, s: "T", bulk_write=lambda df, cfg, raise_on_error: dict(RESULT, bulk_stats=[{}]),
+        write_config=WriteConfig(), log=make_log(ev), config_name="cfg", job_run_id="run1",
+        write_metrics=lambda s, b, w: None, read_source_latest=lambda s: LATEST, write_source_relay=bad_relay,
+        write_print_relay=lambda s, b, text: ev.items.append(("relay", b, text)),
+        printer=printed.append, clock=Clock())
+    fb(FakeBatchDF(), 3)  # does not raise
+    assert rows_of(ev, "batch_end")[0]["status"] == "success"
+    assert any("could not relay batch 3's source version" in p for p in printed)
+    assert [e[:2] for e in ev.items if e[0] == "relay"] == [("relay", 3)]
+
+
+def test_foreach_batch_no_source_relay_when_the_batch_fails():
+    ev = Events()
+
+    def failing_write(df, cfg, raise_on_error):
+        raise ConnectionError("ES down")
+    with pytest.raises(ConnectionError):
+        _fb_src(ev, bulk_write=failing_write)(FakeBatchDF(), 5)
+    assert "source_relay" not in ev.types()
+
+
+def test_foreach_batch_skips_the_read_and_relay_when_the_log_is_off():
+    ev = Events()
+    _fb_src(ev, log=MonitoringLog("", lambda *a: None))(FakeBatchDF(), 8)
+    assert "read_latest" not in ev.types() and "source_relay" not in ev.types()
+
+
+def test_foreach_batch_without_a_reader_keeps_the_old_batch_start_payload():
+    ev = Events()
+    _fb(ev)(FakeBatchDF(), 1)
+    assert json.loads(rows_of(ev, "batch_start")[0]["payload"]) == {"mode": "streaming"}
+
+
+def test_progress_recorder_adds_the_relayed_source_version_to_batch_summary():
+    ev = Events()
+    asked = []
+    rep = dict(report(5), sources=[{"endOffset": json.dumps({"reservoirVersion": 10, "index": -1})}])
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked.append(bid) or LATEST_FACTS)
+    rec(FakeQuery([[rep]]))
+    row, = rows_of(ev, "batch_summary")
+    assert asked == [5]
+    assert (row["source_latest_version"], row["source_end_version"], row["source_end_index"]) == (9, 10, -1)
+
+
+def test_progress_recorder_without_a_relayed_version_still_records_the_summary():
+    ev = Events()
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: None)
+    rec(FakeQuery([[report(0)]]))
+    row, = rows_of(ev, "batch_summary")
+    assert row["source_latest_version"] is None and "source_latest" not in json.loads(row["payload"])
+
+
+def test_progress_recorder_does_not_read_the_source_relay_when_the_log_is_off():
+    asked = []
+    rec = ProgressRecorder(MonitoringLog("", lambda *a: None), "cfg", "", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked.append(bid))
+    rec(FakeQuery([[report(0)]]))
+    assert asked == [] and rec.last_batch_id == 0
+
+
+def test_progress_recorder_prunes_relays_once_when_reports_were_lost():
+    ev = Events()
+    pruned, asked = [], []
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None,
+                           read_source_relay=lambda bid: asked.append(bid) or LATEST_FACTS, prune_relays=pruned.append)
+    q = FakeQuery([[report(0)], [report(1)], [report(4)]])  # the reports of batches 2 and 3 were lost
+    rec(q)
+    rec(q)
+    assert pruned == [0]  # the first recorded batch; then consecutive ids, nothing was skipped
+    rec(q)
+    assert pruned == [0, 4] and asked == [0, 1, 4]
+    assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 1, 4]
+
+
+def test_progress_recorder_first_report_prunes_below_it_once():
+    pruned = []
+    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
+                           prune_relays=pruned.append)
+    q = FakeQuery([[report(500)], [report(500), report(501)]])
+    rec(q)  # run start cleared the relay dirs, so anything below the first recorded id was a lost report
+    rec(q)
+    assert pruned == [500]
+
+
+def test_progress_recorder_prune_failure_only_warns_and_still_records():
+    ev = Events()
+    printed = []
+
+    def bad_prune(below):
+        raise OSError("volume blip")
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=printed.append,
+                           prune_relays=bad_prune)
+    q = FakeQuery([[report(0)], [report(3)]])
+    rec(q)
+    rec(q)
+    assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 3] and rec.last_batch_id == 3
+    assert any("could not prune relays below batch 3" in p for p in printed)
+
+
+def test_progress_recorder_without_a_pruner_tolerates_a_gap():
+    ev = Events()
+    rec = ProgressRecorder(make_log(ev), "cfg", "run1", session=None, printer=lambda *_: None)
+    q = FakeQuery([[report(0)], [report(3)]])
+    rec(q)
+    rec(q)
+    assert [r["batch_id"] for r in rows_of(ev, "batch_summary")] == [0, 3]
+
+
+class FileInfo:
+    def __init__(self, path):
+        self.path = path
+        self.name = path.rstrip("/").rsplit("/", 1)[-1] + ("/" if path.endswith("/") else "")
+
+
+def test_prune_relay_dirs_deletes_only_numeric_entries_below_the_batch():
+    from pipeline_lib.stream_progress import prune_relay_dirs
+    listing = {"/r/a": [FileInfo("/r/a/1/"), FileInfo("/r/a/2/"), FileInfo("/r/a/3/"), FileInfo("/r/a/x/")],
+               "/r/b": [FileInfo("/r/b/0/"), FileInfo("/r/b/12/")]}
+    removed = []
+    prune_relay_dirs(("/r/a", "/r/b"), 3, ls=lambda d: listing[d], rm=removed.append)
+    assert removed == ["/r/a/1/", "/r/a/2/", "/r/b/0/"]
+
+
+def test_prune_relay_dirs_skips_a_missing_dir_and_a_failed_delete():
+    from pipeline_lib.stream_progress import prune_relay_dirs
+    removed = []
+
+    def ls(d):
+        if d == "/missing":
+            raise FileNotFoundError(d)
+        return [FileInfo("/r/1/"), FileInfo("/r/2/")]
+
+    def rm(path):
+        if path == "/r/1/":
+            raise OSError("blip")
+        removed.append(path)
+    prune_relay_dirs(("/missing", "/r"), 5, ls=ls, rm=rm)  # does not raise
+    assert removed == ["/r/2/"]
+
+
+def test_foreach_batch_reads_without_a_relay_writer():
+    ev = Events()
+    printed = []
+    fb = make_foreach_batch(
+        transform=lambda b, s: "T", bulk_write=lambda df, cfg, raise_on_error: dict(RESULT),
+        write_config=WriteConfig(), log=make_log(ev), config_name="cfg", job_run_id="run1",
+        write_metrics=lambda s, b, w: None, read_source_latest=lambda s: LATEST, write_source_relay=None,
+        printer=printed.append, clock=Clock())
+    fb(FakeBatchDF(), 2)
+    assert json.loads(rows_of(ev, "batch_start")[0]["payload"])["source_latest"] == LATEST_FACTS
+    assert rows_of(ev, "batch_end")[0]["status"] == "success"
+    assert not any("could not relay" in p for p in printed)
+
+
+def test_prune_relay_dirs_skips_non_ascii_digit_names():
+    from pipeline_lib.stream_progress import prune_relay_dirs
+    removed = []
+    entries = [FileInfo("/r/²/"), FileInfo("/r/٣/"), FileInfo("/r/1/")]
+    prune_relay_dirs(("/r",), 5, ls=lambda d: entries, rm=removed.append)
+    assert removed == ["/r/1/"]
+
+
+@pytest.mark.parametrize("line", [None, "", "not json", "[1]", "9", '"s"', "null", "{", "[" * 200000])
+def test_parse_source_relay_rejects_anything_but_a_json_object(line):
+    from pipeline_lib.stream_progress import parse_source_relay
+    assert parse_source_relay(line) is None
+
+
+def test_parse_source_relay_round_trips_the_facts():
+    from pipeline_lib.stream_progress import parse_source_relay
+    assert parse_source_relay(json.dumps(LATEST_FACTS)) == LATEST_FACTS
+    assert parse_source_relay('{"error": "OSError: blip"}') == {"error": "OSError: blip"}
+
+
+def test_writer_casts_every_timestamp_column_as_utc_and_parses_the_payload():
+    from pipeline_lib.monitoring_sink import MONITORING_TABLE_COLUMNS, ROW_FIELDS
+    from pipeline_lib.monitoring_writer import column_cast_sql
+    types = {name: sql_type for name, sql_type, _c in MONITORING_TABLE_COLUMNS}
+    casts = {name: column_cast_sql(name, types[name]) for name in ROW_FIELDS}
+    timestamps = [n for n in ROW_FIELDS if types[n] == "TIMESTAMP"]
+    assert timestamps == ["event_ts", "start_ts", "end_ts", "source_latest_ts"]
+    for name in timestamps:
+        # The builders' strings are UTC with no offset: the Z makes the cast independent of the session time zone.
+        assert casts[name] == f"CAST(concat({name}, 'Z') AS TIMESTAMP)"
+    assert casts["payload"] == "parse_json(payload)"
+    assert all(casts[n] is None for n in ROW_FIELDS if types[n] not in ("TIMESTAMP", "VARIANT"))
+
+
+def test_source_latest_from_row_converts_epoch_micros_to_utc():
+    from pipeline_lib.monitoring_sink import source_latest_facts
+    from pipeline_lib.stream_batch import source_latest_from_row
+    version, ts = source_latest_from_row({"version": 9, "ts_us": 1791571591250000})
+    assert (version, ts) == (9, datetime(2026, 10, 9, 18, 46, 31, 250000, tzinfo=timezone.utc))
+    assert source_latest_facts(version, ts)["timestamp"] == "2026-10-09T18:46:31.250000"
+
+
+@pytest.mark.parametrize("row", [{"version": 9}, {"ts_us": 1}, {"version": 9, "ts_us": None}, {"version": 9, "ts_us": "1"},
+                                 {"version": 9, "ts_us": True}, {"version": 9, "ts_us": 1.5}])
+def test_source_latest_from_row_rejects_a_row_without_usable_fields(row):
+    from pipeline_lib.stream_batch import source_latest_from_row
+    with pytest.raises((KeyError, TypeError, ValueError)):
+        source_latest_from_row(row)
+
+
+def test_progress_recorder_also_prunes_periodically():
+    from pipeline_lib.stream_progress import PRUNE_EVERY_RECORDED_BATCHES
+    pruned = []
+    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
+                           prune_relays=pruned.append)
+    n = 2 * PRUNE_EVERY_RECORDED_BATCHES + 1
+    for bid in range(n):  # consecutive ids: no gap
+        rec(FakeQuery([[report(bid)]]))
+    assert pruned == [0, PRUNE_EVERY_RECORDED_BATCHES, 2 * PRUNE_EVERY_RECORDED_BATCHES]
+
+
+def test_progress_recorder_periodic_interval_restarts_after_a_gap_prune():
+    from pipeline_lib.stream_progress import PRUNE_EVERY_RECORDED_BATCHES as N
+    pruned = []
+    rec = ProgressRecorder(make_log(Events()), "cfg", "run1", session=None, printer=lambda *_: None,
+                           prune_relays=pruned.append)
+    for bid in list(range(10)) + list(range(20, 20 + N + 1)):  # a gap from 9 to 20
+        rec(FakeQuery([[report(bid)]]))
+    assert pruned == [0, 20, 20 + N]
