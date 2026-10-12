@@ -2002,3 +2002,9 @@ def test_bare_resources_include_and_yaml_leftover_rejected(tmp_path, monkeypatch
     assert gen_jobs.legacy_root_job_files() == [str(old / "legacy.job.yaml")]
     assert gen_jobs.main(["--check"]) == 1
 
+
+
+@pytest.mark.parametrize("targets", [["dev"], "dev"])
+def test_malformed_targets_fails_closed(targets):
+    with pytest.raises(ValueError, match="targets \\(databricks.yml\\) must be a mapping"):
+        gen_jobs.require_default_es_host_config("es_host_default", {"es_host_default"}, {"targets": targets})

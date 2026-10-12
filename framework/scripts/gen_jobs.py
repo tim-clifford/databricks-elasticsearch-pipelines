@@ -300,6 +300,9 @@ def _reject_target_overrides(var: str, doc: dict, why: str, path: str | None = N
     environment variable in the generator's own environment is rejected too. (A --var or BUNDLE_VAR_<var>
     on the deploy side can't be seen here; the README says not to use either for these.)"""
     targets = doc.get("targets") or {}
+    if not isinstance(targets, dict):
+        raise ValueError(f"targets (databricks.yml) must be a mapping of target name -> settings, got "
+                         f"{type(targets).__name__}")
     overridden = [
         f"target {target}"
         for target, tspec in sorted(targets.items())
