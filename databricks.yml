@@ -162,8 +162,9 @@ variables:
   #
   # To ADD another host config (e.g. a second cluster for some pipelines): declare another complex
   # variable here with the same three empty-default fields, give it per-target values under each target
-  # below, and point a pipeline at it with `es_host_config: <that name>`. See the commented
-  # `es_host_secondary` example here and in the dev target below.
+  # below, add its entry to es_host_configs_json (just below), and point a pipeline at it with
+  # `es_host_config: <that name>`. See the commented `es_host_secondary` example here and in the dev
+  # target below.
   es_host_primary:
     type: complex
     description: "ES host config 'es_host_primary': endpoint + secret scope/key. Per-target values under targets.<env>.variables."
@@ -179,13 +180,29 @@ variables:
   #     secret_scope_name: ""
   #     secret_key_name: ""
 
+  # Every host config above, as one JSON object the `_es diagnostics` job carries to its notebook so a
+  # run can pick any host by name (es_host_config). One entry per es_host_* variable, each field the
+  # reference ${var.<name>.<field>}: the references resolve per target at deploy, so set this ONCE here
+  # and never per target. framework/scripts/gen_jobs.py fails closed unless the entries match the declared
+  # host configs exactly. To add es_host_secondary, append its entry inside the outer braces:
+  #   , "es_host_secondary": {"es_host_url": "${var.es_host_secondary.es_host_url}",
+  #   "secret_scope_name": "${var.es_host_secondary.secret_scope_name}",
+  #   "secret_key_name": "${var.es_host_secondary.secret_key_name}"}
+  es_host_configs_json:
+    description: "JSON map of every es_host_* host config (name -> ${var.<name>.<field>} references) for the _es diagnostics job. Set once here, never per target; gen_jobs checks it against the declared host configs."
+    default: >-
+      {"es_host_primary": {"es_host_url": "${var.es_host_primary.es_host_url}",
+      "secret_scope_name": "${var.es_host_primary.secret_scope_name}",
+      "secret_key_name": "${var.es_host_primary.secret_key_name}"}}
+
   # The host config a pipeline uses when it OMITS es_host_config. Its value must name one of the
   # es_host_* complex variables above. framework/scripts/gen_jobs.py reads THIS variable's `default:` at GENERATION
   # time to resolve an omitted es_host_config, so only the value set here applies - per-target or --var
   # overrides of default_es_host_config are NOT seen by the generator (the default host-config NAME is a
   # repo-level choice; its per-environment VALUES still live on the host config itself, above). Rename it
   # or point it at your own default host config; a pipeline that omits es_host_config AND has no default
-  # declared here fails closed at generation.
+  # declared here fails closed at generation. The `_es diagnostics` job also uses it, as the default of its
+  # es_host_config parameter (resolved at deploy), so keep it set only here so both agree.
   default_es_host_config:
     description: "Host config a pipeline uses when it omits es_host_config (must name an es_host_* complex variable). Read at generation time."
     default: es_host_primary

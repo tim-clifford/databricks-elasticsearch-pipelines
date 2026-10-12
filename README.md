@@ -295,9 +295,29 @@ targets:
 A pipeline whose host config is left empty for the target it deploys to **fails closed** at run
 (`missing required parameter: es_host_url`) rather than writing nowhere.
 
-**To add another host config** (e.g. to route some pipelines to a second cluster): declare a second
-complex variable (`es_host_secondary`, same three fields), give it per-target values, and point a
-pipeline at it with `es_host_config: es_host_secondary`. A pipeline referencing a host config that
+**To add another host config** (e.g. to route some pipelines to a second cluster), all in `databricks.yml`:
+
+1. Declare a second complex variable (`es_host_secondary`, same three fields) and give it per-target values.
+2. Add its entry to `es_host_configs_json`, the variable just below the host configs. It lists every
+   host config for the `es_diagnostics` job (see
+   [Diagnosing a congested Elasticsearch host](#diagnosing-a-congested-elasticsearch-host)); the entry is
+   the three fields as references (the commented example in `databricks.yml` shows it):
+   ```yaml
+   es_host_configs_json:
+     default: >-
+       {"es_host_primary": {"es_host_url": "${var.es_host_primary.es_host_url}",
+       "secret_scope_name": "${var.es_host_primary.secret_scope_name}",
+       "secret_key_name": "${var.es_host_primary.secret_key_name}"},
+       "es_host_secondary": {"es_host_url": "${var.es_host_secondary.es_host_url}",
+       "secret_scope_name": "${var.es_host_secondary.secret_scope_name}",
+       "secret_key_name": "${var.es_host_secondary.secret_key_name}"}}
+   ```
+   Set it once, at the top level: the references pick up each target's values at deploy. The generator
+   fails closed unless the map lists exactly the declared host configs, each entry referencing its own
+   host's fields, and no target overrides it.
+3. Point a pipeline at it with `es_host_config: es_host_secondary`.
+
+A pipeline referencing a host config that
 isn't declared in `databricks.yml` fails **at generation** (`framework/scripts/gen_jobs.py`), before deploy — as
 does a pipeline that omits `es_host_config` when no `default_es_host_config` is declared. (The default
 is read from the variable's `default:` at generation time, so it can't vary per target or by `--var`;
@@ -879,17 +899,20 @@ job (a serverless maintenance job, `framework/resources/_es_diagnostics.job.yml`
 the cluster is doing:
 
 ```bash
-databricks bundle run es_diagnostics -t <target> -p <profile>                              # es_host_primary, cluster/node level
+databricks bundle run es_diagnostics -t <target> -p <profile>                              # default host config, cluster/node level
 databricks bundle run es_diagnostics -t <target> -p <profile> --params index_name=<index>  # + deep-dive one index
 databricks bundle run es_diagnostics -t <target> -p <profile> --params es_host_config=es_host_secondary  # hit a different host config
 ```
 
 It only issues `GET` requests (it never writes a document or reads the ES secret for anything but the
-`Authorization` header) and connects to the host config named by the `es_host_config` parameter (default
-`es_host_primary`), the same endpoints and `api_key` secrets the pipelines use — so testing a different
-configured host is a `--params es_host_config=<name>`, not a YAML edit (the job carries every configured
-host's url + secret scope/key, and the notebook resolves the chosen name, failing closed on an unknown
-one). It gathers: write thread-pool saturation and rejections, indexing pressure,
+`Authorization` header) and connects to the host config named by the `es_host_config` parameter (default:
+the bundle's `default_es_host_config`), the same endpoints and `api_key` secrets the pipelines use — so
+testing a different configured host is a `--params es_host_config=<name>`, not a YAML edit. The job carries
+every configured host's url + secret scope/key from the `es_host_configs_json` variable in `databricks.yml`
+(see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)), and the
+notebook resolves the chosen name, failing closed on an unknown one. The job file itself names no host
+config, so adding or renaming one never touches it. The host is picked only by name: the job takes no
+run-time URL or secret, so someone who can run it can't point it, and the `api_key`, at another endpoint. It gathers: write thread-pool saturation and rejections, indexing pressure,
 circuit breakers, node heap/GC, cluster health and pending tasks, in-flight bulk tasks, hot threads, and
 (when `index_name` is set) that index's `_stats`/`_settings`/`_count`/shard placement. It samples the
 counter endpoints **twice** (`sample_interval_secs` apart, default 5s) so rejection/GC rates reflect the

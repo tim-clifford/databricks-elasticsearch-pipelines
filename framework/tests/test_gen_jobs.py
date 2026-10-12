@@ -1,7 +1,9 @@
 """Offline unit tests for framework/scripts/gen_jobs.py: the compute-aware job rendering and the reusable
 job-cluster spec loader. No cluster, no bundle: render to YAML text and assert the parsed structure.
 """
+import json
 import os
+import re
 import sys
 
 import pytest
@@ -1497,6 +1499,16 @@ def test_es_index_list_multidigit_dropped_count_stays_within_cap():
     assert len(value.split()[:-1]) + dropped == 200  # every name kept-or-counted
 
 
+def _write_bundle_variables(tmp_path):
+    """A databricks.yml in tmp_path holding the repo's real `variables:` block (no targets), so a test that
+    runs gen_jobs.main() against a temp tree sees every variable the generator requires."""
+    with open(os.path.join(_REPO_ROOT, "databricks.yml")) as fh:
+        variables = yaml.safe_load(fh)["variables"]
+    dab_yml = tmp_path / "databricks.yml"
+    dab_yml.write_text(yaml.safe_dump({"variables": variables}))
+    return dab_yml
+
+
 def test_config_name_underscore_prefix_rejected(tmp_path, monkeypatch):
     # Config names starting with underscore are reserved for hand-authored files and rejected at generation.
     # This prevents a generated file from overwriting a hand-authored _prefixed file.
@@ -1512,15 +1524,7 @@ def test_config_name_underscore_prefix_rejected(tmp_path, monkeypatch):
     )
     resources_dir = tmp_path / "resources"
     resources_dir.mkdir()
-    dab_yml = tmp_path / "databricks.yml"
-    dab_yml.write_text(
-        "variables:\n"
-        "  job_name_prefix: {default: ''}\n"
-        "  support_email: {default: []}\n"
-        "  global_job_tags: {type: complex, default: {}}\n"
-        "  pipeline_mode: {default: batch}\n"
-        "  streaming_start: {default: new}\n"
-    )
+    dab_yml = _write_bundle_variables(tmp_path)
     # Monkeypatch the module paths to use tmp_path
     monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
     monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
@@ -1544,15 +1548,7 @@ def test_job_group_underscore_prefix_rejected(tmp_path, monkeypatch):
     )
     resources_dir = tmp_path / "resources"
     resources_dir.mkdir()
-    dab_yml = tmp_path / "databricks.yml"
-    dab_yml.write_text(
-        "variables:\n"
-        "  job_name_prefix: {default: ''}\n"
-        "  support_email: {default: []}\n"
-        "  global_job_tags: {type: complex, default: {}}\n"
-        "  pipeline_mode: {default: batch}\n"
-        "  streaming_start: {default: new}\n"
-    )
+    dab_yml = _write_bundle_variables(tmp_path)
     monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
     monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
@@ -1573,15 +1569,7 @@ def test_hand_authored_file_not_treated_as_orphan(tmp_path, monkeypatch):
     hand_authored.write_text("resources:\n  jobs:\n    custom_job: {}\n")
     stale = resources_dir / "gone_pipeline.job.yml"
     stale.write_text(gen_jobs._GENERATED_MARKER + " from a deleted config\nresources: {}\n")
-    dab_yml = tmp_path / "databricks.yml"
-    dab_yml.write_text(
-        "variables:\n"
-        "  job_name_prefix: {default: ''}\n"
-        "  support_email: {default: []}\n"
-        "  global_job_tags: {type: complex, default: {}}\n"
-        "  pipeline_mode: {default: batch}\n"
-        "  streaming_start: {default: new}\n"
-    )
+    dab_yml = _write_bundle_variables(tmp_path)
     monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
     monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
@@ -1618,16 +1606,7 @@ def test_legacy_marker_files_are_ours(tmp_path, monkeypatch):
     kept.write_text(legacy.format("kept.yml") + "resources: {}\n")
     gone = resources_dir / "gone.job.yml"
     gone.write_text(legacy.format("gone.yml") + "resources: {}\n")
-    dab_yml = tmp_path / "databricks.yml"
-    dab_yml.write_text(
-        "variables:\n"
-        "  job_name_prefix: {default: ''}\n"
-        "  support_email: {default: []}\n"
-        "  global_job_tags: {type: complex, default: {}}\n"
-        "  es_host_primary: {type: complex, default: {es_host_url: '', secret_scope_name: '', secret_key_name: ''}}\n"
-        "  default_es_host_config: {default: es_host_primary}\n"
-        + "".join(f"  {name}: {{default: ''}}\n" for name in gen_jobs._RUNTIME_KNOB_GLOBAL_REFS)
-    )
+    dab_yml = _write_bundle_variables(tmp_path)
     monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
     monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
@@ -1638,3 +1617,117 @@ def test_legacy_marker_files_are_ours(tmp_path, monkeypatch):
     assert not gone.exists()
     assert kept.read_text().startswith(gen_jobs._GENERATED_MARKER + " from _pipelines/pipeline_configs/kept.yml")
     assert gen_jobs.main(["--check"]) == 0
+
+
+def test_main_reads_the_databricks_yml_it_is_pointed_at(tmp_path, monkeypatch):
+    # The bundle path must be looked up when main() runs, not bound at import: a temp databricks.yml missing
+    # job_name_prefix has to fail generation. (With an import-time default, main() silently read the repo's
+    # real databricks.yml and every temp-tree test's bundle fixture went unused.)
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    resources_dir = tmp_path / "_pipelines" / "resources"
+    resources_dir.mkdir()
+    dab_yml = tmp_path / "databricks.yml"
+    dab_yml.write_text("variables: {}\n")
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    with pytest.raises(ValueError, match="job_name_prefix is not declared"):
+        gen_jobs.main(["--check"])
+
+
+# ---------------------------------------------------------------- es_host_configs_json (diagnostics host map)
+def _host_entry(name):
+    return {field: f"${{var.{name}.{field}}}" for field in ("es_host_url", "secret_scope_name", "secret_key_name")}
+
+
+def _hosts_doc(entries, raw=None, spec_extra=None, targets=None):
+    spec = {"default": raw if raw is not None else json.dumps(entries)}
+    spec.update(spec_extra or {})
+    doc = {"variables": {"es_host_configs_json": spec}}
+    if targets is not None:
+        doc["targets"] = targets
+    return doc
+
+
+def test_es_host_configs_json_exact_map_accepted():
+    hosts = {"es_host_primary", "es_host_secondary"}
+    gen_jobs.require_es_host_configs_json(hosts, doc=_hosts_doc({h: _host_entry(h) for h in hosts}))
+    # No host configs declared: the empty object is the matching map.
+    gen_jobs.require_es_host_configs_json(set(), doc=_hosts_doc({}))
+
+
+def test_es_host_configs_json_shipped_databricks_yml_matches_declared_hosts():
+    with open(os.path.join(_REPO_ROOT, "databricks.yml")) as fh:
+        doc = yaml.safe_load(fh)
+    declared = gen_jobs.load_es_host_configs(doc=doc)
+    assert declared  # the shipped bundle declares at least one host config
+    gen_jobs.require_es_host_configs_json(declared, doc=doc)
+
+
+@pytest.mark.parametrize("doc, match", [
+    ({"variables": {}}, "not declared in databricks.yml as a plain string variable"),
+    ({"variables": {"es_host_configs_json": "x"}}, "plain string variable"),
+    (_hosts_doc({}, spec_extra={"type": "complex"}), "plain string variable"),
+    ({"variables": {"es_host_configs_json": {"default": {"es_host_primary": {}}}}}, "plain string variable"),
+    (_hosts_doc({}, raw='{"es_host_primary": '), "not valid JSON"),
+    (_hosts_doc({}, raw='["es_host_primary"]'), "must be a JSON object"),
+    (_hosts_doc({}), "missing: es_host_primary"),
+    (_hosts_doc({"es_host_primary": _host_entry("es_host_primary"),
+                 "es_host_secondary": _host_entry("es_host_secondary")}), "not declared: es_host_secondary"),
+    (_hosts_doc({"es_host_primary": dict(_host_entry("es_host_primary"),
+                                         es_host_url="${var.es_host_secondary.es_host_url}")}),
+     "entry 'es_host_primary' must be exactly"),
+    (_hosts_doc({"es_host_primary": dict(_host_entry("es_host_primary"), es_host_url="https://h:9200")}),
+     "entry 'es_host_primary' must be exactly"),
+    (_hosts_doc({"es_host_primary": dict(_host_entry("es_host_primary"), extra="x")}),
+     "entry 'es_host_primary' must be exactly"),
+    (_hosts_doc({"es_host_primary": {k: v for k, v in _host_entry("es_host_primary").items()
+                                     if k != "secret_key_name"}}),
+     "entry 'es_host_primary' must be exactly"),
+    (_hosts_doc({"es_host_primary": _host_entry("es_host_primary")},
+                targets={"dev": {"variables": {"es_host_configs_json": "{}"}}, "prd": {}}),
+     r"overridden in target\(s\) dev;"),
+])
+def test_es_host_configs_json_rejects(doc, match):
+    with pytest.raises(ValueError, match=match):
+        gen_jobs.require_es_host_configs_json({"es_host_primary"}, doc=doc)
+
+
+def test_es_diagnostics_job_names_no_host_config():
+    # The diagnostics job is a fixed framework file: its host map and default host come from bundle
+    # variables, so adding, renaming or removing a host config never requires editing it.
+    path = os.path.join(_FRAMEWORK_ROOT, "resources", "_es_diagnostics.job.yml")
+    with open(path) as fh:
+        text = fh.read()
+    job = yaml.safe_load(text)["resources"]["jobs"]["es_diagnostics"]
+    params = {p["name"]: p["default"] for p in job["parameters"]}
+    assert params["es_host_config"] == "${var.default_es_host_config}"
+    base = job["tasks"][0]["notebook_task"]["base_parameters"]
+    assert base["es_host_configs_json"] == "${var.es_host_configs_json}"
+    # No reference to any one host config's fields (only the whole-map variable), and no host name literal.
+    assert re.findall(r"\$\{var\.es_host_\w+", text) == ["${var.es_host_configs_json"]
+    assert "es_host_primary" not in text
+
+
+def test_generation_fails_when_es_host_configs_json_misses_a_host(tmp_path, monkeypatch):
+    # main() runs the check: a declared host config left out of the diagnostics host map fails generation
+    # (and --check) before anything is written.
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    resources_dir = tmp_path / "_pipelines" / "resources"
+    resources_dir.mkdir()
+    dab_yml = _write_bundle_variables(tmp_path)
+    doc = yaml.safe_load(dab_yml.read_text())
+    doc["variables"]["es_host_extra"] = {
+        "type": "complex", "default": {"es_host_url": "", "secret_scope_name": "", "secret_key_name": ""}}
+    dab_yml.write_text(yaml.safe_dump(doc))
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    for argv in (["--check"], []):
+        with pytest.raises(ValueError, match="missing: es_host_extra"):
+            gen_jobs.main(argv)
+    assert not list(resources_dir.iterdir())

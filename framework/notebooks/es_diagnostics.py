@@ -16,10 +16,11 @@
 # MAGIC collected AND clear; a signal it could not read degrades the verdict to INCONCLUSIVE.
 # MAGIC
 # MAGIC Parameters:
-# MAGIC - `es_host_config` (job parameter, default `es_host_primary`): the NAME of a host config declared in
-# MAGIC   databricks.yml to hit. The job renders the configured host configs' url + secret scope/key into
-# MAGIC   `es_host_configs_json` (a deploy-time base_parameter) and this notebook resolves the name against
-# MAGIC   that map, fail-closed on an unknown name. Override per run with `--params es_host_config=<name>`.
+# MAGIC - `es_host_config` (job parameter, default the bundle's `default_es_host_config`): the NAME of a host
+# MAGIC   config declared in databricks.yml to hit. The job carries every configured host config's url +
+# MAGIC   secret scope/key in `es_host_configs_json` (a deploy-time base_parameter, from the databricks.yml
+# MAGIC   variable of that name) and this notebook resolves the name against that map, fail-closed on an
+# MAGIC   unknown name. Override per run with `--params es_host_config=<name>`.
 # MAGIC - `ca_certs` (deploy-time base_parameter, from `${var.ca_certs}`): UC Volume path to a CA bundle
 # MAGIC   verifying the ES TLS cert. Empty => system CAs (unless `verify_certs=false`).
 # MAGIC - `verify_certs` (job parameter, default "true"): set "false" to skip TLS verification (self-signed
@@ -76,7 +77,7 @@ from pipeline_lib.es_diagnostics import (  # noqa: E402
     write_pool_saturated,
 )
 
-dbutils.widgets.text("es_host_config", "es_host_primary", "Which host config to hit (a name from databricks.yml, e.g. es_host_primary)")
+dbutils.widgets.text("es_host_config", "", "Which host config to hit (a name from databricks.yml; the job defaults it to default_es_host_config)")
 dbutils.widgets.text("es_host_configs_json", "{}", "Deploy-time JSON map of configured host configs -> {es_host_url, secret_scope_name, secret_key_name}")
 dbutils.widgets.text("ca_certs", "", "UC Volume path to a CA bundle (PEM) verifying the ES TLS cert (empty => system CAs)")
 dbutils.widgets.text("verify_certs", "true", "Verify TLS certs: true|false (false for self-signed; ignored when ca_certs set)")

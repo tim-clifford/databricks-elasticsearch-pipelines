@@ -10,20 +10,21 @@ resources:
         twice (sample_interval_secs apart) so rejection/GC rates are meaningful, then prints a fail-closed
         congestion verdict. It only issues GET requests and never writes to ES. Pick which host config to
         hit at run time with the es_host_config parameter (a name from databricks.yml, default
-        es_host_primary); the job carries every configured host's url + secret scope/key so the notebook
-        resolves the chosen one by name. Runs serverless by default; set the diagnostics_existing_cluster_id
+        default_es_host_config); the job carries every configured host's url + secret scope/key so the
+        notebook resolves the chosen one by name. Runs serverless by default; set the diagnostics_existing_cluster_id
         or diagnostics_job_clusters+diagnostics_job_cluster_key vars to run on a specific cluster (deploy-time).
 
       # Run-time job parameters, all overridable with `--params <name>=<value>`:
-      # - es_host_config: NAME of a host config in databricks.yml to hit (default es_host_primary). The
-      #   notebook resolves it against es_host_configs_json (rendered below), fail-closed on an unknown name.
+      # - es_host_config: NAME of a host config in databricks.yml to hit (default: the bundle's
+      #   default_es_host_config). The notebook resolves it against es_host_configs_json (below),
+      #   fail-closed on an unknown name.
       # - index_name: an index to deep-dive; blank => cluster/node level only.
       # - verify_certs: "false" for a self-signed endpoint (ignored when ca_certs is set).
       # - sample_interval_secs: gap between the two counter samples ("0" => single snapshot).
       # - request_timeout_secs: per-request client timeout.
       parameters:
         - name: es_host_config
-          default: es_host_primary
+          default: ${var.default_es_host_config}
         - name: index_name
           default: ""
         - name: verify_certs
@@ -69,17 +70,11 @@ resources:
             notebook_path: ../notebooks/es_diagnostics.py
             base_parameters:
               # es_host_configs_json carries EVERY configured host config's url + secret scope/key as a
-              # name -> {..} JSON map, rendered from the databricks.yml es_host_* complex vars per target
-              # (bundle var references resolve at deploy, so the notebook picks by es_host_config NAME from
-              # this carried-in map at run time). One "<name>": {..} block per host config; to add
-              # es_host_secondary, uncomment its var in databricks.yml AND its block here.
-              es_host_configs_json: >-
-                {"es_host_primary": {"es_host_url": "${var.es_host_primary.es_host_url}",
-                "secret_scope_name": "${var.es_host_primary.secret_scope_name}",
-                "secret_key_name": "${var.es_host_primary.secret_key_name}"}}
-              # es_host_secondary example (mirror the databricks.yml es_host_secondary var):
-              #  {"es_host_primary": {"es_host_url": "${var.es_host_primary.es_host_url}", "secret_scope_name": "${var.es_host_primary.secret_scope_name}", "secret_key_name": "${var.es_host_primary.secret_key_name}"},
-              #   "es_host_secondary": {"es_host_url": "${var.es_host_secondary.es_host_url}", "secret_scope_name": "${var.es_host_secondary.secret_scope_name}", "secret_key_name": "${var.es_host_secondary.secret_key_name}"}}
+              # name -> {..} JSON map, from the databricks.yml es_host_configs_json variable (its
+              # ${var.<name>.<field>} references resolve per target at deploy, so the notebook picks by
+              # es_host_config NAME from this carried-in map at run time). Adding a host config is done in
+              # databricks.yml only; this file never changes.
+              es_host_configs_json: ${var.es_host_configs_json}
               ca_certs: ${var.ca_certs}
           # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
           # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})

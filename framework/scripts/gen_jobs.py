@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import re
 import sys
@@ -157,16 +158,19 @@ def load_job_cluster_spec(key: str) -> dict:
     return spec
 
 
-def _read_bundle_doc(path: str = _DATABRICKS_YML) -> dict:
+def _read_bundle_doc(path: str | None = None) -> dict:
     """Parse databricks.yml once. main() reads several things from it, so it parses once here and passes
     the parsed doc to the loaders below (their `doc=` argument), opening the file a single time per run.
     The loaders keep a path default so each is still independently callable (and unit-testable) on its own.
+    `path=None` means _DATABRICKS_YML, looked up at CALL time (a `path=_DATABRICKS_YML` default would be
+    bound once at import, so a test that points the module at another databricks.yml would still read
+    the real one).
     """
-    with open(path) as fh:
+    with open(path if path is not None else _DATABRICKS_YML) as fh:
         return yaml.safe_load(fh) or {}
 
 
-def _load_complex_configs(fields: frozenset, path: str = _DATABRICKS_YML, doc: dict | None = None) -> set:
+def _load_complex_configs(fields: frozenset, path: str | None = None, doc: dict | None = None) -> set:
     """Names of databricks.yml `type: complex` variables whose default mapping's keys are EXACTLY `fields`.
 
     The shared scan behind load_es_host_configs and load_cluster_configs (they differ only in the field
@@ -182,7 +186,7 @@ def _load_complex_configs(fields: frozenset, path: str = _DATABRICKS_YML, doc: d
     }
 
 
-def load_es_host_configs(path: str = _DATABRICKS_YML, doc: dict | None = None) -> set:
+def load_es_host_configs(path: str | None = None, doc: dict | None = None) -> set:
     """The set of declared Elasticsearch host-config names, read from databricks.yml. Fail closed.
 
     A host config is a bundle variable with `type: complex` whose default mapping's keys are exactly
@@ -195,7 +199,7 @@ def load_es_host_configs(path: str = _DATABRICKS_YML, doc: dict | None = None) -
     return _load_complex_configs(_ES_HOST_CONFIG_FIELDS, path, doc)
 
 
-def load_default_es_host_config(path: str = _DATABRICKS_YML, doc: dict | None = None):
+def load_default_es_host_config(path: str | None = None, doc: dict | None = None):
     """The bundle's default host-config name, from databricks.yml `variables.default_es_host_config.default`
     (or None if not declared). A pipeline that OMITS es_host_config falls back to this (see main).
 
@@ -236,7 +240,65 @@ def require_es_host_config(name: str, declared: set) -> None:
         )
 
 
-def load_cluster_configs(path: str = _DATABRICKS_YML, doc: dict | None = None) -> set:
+# The string variable carrying every host config to the `_es diagnostics` job (a fixed file,
+# framework/resources/_es_diagnostics.job.yml): a JSON object, written in databricks.yml next to the host
+# declarations, mapping each host-config name to its three fields as ${var.<name>.<field>} references.
+_ES_HOST_CONFIGS_JSON_VAR = "es_host_configs_json"
+
+
+def require_es_host_configs_json(declared: set, path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at GENERATION unless databricks.yml's es_host_configs_json lists EXACTLY the declared
+    host configs, each entry wired to its OWN host's fields.
+
+    The diagnostics notebook resolves a host by name from this map at run time; bundle references resolve
+    only at deploy, so the map is spelled out in databricks.yml with one entry per declared host config
+    (load_es_host_configs) and every field the exact reference ${var.<name>.<field>}. Anything else is
+    rejected: a missing entry (that host could not be diagnosed), an extra entry (a name no pipeline can
+    use, whose reference fails at deploy), another host's reference (diagnostics would hit the wrong
+    host), a literal value, a default that is not a JSON object string, or a per-target override (the
+    generator reads only the top-level default, so an override would go unchecked).
+    """
+    doc = doc if doc is not None else _read_bundle_doc(path)
+    var = _ES_HOST_CONFIGS_JSON_VAR
+    spec = (doc.get("variables") or {}).get(var)
+    if not isinstance(spec, dict) or spec.get("type") is not None or not isinstance(spec.get("default"), str):
+        raise ValueError(
+            f"{var} is not declared in databricks.yml as a plain string variable; declare it under "
+            f"`variables:` next to the es_host_* host configs (see the README \"Configuring Elasticsearch "
+            f"host connections\")"
+        )
+    try:
+        entries = json.loads(spec["default"])
+    except ValueError as exc:
+        raise ValueError(f"{var} (databricks.yml) default is not valid JSON: {exc}") from None
+    if not isinstance(entries, dict):
+        raise ValueError(f"{var} (databricks.yml) default must be a JSON object of host-config name -> fields")
+    missing, extra = sorted(declared - set(entries)), sorted(set(entries) - declared)
+    if missing or extra:
+        raise ValueError(
+            f"{var} (databricks.yml) must list exactly the declared host configs "
+            f"({', '.join(sorted(declared)) or '<none>'}); missing: {', '.join(missing) or '<none>'}; "
+            f"not declared: {', '.join(extra) or '<none>'}"
+        )
+    for name in sorted(entries):
+        want = {field: f"${{var.{name}.{field}}}" for field in _ES_HOST_CONFIG_FIELDS}
+        if entries[name] != want:
+            raise ValueError(
+                f"{var} (databricks.yml) entry {name!r} must be exactly "
+                f"{json.dumps(dict(sorted(want.items())))}, got {json.dumps(entries[name])}"
+            )
+    overridden = sorted(
+        target for target, tspec in (doc.get("targets") or {}).items()
+        if isinstance(tspec, dict) and var in (tspec.get("variables") or {})
+    )
+    if overridden:
+        raise ValueError(
+            f"{var} is overridden in target(s) {', '.join(overridden)}; set it only once under `variables:` "
+            f"(each target's host values flow in through the ${{var.<name>.<field>}} references)"
+        )
+
+
+def load_cluster_configs(path: str | None = None, doc: dict | None = None) -> set:
     """The set of declared cluster-config names, read from databricks.yml. Fail closed.
 
     A cluster config is a bundle variable with `type: complex` whose default mapping's keys are exactly
@@ -265,7 +327,7 @@ def require_cluster_config(name: str, declared: set) -> None:
         )
 
 
-def require_job_name_prefix_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+def require_job_name_prefix_declared(path: str | None = None, doc: dict | None = None) -> None:
     """Fail closed at GENERATION if databricks.yml declares no `job_name_prefix` variable.
 
     Every generated job name embeds ${var.job_name_prefix} (the branding prefix, default
@@ -283,7 +345,7 @@ def require_job_name_prefix_declared(path: str = _DATABRICKS_YML, doc: dict | No
         )
 
 
-def _require_global_var_declared(name: str, validator, path: str = _DATABRICKS_YML,
+def _require_global_var_declared(name: str, validator, path: str | None = None,
                                  doc: dict | None = None) -> None:
     """Fail closed at GENERATION if databricks.yml declares no `<name>` variable, or its static default
     fails `validator` (the SAME require_* helper the runner applies to the effective value).
@@ -318,7 +380,7 @@ def _require_global_var_declared(name: str, validator, path: str = _DATABRICKS_Y
         raise ValueError(str(exc)) from exc
 
 
-def require_runtime_knobs_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+def require_runtime_knobs_declared(path: str | None = None, doc: dict | None = None) -> None:
     """Fail closed at generation unless databricks.yml declares a legal global default for EVERY run-time
     knob (pipeline_lib.config._RUNTIME_KNOBS).
 
@@ -336,7 +398,7 @@ def require_runtime_knobs_declared(path: str = _DATABRICKS_YML, doc: dict | None
         _require_global_var_declared(knob.name, knob.validator, path, bundle_doc)
 
 
-def require_support_email_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+def require_support_email_declared(path: str | None = None, doc: dict | None = None) -> None:
     """Fail closed at GENERATION if databricks.yml declares no `support_email` variable.
 
     Every generated job emits email_notifications.on_failure: ${var.support_email}, so the bundle needs
@@ -354,7 +416,7 @@ def require_support_email_declared(path: str = _DATABRICKS_YML, doc: dict | None
         )
 
 
-def require_global_job_tags_declared(path: str = _DATABRICKS_YML, doc: dict | None = None) -> None:
+def require_global_job_tags_declared(path: str | None = None, doc: dict | None = None) -> None:
     """Fail closed at GENERATION if databricks.yml declares no `global_job_tags` variable.
 
     Every job carries the global tags: the hand-authored fixed jobs reference ${var.global_job_tags} (so
@@ -372,7 +434,7 @@ def require_global_job_tags_declared(path: str = _DATABRICKS_YML, doc: dict | No
         )
 
 
-def load_global_job_tags(path: str = _DATABRICKS_YML, doc: dict | None = None) -> dict:
+def load_global_job_tags(path: str | None = None, doc: dict | None = None) -> dict:
     """The global job tags map, read from databricks.yml `variables.global_job_tags.default`. Fail closed.
 
     Returns {} when the variable is absent or its default is empty/None (= no tags). A NON-empty default
@@ -1041,6 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
     require_global_job_tags_declared(doc=bundle_doc)
     require_runtime_knobs_declared(doc=bundle_doc)
     es_host_configs = load_es_host_configs(doc=bundle_doc)
+    require_es_host_configs_json(es_host_configs, doc=bundle_doc)
     default_es_host_config = load_default_es_host_config(doc=bundle_doc)
     cluster_configs = load_cluster_configs(doc=bundle_doc)
     global_job_tags = load_global_job_tags(doc=bundle_doc)
