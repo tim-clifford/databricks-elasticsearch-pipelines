@@ -9,7 +9,9 @@ Checked:
   lines joined); YAML comments are joined across wrapped lines.
 
 The anchor rules here cover the Markdown the docs use. Forms they don't model are rejected outright, so a link
-can't escape the check: reference-style links, and headings with underscore emphasis or HTML entities.
+can't escape the check: reference-style links, links with a title or a space or parenthesis in the target,
+setext and indented headings, and headings with underscore emphasis or HTML entities. File names are matched
+case-sensitively, as on GitHub.
 """
 import ast
 import glob
@@ -22,7 +24,7 @@ import pytest
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DOCS = [os.path.join(_REPO_ROOT, "README.md")] + sorted(glob.glob(os.path.join(_REPO_ROOT, "docs", "*.md")))
-_LINK = re.compile(r"\]\(([^)\s]+)\)")
+_LINK = re.compile(r"\]\(([^)]*)\)")
 _REFERENCE_DEFINITION = re.compile(r"^\s*\[[^\]]+\]:\s")
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 _DOC_MENTION = re.compile(r"\bdocs/[\w-]+\.md\b")
@@ -33,13 +35,13 @@ def _outside_fences(path):
     """(line number, line) for every line of a Markdown file outside ``` or ~~~ code fences."""
     fence = None  # the opening fence string while inside one
     for number, line in enumerate(open(path, encoding="utf-8"), 1):
-        m = re.match(r"^\s*(`{3,}|~{3,})", line)
+        m = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\n"))
         if fence is None and m:
             fence = m.group(1)
             continue
         if fence is not None:
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
-                fence = None
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+                fence = None  # a closing fence carries no info string
             continue
         yield number, line
 
@@ -52,7 +54,7 @@ def _slug(heading):
 
 def heading_lines(path):
     """(line number, heading text) for every heading, with inline code marks removed."""
-    return [(number, m.group(2).replace("`", "").strip()) for number, line in _outside_fences(path)
+    return [(number, re.sub(r"[`*]", "", m.group(2)).strip()) for number, line in _outside_fences(path)
             if (m := _HEADING.match(line))]
 
 
@@ -83,19 +85,44 @@ def broken_links(path):
         for target in _LINK.findall(re.sub(r"`[^`]*`", "", line)):
             if re.match(r"^[a-z]+:", target):
                 continue  # http:, https:, mailto:
+            if not target or re.search(r"[\s(]", target):
+                broken.append((number, target, "unsupported link form (title, space or parenthesis)"))
+                continue
             file_part, _, fragment = target.partition("#")
             dest = os.path.normpath(os.path.join(os.path.dirname(path), file_part)) if file_part else path
-            if not os.path.exists(dest):
+            if not _exists_exact_case(dest):
                 broken.append((number, target, "no such file"))
             elif fragment and (not dest.endswith(".md") or fragment not in anchors(dest)):
                 broken.append((number, target, "no such anchor"))
     return broken
 
 
+def _exists_exact_case(path):
+    """os.path.exists, but case-sensitive on every component (GitHub matches paths case-sensitively)."""
+    current = os.sep
+    for part in os.path.abspath(path).split(os.sep):
+        if not part:
+            continue
+        if not os.path.isdir(current) or part not in os.listdir(current):
+            return False
+        current = os.path.join(current, part)
+    return True
+
+
 def unsupported_headings(path):
-    """(line, heading) for headings whose GitHub anchor these rules don't model."""
-    return [(number, text) for number, text in heading_lines(path)
-            if re.search(r"&\w+;|&#\d+;", text) or re.search(r"(^|\W)_[^_\s][^_]*_(\W|$)", text)]
+    """(line, heading) for headings whose GitHub anchor these rules don't model: underscore emphasis or HTML
+    entities in an ATX heading, an indented ATX heading, or a setext heading (text underlined with = or -)."""
+    found = [(number, text) for number, text in heading_lines(path)
+             if re.search(r"&\w+;|&#\d+;", text) or re.search(r"(^|\W)_[^_\s][^_]*_(\W|$)", text)]
+    previous = ""
+    for number, line in _outside_fences(path):
+        if re.match(r"^ {1,3}#{1,6}\s", line):
+            found.append((number, line.strip()))
+        elif re.match(r"^ {0,3}(=+|-+)\s*$", line) and previous.strip() and not re.match(
+                r"^\s*([-*+] |\d+\. |#|\||>)", previous):
+            found.append((number, previous.strip()))
+        previous = line
+    return sorted(found)
 
 
 def python_texts(source):
@@ -122,14 +149,29 @@ def python_texts(source):
 
 
 def yaml_texts(source):
-    """The file with each run of wrapped `#` comment lines joined into one line."""
-    return [re.sub(r"\n\s*#\s*", " ", source)]
+    """Every comment block in a YAML file: consecutive full-line `#` comments joined into one string."""
+    texts, block = [], []
+    for line in source.split("\n"):
+        if line.lstrip().startswith("#"):
+            block.append(line.lstrip().lstrip("#").strip())
+        elif block:
+            texts.append(" ".join(block))
+            block = []
+    if block:
+        texts.append(" ".join(block))
+    return texts
+
+
+def sql_texts(source):
+    """Every `--` comment block in a SQL file, consecutive lines joined."""
+    return yaml_texts(re.sub(r"^(\s*)--", r"\1#", source, flags=re.M))
 
 
 def _pointer_files():
-    files = (glob.glob(os.path.join(_REPO_ROOT, "framework", "**", "*.py"), recursive=True)
-             + glob.glob(os.path.join(_REPO_ROOT, "_pipelines", "**", "*.yml"), recursive=True)
-             + [os.path.join(_REPO_ROOT, "databricks.yml")])
+    files = [os.path.join(_REPO_ROOT, "databricks.yml")]
+    for pattern in ("*.py", "*.yml", "*.yaml", "*.sql"):
+        for top in ("framework", "_pipelines"):
+            files += glob.glob(os.path.join(_REPO_ROOT, top, "**", pattern), recursive=True)
     return [p for p in files if os.path.abspath(p) != os.path.abspath(__file__)]
 
 
@@ -138,7 +180,8 @@ def doc_pointers():
     found = []
     for path in _pointer_files():
         source = open(path, encoding="utf-8").read()
-        texts = python_texts(source) if path.endswith(".py") else yaml_texts(source)
+        texts = (python_texts(source) if path.endswith(".py")
+                 else sql_texts(source) if path.endswith(".sql") else yaml_texts(source))
         rel = os.path.relpath(path, _REPO_ROOT)
         for text in texts:
             for doc in _DOC_MENTION.findall(text):
@@ -177,6 +220,15 @@ def test_the_checks_catch_what_they_claim_to(tmp_path):
         ("[ref]: https://example.com", "reference-style link (use an inline link)")]
     assert headings(str(doc)) == ["Title", "A section", "_emphasis_ &amp; more"]
     assert [h for _, h in unsupported_headings(str(doc))] == ["_emphasis_ &amp; more"]
+
+    forms = tmp_path / "forms.md"
+    forms.write_text('# T\n\n[t](#t "title") [Case](DOC.md)\n\n```bash\n```text\n[in](#fenced)\n```\n\n'
+                     "Setext\n===\n\n  ## Indented\n\n---\n")
+    (tmp_path / "doc.md").touch()
+    assert [p for _, _, p in broken_links(str(forms))] == [
+        "unsupported link form (title, space or parenthesis)", "no such file"]  # DOC.md vs doc.md
+    assert [h for _, h in unsupported_headings(str(forms))] == ["Setext", "## Indented"]
+    assert yaml_texts('key: "x"\n# see "Job\n# groups" in docs/a.md\nother: 1\n') == ['see "Job groups" in docs/a.md']
 
     source = ('def f():\n    """A docstring line ending in a quote: "x"\n    "not a pointer" in docs/a.md"""\n'
               '    raise ValueError(\n        f"see \\"Elasticsearch host "\n        f"configs\\" in docs/setup.md")\n'
