@@ -1090,10 +1090,13 @@ the same `batch_id` (under the new attempt's `task_run_id`). A NULL `source_late
 four columns (the "Adding a column later" step below); it adds them in place. A build that
 writes them to a table without them fails its first append (`run_start`), before any data moves.
 
-Cost: the read is one `DESCRIBE HISTORY <source> LIMIT 1` per batch, on the batch's critical path before its
-data is sent (0.6 to 2.2 s per read in a live probe on DBR 17.3). It runs only for streaming with the log on.
-There is no knob to skip it with the log on; one could be added by gating `read_source_latest` in
-`run_index_pipeline.py` (the code already handles a batch without it).
+Cost: two steps per batch, both inside the batch before its checkpoint commits, about 1.6 s per batch at the
+median (live probes on DBR 17.3, standard-mode job cluster): the `DESCRIBE HISTORY <source> LIMIT 1` read before
+the data is sent (median 0.7 s, first call on a cluster about 3.7 s) and the relay write that hands the value to
+`batch_summary`, one small text write to the checkpoint Volume after `batch_end` (median 0.9 s, p90 1.1 s, first
+write about 10 s). Both run only for streaming with the log on. There is no knob to skip them with the log on; one
+could be added by gating `read_source_latest` in `run_index_pipeline.py` (the code already handles a batch
+without it, and then writes no relay).
 
 Example: caught up or behind per streaming batch, from `batch_summary` alone:
 

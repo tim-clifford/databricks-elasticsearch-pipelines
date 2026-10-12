@@ -629,9 +629,10 @@ if PIPELINE_MODE == "streaming":
         # `{source_relay_dir}/{batch_id}`; the progress recorder adds it to that batch's batch_summary and deletes
         # it. With the end offset on batch_summary it tells "caught up, new files arrived during the batch" from
         # "behind, available files were left for the next batch". BEST-EFFORT on batch_summary (batch_start always
-        # has it). COST: one `DESCRIBE HISTORY ... LIMIT 1` per batch on the batch's critical path (0.6 to 2.2 s
-        # per read in a live probe on DBR 17.3). It is skipped when the log is off; a knob to skip it with the log
-        # on could gate `read_source_latest` below. Cleared at run start.
+        # has it). COST, per batch and before its checkpoint commits: one `DESCRIBE HISTORY ... LIMIT 1` (median
+        # 0.7 s) plus one relay write after batch_end (median 0.9 s), about 1.6 s (live probes, DBR 17.3). Both are
+        # skipped when the log is off; a knob to skip them with the log on could gate `read_source_latest` below.
+        # Cleared at run start.
         source_relay_dir = f"{checkpoint_location}/_source_version_relay"
         dbutils.fs.rm(source_relay_dir, recurse=True)
         dbutils.fs.rm(f"{checkpoint_location}/_batch_relay", recurse=True)  # a previous build's relay; unused now
