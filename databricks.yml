@@ -51,14 +51,13 @@ variables:
     description: "Environment folded into ${environment} in config names. Empty default; set per target below or override with --var."
     default: ""
 
-  # GLOBAL job tags applied to EVERY job this bundle deploys: the 4 hand-authored maintenance jobs
-  # (build_wheel, deploy_views, checkpoint_clear, es_diagnostics) AND every gen_jobs-generated index/group
-  # job. A `type: complex` map of tag key -> tag value. Ships EMPTY ({}) on main: an empty complex var is
+  # GLOBAL job tags applied to EVERY job this bundle deploys: the 6 fixed maintenance jobs in
+  # framework/resources/ AND every gen_jobs-generated index/group job. A `type: complex` map of tag key -> tag value. Ships EMPTY ({}) on main: an empty complex var is
   # OMITTED by DAB, so jobs deploy tagless until you configure this (the same "empty on main" convention as
   # wheel_path and the host configs). Databricks allows at most 25 tags per job.
   #
   # HOW IT REACHES JOBS (two paths, one source):
-  #   - The 4 fixed jobs reference the WHOLE var: `tags: ${var.global_job_tags}`, resolved per target at
+  #   - The 6 fixed jobs reference the WHOLE var: `tags: ${var.global_job_tags}`, resolved per target at
   #     DEPLOY. A per-target override (below / variable-overrides.json) is honored for these.
   #   - Generated jobs: framework/scripts/gen_jobs.py reads THIS variable's `default:` at GENERATION time and bakes
   #     {these tags + an es_index_list tag it computes} into each generated job's `tags:`. So the generated

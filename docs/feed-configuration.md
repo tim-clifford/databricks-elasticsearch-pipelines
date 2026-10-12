@@ -116,7 +116,7 @@ Hardcoded `custom_tags` in a job-cluster spec pass straight through onto the clu
 
 ### Global job tags
 
-The `global_job_tags` bundle variable (a `type: complex` map, empty `{}` on `main`) is applied to every job the bundle deploys: the generated feed/group jobs and the four hand-authored maintenance jobs (`build_wheel`, `deploy_views`, `checkpoint_clear`, `es_diagnostics`). Set it in `databricks.yml` by replacing `default: {}` with a `key: value` mapping:
+The `global_job_tags` bundle variable (a `type: complex` map, empty `{}` on `main`) is applied to every job the bundle deploys: the generated feed/group jobs and the six fixed maintenance jobs in `framework/resources/`. Set it in `databricks.yml` by replacing `default: {}` with a `key: value` mapping:
 
 ```yaml
 global_job_tags:
@@ -152,7 +152,7 @@ The schedule pairs naturally with either export mode: a `batch` job re-exports t
 
 ### Overlapping runs skipped
 
-Every job sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that fires while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. The `queue: {enabled: false}` is load-bearing (see [technical details](technical-details.md#queue-disabled)).
+Every job except `checkpoint_clear` (which allows 20 concurrent runs, one per feed) sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that fires while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. The `queue: {enabled: false}` is load-bearing (see [technical details](technical-details.md#queue-disabled)).
 
 ### Where schedules fire
 

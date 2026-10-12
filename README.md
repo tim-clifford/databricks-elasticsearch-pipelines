@@ -99,13 +99,13 @@ Shared framework (not edited per feed):
     scripts/
       gen_jobs.py               Generates _pipelines/resources/*.job.yml from the configs
                                 (--check guards drift)
-    resources/                  The fixed maintenance jobs (hand-authored):
+    resources/                  The fixed maintenance jobs (hand-authored), by resource key:
       _build_wheel.job.yml        build_wheel
-      _checkpoint_clear.job.yml   _checkpoint clear
+      _checkpoint_clear.job.yml   checkpoint_clear
       _deploy_views.job.yml       deploy_views
-      _es_diagnostics.job.yml     _es diagnostics
-      _log_table_create.job.yml   _log table create
-      _log_table_prune.job.yml    _log table prune (daily, paused by default)
+      _es_diagnostics.job.yml     es_diagnostics
+      _log_table_create.job.yml   log_table_create
+      _log_table_prune.job.yml    log_table_prune (daily; follows schedule_pause_status)
     tests/                      Offline unit tests: python -m pytest framework/tests
 
 Config names and job_group names may not start with `_` (checked at generation), so they never collide

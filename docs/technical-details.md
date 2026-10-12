@@ -195,7 +195,7 @@ Set `bypass_fast_path` to make the counts exact, or accept the possible miscount
 <a id="global-job-tags-key-set"></a>
 ### Why the generated tag key set is fixed at generation
 
-The `global_job_tags` bundle variable's **key set** is baked at generation time for generated jobs. A per-target override that changes the *keys* reaches only the fixed jobs (`deploy_views`, `checkpoint_clear`, `build_wheel`, `es_diagnostics`), exactly like `default_es_host_config`, while per-target **values** still work through `${var...}` references in the tag values themselves.
+The `global_job_tags` bundle variable's **key set** is baked at generation time for generated jobs. A per-target override that changes the *keys* reaches only the six fixed jobs in `framework/resources/`, exactly like `default_es_host_config`, while per-target **values** still work through `${var...}` references in the tag values themselves.
 
 The reason is when each part is resolved. The generator writes each generated job's `tags:` block as literal keys, read from the top-level `default:` (`framework/scripts/gen_jobs.py`), and appends its own `es_index_list` tag. A value that is a `${var...}` reference is copied in verbatim and resolves per target at deploy, but the keys themselves are fixed text in the generated file by then. The fixed jobs instead reference the whole variable (`tags: ${var.global_job_tags}`), which the bundle resolves per target. So keep the key set at the top level and vary values with references.
 
