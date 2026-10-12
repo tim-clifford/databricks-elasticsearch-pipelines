@@ -1523,7 +1523,7 @@ def test_config_name_underscore_prefix_rejected(tmp_path, monkeypatch):
         "view: {catalog: c, schema: s, name: v}\n"
         "source: {catalog: c, schema: s, table: t}\n"
     )
-    resources_dir = tmp_path / "resources"
+    resources_dir = tmp_path / "_pipelines" / "resources"
     resources_dir.mkdir()
     dab_yml = _write_bundle_variables(tmp_path)
     # Monkeypatch the module paths to use tmp_path
@@ -1547,7 +1547,7 @@ def test_job_group_underscore_prefix_rejected(tmp_path, monkeypatch):
         "view: {catalog: c, schema: s, name: v}\n"
         "source: {catalog: c, schema: s, table: t}\n"
     )
-    resources_dir = tmp_path / "resources"
+    resources_dir = tmp_path / "_pipelines" / "resources"
     resources_dir.mkdir()
     dab_yml = _write_bundle_variables(tmp_path)
     monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
@@ -1564,7 +1564,7 @@ def test_hand_authored_file_not_treated_as_orphan(tmp_path, monkeypatch):
     # the generated orphan, never the hand-authored file.
     config_dir = tmp_path / "_pipelines" / "pipeline_configs"
     config_dir.mkdir(parents=True)
-    resources_dir = tmp_path / "resources"
+    resources_dir = tmp_path / "_pipelines" / "resources"
     resources_dir.mkdir()
     hand_authored = resources_dir / "_custom.job.yml"
     hand_authored.write_text("resources:\n  jobs:\n    custom_job: {}\n")
@@ -1689,7 +1689,7 @@ def test_es_host_configs_json_shipped_databricks_yml_matches_declared_hosts():
      "entry 'es_host_default' must be exactly"),
     (_hosts_doc({"es_host_default": _host_entry("es_host_default")},
                 targets={"dev": {"variables": {"es_host_configs_json": "{}"}}, "prd": {}}),
-     r"overridden in target\(s\) dev;"),
+     r"overridden in target dev;"),
 ])
 def test_es_host_configs_json_rejects(doc, match):
     with pytest.raises(ValueError, match=match):
@@ -1743,7 +1743,7 @@ def test_default_es_host_config_accepted():
     (None, {}, "default_es_host_config is not declared"),
     ("es_host_primary", {}, "names 'es_host_primary', which is not a declared host config"),
     ("es_host_default", {"targets": {"stg": {"variables": {"default_es_host_config": "es_host_default"}}}},
-     r"default_es_host_config is overridden in target\(s\) stg;"),
+     r"default_es_host_config is overridden in target stg;"),
 ])
 def test_default_es_host_config_rejects(default, doc, match):
     with pytest.raises(ValueError, match=match):
@@ -1816,3 +1816,77 @@ def test_generated_notebook_path_resolves_from_the_output_dir():
     target = os.path.normpath(os.path.join(gen_jobs._RESOURCES_DIR, rel))
     assert target == os.path.join(_FRAMEWORK_ROOT, "notebooks", "run_index_pipeline.py")
     assert os.path.isfile(target)
+
+
+def _temp_tree(tmp_path, monkeypatch, make_resources=True):
+    """A temp repo root: one batch config, the repo's real variables block, the module pointed at it."""
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    (config_dir / "one.yml").write_text(
+        "es_index_name: one-index\n"
+        "pipeline_mode: batch\n"
+        "view: {catalog: c, schema: s, name: v}\n"
+        "source: {catalog: c, schema: s, table: t}\n"
+    )
+    resources_dir = tmp_path / "_pipelines" / "resources"
+    if make_resources:
+        resources_dir.mkdir()
+    dab_yml = _write_bundle_variables(tmp_path)
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    return resources_dir
+
+
+def test_generation_creates_a_missing_output_dir(tmp_path, monkeypatch):
+    # An upgraded or fresh _pipelines/ tree may have no resources/ folder yet: generation creates it.
+    resources_dir = _temp_tree(tmp_path, monkeypatch, make_resources=False)
+    assert gen_jobs.main(["--check"]) != 0  # missing file is stale
+    assert gen_jobs.main([]) == 0
+    assert (resources_dir / "one.job.yml").read_text().startswith(gen_jobs._GENERATED_MARKER)
+    assert gen_jobs.main(["--check"]) == 0
+
+
+@pytest.mark.parametrize("var", ["es_host_configs_json", "default_es_host_config"])
+def test_variable_overrides_json_override_rejected(tmp_path, monkeypatch, var):
+    _temp_tree(tmp_path, monkeypatch)
+    overrides = tmp_path / ".databricks" / "bundle" / "stg" / "variable-overrides.json"
+    overrides.parent.mkdir(parents=True)
+    overrides.write_text(json.dumps({"wheel_path": "/x.whl", var: "es_host_default"}))
+    with pytest.raises(ValueError, match=rf"{var} is overridden in \.databricks/bundle/stg/variable-overrides\.json"):
+        gen_jobs.main(["--check"])
+
+
+def test_unreadable_variable_overrides_json_fails_closed(tmp_path, monkeypatch):
+    _temp_tree(tmp_path, monkeypatch)
+    overrides = tmp_path / ".databricks" / "bundle" / "dev" / "variable-overrides.json"
+    overrides.parent.mkdir(parents=True)
+    overrides.write_text("{not json")
+    with pytest.raises(ValueError, match="cannot read it as JSON"):
+        gen_jobs.main(["--check"])
+
+
+def test_empty_default_es_host_config_has_its_own_message():
+    doc = {"variables": {"default_es_host_config": {"default": ""}}}
+    with pytest.raises(ValueError, match="has an empty or non-string default"):
+        gen_jobs.require_default_es_host_config(None, {"es_host_default"}, doc)
+
+
+def test_old_root_resources_generated_files_block_generation(tmp_path, monkeypatch):
+    # Generated files left in the old root resources/ would deploy beside the regenerated ones under the same
+    # keys (if the old include stays), so both modes refuse and leave everything untouched. A hand-authored
+    # file there (no marker) does not block.
+    resources_dir = _temp_tree(tmp_path, monkeypatch)
+    old = tmp_path / "resources"
+    old.mkdir()
+    (old / "_mine.job.yml").write_text("resources: {}\n")
+    assert gen_jobs.main(["--check"]) != 0  # stale (nothing generated yet), but not blocked
+    assert gen_jobs.main([]) == 0
+    stale = old / "one.job.yml"
+    stale.write_text("# GENERATED by scripts/gen_jobs.py from _pipelines/pipeline_configs/one.yml. DO NOT EDIT BY HAND.\n")
+    before = (resources_dir / "one.job.yml").read_text()
+    for argv in (["--check"], []):
+        assert gen_jobs.main(argv) == 1
+    assert stale.exists() and (resources_dir / "one.job.yml").read_text() == before
+    assert gen_jobs.legacy_root_generated_files() == [str(stale)]

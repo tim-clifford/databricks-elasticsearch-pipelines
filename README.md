@@ -314,14 +314,16 @@ A pipeline whose host config is left empty for the target it deploys to **fails 
    ```
    Set it once, at the top level: the references pick up each target's values at deploy. The generator
    fails closed unless the map lists exactly the declared host configs, each entry referencing its own
-   host's fields, and no target overrides it.
+   host's fields, and no target overrides it (in `databricks.yml` or a `variable-overrides.json`; don't
+   pass it with `--var` either).
 3. Point a pipeline at it with `es_host_config: es_host_secondary`.
 
 A pipeline referencing a host config that isn't declared in `databricks.yml` fails **at generation**
 (`framework/scripts/gen_jobs.py`), before deploy. So does a `default_es_host_config` that is missing, names
 an undeclared host config, or is overridden in a target: both the pipelines that omit `es_host_config` and
 the `es_diagnostics` job default to it, and the generator reads only its top-level `default:`, so it can't
-vary per target (don't override it with `--var` either). The default host config's *values* are still
+vary per target (a target override in `databricks.yml` or a `variable-overrides.json` fails generation;
+don't override it with `--var` either). The default host config's *values* are still
 per target.
 
 (Don't want to commit even placeholder endpoints? Put the per-target maps in the git-ignored
@@ -1297,8 +1299,9 @@ listed the hosts for the `es_diagnostics` job inside its job file. To move an ex
    (see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). The
    generator fails closed on a pipeline naming an undeclared host and on a map that doesn't match the
    declared hosts, so nothing half-renamed deploys.
-4. Delete the old root `resources/` folder and run `python framework/scripts/gen_jobs.py`, which writes the
-   per-index jobs into `_pipelines/resources/`. (Generated files you moved there yourself are recognized
+4. Delete the old root `resources/` folder (the generator refuses to run while generated files remain
+   there) and run `python framework/scripts/gen_jobs.py`, which writes the per-index jobs into
+   `_pipelines/resources/`, creating the folder if needed. (Generated files you moved there yourself are recognized
    and regenerated.) `--check` should then report every generated file up to date.
 5. Deploy. Job resource keys are unchanged, so each job is updated in place (same job id, same run
    history) and only its notebook path changes. Streaming checkpoints live under `checkpoint_base_path`,

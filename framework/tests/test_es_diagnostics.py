@@ -533,3 +533,17 @@ def test_verdict_rejecting_even_when_other_signals_missing():
 ])
 def test_human_bytes(n, expected):
     assert human_bytes(n) == expected
+
+
+@pytest.mark.parametrize("configs", [None, [], "x", ["es_host_default"]])
+def test_resolve_es_host_config_non_object_map_fails_closed(configs):
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        resolve_es_host_config("es_host_default", configs)
+
+
+@pytest.mark.parametrize("field", ["es_host_url", "secret_scope_name", "secret_key_name"])
+def test_resolve_es_host_config_unresolved_reference_fails_closed(field):
+    # A value still holding a bundle reference (it did not resolve at deploy) must not be used as a host.
+    entry = dict(_HOSTS["es_host_default"], **{field: "${var.es_host_default." + field + "}"})
+    with pytest.raises(ValueError, match=f"unresolved bundle reference in {field}"):
+        resolve_es_host_config("es_host_default", {"es_host_default": entry})

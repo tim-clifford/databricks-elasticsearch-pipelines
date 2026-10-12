@@ -126,8 +126,11 @@ def resolve_es_host_config(name, configs):
     url/scope/key is blank, raises ValueError (never silently falls back to a wrong or empty host), and the
     error names the configured hosts so a typo is obvious.
     """
-    if not isinstance(configs, dict) or name not in configs:
-        available = ", ".join(sorted(configs)) if isinstance(configs, dict) and configs else "(none configured)"
+    if not isinstance(configs, dict):
+        raise ValueError(f"es_host_configs_json must be a JSON object of host-config name -> fields, got "
+                         f"{type(configs).__name__}")
+    if name not in configs:
+        available = ", ".join(sorted(configs)) if configs else "(none configured)"
         raise ValueError(f"unknown es_host_config {name!r}; configured host configs: {available}")
     entry = configs[name] if isinstance(configs.get(name), dict) else {}
     url = (entry.get("es_host_url") or "").strip()
@@ -138,6 +141,11 @@ def resolve_es_host_config(name, configs):
                          f"(set it per target in databricks.yml under this host config)")
     if not scope or not key:
         raise ValueError(f"es_host_config {name!r} is missing secret_scope_name and/or secret_key_name")
+    unresolved = [field for field, value in (("es_host_url", url), ("secret_scope_name", scope),
+                                             ("secret_key_name", key)) if "${" in value]
+    if unresolved:
+        raise ValueError(f"es_host_config {name!r} has an unresolved bundle reference in "
+                         f"{', '.join(unresolved)}; check es_host_configs_json in databricks.yml")
     return url, scope, key
 
 

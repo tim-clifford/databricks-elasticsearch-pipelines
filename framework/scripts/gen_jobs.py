@@ -292,17 +292,29 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
 
 
 def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
-    """Fail closed if any target in databricks.yml sets `var` under its `variables:`. For variables the
-    generator reads only at their top-level default, where a per-target value would go unchecked or split
-    what the generated jobs bake from what deploy-time references resolve."""
-    overridden = sorted(
-        target for target, tspec in (doc.get("targets") or {}).items()
+    """Fail closed if any target sets `var`: under its `variables:` in databricks.yml, or in a git-ignored
+    .databricks/bundle/<target>/variable-overrides.json next to it. For variables the generator reads only
+    at their top-level default, where a per-target value would go unchecked or split what the generated
+    jobs bake from what deploy-time references resolve. (A --var on the deploy command line can't be seen
+    here; the README says not to use one for these.)"""
+    overridden = [
+        f"target {target}"
+        for target, tspec in sorted((doc.get("targets") or {}).items())
         if isinstance(tspec, dict) and var in (tspec.get("variables") or {})
-    )
+    ]
+    pattern = os.path.join(_REPO_ROOT, ".databricks", "bundle", "*", "variable-overrides.json")
+    for path in sorted(glob.glob(pattern)):
+        try:
+            with open(path) as fh:
+                overrides = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{os.path.relpath(path, _REPO_ROOT)}: cannot read it as JSON ({exc})") from None
+        if isinstance(overrides, dict) and var in overrides:
+            overridden.append(os.path.relpath(path, _REPO_ROOT))
     if overridden:
         raise ValueError(
-            f"{var} is overridden in target(s) {', '.join(overridden)}; set it only once under `variables:` "
-            f"({why})"
+            f"{var} is overridden in {', '.join(overridden)}; set it only once under `variables:` "
+            f"in databricks.yml ({why})"
         )
 
 
@@ -317,10 +329,13 @@ def require_default_es_host_config(default, declared: set, doc: dict) -> None:
     override is rejected (diagnostics would default to a different host than the pipelines write to).
     """
     if default is None:
+        declared_var = isinstance((doc.get("variables") or {}).get("default_es_host_config"), dict)
         raise ValueError(
-            "default_es_host_config is not declared in databricks.yml; declare it under `variables:` with a "
-            "default naming one of the es_host_* host configs (the _es diagnostics job's default host, and "
-            "the host a pipeline that omits es_host_config writes to)"
+            ("default_es_host_config (databricks.yml) has an empty or non-string default; set it to"
+             if declared_var else
+             "default_es_host_config is not declared in databricks.yml; declare it under `variables:` with")
+            + " a default naming one of the es_host_* host configs (the _es diagnostics job's default host, "
+            "and the host a pipeline that omits es_host_config writes to)"
         )
     if default not in declared:
         raise ValueError(
@@ -1090,6 +1105,17 @@ def existing_generated_files() -> list[str]:
     ]
 
 
+def legacy_root_generated_files() -> list[str]:
+    """Generated job files left in the repo-root resources/ folder, where the generator wrote before the
+    framework/ move. Left in place (with the old include line) they would deploy alongside the regenerated
+    copies under the same resource keys, so generation and --check refuse to run until they are removed."""
+    return [
+        path
+        for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "resources", "*.job.yml")))
+        if is_generated(path)
+    ]
+
+
 def discover_configs() -> list[str]:
     """All config paths across the supported extensions, sorted, with collisions rejected."""
     paths: list[str] = []
@@ -1125,6 +1151,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config_paths = discover_configs()
+    legacy = legacy_root_generated_files()
+    if legacy:
+        print(
+            "generated job file(s) from the old layout are still in the root resources/ folder: "
+            + ", ".join(os.path.relpath(p, _REPO_ROOT) for p in legacy)
+            + "; delete that folder (the generator now writes to _pipelines/resources/) and replace the "
+            "`resources/*.yml` include in databricks.yml (see the README upgrade steps)",
+            file=sys.stderr,
+        )
+        return 1
 
     # Parse databricks.yml once, then extract each set from the same parsed doc (single read per run).
     # The declared ES host configs (single source of truth: databricks.yml), the default host config a
@@ -1244,6 +1280,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # Write pass: everything already validated and rendered, so this cannot abort partway on a bad config.
+    # The output folder may not exist yet (a fresh _pipelines/ tree, or one upgraded from the old layout).
+    os.makedirs(_RESOURCES_DIR, exist_ok=True)
     for out_path, content in rendered.items():
         with open(out_path, "w") as fh:
             fh.write(content)
