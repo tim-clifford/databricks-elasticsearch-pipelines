@@ -24,9 +24,9 @@
 # MAGIC   from - never the shared base, never another pipeline's checkpoint.
 
 # COMMAND ----------
-# Cell 1 - DEBUG INFO. Read the two parameters, fail closed on anything missing or unsafe, tie config_name
-# to a real pipeline definition, compose the target checkpoint path, and print everything relevant before
-# we touch the filesystem.
+# Cell 1 - DEBUG INFO. Read the two parameters, fail closed on anything missing or unsafe, look up
+# config_name's pipeline definition (advisory, see item 4), compose the target checkpoint path, and print
+# everything relevant before we touch the filesystem.
 #
 # config_name is a per-run JOB PARAMETER (default "" in the job resource, overridable with
 # `--params config_name=<name>`); checkpoint_base_path is a DEPLOY-TIME base_parameter (the bundle
@@ -37,10 +37,10 @@
 #      and `..` BEFORE the name is ever interpolated into a path we recursively delete, so a value like
 #      '../other' can't escape the base and delete another pipeline's checkpoint (or a parent dir),
 #   3. checkpoint_base_path non-empty,
-#   4. a matching _pipelines/pipeline_configs/<config_name>.yml (or .yaml) EXISTS - resolved the same way
-#      run_index_pipeline.py resolves its config. This ties the clear to a real
-#      pipeline: a typo'd/unknown config_name fails closed here instead of composing a nonexistent path
-#      and reporting a benign "nothing to delete" success.
+#   4. a matching _pipelines/pipeline_configs/<config_name>.yml (or .yaml) is looked up the same way
+#      run_index_pipeline.py resolves its config. This is ADVISORY: a missing definition only WARNS and
+#      proceeds (a removed pipeline can leave a checkpoint to clear), and a typo'd name simply finds no
+#      checkpoint and deletes nothing (Cell 3 reports NOT_PRESENT).
 import os
 import re
 
