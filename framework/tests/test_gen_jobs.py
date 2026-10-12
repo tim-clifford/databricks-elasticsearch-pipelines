@@ -53,7 +53,7 @@ def _cfg(compute=None, schedule=None):
     raw = {
         "es_index_name": "ecs-dns-activity",
         "es_id_field": "dsl_id",
-        "es_host_config": "es_host_primary",
+        "es_host_config": "es_host_default",
         "pipeline_mode": "batch",
         "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
         "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity", "primary_key": "dsl_id"},
@@ -395,7 +395,7 @@ def _continuous_cfg(interval="30 seconds"):
     raw = {
         "es_index_name": "ecs-dns-activity",
         "es_id_field": "dsl_id",
-        "es_host_config": "es_host_primary",
+        "es_host_config": "es_host_default",
         "pipeline_mode": "streaming",
         "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
         "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity"},
@@ -473,7 +473,7 @@ def test_render_continuous_existing_cluster():
     raw = {
         "es_index_name": "ecs-dns-activity",
         "es_id_field": "dsl_id",
-        "es_host_config": "es_host_primary",
+        "es_host_config": "es_host_default",
         "pipeline_mode": "streaming",
         "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
         "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity"},
@@ -528,10 +528,10 @@ def test_standard_batch_spec_loads_with_tags_and_no_policy_id():
 
 
 def test_load_es_host_configs_reads_databricks_yml():
-    # The shipped databricks.yml declares es_host_primary (a complex var with the three connection
+    # The shipped databricks.yml declares es_host_default (a complex var with the three connection
     # fields). The scan must find it; the commented es_host_secondary example must NOT appear.
     declared = gen_jobs.load_es_host_configs()
-    assert "es_host_primary" in declared
+    assert "es_host_default" in declared
     assert "es_host_secondary" not in declared
 
 
@@ -541,21 +541,21 @@ def test_load_es_host_configs_ignores_non_host_complex_vars(tmp_path):
     yml = tmp_path / "databricks.yml"
     yml.write_text(
         "variables:\n"
-        "  es_host_primary:\n    type: complex\n    default:\n"
+        "  es_host_default:\n    type: complex\n    default:\n"
         "      es_host_url: ''\n      secret_scope_name: ''\n      secret_key_name: ''\n"
         "  some_cluster:\n    type: complex\n    default:\n      spark_version: '15.4.x'\n"
         "  a_plain_var:\n    default: ''\n"
     )
-    assert gen_jobs.load_es_host_configs(str(yml)) == {"es_host_primary"}
+    assert gen_jobs.load_es_host_configs(str(yml)) == {"es_host_default"}
 
 
 def test_require_es_host_config_unknown_fails_closed():
     with pytest.raises(ValueError, match="not declared in databricks.yml"):
-        gen_jobs.require_es_host_config("es_host_typo", {"es_host_primary"})
+        gen_jobs.require_es_host_config("es_host_typo", {"es_host_default"})
 
 
 def test_require_es_host_config_known_passes():
-    gen_jobs.require_es_host_config("es_host_primary", {"es_host_primary"})  # no raise
+    gen_jobs.require_es_host_config("es_host_default", {"es_host_default"})  # no raise
 
 
 # --------------------------------------------------------------------------- cluster_config (existing_cluster)
@@ -564,12 +564,12 @@ def test_require_es_host_config_known_passes():
 def test_load_cluster_configs_ignores_non_cluster_complex_vars(tmp_path):
     # A cluster config is a complex var whose default keys are EXACTLY {cluster_id}. A host-shaped complex
     # var and a plain string var are ignored, so cluster_config can only ever name a real cluster-id
-    # variable - never es_host_primary, wheel_path, etc.
+    # variable - never es_host_default, wheel_path, etc.
     yml = tmp_path / "databricks.yml"
     yml.write_text(
         "variables:\n"
         "  interactive_primary:\n    type: complex\n    default:\n      cluster_id: ''\n"
-        "  es_host_primary:\n    type: complex\n    default:\n"
+        "  es_host_default:\n    type: complex\n    default:\n"
         "      es_host_url: ''\n      secret_scope_name: ''\n      secret_key_name: ''\n"
         "  wheel_path:\n    default: ''\n"
     )
@@ -583,9 +583,9 @@ def test_load_cluster_configs_none_shipped_on_databricks_yml():
 
 def test_require_cluster_config_unknown_fails_closed():
     # A name that is not a declared cluster config - a typo, or a real but non-cluster variable like
-    # es_host_primary - fails closed at generation (not a deny-list: only cluster-shaped configs pass).
+    # es_host_default - fails closed at generation (not a deny-list: only cluster-shaped configs pass).
     with pytest.raises(ValueError, match="not declared as a cluster config"):
-        gen_jobs.require_cluster_config("es_host_primary", {"interactive_primary"})
+        gen_jobs.require_cluster_config("es_host_default", {"interactive_primary"})
 
 
 def test_require_cluster_config_known_passes():
@@ -593,9 +593,9 @@ def test_require_cluster_config_known_passes():
 
 
 def test_load_default_es_host_config_reads_databricks_yml():
-    # The shipped databricks.yml sets default_es_host_config to es_host_primary; that is what a pipeline
+    # The shipped databricks.yml sets default_es_host_config to es_host_default; that is what a pipeline
     # that omits es_host_config falls back to.
-    assert gen_jobs.load_default_es_host_config() == "es_host_primary"
+    assert gen_jobs.load_default_es_host_config() == "es_host_default"
 
 
 def test_load_default_es_host_config_absent_is_none(tmp_path):
@@ -617,7 +617,7 @@ def test_load_default_es_host_config_rejects_bad_identifier(tmp_path, bad):
 def test_omitted_es_host_config_resolves_to_bundle_default():
     # A pipeline that omits es_host_config (validate returns None) must render the BUNDLE DEFAULT's refs,
     # mirroring how main() resolves it (cfg["es_host_config"] or the default) before rendering.
-    default = gen_jobs.load_default_es_host_config()  # es_host_primary
+    default = gen_jobs.load_default_es_host_config()  # es_host_default
     cfg = validate_config({
         "es_index_name": "ecs-dns-activity", "es_id_field": "dsl_id",  # no es_host_config
         "pipeline_mode": "batch", "view": {"catalog": "c", "schema": "s", "name": "v"},
@@ -626,7 +626,7 @@ def test_omitted_es_host_config_resolves_to_bundle_default():
     assert cfg["es_host_config"] is None
     cfg["es_host_config"] = cfg["es_host_config"] or default  # what main() does
     bp = _render_job(cfg)["tasks"][0]["notebook_task"]["base_parameters"]
-    assert bp["es_host_url"] == "${var.es_host_primary.es_host_url}"
+    assert bp["es_host_url"] == "${var.es_host_default.es_host_url}"
 
 
 def test_render_unresolved_es_host_config_fails_closed():
@@ -937,7 +937,7 @@ def _member(config_filename, name, es_index, *, group="g1", postfix=None, mode="
     """One (config_filename, name, cfg, spec) group member. spec is a job-cluster new_cluster spec when
     job_cluster_config is set (mirrors what main() loads), else None."""
     raw = {
-        "es_index_name": es_index, "es_id_field": "dsl_id", "es_host_config": "es_host_primary",
+        "es_index_name": es_index, "es_id_field": "dsl_id", "es_host_config": "es_host_default",
         "pipeline_mode": mode, "job_group": group,
         "view": {"catalog": "c", "schema": "s", "name": "v"},
         "source": {"catalog": "c", "schema": "s", "table": "t"},
@@ -993,7 +993,7 @@ def test_group_run_time_knobs_move_into_task_base_parameters():
     # The 17 run-time knobs (from job_parameters) become each task's base_parameters, with per-member
     # defaults; the notebook reads the same widget names, so no notebook change.
     cfg = validate_config({
-        "es_index_name": "idx-a", "es_id_field": "dsl_id", "es_host_config": "es_host_primary",
+        "es_index_name": "idx-a", "es_id_field": "dsl_id", "es_host_config": "es_host_default",
         "pipeline_mode": "batch", "job_group": "g1", "chunk_size": 500, "write_concurrency": 4,
         "view": {"catalog": "c", "schema": "s", "name": "v"},
         "source": {"catalog": "c", "schema": "s", "table": "t"},
@@ -1595,7 +1595,7 @@ def test_legacy_marker_files_are_ours(tmp_path, monkeypatch):
     (config_dir / "kept.yml").write_text(
         "es_index_name: kept-index\n"
         "pipeline_mode: batch\n"
-        "es_host_config: es_host_primary\n"
+        "es_host_config: es_host_default\n"
         "view: {catalog: c, schema: s, name: v}\n"
         "source: {catalog: c, schema: s, table: t}\n"
     )
@@ -1652,7 +1652,7 @@ def _hosts_doc(entries, raw=None, spec_extra=None, targets=None):
 
 
 def test_es_host_configs_json_exact_map_accepted():
-    hosts = {"es_host_primary", "es_host_secondary"}
+    hosts = {"es_host_default", "es_host_secondary"}
     gen_jobs.require_es_host_configs_json(hosts, doc=_hosts_doc({h: _host_entry(h) for h in hosts}))
     # No host configs declared: the empty object is the matching map.
     gen_jobs.require_es_host_configs_json(set(), doc=_hosts_doc({}))
@@ -1670,29 +1670,29 @@ def test_es_host_configs_json_shipped_databricks_yml_matches_declared_hosts():
     ({"variables": {}}, "not declared in databricks.yml as a plain string variable"),
     ({"variables": {"es_host_configs_json": "x"}}, "plain string variable"),
     (_hosts_doc({}, spec_extra={"type": "complex"}), "plain string variable"),
-    ({"variables": {"es_host_configs_json": {"default": {"es_host_primary": {}}}}}, "plain string variable"),
-    (_hosts_doc({}, raw='{"es_host_primary": '), "not valid JSON"),
-    (_hosts_doc({}, raw='["es_host_primary"]'), "must be a JSON object"),
-    (_hosts_doc({}), "missing: es_host_primary"),
-    (_hosts_doc({"es_host_primary": _host_entry("es_host_primary"),
+    ({"variables": {"es_host_configs_json": {"default": {"es_host_default": {}}}}}, "plain string variable"),
+    (_hosts_doc({}, raw='{"es_host_default": '), "not valid JSON"),
+    (_hosts_doc({}, raw='["es_host_default"]'), "must be a JSON object"),
+    (_hosts_doc({}), "missing: es_host_default"),
+    (_hosts_doc({"es_host_default": _host_entry("es_host_default"),
                  "es_host_secondary": _host_entry("es_host_secondary")}), "not declared: es_host_secondary"),
-    (_hosts_doc({"es_host_primary": dict(_host_entry("es_host_primary"),
+    (_hosts_doc({"es_host_default": dict(_host_entry("es_host_default"),
                                          es_host_url="${var.es_host_secondary.es_host_url}")}),
-     "entry 'es_host_primary' must be exactly"),
-    (_hosts_doc({"es_host_primary": dict(_host_entry("es_host_primary"), es_host_url="https://h:9200")}),
-     "entry 'es_host_primary' must be exactly"),
-    (_hosts_doc({"es_host_primary": dict(_host_entry("es_host_primary"), extra="x")}),
-     "entry 'es_host_primary' must be exactly"),
-    (_hosts_doc({"es_host_primary": {k: v for k, v in _host_entry("es_host_primary").items()
+     "entry 'es_host_default' must be exactly"),
+    (_hosts_doc({"es_host_default": dict(_host_entry("es_host_default"), es_host_url="https://h:9200")}),
+     "entry 'es_host_default' must be exactly"),
+    (_hosts_doc({"es_host_default": dict(_host_entry("es_host_default"), extra="x")}),
+     "entry 'es_host_default' must be exactly"),
+    (_hosts_doc({"es_host_default": {k: v for k, v in _host_entry("es_host_default").items()
                                      if k != "secret_key_name"}}),
-     "entry 'es_host_primary' must be exactly"),
-    (_hosts_doc({"es_host_primary": _host_entry("es_host_primary")},
+     "entry 'es_host_default' must be exactly"),
+    (_hosts_doc({"es_host_default": _host_entry("es_host_default")},
                 targets={"dev": {"variables": {"es_host_configs_json": "{}"}}, "prd": {}}),
      r"overridden in target\(s\) dev;"),
 ])
 def test_es_host_configs_json_rejects(doc, match):
     with pytest.raises(ValueError, match=match):
-        gen_jobs.require_es_host_configs_json({"es_host_primary"}, doc=doc)
+        gen_jobs.require_es_host_configs_json({"es_host_default"}, doc=doc)
 
 
 def test_es_diagnostics_job_names_no_host_config():
@@ -1708,7 +1708,7 @@ def test_es_diagnostics_job_names_no_host_config():
     assert base["es_host_configs_json"] == "${var.es_host_configs_json}"
     # No reference to any one host config's fields (only the whole-map variable), and no host name literal.
     assert re.findall(r"\$\{var\.es_host_\w+", text) == ["${var.es_host_configs_json"]
-    assert "es_host_primary" not in text
+    assert "es_host_default" not in text
 
 
 def test_generation_fails_when_es_host_configs_json_misses_a_host(tmp_path, monkeypatch):

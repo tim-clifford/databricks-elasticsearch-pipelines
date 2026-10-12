@@ -8,7 +8,7 @@
 # feeding its own index (ecs-dns-group-b). Same source, distinct index - the required per-member rule.
 es_index_name: ecs-dns-group-b               # this member's own ES index (distinct from member A's)
 es_id_field: dsl_id                          # OPTIONAL: view output column used as the ES document _id (idempotent upserts on re-run)
-es_host_config: es_host_primary              # ES host config (endpoint + secret scope/key); declared in databricks.yml
+es_host_config: es_host_default              # ES host config (endpoint + secret scope/key); declared in databricks.yml
 pipeline_mode: batch                         # default export mode: batch | streaming
 
 job_group: ecs_dns_group                     # same group as member A => merged into one shared-cluster job

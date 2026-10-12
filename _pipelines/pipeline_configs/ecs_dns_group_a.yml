@@ -12,7 +12,7 @@
 # concurrent tasks, so two writing one index would double-write it - the generator fails closed on that).
 es_index_name: ecs-dns-group-a               # this member's own ES index (distinct from member B's)
 es_id_field: dsl_id                          # OPTIONAL: view output column used as the ES document _id (idempotent upserts on re-run)
-es_host_config: es_host_primary              # ES host config (endpoint + secret scope/key); declared in databricks.yml
+es_host_config: es_host_default              # ES host config (endpoint + secret scope/key); declared in databricks.yml
 pipeline_mode: batch                         # default export mode: batch | streaming
 
 job_group: ecs_dns_group                     # MERGE with every config sharing this job_group into one job

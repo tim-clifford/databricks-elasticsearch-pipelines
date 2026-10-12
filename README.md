@@ -136,7 +136,7 @@ value fails closed wherever the value is required. The bundle variables are:
 | `checkpoint_base_path` | UC Volume base path for **streaming** checkpoints; the runner appends `/<config_name>` so each stream gets its own subfolder. Set per target (empty on `main`). Required for a streaming run (fails closed if empty); unused by batch and `deploy_views`. The `dev` target shows how to append `${workspace.current_user.short_name}` to isolate each developer's checkpoints (see [Streaming](#streaming)) |
 | `cluster_policy_id` | workspace-specific cluster policy id injected into every job cluster (see [Compute](#compute)). Set per target (empty on `main`); required only when a pipeline uses `job_cluster` compute |
 | `ca_certs` | UC Volume path to a CA bundle (PEM) the connector uses to verify the ES server's TLS certificate. One global bundle shared by every host config. Set per target (empty on `main`); empty means fall back to the system CA store. Incompatible with `verify_certs: false` (the connector rejects that combination at run). Per-endpoint CA pinning is not supported (would need `ca_certs` moved onto the `es_host_*` complex variables) |
-| `default_es_host_config` | name of the ES **host config** a pipeline writes to when it omits `es_host_config` (out of the box `es_host_primary`); must name one of the `es_host_*` complex variables. Read at **generation** time, so it is a repo-level choice: per-target and `--var` overrides are not seen by the generator (its per-environment values live on the host config itself). See [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections) |
+| `default_es_host_config` | name of the ES **host config** a pipeline writes to when it omits `es_host_config` (out of the box `es_host_default`); must name one of the `es_host_*` complex variables. Read at **generation** time, so it is a repo-level choice: per-target and `--var` overrides are not seen by the generator (its per-environment values live on the host config itself). See [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections) |
 | `schedule_pause_status` | target-wide default `PAUSED` or `UNPAUSED` applied to every scheduled **and** continuous job (default `PAUSED`, fail-safe). `dev` and `stg` inherit the paused default so they deploy the trigger without firing it; only `prd` binds `UNPAUSED` to actually run it. A pipeline config's own top-level `pause_status` overrides this for that one job's trigger. Affects jobs that declare a `schedule` or a `continuous` block (see [Scheduling](#scheduling) and [Continuous streaming](#continuous-always-on-streaming)) |
 | `support_email` | email recipients (a **list**) notified on any job/task run **failure** in the target. Every job (generated index/group jobs plus the hand-authored `deploy_views`, `checkpoint_clear`, `build_wheel`) emits `email_notifications.on_failure: ${var.support_email}` with `notification_settings` that suppress SKIPPED and CANCELED runs, so the address is paged only on a genuine failure. A `type: complex` LIST var: the empty list `[]` turns notifications **off** (an unambiguous "no recipients", unlike a single empty string). Set per target (empty `[]` on `main`, `dev`, `stg`; set a real address, e.g. `["es-oncall@yourco.com"]`, only in `prd`). Because it is complex it **cannot** be set via `--var`; override `dev` through the git-ignored `.databricks/bundle/<target>/variable-overrides.json` |
 | `bulk_stats` | global default for the connector's `bulk_stats` diagnostics (per-partition ES bulk-send stats in the run log). Empty default (off). The generator bakes `${var.bulk_stats}` as the `bulk_stats` job-parameter default for any pipeline that omits it, so setting this per target (or `--var=bulk_stats=true`) turns diagnostics on for a whole environment. A pipeline's own `bulk_stats:` and a per-run `--params bulk_stats=<v>` override it (see [Configuration](#configuration)) |
@@ -163,7 +163,7 @@ its `.sql` filename):
 ```yaml
 es_index_name: ecs-dns-activity   # target ES index (hyphens allowed)
 es_id_field: dsl_id               # OPTIONAL: view output column passed to the connector as the ES document _id (idempotent upserts). Omit to let ES auto-generate _ids (replays may duplicate; see below)
-es_host_config: es_host_primary   # OPTIONAL: which ES host config to write to; declared in databricks.yml (see below). Omit to use the bundle default
+es_host_config: es_host_default   # OPTIONAL: which ES host config to write to; declared in databricks.yml (see below). Omit to use the bundle default
 pipeline_mode: batch              # OPTIONAL default export mode: batch | streaming. Omit to defer to the global ${var.pipeline_mode} default (batch), or set here; override per run. A continuous pipeline must set streaming explicitly (can't inherit the global)
 filter_condition: "action = 'allowed'"  # OPTIONAL default row filter (Spark SQL); omit for no filter
 chunk_size: 1000                  # OPTIONAL EsWriteConfig tuning (docs per bulk request); omit for connector default
@@ -253,7 +253,7 @@ defined "last" row. Ensure the column is unique across the input when you need a
 Each pipeline writes to one **host config**: a named group of the three connection settings the
 connector needs, declared once in `databricks.yml` and referenced by name from the pipeline
 (`es_host_config: <name>`). `es_host_config` is **optional**: a pipeline that omits it falls back to
-the bundle's `default_es_host_config` (a `databricks.yml` variable, `es_host_primary` out of the box —
+the bundle's `default_es_host_config` (a `databricks.yml` variable, `es_host_default` out of the box —
 rename it or point it at your own default). A host config is:
 
 | Field | What it is |
@@ -273,20 +273,20 @@ A host config is a `type: complex` bundle variable. On `main` the per-target val
 ```yaml
 # databricks.yml
 variables:
-  es_host_primary:
+  es_host_default:
     type: complex
     default: {es_host_url: "", secret_scope_name: "", secret_key_name: ""}   # empty = fail-closed
 
 targets:
   dev:
     variables:
-      es_host_primary:
+      es_host_default:
         es_host_url: "https://your-dev-es-host:9200"
         secret_scope_name: "es_dev"
         secret_key_name: "api_key"
   prd:
     variables:
-      es_host_primary:
+      es_host_default:
         es_host_url: "https://your-prd-es-host:9200"
         secret_scope_name: "es_prd"
         secret_key_name: "api_key"
@@ -305,9 +305,9 @@ A pipeline whose host config is left empty for the target it deploys to **fails 
    ```yaml
    es_host_configs_json:
      default: >-
-       {"es_host_primary": {"es_host_url": "${var.es_host_primary.es_host_url}",
-       "secret_scope_name": "${var.es_host_primary.secret_scope_name}",
-       "secret_key_name": "${var.es_host_primary.secret_key_name}"},
+       {"es_host_default": {"es_host_url": "${var.es_host_default.es_host_url}",
+       "secret_scope_name": "${var.es_host_default.secret_scope_name}",
+       "secret_key_name": "${var.es_host_default.secret_key_name}"},
        "es_host_secondary": {"es_host_url": "${var.es_host_secondary.es_host_url}",
        "secret_scope_name": "${var.es_host_secondary.secret_scope_name}",
        "secret_key_name": "${var.es_host_secondary.secret_key_name}"}}
@@ -1278,19 +1278,28 @@ Config names and job_group names may not start with `_` (checked at generation),
 with the `_`-prefixed fixed jobs.
 ```
 
-### Upgrading from the single-folder layout
+### Upgrading from earlier builds
 
 Earlier builds kept `notebooks/`, `pipeline_lib/`, `scripts/`, `tests/`, `requirements.txt` and every job
-resource (fixed and generated) at the repo root. To move an existing copy to this layout:
+resource (fixed and generated) at the repo root, named the shipped host config `es_host_primary`, and
+listed the hosts for the `es_diagnostics` job inside its job file. To move an existing copy to this build:
 
 1. Replace those root folders with `framework/` from this build. `_pipelines/pipeline_configs/`,
    `_pipelines/pipeline_views/` and `_pipelines/job_cluster_configs/` carry over unchanged.
 2. In `databricks.yml`, replace the `resources/*.yml` include with the two lines this build ships:
    `framework/resources/*.yml` and `_pipelines/resources/*.yml`.
-3. Delete the old root `resources/` folder and run `python framework/scripts/gen_jobs.py`, which writes the
+3. Rename the host config `es_host_primary` to `es_host_default` everywhere you set it: its declaration
+   and each target's values in `databricks.yml`, `default_es_host_config`, any
+   `.databricks/bundle/<target>/variable-overrides.json`, and every pipeline config with
+   `es_host_config: es_host_primary`. (Or keep your own name: the shipped one is only a default.) Then
+   add the `es_host_configs_json` variable this build ships, with one entry per host config you declare
+   (see [Configuring Elasticsearch host connections](#configuring-elasticsearch-host-connections)). The
+   generator fails closed on a pipeline naming an undeclared host and on a map that doesn't match the
+   declared hosts, so nothing half-renamed deploys.
+4. Delete the old root `resources/` folder and run `python framework/scripts/gen_jobs.py`, which writes the
    per-index jobs into `_pipelines/resources/`. (Generated files you moved there yourself are recognized
    and regenerated.) `--check` should then report every generated file up to date.
-4. Deploy. Job resource keys are unchanged, so each job is updated in place (same job id, same run
+5. Deploy. Job resource keys are unchanged, so each job is updated in place (same job id, same run
    history) and only its notebook path changes. Streaming checkpoints live under `checkpoint_base_path`,
    not in the repo, so a streaming pipeline resumes where it left off.
 

@@ -1567,7 +1567,7 @@ def job_base_parameters(
     - `es_host_url_ref`, `secret_scope_name_ref`, `secret_key_name_ref`: the ES connection settings
       (endpoint, and the secret scope/key holding the ES api_key) for THIS pipeline's chosen host
       config. The generator passes fields of the pipeline's es_host_config complex bundle variable
-      (e.g. "${var.es_host_primary.es_host_url}"), so a pipeline can target a different ES host and the
+      (e.g. "${var.es_host_default.es_host_url}"), so a pipeline can target a different ES host and the
       bundle resolves the right per-target values at deploy.
     - `checkpoint_base_path_ref` (e.g. "${var.checkpoint_base_path}"): the global base path (a UC
       Volume) under which each STREAMING job keeps its checkpoint; the runner appends /<config_name>

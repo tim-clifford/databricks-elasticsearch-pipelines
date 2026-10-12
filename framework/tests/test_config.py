@@ -47,9 +47,9 @@ def _job_base_parameters(config_name):
         config_name,
         environment_ref="${var.environment}",
         wheel_path_ref="${var.wheel_path}",
-        es_host_url_ref="${var.es_host_primary.es_host_url}",
-        secret_scope_name_ref="${var.es_host_primary.secret_scope_name}",
-        secret_key_name_ref="${var.es_host_primary.secret_key_name}",
+        es_host_url_ref="${var.es_host_default.es_host_url}",
+        secret_scope_name_ref="${var.es_host_default.secret_scope_name}",
+        secret_key_name_ref="${var.es_host_default.secret_key_name}",
         checkpoint_base_path_ref="${var.checkpoint_base_path}",
         ca_certs_ref="${var.ca_certs}",
         monitoring_log_table_ref="${var.monitoring_log_table}",
@@ -61,7 +61,7 @@ def _base():
     return {
         "es_index_name": "ecs-dns-activity",
         "es_id_field": "dsl_id",
-        "es_host_config": "es_host_primary",
+        "es_host_config": "es_host_default",
         "pipeline_mode": "batch",
         "view": {"catalog": "cat", "schema": "es_poc", "name": "ecs_dns_activity"},
         "source": {"catalog": "cat", "schema": "ocsf", "table": "dns_activity", "primary_key": "dsl_id"},
@@ -349,7 +349,7 @@ def test_es_host_config_carried_through_resolve():
     # es_host_config names a bundle variable, not an object name: no ${environment} folding; resolve
     # must keep it verbatim so the generated ${var.<name>.*} refs stay intact.
     out = resolve_config(validate_config(_with_env()), environment="prod")
-    assert out["es_host_config"] == "es_host_primary"
+    assert out["es_host_config"] == "es_host_default"
 
 
 def test_unknown_top_level_key():
@@ -670,9 +670,9 @@ def test_job_base_parameters():
         "config_name": "ecs_dns_activity",
         "environment": "${var.environment}",
         "wheel_path": "${var.wheel_path}",
-        "es_host_url": "${var.es_host_primary.es_host_url}",
-        "secret_scope_name": "${var.es_host_primary.secret_scope_name}",
-        "secret_key_name": "${var.es_host_primary.secret_key_name}",
+        "es_host_url": "${var.es_host_default.es_host_url}",
+        "secret_scope_name": "${var.es_host_default.secret_scope_name}",
+        "secret_key_name": "${var.es_host_default.secret_key_name}",
         "checkpoint_base_path": "${var.checkpoint_base_path}",
         "ca_certs": "${var.ca_certs}",
         "monitoring_log_table": "${var.monitoring_log_table}",
@@ -688,8 +688,8 @@ def test_job_base_parameters_streaming_trigger_interval():
     # the passed literal, and defaults to "" (availableNow) when omitted.
     assert _job_base_parameters("x")["streaming_trigger_interval"] == ""
     params = job_base_parameters(
-        "x", "${var.environment}", "${var.wheel_path}", "${var.es_host_primary.es_host_url}",
-        "${var.es_host_primary.secret_scope_name}", "${var.es_host_primary.secret_key_name}",
+        "x", "${var.environment}", "${var.wheel_path}", "${var.es_host_default.es_host_url}",
+        "${var.es_host_default.secret_scope_name}", "${var.es_host_default.secret_key_name}",
         "${var.checkpoint_base_path}", "${var.ca_certs}", "${var.monitoring_log_table}", "30 seconds",
     )
     assert params["streaming_trigger_interval"] == "30 seconds"

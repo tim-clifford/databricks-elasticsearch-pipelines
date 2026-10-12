@@ -6,7 +6,7 @@
 # used as-is.
 es_index_name: ecs-authentication   # target Elasticsearch index (hyphens allowed)
 es_id_field: dsl_id                 # OPTIONAL: view output column used as the ES document _id (idempotent upserts). Omit => ES auto-generates _ids, so replays may duplicate documents
-es_host_config: es_host_primary     # ES host config (endpoint + secret scope/key); declared in databricks.yml
+es_host_config: es_host_default     # ES host config (endpoint + secret scope/key); declared in databricks.yml
 pipeline_mode: streaming            # default export mode: batch | streaming (override per run with --params)
 
 view:                               # the view this pipeline creates and exports
