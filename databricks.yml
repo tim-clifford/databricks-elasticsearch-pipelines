@@ -115,7 +115,7 @@ variables:
   # while an index-job run with an empty wheel_path fails closed in the runner. Override at deploy if
   # needed, e.g.
   #   --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
-  # See the README "Configuration" / "Deploy and run" sections for the full rationale (version-in-filename, forking).
+  # See wheel_path in docs/parameters.md and "Updating the connector" in docs/framework-maintenance.md.
   wheel_path:
     description: "UC Volume path to the databricks-es-connector wheel every index job installs (version lives in the filename). Empty default; set per target below or override with --var. Required for index-job runs (fails closed if empty)."
     default: ""
@@ -156,7 +156,7 @@ variables:
   # deploying to a target automatically uses THAT environment's hosts - no --var needed.
   #
   # PLACEHOLDERS on main: the per-target values below ship EMPTY. Fill them in for the environments you
-  # deploy to (see the README "Configuring Elasticsearch host connections"). Only the api_key VALUE is a
+  # deploy to (see "Elasticsearch host configs" in docs/setup.md). Only the api_key VALUE is a
   # secret and it stays in the Databricks secret scope; the endpoint and the scope/key NAMES are not
   # secret, so committing them per target is fine.
   #
@@ -253,8 +253,8 @@ variables:
   # unconditionally because the Jobs API rejects an empty cluster_log_conf (400 "Invalid cluster log
   # storage info", seen live), and a bundle cannot omit a nested block at deploy. So a config that opts
   # in needs this set to a real path in EVERY target it deploys to (empty there fails the deploy, loudly).
-  # Serverless has no cluster log delivery. Logs ACCUMULATE: nothing here deletes them. See the README
-  # "Cluster log delivery" section (grants, contents). Simple string, so --var-settable.
+  # Serverless has no cluster log delivery. Logs ACCUMULATE: nothing here deletes them. See "Cluster log
+  # delivery" in docs/operations.md (grants, contents). Simple string, so --var-settable.
   cluster_log_volume_path:
     description: "UC Volume path job-cluster logs are delivered to, for job cluster configs that opt in with a cluster_log_conf block referencing ${var.cluster_log_volume_path}. Empty default (unused). Must be set in every target such a config deploys to. Logs accumulate; no automatic cleanup."
     default: ""

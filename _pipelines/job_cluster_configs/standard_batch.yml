@@ -30,7 +30,7 @@ custom_tags:
   project: elastic              # example hardcoded tag applied to the job cluster
 # OPTIONAL cluster log delivery (classic only): uncomment to deliver this cluster's driver/executor logs to
 # the ${var.cluster_log_volume_path} UC Volume, then set that variable in EVERY target this deploys to (an
-# empty destination fails the deploy). Logs accumulate there; see the README "Cluster log delivery".
+# empty destination fails the deploy). Logs accumulate there; see "Cluster log delivery" in docs/operations.md.
 # cluster_log_conf:
 #   volumes:
 #     destination: ${var.cluster_log_volume_path}

@@ -249,7 +249,7 @@ _VALID_PAUSE_STATUSES = ("PAUSED", "UNPAUSED")
 # framework typically runs (a day is only ~hundreds of MB, which 128m scans in just a few splits)
 # parallelize across the cluster instead of running on a handful of cores. Tune it so the read yields
 # ~2-3x worker cores partitions (data_size / (2-3 x cores)), the same partition-count target as
-# write_repartition; see the README. Note a very large one-off load wants a LARGER value than this
+# write_repartition; see "Partitions" in docs/throughput.md. Note a very large one-off load wants a LARGER value than this
 # default (e.g. tens of MB) to avoid thousands of tiny partitions. "0" means "do not set it"
 # (defer to the cluster/engine default). max_partition_bytes accepts a Spark byte-size string ("2m",
 # "16m", "128m") or a raw byte count.
@@ -563,8 +563,8 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     op_type is a STRING knob (index | create) parsed by require_op_type: a set value is passed through
     unchanged (the connector validates the allowed set, not this layer), an unset "" is omitted so the
     connector's default op_type ("index") stands. Requires connector 0.10.0+, dropped fail-soft on an
-    older wheel like bulk_stats. It is per-config (no global ${var.*}), so unlike bulk_stats it has no
-    target-wide default: a feed opts into create explicitly.
+    older wheel like bulk_stats. Like the other run-time knobs it also takes the target-wide ${var.op_type}
+    global; that ships empty, so a feed still opts into create explicitly unless a target sets it.
 
     bypass_fast_path is the same shape of bool knob as bulk_stats/retry_transport_timeout (canonical
     "true"/"false"/"" via require_es_flag): when true the connector skips the filter_path="errors" probe
@@ -895,9 +895,9 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # op_type selects the _bulk action for index writes: "index" (default, an upsert-over-_id) or
     # "create" (append-only, plus the connector's create-409-is-a-no-op dedup so a resend of an
     # already-indexed doc is skipped instead of overwriting or failing the batch). OPTIONAL: absent -> ""
-    # (unset), which defers to the connector default ("index"). It is PER-CONFIG with NO global ${var.*}
-    # (a feed opts into create explicitly, unlike bulk_stats/retry_transport_timeout which take a
-    # target-wide default). Stored canonical string form (a job-parameter default). A present value is
+    # (unset), which inherits the target-wide ${var.op_type} global and, when that is empty too (as shipped),
+    # defers to the connector default ("index"), so a feed opts into create explicitly unless a target
+    # sets the global. Stored canonical string form (a job-parameter default). A present value is
     # passed THROUGH to the connector, which is the single source of truth for the allowed set (so it is
     # NOT re-enumerated here); a non-string/malformed token fails closed. Requires connector 0.10.0+; on
     # an older wheel the runner drops it fail-soft.
