@@ -1673,6 +1673,7 @@ def test_es_host_configs_json_shipped_databricks_yml_matches_declared_hosts():
 @pytest.mark.parametrize("doc, match", [
     ({"variables": {}}, "es_host_configs_json is not declared in databricks.yml;"),
     ({"variables": {"es_host_configs_json": "x"}}, "must be declared as a string variable with a `default:`"),
+    ({"variables": {"es_host_configs_json": None}}, "must be declared as a string variable with a `default:`"),
     (_hosts_doc({}, spec_extra={"type": "complex"}), "must be declared as a string variable"),
     ({"variables": {"es_host_configs_json": {"default": {"es_host_default": {}}}}}, "must be declared as a string variable"),
     (_hosts_doc({}, raw='{"es_host_default": '), "not valid JSON"),
@@ -1963,4 +1964,15 @@ def test_old_root_resources_message_comes_before_config_errors(tmp_path, monkeyp
     (tmp_path / "_pipelines" / "pipeline_configs" / "bad.name.yml").write_text("es_index_name: x\n")
     (tmp_path / "resources").mkdir()
     assert gen_jobs.main(["--check"]) == 1
-    assert "root resources/ folder still exists" in capsys.readouterr().err
+    assert "root resources/ folder (or a file of that name) still exists" in capsys.readouterr().err
+
+
+def test_old_root_resources_file_or_dangling_link_also_blocks(tmp_path, monkeypatch):
+    _temp_tree(tmp_path, monkeypatch)
+    old = tmp_path / "resources"
+    old.write_text("x")
+    assert gen_jobs.main(["--check"]) == 1
+    old.unlink()
+    old.symlink_to(tmp_path / "nowhere")
+    assert gen_jobs.old_root_resources_dir() == str(old)
+    assert gen_jobs.main(["--check"]) == 1

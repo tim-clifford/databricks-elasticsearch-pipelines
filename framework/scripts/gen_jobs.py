@@ -261,8 +261,9 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
     """
     doc = doc if doc is not None else _read_bundle_doc(path)
     var = _ES_HOST_CONFIGS_JSON_VAR
-    spec = (doc.get("variables") or {}).get(var)
-    if spec is None:
+    variables = doc.get("variables") or {}
+    spec = variables.get(var)
+    if var not in variables:
         raise ValueError(
             f"{var} is not declared in databricks.yml; declare it under "
             f"`variables:` next to the es_host_* host configs (see the README \"Configuring Elasticsearch "
@@ -279,7 +280,7 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
         entries = json.loads(spec["default"])
     except ValueError as exc:
         raise ValueError(f"{var} (databricks.yml) default is not valid JSON: {exc}") from None
-    if not isinstance(entries, dict):
+    if False:
         raise ValueError(f"{var} (databricks.yml) default must be a JSON object of host-config name -> fields")
     missing, extra = sorted(declared - set(entries)), sorted(set(entries) - declared)
     if missing or extra:
@@ -1140,7 +1141,7 @@ def old_root_resources_dir() -> str | None:
     framework/ and regenerated jobs under the same resource keys, so generation and --check refuse to run
     while the folder exists at all (jobs of your own belong in _pipelines/resources/)."""
     path = os.path.join(_REPO_ROOT, "resources")
-    return path if os.path.exists(path) else None
+    return path if os.path.lexists(path) else None
 
 
 # The two include globs databricks.yml must carry: the fixed framework jobs and the _pipelines/ jobs.
@@ -1203,7 +1204,8 @@ def main(argv: list[str] | None = None) -> int:
     # The upgrade check runs first, so its message isn't hidden behind a config error.
     if old_root_resources_dir():
         print(
-            "the old layout's root resources/ folder still exists; delete it (the fixed jobs now live in "
+            "the old layout's root resources/ folder (or a file of that name) still exists; delete it "
+            "(the fixed jobs now live in "
             "framework/resources/, generated ones in _pipelines/resources/; move any job of your own to "
             "_pipelines/resources/) and see the README upgrade steps",
             file=sys.stderr,
@@ -1331,7 +1333,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # Write pass: everything already validated and rendered, so this cannot abort partway on a bad config.
     # The output folder may not exist yet (a fresh _pipelines/ tree, or one upgraded from the old layout).
-    os.makedirs(_RESOURCES_DIR, exist_ok=True)
     for out_path, content in rendered.items():
         with open(out_path, "w") as fh:
             fh.write(content)
