@@ -553,3 +553,11 @@ def test_resolve_es_host_config_unresolved_reference_fails_closed(field):
 def test_resolve_es_host_config_non_object_entry_fails_closed(entry):
     with pytest.raises(ValueError, match="empty es_host_url"):
         resolve_es_host_config("es_host_default", {"es_host_default": entry})
+
+
+@pytest.mark.parametrize("field", ["es_host_url", "secret_scope_name", "secret_key_name"])
+@pytest.mark.parametrize("value", [3, True, ["x"], {"a": 1}])
+def test_resolve_es_host_config_non_string_field_fails_closed(field, value):
+    entry = dict(_HOSTS["es_host_default"], **{field: value})
+    with pytest.raises(ValueError, match=f"field {field} must be a string"):
+        resolve_es_host_config("es_host_default", {"es_host_default": entry})

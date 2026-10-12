@@ -133,6 +133,10 @@ def resolve_es_host_config(name, configs):
         available = ", ".join(sorted(configs)) if configs else "(none configured)"
         raise ValueError(f"unknown es_host_config {name!r}; configured host configs: {available}")
     entry = configs[name] if isinstance(configs.get(name), dict) else {}
+    for field in ("es_host_url", "secret_scope_name", "secret_key_name"):
+        if entry.get(field) is not None and not isinstance(entry[field], str):
+            raise ValueError(f"es_host_config {name!r} field {field} must be a string, got "
+                             f"{type(entry[field]).__name__}")
     url = (entry.get("es_host_url") or "").strip()
     scope = (entry.get("secret_scope_name") or "").strip()
     key = (entry.get("secret_key_name") or "").strip()
