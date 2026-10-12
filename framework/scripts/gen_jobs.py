@@ -280,7 +280,7 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
         entries = json.loads(spec["default"])
     except ValueError as exc:
         raise ValueError(f"{var} (databricks.yml) default is not valid JSON: {exc}") from None
-    if False:
+    if not isinstance(entries, dict):
         raise ValueError(f"{var} (databricks.yml) default must be a JSON object of host-config name -> fields")
     missing, extra = sorted(declared - set(entries)), sorted(set(entries) - declared)
     if missing or extra:
@@ -1333,6 +1333,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Write pass: everything already validated and rendered, so this cannot abort partway on a bad config.
     # The output folder may not exist yet (a fresh _pipelines/ tree, or one upgraded from the old layout).
+    os.makedirs(_RESOURCES_DIR, exist_ok=True)
     for out_path, content in rendered.items():
         with open(out_path, "w") as fh:
             fh.write(content)
