@@ -12,6 +12,7 @@ definitions.
 - [Feed definition keys](#feed-definition-keys) (feed config)
 - [Run-time knobs](#run-time-knobs) (`databricks.yml`, feed config and `--params`)
 - [Maintenance job parameters](#maintenance-job-parameters) (`--params`)
+- [Summary table](#summary-table)
 
 ## How values are set
 
@@ -28,9 +29,9 @@ The workspace itself is not a variable: it comes from your Databricks CLI profil
 
 ### Bundle variables
 
-Each environment-specific variable is set per target in `databricks.yml` and ships empty on `main`, so
-you fill in the targets you deploy to once and a routine deploy needs no `--var`. An empty value fails
-closed wherever the value is required.
+Each environment-specific variable is set per target in `databricks.yml`. Fill in the targets you
+deploy to once, and a routine deploy needs no `--var`. An empty value fails closed wherever the value
+is required.
 
 When the same variable is set in more than one place, the highest of these wins:
 
@@ -55,7 +56,8 @@ reads `databricks.yml` alone, so its checks would not see a variable declared el
 
 **Read at generation.** A few variables are also read by the generator, which sees only the top-level
 `default:` in `databricks.yml`: never a target override, `--var`, `BUNDLE_VAR_` variable or
-`variable-overrides.json`. Those entries say so. ([Why](technical-details.md#generation-reads-only-top-level-defaults).)
+`variable-overrides.json`. Each of those entries below has a **Read at generation** line
+([why](technical-details.md#generation-reads-only-top-level-defaults)).
 
 ### Run-time knobs: one precedence rule
 
@@ -74,9 +76,9 @@ Two exceptions:
 
 - In a [job group](feed-configuration.md#job-groups), each member's knobs are baked into its task at
   deploy, so `--params` can't override one member. A run-time override applies job-wide to every task.
-- Most globals ship empty, meaning "no target-wide default". Setting a non-empty global applies it to
-  every feed that omits the knob, with no way for one feed to opt back out to the connector default.
-  This matters most for [`filter_condition`](#filter_condition).
+- An empty global means "no target-wide default". Setting a non-empty global applies it to every feed
+  that omits the knob, with no way for one feed to opt back out to the connector default. This matters
+  most for [`filter_condition`](#filter_condition).
 
 ## Environment variables
 
@@ -124,8 +126,7 @@ The workspace's cluster policy id, injected into every job cluster (with
 - **Set:** per target, or `--var`. Default empty.
 - **Required by:** any feed with `job_cluster` compute. An empty value fails the deploy, since the Jobs
   API rejects `policy_id: ""`. Serverless and `existing_cluster` feeds don't use it.
-- **Note:** a policy id is workspace-specific. Under `dev`'s development mode each engineer deploys to
-  their own workspace, so a committed `dev` value fits one workspace; others pass `--var`.
+- **Note:** a policy id is workspace-specific, so set it in each target for that target's workspace.
 
 ### `ca_certs`
 
@@ -149,8 +150,10 @@ with a `cluster_log_conf` block (see [Logging and Monitoring](monitoring.md#clus
 The prefix in every job's display name, `[<target>] <prefix>: <postfix>` (see
 [Job naming](feed-configuration.md#job-naming)).
 
-- **Set:** top level, per target, or `--var`. Default `databricks-elasticsearch-pipelines`.
+- **Set:** top level, per target, or `--var`.
 - **Takes effect:** at deploy, with no regeneration.
+- **Recommendation:** set it once at the top level to a name that identifies these jobs in your
+  workspace (a team or product name), so every job sorts and filters together in the Jobs UI.
 
 ### `global_job_tags`
 
@@ -159,7 +162,7 @@ job clusters as cluster tags. See [Job tags](feed-configuration.md#job-tags).
 
 - **Set:** `type: complex`, so in `databricks.yml` or `variable-overrides.json`, not `--var`. Default
   `{}` (no tags).
-- **Takes effect:** the fixed maintenance jobs resolve it per target at deploy. Generated jobs bake
+- **Read at generation:** the fixed maintenance jobs resolve it per target at deploy. Generated jobs bake
   the top-level default **at generation**, so the tag key set for generated jobs comes from the top
   level only; per-target values still work through `${var...}` references.
 - **Values:** at most 24 keys (each generated job also gets an `es_index_list` tag, and a job may
@@ -169,10 +172,13 @@ job clusters as cluster tags. See [Job tags](feed-configuration.md#job-tags).
 ### `schedule_pause_status`
 
 The target-wide pause state for every scheduled and continuous trigger (see
-[Scheduling](feed-configuration.md#scheduling)).
+[Pausing triggers](feed-configuration.md#pausing-triggers)).
 
-- **Set:** top level, per target, or `--var`. Default `PAUSED`; only `prd` sets `UNPAUSED`.
+- **Set:** top level, per target, or `--var`.
 - **Values:** `PAUSED` or `UNPAUSED`.
+- **Recommendation:** `PAUSED` at the top level, so a target fires its triggers only when it opts in,
+  and `UNPAUSED` in the targets where scheduled and continuous jobs should run (usually only
+  production).
 - **Override:** a feed's own [`pause_status`](#pause_status) wins for that job.
 
 ### `support_email`
@@ -180,9 +186,10 @@ The target-wide pause state for every scheduled and continuous trigger (see
 The email recipients (a list) notified when any job or task run fails. Skipped and canceled runs don't
 notify.
 
-- **Set:** `type: complex`, so in `databricks.yml` or `variable-overrides.json`. Default `[]`.
-- **Values:** a list such as `["es-oncall@yourco.com"]`. The empty list turns notifications off. Ships
-  `[]` everywhere; set a real address in `prd`.
+- **Set:** per target. `type: complex`, so in `databricks.yml` or `variable-overrides.json`.
+- **Values:** a list such as `["es-oncall@yourco.com"]`. The empty list `[]` turns notifications off.
+- **Recommendation:** a real address in the targets that should alert someone (usually production), and
+  `[]` in the rest.
 
 ### `monitoring_log_table`
 
@@ -251,14 +258,15 @@ The host config a feed uses when it omits `es_host_config`, and the default host
 ## Cluster configs
 
 A cluster config is a `type: complex` variable with a single `cluster_id` field, named by a feed's
-`compute.cluster_config` to attach it to an existing cluster. `databricks.yml` ships a commented
-`interactive_primary` example; declare as many as you need, with per-target values (a cluster id is
-workspace-specific). An empty `cluster_id` fails the deploy, and a `cluster_config` that names no
+`compute.cluster_config` to attach it to an existing cluster. Declare as many as you need, for example
+`interactive_primary`, with per-target values (a cluster id is workspace-specific). An empty `cluster_id` fails the deploy, and a `cluster_config` that names no
 declared cluster config fails generation. See [Compute](feed-configuration.md#compute).
 
 ## Diagnostics compute
 
-The `es_diagnostics` job runs serverless unless one of these is set. Compute is a deploy-time
+The `es_diagnostics` job (a work in progress; see
+[Diagnosing an Elasticsearch host](maintenance-jobs.md#diagnosing-an-elasticsearch-host)) runs
+serverless unless one of these is set. Compute is a deploy-time
 property, so redeploy after changing them. Set at most one path; setting both fails the deploy.
 
 ### `diagnostics_existing_cluster_id`
@@ -308,7 +316,10 @@ Optional. A column of the view's output, handed to the connector as each documen
 - **Values:** a column identifier. To get random ids you must omit the key; a present but blank or
   `null` value fails the config.
 - **Checked:** when `deploy_views` creates the view, it verifies the column is in the view's output.
-- Required by [`op_type: create`](#op_type).
+- **With [`op_type: create`](#op_type):** required. A document whose `_id` is already in the index
+  returns a 409. The connector counts it as `ignored` (and as `docs_deduped` in `bulk_stats`), not as an
+  error, and leaves the existing document unchanged. Expect 409s on every re-send under `create`: a
+  retried batch, a restarted stream, or a backfill over rows already sent.
 
 ### `es_host_config`
 
@@ -355,7 +366,7 @@ An unknown type, a missing key, or a key that doesn't belong to the type fails a
 
 Optional. A Quartz cron (`quartz_cron_expression`), always in UTC. Omit for an on-demand job. Quartz has
 6 or 7 fields (seconds first), so a 5-field Unix cron is rejected. Can't be combined with `continuous`.
-See [Scheduling](feed-configuration.md#scheduling).
+See [CRON scheduling](feed-configuration.md#cron-scheduling).
 
 ### `continuous`
 
@@ -368,7 +379,8 @@ explicitly in the config (not inherited from the global) and classic compute (`j
 
 Optional. `PAUSED` or `UNPAUSED`, overriding [`schedule_pause_status`](#schedule_pause_status) for this
 job's trigger. Only valid on a job that has a trigger: a standalone on-demand feed that sets it fails at
-load, and so does a job group with no trigger. Within a group, at most one distinct value is allowed.
+load, and so does a job group with no trigger. Within a group, set it on one member or the same value on
+several; different values fail generation.
 
 ### `job_group`
 
@@ -379,8 +391,9 @@ one task per feed. Letters, digits, `_` and `-`, not starting with `_`. See
 ### `job_name_postfix`
 
 Optional. Replaces the trailing segment of the job's display name (default: the config name, or the
-group name). Cosmetic only: it never changes a resource or task key. In a group, set it on at most one
-member (conflicting values fail generation). See [Job naming](feed-configuration.md#job-naming).
+group name). Cosmetic only: it never changes a resource or task key. In a group, set it on one member
+or the same value on several; different values fail generation. See
+[Job naming](feed-configuration.md#job-naming).
 
 ## Run-time knobs
 
@@ -392,7 +405,9 @@ interact, see [Throughput Tuning](throughput.md).
 ### `pipeline_mode`
 
 `batch` re-exports the whole view each run; `streaming` reads only new source commits since the last run.
-Global default `batch`. A continuous feed must set `streaming` in its own config. See
+There is no built-in default: if the global, the feed and `--params` all leave it empty, the run fails.
+Set the global to the mode most of your feeds use. A continuous feed must set `streaming` in its own
+config. See
 [Batch or streaming](feed-configuration.md#batch-or-streaming).
 
 ### `filter_condition`
@@ -405,13 +420,13 @@ Leave the global empty unless every feed that omits the key really should carry 
 ### `streaming_start`
 
 Where a streaming feed starts on its first run: `new` (only commits after the stream starts; batch mode
-owns the history) or `full` (backfill the whole table first). Global default `new`.
+owns the history) or `full` (backfill the whole table first). Built-in default `new`.
 
 It is honored only on the first run. Once a checkpoint exists, the checkpoint is the position of record,
-so changing this has no effect until the checkpoint is
-[cleared](maintenance-jobs.md#resetting-a-checkpoint). On a `new` start the source's current commit is
-included, so if it is an append its rows are sent once more; with `es_id_field` set that overwrites the
-same documents.
+so changing this has no effect unless the checkpoint is
+[cleared](maintenance-jobs.md#resetting-a-checkpoint). A `new` start sends nothing that is already in the
+table: it records the source's current version in the checkpoint without exporting it
+([how](technical-details.md#inclusive-start-version)).
 
 ### `chunk_size`
 
@@ -433,8 +448,10 @@ sized to it automatically. See [Throughput Tuning](throughput.md#write_concurren
 
 The per-request ES client timeout, in seconds. A positive integer. Connector default `60`.
 
-Raise it (together with a smaller `chunk_size`) when bulk sends time out (`ConnectionTimeout ... The
-write operation timed out`).
+When bulk sends time out (`ConnectionTimeout ... The write operation timed out`), first find out why
+before raising it: an overloaded ES host needs less pressure, not a longer wait, and a longer timeout
+holds a thread on a request that may never return. Raise it when ES is healthy but large requests
+legitimately take longer. See [Throughput Tuning](throughput.md#timeouts-and-retries).
 
 ### `transport_max_retries`
 
@@ -442,8 +459,9 @@ How many times the ES client re-sends a whole request after a transport failure 
 timeout, or a 429 or 503 on the bulk call itself). A non-negative integer; `0` disables. Connector
 default `3`.
 
-It never sees a single document rejected inside a successful response; that is
-[`max_retries_per_doc`](#max_retries_per_doc).
+It retries only whole requests that fail. When a request succeeds but ES rejects some of the documents
+in it (per-document 429s in the response), those documents are retried by
+[`max_retries_per_doc`](#max_retries_per_doc) instead.
 
 ### `max_retries_per_doc`
 
@@ -462,32 +480,47 @@ is re-sent with backoff (up to `transport_max_retries` times) instead of the ES 
 silently and then failing the batch. Default off.
 
 It only changes timeout handling; connection resets and 429 or 503 responses are retried as before.
-With `bulk_stats` on, the cost shows as `timeout_sends` and `timeout_wait_ms`. Requires connector
-0.9.7 or later (ignored with a warning on older wheels).
+With `bulk_stats` on, the cost shows as `timeout_sends` and `timeout_wait_ms`.
+
+**Recommendation:** turn it on for every feed (set the global `${var.retry_transport_timeout}` to
+`true`). It changes nothing until a request times out, and then makes the timeouts and the time spent
+retrying them visible. ([Why it exists](technical-details.md#retry-transport-timeout).)
 
 ### `op_type`
 
-The bulk action: `index` (overwrite by `_id`) or `create` (append only). The global `${var.op_type}`
-ships empty, which means the connector default, `index`, so a feed opts into `create` in its own config
-unless a target sets the global.
+The bulk action: `index` (overwrite by `_id`) or `create` (append only). An empty global
+`${var.op_type}` means the connector default, `index`, so each feed that should append only sets
+`create` in its own config.
 
 With `create`, re-sending an existing `_id` returns a 409 the connector treats as already written, so
 the document is neither overwritten nor duplicated. Use it only for feeds that never legitimately update
 a document, since a real update is silently dropped. It requires [`es_id_field`](#es_id_field): a config
 that sets `create` without one fails at load, and `create` arriving through the global or `--params` on
-a feed without one fails the run before any document is sent (connector 0.10.0 or later rejects it with
-`op_type='create' requires id_field ...`; an older wheel ignores `op_type` altogether).
+a feed without one fails the run before any document is sent (`op_type='create' requires id_field
+...`).
 
 Under the default fast path, a chunk mixing new and already-indexed `_id`s can count a new document as
 deduplicated instead of written. The data is correct; only the count is off.
 [`bypass_fast_path`](#bypass_fast_path) makes the counts exact.
-([Why](technical-details.md#op_type-create-miscount).) Requires connector 0.10.0 or later.
+([Why](technical-details.md#op_type-create-miscount).)
 
 ### `bypass_fast_path`
 
-`true` skips the connector's fast path (an `errors`-only response probe) and checks every document's
-result on the first send. Counts become exact for `op_type: create`, at some cost to throughput on clean
-chunks. Default off. Requires connector 0.10.0 or later.
+`true` skips the connector's fast path and checks every document's result on the first send. Default
+off.
+
+Under the fast path, each chunk is sent with a request for only the response's `errors` flag. A clean
+chunk is done in one send with very little to decode. A chunk with any document-level error (a 409, a
+429, a mapping error) is then sent again in full to get each document's result. So:
+
+- **It helps** a feed where document-level errors are routine, above all `op_type: create` with
+  re-sends, where most chunks carry 409s: the fast path sends each of those chunks twice, and bypassing
+  it sends them once. It also makes the `create` counts exact, and avoids the second send duplicating a
+  chunk's good documents when the feed has no `es_id_field`.
+- **It costs** on a feed whose chunks are almost always clean: every response then carries and decodes
+  a result per document, which takes more time for no benefit.
+
+Turn on [`bulk_stats`](#bulk_stats) to see which case a feed is in.
 
 ### `require_existing_index`
 
@@ -509,8 +542,7 @@ endpoint, for example). Connector default `true`. `false` can't be combined with
 
 `true` logs per-partition bulk-send diagnostics under the `BULK_STATS` tag: docs per request, round-trip
 and ES time, straggler partitions. Default off. Turn it on when tuning or investigating a slow feed; see
-[Throughput Tuning](throughput.md#reading-the-signals) for how to read it. Requires connector 0.9.3 or
-later.
+[Logging and Monitoring](monitoring.md#reading-the-bulk_stats-output) for how to read it.
 
 ### `monitoring_log_enabled`
 
@@ -525,7 +557,7 @@ Sets `spark.sql.files.maxPartitionBytes` for the source read: smaller values spl
 smaller partitions, which carry through the view to the write. A Spark byte size (`2m`, `32m`) or a
 byte count; `0` leaves the engine default. Built-in default `2m`.
 
-A good target is about 2 to 3 times total worker cores in partitions. See
+A good starting target is about 1x to 3x the total worker cores in partitions. See
 [Throughput Tuning](throughput.md#partitions).
 
 ### `write_repartition`
@@ -533,9 +565,9 @@ A good target is about 2 to 3 times total worker cores in partitions. See
 Repartitions the write input into this many partitions before the ES write. A non-negative integer;
 `0` (built-in default) turns it off.
 
-Usually unnecessary, because `max_partition_bytes` already sets the partitioning that reaches the
-write. Set it when the view shuffles (a non-broadcast join, `GROUP BY`, `DISTINCT`, a window), which
-resets the partition count, or when large source files read into too few partitions. It adds a shuffle.
+Set it per feed: the right value depends on the feed's data and its cluster. It adds a shuffle, and in
+return gives the write a set number of evenly sized partitions. See
+[Throughput Tuning](throughput.md#partitions) for how to choose it.
 
 ### `max_files_per_trigger`
 
@@ -576,3 +608,65 @@ above at deploy.
 | `wheel_version` | none (required) | the version to build; must match the repo's `pyproject.toml` |
 
 `deploy_views`, `log_table_create` and `log_table_prune` take no run-time parameters.
+
+## Summary table
+
+Every parameter on this page, with where it is set and what happens when it is left empty. "Bundle"
+means a `databricks.yml` variable, "Config" a feed config key, "Knob" a run-time knob (bundle global,
+feed config, or `--params`), and "Job" a maintenance job's `--params`.
+
+| Parameter | Kind | Set in | Left empty |
+|---|---|---|---|
+| [`environment`](#environment) | Bundle | per target | fine unless a config name uses `${environment}` |
+| [`wheel_path`](#wheel_path) | Bundle | per target | every feed run fails |
+| [`checkpoint_base_path`](#checkpoint_base_path) | Bundle | per target | streaming runs fail |
+| [`cluster_policy_id`](#cluster_policy_id) | Bundle | per target | deploy fails for `job_cluster` feeds |
+| [`ca_certs`](#ca_certs) | Bundle | per target | the system CA store is used |
+| [`cluster_log_volume_path`](#cluster_log_volume_path) | Bundle | per target | deploy fails for opted-in cluster configs |
+| [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | must be set |
+| [`global_job_tags`](#global_job_tags) | Bundle | top level (keys), values may vary | no tags |
+| [`schedule_pause_status`](#schedule_pause_status) | Bundle | top level and per target | must be set |
+| [`support_email`](#support_email) | Bundle | per target | no failure emails |
+| [`monitoring_log_table`](#monitoring_log_table) | Bundle | per target | the log can't be turned on; `log_table_prune` fails |
+| [`monitoring_log_retention_days`](#monitoring_log_retention_days) | Bundle | per target | `log_table_prune` fails (`0` keeps everything) |
+| [`es_host_default`](#es_host_default) and other host configs | Bundle | per target | runs that use the host fail |
+| [`es_host_configs_json`](#es_host_configs_json) | Bundle | top level only | generation fails |
+| [`default_es_host_config`](#default_es_host_config) | Bundle | top level only | generation fails |
+| [Cluster configs](#cluster-configs) | Bundle | per target | deploy fails for feeds that use them |
+| [`diagnostics_existing_cluster_id`](#diagnostics_existing_cluster_id) | Bundle | per target | `es_diagnostics` runs serverless |
+| [`diagnostics_job_cluster_key`](#diagnostics_job_cluster_key) | Bundle | per target | `es_diagnostics` runs serverless |
+| [`diagnostics_job_clusters`](#diagnostics_job_clusters) | Bundle | per target | `es_diagnostics` runs serverless |
+| [`es_index_name`](#es_index_name) | Config | feed config | required |
+| [`es_id_field`](#es_id_field) | Config | feed config | Elasticsearch assigns random ids |
+| [`es_host_config`](#es_host_config) | Config | feed config | `default_es_host_config` |
+| [`view`](#view) | Config | feed config | required |
+| [`source`](#source) | Config | feed config | required |
+| [`reference_tables`](#reference_tables) | Config | feed config | no joins |
+| [`compute`](#compute) | Config | feed config | serverless |
+| [`schedule`](#schedule) | Config | feed config | no schedule |
+| [`continuous`](#continuous) | Config | feed config | not always-on |
+| [`pause_status`](#pause_status) | Config | feed config | `schedule_pause_status` |
+| [`job_group`](#job_group) | Config | feed config | the feed gets its own job |
+| [`job_name_postfix`](#job_name_postfix) | Config | feed config | the config or group name |
+| [`pipeline_mode`](#pipeline_mode) | Knob | global, config, `--params` | the run fails |
+| [`filter_condition`](#filter_condition) | Knob | global, config, `--params` | no filter |
+| [`streaming_start`](#streaming_start) | Knob | global, config, `--params` | `new` |
+| [`chunk_size`](#chunk_size) | Knob | global, config, `--params` | `500` |
+| [`write_concurrency`](#write_concurrency) | Knob | global, config, `--params` | `1` |
+| [`request_timeout`](#request_timeout) | Knob | global, config, `--params` | `60` seconds |
+| [`transport_max_retries`](#transport_max_retries) | Knob | global, config, `--params` | `3` |
+| [`max_retries_per_doc`](#max_retries_per_doc) | Knob | global, config, `--params` | `3` |
+| [`retry_transport_timeout`](#retry_transport_timeout) | Knob | global, config, `--params` | off |
+| [`op_type`](#op_type) | Knob | global, config, `--params` | `index` |
+| [`bypass_fast_path`](#bypass_fast_path) | Knob | global, config, `--params` | off |
+| [`require_existing_index`](#require_existing_index) | Knob | global, config, `--params` | on |
+| [`verify_certs`](#verify_certs) | Knob | global, config, `--params` | on |
+| [`bulk_stats`](#bulk_stats) | Knob | global, config, `--params` | off |
+| [`monitoring_log_enabled`](#monitoring_log_enabled) | Knob | global, config, `--params` | off |
+| [`max_partition_bytes`](#max_partition_bytes) | Knob | global, config, `--params` | `2m` |
+| [`write_repartition`](#write_repartition) | Knob | global, config, `--params` | off |
+| [`max_files_per_trigger`](#max_files_per_trigger) | Knob | global, config, `--params` | `1000` (Spark) |
+| [`max_bytes_per_trigger`](#max_bytes_per_trigger) | Knob | global, config, `--params` | no cap |
+| `config_name` | Job | `checkpoint_clear` | required |
+| `es_host_config`, `index_name`, `verify_certs`, `sample_interval_secs`, `request_timeout_secs` | Job | `es_diagnostics` | see [Maintenance job parameters](#maintenance-job-parameters) |
+| `repo_workspace_path`, `wheel_version` | Job | `build_wheel` | required |
