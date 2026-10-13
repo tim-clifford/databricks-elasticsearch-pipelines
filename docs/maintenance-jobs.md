@@ -16,9 +16,9 @@ Six fixed jobs handle setup and upkeep. Run any with `databricks bundle run <res
 | `deploy_views` | Deploy views | Creates or updates every feed's view in the workspace. Fails closed if the schema or join logic is invalid. | Once per deploy, before the first index run. Re-run if you modify a view's SQL. |
 | `build_wheel` | Build wheel | Builds the `databricks-es-connector` wheel from a checked-out copy of the connector repo (with `--params repo_workspace_path=<path>,wheel_version=<x.x.x>`). Publishes it to the UC Volume next to your existing wheels. Does not switch your feeds to it. | On demand when you want to update the connector version. |
 | `checkpoint_clear` | Checkpoint clear | Deletes a feed's checkpoint directory (with `--params config_name=<config_name>`). The next streaming run starts fresh. Safe to run while the stream is paused. | When you wipe an index and want to backfill it, or when you change `streaming_start`. |
-| `es_diagnostics` | Diagnostics | Samples an Elasticsearch cluster twice (5 seconds apart by default) and reports a verdict on its health (with optional `--params index_name=<index>,es_host_config=<name>`). Reports load-bearing metrics: write thread-pool saturation, rejections, indexing pressure, circuit breakers, node heap/GC, and cluster state. | When writes are slow or timing out, to see if the host is saturated. |
-| `log_table_create` | Log table create | Creates the monitoring Delta table if it does not exist, or adds any new columns to an existing table. Idempotent. (See [Monitoring log](monitoring.md#monitoring-log) below.) | Once, before turning the monitoring log on. Re-run before deploying a build that adds a new monitoring column. |
-| `log_table_prune` | Log table prune | Deletes rows older than `monitoring_log_retention_days` (default 90), then optimizes and vacuums. Runs daily on the shared pause setting: live in `prd`, paused elsewhere. | Leave it scheduled where the log is in use; pause it in `prd` if you don't use the log there (it fails without a table). |
+| `es_diagnostics` | Diagnostics | A work in progress ([see below](#diagnosing-an-elasticsearch-host)). Samples an Elasticsearch cluster twice (5 seconds apart by default) and reports a verdict on its health (with optional `--params index_name=<index>,es_host_config=<name>`). Reports write thread-pool saturation, rejections, indexing pressure, circuit breakers, node heap/GC, and cluster state. | When writes are slow or timing out, as one input on whether the host is saturated. |
+| `log_table_create` | Log table create | Creates the monitoring Delta table if it does not exist, or adds any new columns to an existing table. Idempotent. (See [Monitoring log](monitoring.md#monitoring-log) below.) | Once, before turning the monitoring log on. Re-run after deploying a build that adds a monitoring column, before its feeds run again ([how](framework-maintenance.md#upgrading-an-existing-log-table)). |
+| `log_table_prune` | Log table prune | Deletes rows older than `monitoring_log_retention_days` (default 90), then optimizes and vacuums. Runs daily, paused or unpaused by the target's `schedule_pause_status`. | Leave it scheduled where the log is in use; pause it in any target where triggers are unpaused but the log isn't used (it fails without a table). |
 
 Every maintenance job parameter is in [Parameters Reference](parameters.md#maintenance-job-parameters).
 
@@ -46,6 +46,10 @@ Concurrency: unlike every other job, `checkpoint_clear` allows up to 20 concurre
 
 ## Diagnosing an Elasticsearch host
 
+> **Work in progress.** `es_diagnostics` is still being developed. Treat its checks and verdicts as a
+> starting point for looking into a slow host, not as a production monitoring tool, and confirm what it
+> reports with the Elasticsearch cluster's own monitoring.
+
 When a host looks backed up (writes slowing, requests timing out), run the read-only `es_diagnostics` job to collect an outside view of what the cluster is doing:
 
 ```bash
@@ -62,8 +66,8 @@ It gathers: write thread-pool saturation and rejections, indexing pressure, circ
 - `SATURATED`: the write queue is building but not yet rejecting (near capacity).
 - `PRESSURED`: indexing-pressure memory is a high fraction of its limit (rejections imminent).
 - `HEAP_GC_PRESSURE`: high heap and/or heavy GC in the window: the node is processing slowly rather than queueing. A slow `_bulk` that times out client-side (rather than a fast 429) points here or at the network.
-- `HEALTHY`: every load-bearing signal was collected and is clear.
-- `INCONCLUSIVE`: a load-bearing signal (write rejections/queue, indexing pressure) could not be collected, so the host cannot be cleared as healthy. The failed endpoints are listed.
+- `HEALTHY`: every key signal was collected and is clear.
+- `INCONCLUSIVE`: a key signal (write rejections/queue, indexing pressure) could not be collected, so the host cannot be cleared as healthy. The failed endpoints are listed.
 
 The run **fails only** when it could collect nothing at all (bad host, api_key, TLS, or egress). A verdict of "found congestion" is a successful run; reporting congestion is the job's purpose.
 
