@@ -226,7 +226,7 @@ For a one-off test, unpause a single job in the Jobs UI or API, or deploy with `
 
 ### Overlapping runs skipped
 
-Every job except `checkpoint_clear` (which allows 20 concurrent runs, one per feed) sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that fires while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. Without `queue: {enabled: false}` the tick would wait in a queue instead (see [technical details](technical-details.md#queue-disabled)).
+Every job except `checkpoint_clear` (which allows 20 concurrent runs, one per feed) sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that comes while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. Without `queue: {enabled: false}` the tick would wait in a queue instead (see [technical details](technical-details.md#queue-disabled)).
 
 ## Job groups
 

@@ -330,7 +330,7 @@ How to read the table is in [Logging and Monitoring](monitoring.md#monitoring-lo
 ## Optional: failure emails, job clusters, cluster logs
 
 - **Failure emails.** Set [`support_email`](parameters.md#support_email) (a list) in the targets that
-  should page someone, usually only `prd`. Skipped and canceled runs don't email.
+  should page someone, usually only production. Skipped and canceled runs don't email.
 - **Job clusters.** If any feed uses `job_cluster` compute, set
   [`cluster_policy_id`](parameters.md#cluster_policy_id) in each target it deploys to.
 - **Cluster log delivery.** To keep job-cluster logs after the cluster ends, see

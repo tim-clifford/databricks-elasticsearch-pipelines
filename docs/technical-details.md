@@ -79,7 +79,7 @@ Note the task retry limit is **per run and cumulative**: a long-lived run's earl
 <a id="queue-disabled"></a>
 ### Overlapping runs are skipped, not queued
 
-Every job (except `_checkpoint clear`) sets `max_concurrent_runs: 1` **and** `queue: {enabled: false}`, so a scheduled tick that fires while the previous run is still going is **skipped** (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or piling up.
+Every job (except `_checkpoint clear`) sets `max_concurrent_runs: 1` **and** `queue: {enabled: false}`, so a scheduled tick that comes while the previous run is still going is **skipped** (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or piling up.
 
 The `queue` disable is what makes overlapping runs skip: the Jobs API defaults `queue.enabled` to `true`, which would otherwise *queue* the overlapping tick (waiting up to 48 hours for the slot) instead of dropping it. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view.
 

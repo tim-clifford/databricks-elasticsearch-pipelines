@@ -176,7 +176,7 @@ The target-wide pause state for every scheduled and continuous trigger (see
 
 - **Set:** top level, per target, or `--var`.
 - **Values:** `PAUSED` or `UNPAUSED`.
-- **Recommendation:** `PAUSED` at the top level, so a target fires its triggers only when it opts in,
+- **Recommendation:** `PAUSED` at the top level, so a target runs its triggers only when it opts in,
   and `UNPAUSED` in the targets where scheduled and continuous jobs should run (usually only
   production).
 - **Override:** a feed's own [`pause_status`](#pause_status) wins for that job.
