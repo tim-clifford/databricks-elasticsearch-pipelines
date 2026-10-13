@@ -2,7 +2,7 @@
 # the same `job_group`, so framework/scripts/gen_jobs.py merges them into ONE Databricks job
 # (index_pipeline_group_ecs_dns_group) with one independent task each (no dependencies). Because BOTH
 # members name the same job cluster (compute.job_cluster_config: standard_batch), they run on ONE shared
-# job cluster instead of two - the resource-saving point of grouping. See the README "Job groups" section.
+# job cluster instead of two - the resource-saving point of grouping. See "Job groups" in docs/feed-configuration.md.
 #
 # This member also sets job_name_postfix (member B omits it and inherits it, per the define-once rule),
 # so the merged job's display name is `[<target>] <prefix>: ECS DNS group (a+b, shared cluster)`.

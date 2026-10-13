@@ -94,7 +94,7 @@ _BUNDLE_REF_RE = re.compile(r"\$\{[^}]*\}")
 # Databricks caps a job at 25 tags. The generator adds es_index_list to EVERY generated job, so at most
 # _JOB_TAG_LIMIT - 1 global tags leave room for it; a larger global_job_tags fails closed at generation
 # rather than at deploy. (Development mode adds its own `dev` tag at deploy on top of these, so keep the
-# global set well under the cap in dev - documented in the README.)
+# global set well under the cap in dev - documented under "Job tags" in docs/feed-configuration.md.)
 _JOB_TAG_LIMIT = 25
 
 # Config files may use either extension; both are treated identically.
@@ -266,15 +266,15 @@ def require_es_host_configs_json(declared: set, path: str | None = None, doc: di
     if var not in variables:
         raise ValueError(
             f"{var} is not declared in databricks.yml; declare it under "
-            f"`variables:` next to the es_host_* host configs (see the README \"Configuring Elasticsearch "
-            f"host connections\")"
+            f"`variables:` next to the es_host_* host configs (see \"Elasticsearch host configs\" in "
+            f"docs/setup.md)"
         )
     if not isinstance(spec, dict) or spec.get("type") is not None or not isinstance(spec.get("default"), str):
         raise ValueError(
             f"{var} (databricks.yml) must be declared as a string variable with a `default:` (no `type:`), "
             f"like the shipped declaration; declare it under "
-            f"`variables:` next to the es_host_* host configs (see the README \"Configuring Elasticsearch "
-            f"host connections\")"
+            f"`variables:` next to the es_host_* host configs (see \"Elasticsearch host configs\" in "
+            f"docs/setup.md)"
         )
     try:
         entries = json.loads(spec["default"])
@@ -304,8 +304,8 @@ def _reject_target_overrides(var: str, doc: dict, why: str) -> None:
     """Fail closed if any target in databricks.yml sets `var` under its `variables:`. For variables the
     generator reads only at their top-level default, where a per-target value would go unchecked or split
     what the generated jobs bake from what deploy-time references resolve. Only databricks.yml is checked:
-    a variable-overrides.json, --var or BUNDLE_VAR_ override can't be seen here, and the README says not
-    to use one for these."""
+    a variable-overrides.json, --var or BUNDLE_VAR_ override can't be seen here, and docs/parameters.md says
+    not to use one for these."""
     require_bundle_shape(doc)
     overridden = [
         target for target, tspec in sorted(_block(doc, "targets", dict).items())
@@ -1207,7 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
             "the old layout's root resources/ folder (or a file of that name) still exists; delete it "
             "(the fixed jobs now live in "
             "framework/resources/, generated ones in _pipelines/resources/; move any job of your own to "
-            "_pipelines/resources/) and see the README upgrade steps",
+            "_pipelines/resources/) and see \"Upgrading from earlier builds\" in docs/framework-maintenance.md",
             file=sys.stderr,
         )
         return 1
