@@ -1,6 +1,6 @@
 # Technical Details
 
-This document explains the rationale behind the framework's design decisions, edge-case behaviors, and the live evidence supporting them. It is a reference for "why" the framework is built as it is and how to interpret unusual scenarios. Readers should be familiar with [Feed Configuration Guide](feed-configuration.md) and [Logging and Monitoring](monitoring.md).
+This document explains the rationale behind the framework's design decisions, edge-case behaviors, and the live evidence supporting them. It is a reference for "why" the framework is built as it is and how to interpret unusual scenarios. It is advanced material for a deeper understanding, and most day-to-day operation never needs it. Readers should be familiar with [Feed Configuration Guide](feed-configuration.md) and [Logging and Monitoring](monitoring.md).
 
 ## Contents
 
@@ -8,7 +8,7 @@ This document explains the rationale behind the framework's design decisions, ed
   - [Source primary key](#source-primary-key)
   - [Delivery is at least once](#delivery-is-at-least-once)
   - [Streaming runs the view per micro-batch](#streaming-view-per-micro-batch)
-  - [The start version is inclusive](#inclusive-start-version)
+  - [Where a new stream starts](#inclusive-start-version)
   - [Schema changes in a stream](#schema-changes-in-a-stream)
 - [Scheduling and recovery](#scheduling-and-recovery)
   - [Overlapping runs are skipped, not queued](#queue-disabled)
@@ -22,10 +22,11 @@ This document explains the rationale behind the framework's design decisions, ed
   - [Caught up or behind: offset semantics](#caught-up-or-behind-offset-semantics)
   - [Cost of the source version read](#source-version-read-cost)
   - [Diagnostics picks a host only by name](#diagnostics-host-by-name-security)
-  - [Timestamp shift in rows from older builds](#timestamp-shift-old-rows)
   - [Why BULK_STATS lines arrive late](#bulk-stats-relay-timing)
   - [Monitoring table layout](#liquid-clustering)
   - [Why cluster log delivery is opt-in](#cluster-log-delivery-opt-in)
+- [Writing to Elasticsearch](#writing-to-elasticsearch)
+  - [Why retry_transport_timeout exists](#retry-transport-timeout)
 - [Generation and deployment](#generation-and-deployment)
   - [Generation reads only top-level defaults](#generation-reads-only-top-level-defaults)
   - [op_type create miscount](#op_type-create-miscount)
@@ -57,15 +58,17 @@ The view logic runs over each micro-batch, not by reading the deployed view. The
 This design choice is why streaming supports only **row-wise** views: projection, filters, scalar expressions, and 1:1 reference joins, where each output row depends on a single source row. A view that aggregates **across** source rows (`GROUP BY`, `DISTINCT`, window/`OVER`, `PIVOT`) would be computed per batch, not over the whole stream, so its streamed results would silently differ from batch mode. This is a limitation of streaming mode; use `batch` mode for aggregating views.
 
 <a id="inclusive-start-version"></a>
-### The start version is inclusive
+### Where a new stream starts
 
 When a stream starts for the first time, `streaming_start` controls whether it begins with `new` (the source's current Delta version, so existing history is not re-exported) or `full` (backfill the whole existing table). This choice is honored **only on the first run**, before a checkpoint exists: once a stream has a checkpoint, that checkpoint is the position of record and `streaming_start` is ignored.
 
-The start version is **inclusive**, so if the source's current commit is itself an append, that one commit's rows are re-sent on a `new` run. Deterministic `_id`s make this a harmless idempotent upsert bounded to a single commit.
+A `new` start reads the source's current version with a separate no-op stream first: it starts at that version (Delta's `startingVersion` is inclusive), reads through it without sending anything to Elasticsearch, and commits the checkpoint after it. The real stream then resumes from that checkpoint, so it sends only commits made after the start. On a large table this no-op pass is also much cheaper than having the real stream position itself.
+
+Two fallbacks pin `startingVersion` on the real stream instead. If the no-op pass commits nothing (the current version has no data to read), nothing is re-sent either. If the runner can't tell whether a checkpoint already exists (a listing error), it starts the real stream at the current version, which is safe on a resume and on a true first run but, on a first run, sends that one commit's rows once. With `es_id_field` set that is an idempotent overwrite. The logic is in `framework/notebooks/run_index_pipeline.py`, before the stream starts.
 
 ### Schema changes in a stream
 
-An **added** source column fails the stream once with `DELTA_SCHEMA_CHANGED_WITH_VERSION` ("Please try restarting the query"); the task retry restarts it with the new schema and it continues (verified live). The views list their columns explicitly, so a new column does not reach Elasticsearch until the view is changed to include it.
+An **added** source column fails the stream once with `DELTA_SCHEMA_CHANGED_WITH_VERSION` ("Please try restarting the query"); the task retry restarts it with the new schema and it continues (verified live). Whether the new column reaches Elasticsearch depends on the view: a view that names its columns sends it only once the view is changed to include it, while a view that uses `SELECT *` sends it from the restarted stream on, because the stream runs the view's SQL against each micro-batch.
 
 A **renamed or dropped** column fails on every attempt with `DELTA_STREAMING_INCOMPATIBLE_SCHEMA_CHANGE_USE_SCHEMA_LOG` and needs an operator (deliberately: no `schemaTrackingLocation` is set).
 
@@ -78,19 +81,19 @@ Note the task retry limit is **per run and cumulative**: a long-lived run's earl
 
 Every job (except `_checkpoint clear`) sets `max_concurrent_runs: 1` **and** `queue: {enabled: false}`, so a scheduled tick that fires while the previous run is still going is **skipped** (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or piling up.
 
-The `queue` disable is load-bearing: the Jobs API defaults `queue.enabled` to `true`, which would otherwise *queue* the overlapping tick (waiting up to 48 hours for the slot) instead of dropping it. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view.
+The `queue` disable is what makes overlapping runs skip: the Jobs API defaults `queue.enabled` to `true`, which would otherwise *queue* the overlapping tick (waiting up to 48 hours for the slot) instead of dropping it. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view.
 
 <a id="task-retry-mode"></a>
 ### Continuous jobs pin task_retry_mode
 
-A continuous job's per-task recovery is governed by the continuous trigger's `task_retry_mode`, which the generator pins to **`ON_FAILURE`** for every continuous job. This is deliberate and load-bearing: the field's API/bundle default when omitted is **`NEVER`** (a failed task is never retried), even though the Jobs UI defaults it to `ON_FAILURE`.
+A continuous job's per-task recovery is governed by the continuous trigger's `task_retry_mode`, which the generator pins to **`ON_FAILURE`** for every continuous job. This is deliberate, and recovery depends on it: the field's API/bundle default when omitted is **`NEVER`** (a failed task is never retried), even though the Jobs UI defaults it to `ON_FAILURE`.
 
 Under `ON_FAILURE`:
 
 - If a task's stream fails, Databricks **retries that task in place** (with exponential backoff) as long as at least one other task in the run is still on its first attempt, so one stream can recover without disturbing the others.
 - When that no longer holds, or the retry limit is reached, the **whole run is cancelled and a fresh one started** (the job-level restart, itself exponential-backoff throttled).
 
-This matters most for a **job group** of continuous streams (multiple tasks in one run): under the `NEVER` default a failed task would sit `FAILED` while the sibling streams keep running, so the run never reaches a terminal state and the continuous trigger never restarts it either. The failed task would never recover. `ON_FAILURE` gives the intended "retry the task, else restart the job" behavior. A single-task continuous job recovers under either value (its failure ends the run, which the trigger restarts), but it is pinned the same way for consistency. Continuous jobs deployed before this change carry the `NEVER` default until redeployed.
+This matters most for a **job group** of continuous streams (multiple tasks in one run): under the `NEVER` default a failed task would sit `FAILED` while the sibling streams keep running, so the run never reaches a terminal state and the continuous trigger never restarts it either. The failed task would never recover. `ON_FAILURE` gives the intended "retry the task, else restart the job" behavior. A single-task continuous job recovers under either value (its failure ends the run, which the trigger restarts), but it is pinned the same way for consistency.
 
 <a id="serverless-and-continuous"></a>
 ### Continuous needs classic compute
@@ -152,11 +155,6 @@ Both run only for streaming with the log on. There is no knob to skip them with 
 
 The diagnostics job connects to the host config named by the `es_host_config` parameter (default: the bundle's `default_es_host_config`). The host is picked **only by name**: the job takes no run-time URL or secret, so someone who can run it can't point it, and the `api_key`, at another endpoint. This design choice trades away the flexibility of a run-time URL for the security that the diagnostics endpoint and its credentials are vetted at deployment and cannot be redirected at runtime.
 
-<a id="timestamp-shift-old-rows"></a>
-### Timestamp shift in rows from older builds
-
-Builds before the `source_latest_version` and related columns read the writer's UTC strings in the Spark session time zone, so on a cluster whose `spark.sql.session.timeZone` was not UTC (the Databricks default is UTC) rows logged by those builds are shifted by that zone's offset relative to newer rows.
-
 <a id="bulk-stats-relay-timing"></a>
 ### Why BULK_STATS lines arrive late
 
@@ -177,6 +175,17 @@ The monitoring table is **liquid-clustered** on `(config_name, event_ts)` (the c
 Cluster log delivery (`cluster_log_conf`) is deliberately not injected into every job cluster automatically: the Jobs API rejects an empty `cluster_log_conf` (`400 Invalid cluster log storage info`, seen live), and a bundle cannot drop a nested block at deploy, so an opted-in config whose target leaves the path empty **fails that deploy** (loudly, nothing is half-applied).
 
 **Classic job clusters only.** Serverless compute does not support cluster log delivery, so serverless feeds and the serverless maintenance jobs are unaffected; their output stays in the run log. `existing_cluster` feeds use whatever the existing cluster is configured with.
+
+## Writing to Elasticsearch
+
+<a id="retry-transport-timeout"></a>
+### Why retry_transport_timeout exists
+
+When a bulk request takes longer than `request_timeout`, the outcome is unknown: ES may or may not have applied it. By default the Elasticsearch Python client handles that inside its transport layer. It re-sends the same request right away, up to `transport_max_retries` times, each attempt waiting a full `request_timeout`, and the connector sees nothing until the last attempt fails. A run of timeouts therefore shows up only as a slow batch, with no record of how many sends timed out or how long the retries took.
+
+With `retry_transport_timeout` on, the connector builds its client with the transport's timeout retry turned off and does the retry itself: on a timeout only, it waits with exponential backoff (2 seconds, doubling, at most 30) and re-sends the chunk, within the same `transport_max_retries` budget. Every attempt, failed ones included, is recorded in `bulk_stats` (`timeout_sends`, `timeout_wait_ms`), so the cost of timeouts is visible, and the backoff gives a busy ES host time to recover instead of receiving the same request again at once. Connection resets and 429 or 503 responses are still retried by the transport, as before. A re-sent chunk is applied again, which is an overwrite with `es_id_field` set and a duplicate without it, the same as any other retry.
+
+The logic is in the connector (`retry_transport_timeout` in `EsWriteConfig`, and the bulk sender in `bulk.py`).
 
 ## Generation and deployment
 
