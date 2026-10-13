@@ -37,7 +37,9 @@ The bundle deploys:
 | Add a new feed | [New Feed Quick Start](docs/quick-start.md) |
 | Change how a feed runs: streaming, compute, schedule, job groups, shared views | [Feed Configuration Guide](docs/feed-configuration.md) |
 | Look up any setting: what it does, where it's set, its default | [Parameters Reference](docs/parameters.md) |
-| Run feeds, reset a checkpoint, check an ES host, use the monitoring log | [Operations and Monitoring](docs/operations.md) |
+| Deploy the bundle and run feeds | [Deployment](docs/deployment.md) |
+| Run a maintenance job: views, checkpoints, the connector wheel, the ES host check, the log table | [Maintenance Jobs](docs/maintenance-jobs.md) |
+| Read a feed's run output, the monitoring log, or cluster logs | [Logging and Monitoring](docs/monitoring.md) |
 | Make a feed write faster without overloading Elasticsearch | [Throughput Tuning](docs/throughput.md) |
 | Re-send existing data to Elasticsearch | [How to Backfill](docs/backfill.md) |
 | Fix a failed or misbehaving feed | [Troubleshooting](docs/troubleshooting.md) |

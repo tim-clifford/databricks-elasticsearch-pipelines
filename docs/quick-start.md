@@ -108,7 +108,7 @@ ORDER BY start_ts DESC
 LIMIT 5;
 ```
 
-The latest row should show `status = 'success'`. See [Operations: Monitoring log](operations.md#monitoring-log) for more.
+The latest row should show `status = 'success'`. See [Logging and Monitoring: Monitoring log](monitoring.md#monitoring-log) for more.
 
 ## Next steps
 

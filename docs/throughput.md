@@ -123,7 +123,7 @@ A streaming feed processes new data in micro-batches.
 [`max_bytes_per_trigger`](parameters.md#max_bytes_per_trigger) cap how much each one reads.
 
 - **Larger batches:** fewer fixed per-batch costs (planning, checkpoint commits and, with the
-  [monitoring log](operations.md#monitoring-log) on, its writes), so better throughput, but each batch takes
+  [monitoring log](monitoring.md#monitoring-log) on, its writes), so better throughput, but each batch takes
   longer and a retried batch re-sends more.
 - **Smaller batches:** steadier, shorter batches, at more total overhead.
 
@@ -138,7 +138,7 @@ which side of the balance a feed is on:
 
 | You see | It means | Try |
 |---|---|---|
-| 429 rejections (`rejected(429=...)`), or `took_ms` rising run over run | ES is under too much pressure | lower `write_concurrency` or the partition count; check the host with [`es_diagnostics`](operations.md#diagnosing-an-elasticsearch-host) |
+| 429 rejections (`rejected(429=...)`), or `took_ms` rising run over run | ES is under too much pressure | lower `write_concurrency` or the partition count; check the host with [`es_diagnostics`](maintenance-jobs.md#diagnosing-an-elasticsearch-host) |
 | `es_diagnostics` reports `REJECTING`, `SATURATED`, `PRESSURED` or `HEAP_GC_PRESSURE` | the ES host is the limit | lower the pressure, or add ES capacity |
 | `rtt_ms` far above `took_ms`, no 429s, executors idle | the write is waiting on round trips | raise `write_concurrency`, or add partitions or cores |
 | `gil_wait_ms` a large share of the partition's time | a partition's threads are waiting for the GIL | lower `write_concurrency` and get parallelism from more partitions instead |
@@ -163,7 +163,7 @@ With `bulk_stats` on, each batch logs lines tagged `BULK_STATS`:
 Every line carries a `ts=` timestamp, which is when the batch actually ran; for streaming, the line can
 appear in the log later than that. ([Why](technical-details.md#bulk-stats-relay-timing).)
 
-For trends across runs, the [monitoring log](operations.md#monitoring-log) keeps each batch's counts and
+For trends across runs, the [monitoring log](monitoring.md#monitoring-log) keeps each batch's counts and
 write diagnostics, including 429s per batch.
 
 ## A tuning procedure

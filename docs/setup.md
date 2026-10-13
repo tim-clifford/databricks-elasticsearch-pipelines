@@ -254,7 +254,7 @@ The prune job fails when `monitoring_log_table` is empty, and in `prd` its sched
 deploy to `prd` without the monitoring log, pause `log_table_prune` there; otherwise it fails, and emails
 `support_email`, every day.
 
-How to read the table is in [Operations](operations.md#monitoring-log).
+How to read the table is in [Logging and Monitoring](monitoring.md#monitoring-log).
 
 ## Optional: failure emails, job clusters, cluster logs
 
@@ -263,7 +263,7 @@ How to read the table is in [Operations](operations.md#monitoring-log).
 - **Job clusters.** If any feed uses `job_cluster` compute, set
   [`cluster_policy_id`](parameters.md#cluster_policy_id) in each target it deploys to.
 - **Cluster log delivery.** To keep job-cluster logs after the cluster ends, see
-  [Cluster log delivery](operations.md#cluster-log-delivery).
+  [Cluster log delivery](monitoring.md#cluster-log-delivery).
 
 ## First deploy
 
@@ -285,4 +285,4 @@ Then run one feed and check its output, as in the [quick start](quick-start.md#v
 If you have CI, run `python framework/scripts/gen_jobs.py --check` there: it changes nothing and fails if
 a config was edited without regenerating its job.
 
-Next: [add a feed](quick-start.md), or see [Operations](operations.md) for running feeds day to day.
+Next: [add a feed](quick-start.md), or see [Deployment](deployment.md) for running feeds day to day.

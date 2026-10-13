@@ -1,6 +1,6 @@
 # Technical Details
 
-This document explains the rationale behind the framework's design decisions, edge-case behaviors, and the live evidence supporting them. It is a reference for "why" the framework is built as it is and how to interpret unusual scenarios. Readers should be familiar with [Feed Configuration Guide](feed-configuration.md) and [Operations and Monitoring](operations.md).
+This document explains the rationale behind the framework's design decisions, edge-case behaviors, and the live evidence supporting them. It is a reference for "why" the framework is built as it is and how to interpret unusual scenarios. Readers should be familiar with [Feed Configuration Guide](feed-configuration.md) and [Logging and Monitoring](monitoring.md).
 
 ## Contents
 

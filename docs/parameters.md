@@ -139,7 +139,7 @@ One bundle is shared by every host config.
 ### `cluster_log_volume_path`
 
 The UC Volume destination for job-cluster log delivery, used only by a job cluster config that opts in
-with a `cluster_log_conf` block (see [Operations](operations.md#cluster-log-delivery)).
+with a `cluster_log_conf` block (see [Logging and Monitoring](monitoring.md#cluster-log-delivery)).
 
 - **Set:** per target, or `--var`. Default empty (unused).
 - **Fails closed:** a config that opts in fails the deploy in any target where this is empty.
@@ -187,7 +187,7 @@ notify.
 ### `monitoring_log_table`
 
 The fully-qualified `catalog.schema.table` of the shared monitoring Delta table (see
-[Operations](operations.md#monitoring-log)).
+[Logging and Monitoring](monitoring.md#monitoring-log)).
 
 - **Set:** per target, or `--var`. Default empty.
 - **Takes effect:** at deploy (a notebook base parameter, not a per-run parameter).
@@ -409,7 +409,7 @@ owns the history) or `full` (backfill the whole table first). Global default `ne
 
 It is honored only on the first run. Once a checkpoint exists, the checkpoint is the position of record,
 so changing this has no effect until the checkpoint is
-[cleared](operations.md#resetting-a-checkpoint). On a `new` start the source's current commit is
+[cleared](maintenance-jobs.md#resetting-a-checkpoint). On a `new` start the source's current commit is
 included, so if it is an append its rows are sent once more; with `es_id_field` set that overwrites the
 same documents.
 
@@ -517,7 +517,7 @@ later.
 `true` also records every run and batch in the [monitoring table](#monitoring_log_table). Default off.
 
 When on, the log is required: a missing table or any failed append fails the task, so no data is sent
-without a record. See [Operations](operations.md#monitoring-log).
+without a record. See [Logging and Monitoring](monitoring.md#monitoring-log).
 
 ### `max_partition_bytes`
 
@@ -552,13 +552,13 @@ byte size such as `128m`. Default: no cap.
 These are `--params` on the fixed maintenance jobs. Each job also receives some of the bundle variables
 above at deploy.
 
-**`checkpoint_clear`** ([Resetting a checkpoint](operations.md#resetting-a-checkpoint))
+**`checkpoint_clear`** ([Resetting a checkpoint](maintenance-jobs.md#resetting-a-checkpoint))
 
 | Parameter | Default | What it does |
 |---|---|---|
 | `config_name` | none (required) | the feed whose checkpoint (`<checkpoint_base_path>/<config_name>`) to delete. A blank or path-bearing value fails |
 
-**`es_diagnostics`** ([Diagnosing an Elasticsearch host](operations.md#diagnosing-an-elasticsearch-host))
+**`es_diagnostics`** ([Diagnosing an Elasticsearch host](maintenance-jobs.md#diagnosing-an-elasticsearch-host))
 
 | Parameter | Default | What it does |
 |---|---|---|

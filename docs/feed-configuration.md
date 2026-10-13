@@ -66,7 +66,7 @@ Streaming mode supports only row-wise views: projection, filters, scalar express
 
 The stream assumes the source is append-only. The runner uses `skipChangeCommits`, so non-append commits (manual `UPDATE`, `DELETE`, or `MERGE` on the source) are skipped rather than failing the stream. If you make such a change and need it reflected in the index, re-send the affected records with a `batch` run.
 
-To manage stream position, see [Operations](operations.md#resetting-a-checkpoint).
+To manage stream position, see [Maintenance Jobs](maintenance-jobs.md#resetting-a-checkpoint).
 
 ## Compute
 

@@ -8,9 +8,9 @@ symptom, the error text where there is one (`...` marks the parts that vary), th
 1. **Read the failed run's output.** Open the run in the Jobs UI. The framework fails closed with a
    specific message: almost every failure names the setting or file at fault.
 2. **Check the monitoring log**, if it's on: the run's `run_end` and `batch_end` rows carry the error type
-   and message, and a missing end row says where the run stopped ([Operations](operations.md#monitoring-log)).
+   and message, and a missing end row says where the run stopped ([Logging and Monitoring](monitoring.md#monitoring-log)).
 3. **For slow or failing writes, check the ES host** with
-   [`es_diagnostics`](operations.md#diagnosing-an-elasticsearch-host).
+   [`es_diagnostics`](maintenance-jobs.md#diagnosing-an-elasticsearch-host).
 
 ## Symptom index
 
@@ -132,7 +132,7 @@ A feed's [cluster config](parameters.md#cluster-configs) has an empty `cluster_i
 
 A job cluster config opts in to log delivery, but
 [`cluster_log_volume_path`](parameters.md#cluster_log_volume_path) is empty in this target. Set it, or
-remove the `cluster_log_conf` block ([Cluster log delivery](operations.md#cluster-log-delivery)).
+remove the `cluster_log_conf` block ([Cluster log delivery](monitoring.md#cluster-log-delivery)).
 
 ### A tag conflicts with the cluster policy
 
@@ -229,7 +229,7 @@ documents with backoff, which absorbs brief bursts. If 429s are steady, lower th
 Turn on [`bulk_stats`](parameters.md#bulk_stats) and use
 [Reading the signals](throughput.md#reading-the-signals) to tell whether ES or the client side is the
 limit. `es_diagnostics` reports the host's state; its verdicts are explained in
-[Operations](operations.md#diagnosing-an-elasticsearch-host).
+[Maintenance Jobs](maintenance-jobs.md#diagnosing-an-elasticsearch-host).
 
 ## Data looks wrong
 
@@ -248,13 +248,13 @@ rows can also duplicate ([Job groups](feed-configuration.md#job-groups)).
 ### A stream writes nothing after the index was rebuilt
 
 The feed runs and reports 0 rows. Its checkpoint still records everything already sent, so it only sends
-new commits. To re-send the table, [reset the checkpoint](operations.md#resetting-a-checkpoint) and run
+new commits. To re-send the table, [reset the checkpoint](maintenance-jobs.md#resetting-a-checkpoint) and run
 with `streaming_start=full`, or run the feed once in batch mode.
 
 ### A streaming_start change did nothing
 
 [`streaming_start`](parameters.md#streaming_start) applies only to a stream's first run. Once a checkpoint
-exists, it decides the position. [Reset the checkpoint](operations.md#resetting-a-checkpoint) to start
+exists, it decides the position. [Reset the checkpoint](maintenance-jobs.md#resetting-a-checkpoint) to start
 over from the new setting.
 
 ### Updates or deletes on the source are missing
@@ -278,7 +278,7 @@ reaches ES only once you add it to the view and run `deploy_views`.
 
 This fails on every attempt and needs an operator: the stream can't continue across that change
 ([why](technical-details.md#schema-changes-in-a-stream)). Update the view for the new schema, then decide
-how the stream should resume, for example by [resetting its checkpoint](operations.md#resetting-a-checkpoint)
+how the stream should resume, for example by [resetting its checkpoint](maintenance-jobs.md#resetting-a-checkpoint)
 and choosing `streaming_start`.
 
 ### A continuous run cancelled at its retry limit
@@ -328,4 +328,4 @@ For a feed config change, regenerate before deploying.
   before it can write `run_end`.
 - **A second `batch_start` for the same `batch_id`:** a retry, under the retry's own `task_run_id`.
 
-See [Operations](operations.md#monitoring-log) for the row model and queries.
+See [Logging and Monitoring](monitoring.md#monitoring-log) for the row model and queries.

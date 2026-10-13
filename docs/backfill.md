@@ -7,7 +7,7 @@ This guide is a placeholder and will be filled in. Until then, these references 
 
 - [`streaming_start`](parameters.md#streaming_start): where a streaming feed starts on its first run
   (`full` backfills the whole table).
-- [Resetting a checkpoint](operations.md#resetting-a-checkpoint): making a streaming feed start over.
+- [Resetting a checkpoint](maintenance-jobs.md#resetting-a-checkpoint): making a streaming feed start over.
 - [`max_files_per_trigger`](parameters.md#max_files_per_trigger) and
   [`max_bytes_per_trigger`](parameters.md#max_bytes_per_trigger): bounding each micro-batch during a
   backfill.
