@@ -2,7 +2,7 @@
 
 A framework for exporting data from Databricks Delta tables into Elasticsearch, packaged as
 [Databricks Asset Bundles](https://docs.databricks.com/dev-tools/bundles/). It uses the
-[**databricks-es-connector**](https://github.com/tim-clifford/es-databricks-connector) library for the
+[**databricks-es-connector**](/../../../es-databricks-connector) library for the
 transfer.
 
 ## Overview
