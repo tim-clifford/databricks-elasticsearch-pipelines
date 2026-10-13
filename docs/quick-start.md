@@ -115,7 +115,7 @@ The latest row should show `status = 'success'`. See [Logging and Monitoring: Mo
 Explore these to shape your feed:
 
 - **Batch or streaming**: [Feed Configuration: Batch or streaming](feed-configuration.md#batch-or-streaming)
-- **Scheduling**: [Feed Configuration: Scheduling](feed-configuration.md#scheduling)
+- **Scheduling**: [Feed Configuration: CRON scheduling](feed-configuration.md#cron-scheduling)
 - **Compute**: [Feed Configuration: Compute](feed-configuration.md#compute)
 - **Tuning for throughput**: [Throughput Tuning](throughput.md)
 - **Sharing a view**: [Feed Configuration: Sharing a view across feeds](feed-configuration.md#sharing-a-view-across-feeds)

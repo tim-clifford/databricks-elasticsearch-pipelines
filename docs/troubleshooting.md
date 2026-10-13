@@ -304,7 +304,7 @@ unpause the job in the UI.
 
 The previous run was still going, and overlapping runs are skipped rather than queued. No work is lost:
 the next run catches up. If it happens often, the feed takes longer than its schedule interval: lengthen
-the interval or make the feed faster ([Scheduling](feed-configuration.md#scheduling)).
+the interval or make the feed faster ([Overlapping runs skipped](feed-configuration.md#overlapping-runs-skipped)).
 
 ## A committed value seems ignored
 
