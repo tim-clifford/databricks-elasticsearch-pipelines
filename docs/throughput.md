@@ -31,7 +31,10 @@ The source's Delta history gives the numbers. This lists the rows and bytes adde
 notebook. It counts every commit that reports rows written (appends, streaming writes, `COPY INTO`,
 `CREATE` or `REPLACE TABLE AS SELECT`) and the rows a `MERGE` inserts, and leaves out commits with no
 row count. The metrics differ by operation, so check the result against a few commits in the table's
-history before relying on it:
+history before relying on it. It can also overstate what a feed sends: a `REPLACE TABLE AS SELECT`
+counts the whole table, a `MERGE`'s bytes include files rewritten for updates, and a streaming feed
+skips change commits (`MERGE`, `UPDATE`, `DELETE`) altogether, so for a streaming feed count only the
+append-type commits:
 
 ```python
 from pyspark.sql import functions as F

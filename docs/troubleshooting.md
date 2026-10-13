@@ -107,7 +107,8 @@ Rename the config file. The name becomes the job's resource key.
 `the old layout's root resources/ folder (or a file of that name) still exists; delete it ...`, or
 `include (databricks.yml) must list ...`
 
-Job resources live in `framework/resources/` (the fixed jobs) and `_pipelines/resources/` (the generated
+The copy still has parts of an earlier repo layout, which this framework no longer supports. Job
+resources live in `framework/resources/` (the fixed jobs) and `_pipelines/resources/` (the generated
 ones), and `databricks.yml` must include exactly those two folders. Move any job of your own from a root
 `resources/` folder to `_pipelines/resources/` (the generator leaves files it didn't write alone), delete
 the root folder, set `include` to `framework/resources/*.yml` and `_pipelines/resources/*.yml`, and run

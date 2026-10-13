@@ -47,7 +47,7 @@ The `log_table_create` job takes the schema from the deployed framework code, so
 
    The job is re-runnable: it adds any column the new schema has and the table lacks, without dropping or replacing the table, so existing rows are preserved and receive `NULL` for new columns.
 
-A feed run that starts between the two steps writes a column the table lacks and fails at its first log write (`run_start`, before any data is sent); the next scheduled run, or a continuous job's retry, then succeeds. To avoid even those failures, deploy the build with its triggers paused (`databricks bundle deploy -t <target> -p <profile> --var=schedule_pause_status=PAUSED`), run `log_table_create`, then deploy again without the `--var` to restore the target's pause state. A feed that sets its own `pause_status: UNPAUSED` stays unpaused through the first deploy, so check for those first.
+A feed run that starts between the two steps writes a column the table lacks and fails at its first log write (`run_start`, before any data is sent); the next scheduled run, or a continuous job's retry, then succeeds. To avoid even those failures, deploy the build with its triggers paused (`databricks bundle deploy -t <target> -p <profile> --var=schedule_pause_status=PAUSED`), run `log_table_create`, then deploy again without the `--var` to restore the target's pause state. A feed that sets its own `pause_status: UNPAUSED` stays unpaused through the first deploy, so check for those first. Between the two deploys every inherited trigger is paused, so continuous feeds stop and `log_table_prune` doesn't run, and a run started by hand in that window still fails at its first log write.
 
 ### Adding a column later
 

@@ -59,6 +59,7 @@ same view and index as the regular feed:
 - It gets its own job (`index_pipeline_<config_name>_backfill`) and, if streaming, its own checkpoint,
   so it can't disturb the regular feed's job or position.
 - Leave it on demand (no `schedule`, `continuous` or `job_group`), so it runs only when you start it.
+- Set its `pipeline_mode` to the method you'll use: `streaming` for Method 1, `batch` for Method 2.
 - Generate, deploy, run it as often as the backfill needs, then delete the config, regenerate and
   deploy to remove the job.
 
@@ -90,7 +91,7 @@ regular feed is left alone. Run it with `streaming_start=full`:
 
 ```bash
 databricks bundle run index_pipeline_<config_name>_backfill -t <target> -p <profile> \
-  --params streaming_start=full
+  --params pipeline_mode=streaming,streaming_start=full
 ```
 
 **With the feed's own job (Option 1):** with its trigger paused (step 2), clear this feed's checkpoint
@@ -100,7 +101,7 @@ beginning:
 ```bash
 databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>
 databricks bundle run index_pipeline_<config_name> -t <target> -p <profile> \
-  --params streaming_start=full
+  --params pipeline_mode=streaming,streaming_start=full
 ```
 
 For a **continuous** feed, the always-on run is the job's only run, so instead of the second command,
