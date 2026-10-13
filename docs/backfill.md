@@ -60,8 +60,10 @@ same view and index as the regular feed:
   so it can't disturb the regular feed's job or position.
 - Leave it on demand (no `schedule`, `continuous` or `job_group`), so it runs only when you start it.
 - Set its `pipeline_mode` to the method you'll use: `streaming` for Method 1, `batch` for Method 2.
-- Generate, deploy, run it as often as the backfill needs, then delete the config, regenerate and
-  deploy to remove the job.
+- Generate, deploy, run it as often as the backfill needs. When it's done, clear its checkpoint if it
+  streamed (`checkpoint_clear` with `config_name=<config_name>_backfill`; the checkpoint outlives the
+  job, and a later backfill under the same name would resume from it), then delete the config,
+  regenerate and deploy to remove the job.
 
 This option works for any feed, including continuous feeds and job group members. The regular feed
 keeps running throughout, so the ES load of both has to fit together
