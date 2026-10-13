@@ -27,18 +27,22 @@ minutes to stay caught up". Size for the peak interval, not the daily average, a
 catching up after a pause or a failure. A spiky source either needs capacity for the spike or has to
 accept falling behind during it and catching up after.
 
-The source's Delta history gives the numbers. For an append-only table, this lists rows and bytes
-written per 15 minutes, from a notebook:
+The source's Delta history gives the numbers. This lists the rows and bytes added per 15 minutes, from a
+notebook. It counts every commit that reports rows written (appends, streaming writes, `COPY INTO`,
+`CREATE` or `REPLACE TABLE AS SELECT`) and the rows a `MERGE` inserts, and leaves out commits with no
+row count. The metrics differ by operation, so check the result against a few commits in the table's
+history before relying on it:
 
 ```python
 from pyspark.sql import functions as F
 
+m = F.col("operationMetrics")
 history = spark.sql("DESCRIBE HISTORY <catalog>.<schema>.<table>")
 (history
-    .where(F.col("operation").isin("WRITE", "STREAMING UPDATE"))
     .select("timestamp",
-            F.col("operationMetrics")["numOutputRows"].cast("long").alias("rows"),
-            F.col("operationMetrics")["numOutputBytes"].cast("long").alias("bytes"))
+            F.coalesce(m["numTargetRowsInserted"], m["numOutputRows"]).cast("long").alias("rows"),
+            F.coalesce(m["numTargetBytesAdded"], m["numOutputBytes"]).cast("long").alias("bytes"))
+    .where(F.col("rows").isNotNull())
     .groupBy(F.window("timestamp", "15 minutes").alias("interval"))
     .agg(F.count("*").alias("commits"), F.sum("rows").alias("rows"), F.sum("bytes").alias("bytes"))
     .orderBy("interval")

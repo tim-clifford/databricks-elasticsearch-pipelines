@@ -424,9 +424,10 @@ owns the history) or `full` (backfill the whole table first). Built-in default `
 
 It is honored only on the first run. Once a checkpoint exists, the checkpoint is the position of record,
 so changing this has no effect unless the checkpoint is
-[cleared](maintenance-jobs.md#resetting-a-checkpoint). A `new` start sends nothing that is already in the
-table: it records the source's current version in the checkpoint without exporting it
-([how](technical-details.md#inclusive-start-version)).
+[cleared](maintenance-jobs.md#resetting-a-checkpoint). A `new` start normally sends nothing that is
+already in the table: it records the source's current version in the checkpoint without exporting it.
+In one rare fallback (the runner can't tell whether a checkpoint exists) it sends the current commit's
+rows once ([how](technical-details.md#inclusive-start-version)).
 
 ### `chunk_size`
 
@@ -611,7 +612,8 @@ above at deploy.
 
 ## Summary table
 
-Every parameter on this page, with where it is set and what happens when it is left empty. "Bundle"
+Every parameter on this page, with where it is set and what happens when it is left empty ("set it"
+marks the ones that need a value: leaving them empty isn't a supported setting). "Bundle"
 means a `databricks.yml` variable, "Config" a feed config key, "Knob" a run-time knob (bundle global,
 feed config, or `--params`), and "Job" a maintenance job's `--params`.
 
@@ -623,9 +625,9 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`cluster_policy_id`](#cluster_policy_id) | Bundle | per target | deploy fails for `job_cluster` feeds |
 | [`ca_certs`](#ca_certs) | Bundle | per target | the system CA store is used |
 | [`cluster_log_volume_path`](#cluster_log_volume_path) | Bundle | per target | deploy fails for opted-in cluster configs |
-| [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | must be set |
+| [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | set it |
 | [`global_job_tags`](#global_job_tags) | Bundle | top level (keys), values may vary | no tags |
-| [`schedule_pause_status`](#schedule_pause_status) | Bundle | top level and per target | must be set |
+| [`schedule_pause_status`](#schedule_pause_status) | Bundle | top level and per target | set it (`PAUSED` or `UNPAUSED`) |
 | [`support_email`](#support_email) | Bundle | per target | no failure emails |
 | [`monitoring_log_table`](#monitoring_log_table) | Bundle | per target | the log can't be turned on; `log_table_prune` fails |
 | [`monitoring_log_retention_days`](#monitoring_log_retention_days) | Bundle | per target | `log_table_prune` fails (`0` keeps everything) |
