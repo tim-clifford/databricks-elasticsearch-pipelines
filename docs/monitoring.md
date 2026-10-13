@@ -1,10 +1,53 @@
 # Logging and Monitoring
 
-Where a feed's runs are recorded and how to read them: the monitoring log, always-on feeds, and cluster logs. For anyone operating feeds.
+Where a feed's runs are recorded and how to read them: the run output, failure emails, the bulk-write statistics, the monitoring log, always-on feeds, and cluster logs. For anyone operating feeds. When something has gone wrong, [Troubleshooting](troubleshooting.md) starts from the symptom.
 
+- [Run output](#run-output)
+- [Failure emails](#failure-emails)
+- [Reading the BULK_STATS output](#reading-the-bulk_stats-output)
 - [Monitoring log](#monitoring-log)
 - [Watching an always-on feed](#watching-an-always-on-feed)
 - [Cluster log delivery](#cluster-log-delivery)
+
+## Run output
+
+Every feed run prints a summary line at the end of its output, in the Jobs UI:
+
+- **Batch:** `BATCH EXPORT COMPLETE: written=<N> deleted=<N> errors=<N> ignored=<N> total_input=<N>`.
+  `written` should match `total_input` with `errors=0`. `ignored` counts documents Elasticsearch didn't
+  need to apply, such as 409s on already-indexed `_id`s under `op_type: create`.
+- **Streaming:** `STREAMING EXPORT COMPLETE: streaming_start=<new|full> batches=<N> rows_pushed=<N> ...`,
+  or `STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)` when there was
+  nothing new to send.
+
+An always-on (continuous) run never prints a summary line, because it never ends: see
+[Watching an always-on feed](#watching-an-always-on-feed).
+
+## Failure emails
+
+Every job, generated or fixed, emails the [`support_email`](parameters.md#support_email) list when a job
+or task run fails. Skipped and canceled runs don't email. Set the list per target; an empty list sends
+nothing.
+
+## Reading the `BULK_STATS` output
+
+With [`bulk_stats`](parameters.md#bulk_stats) on, each batch logs lines tagged `BULK_STATS`:
+
+- **`overall`:** totals for the batch: `docs/send` (real documents per request), the round-trip time the
+  client saw (`rtt_ms`) and the time ES reports spending (`took_ms`), CPU and GIL-wait totals, and
+  rejection counts.
+- **One line per partition** (batch mode), with median, 95th percentile and maximum for the same timings.
+- **`tail:`**, a summary of the slowest partition against the median one: its wall time, sends and
+  documents, and the spread (`wall_p95`, `wall_max/median`, `stragglers>2x`, `docs_max/median`).
+  Streaming feeds log `overall` and `tail:` for each micro-batch.
+
+`rtt_ms` minus `took_ms` is time spent outside ES: the network, queuing, and decoding on the client.
+Every line carries a `ts=` timestamp, which is when the batch actually ran; for streaming, the line can
+appear in the log later than that. ([Why](technical-details.md#bulk-stats-relay-timing).)
+
+What each signal says about the write, and which lever to move, is in
+[Troubleshooting: Reading the signals](troubleshooting.md#reading-the-signals). For trends across runs,
+the monitoring log below keeps each batch's write diagnostics.
 
 ## Monitoring log
 
@@ -16,7 +59,7 @@ To keep a durable record of every run and every batch for support, dashboards, a
 databricks bundle run log_table_create -t <target> -p <profile>
 ```
 
-It runs `CREATE TABLE IF NOT EXISTS` with the log's schema (from `framework/pipeline_lib/monitoring_sink.py`) and is idempotent. The identity that runs this job needs `CREATE TABLE` (and `USE CATALOG` / `USE SCHEMA`) on the target schema. Export jobs only append, so their identity needs only `MODIFY` on the table. If a table name is blank or not a three-part identifier it fails closed.
+It runs `CREATE TABLE IF NOT EXISTS` with the log's schema (from `framework/pipeline_lib/monitoring_sink.py`), then `ALTER TABLE ADD COLUMNS` for any column an existing table lacks, and is idempotent. The identity that runs this job needs `CREATE TABLE` (and `USE CATALOG` / `USE SCHEMA`) on the target schema. That identity owns the table it creates, so it can always re-run the job; a different identity re-running it on an existing table also needs `SELECT` and `MODIFY` on the table, which adding columns requires. Export jobs only append, so their identity needs only `MODIFY` on the table. If a table name is blank or not a three-part identifier it fails closed.
 
 Set up the monitoring table once per environment in [Environment Setup](setup.md#monitoring-log-table).
 
@@ -117,7 +160,7 @@ WHERE record_type = 'batch_summary' AND event_ts > current_timestamp() - INTERVA
 ORDER BY config_name, batch_id DESC;
 ```
 
-**Retention and the prune job.** The table grows without limit otherwise. The `log_table_prune` job enforces retention: it deletes rows older than `monitoring_log_retention_days` (default 90; `0` disables the delete), then optimizes (reclusters and compacts) and vacuums. It runs daily at 03:00 UTC on the same pause setting as every scheduled job ([`schedule_pause_status`](parameters.md#schedule_pause_status)), so it fires in `prd` and is paused in `dev` and `stg` until you unpause it. It fails when `monitoring_log_table` is empty, so pause it in any target where the schedule is live but the log isn't used. Run it on demand with:
+**Retention and the prune job.** The table grows without limit otherwise. The `log_table_prune` job enforces retention: it deletes rows older than `monitoring_log_retention_days` (default 90; `0` disables the delete), then optimizes (reclusters and compacts) and vacuums. It runs daily at 03:00 UTC, paused or unpaused by the target's [`schedule_pause_status`](parameters.md#schedule_pause_status) like every other trigger. It fails when `monitoring_log_table` is empty, so in any target where triggers are unpaused but the log isn't used, pause `log_table_prune` (or it fails, and emails `support_email`, every day). Run it on demand with:
 
 ```bash
 databricks bundle run log_table_prune -t <target> -p <profile>
@@ -128,8 +171,6 @@ The table is liquid-clustered on `(config_name, event_ts)` (the columns monitori
 ## Watching an always-on feed
 
 An always-on (continuous) run never reaches an end-of-run summary because it never terminates. Health comes from the Databricks Jobs continuous-run state (RUNNING, restart count, failure notifications) plus, with the monitoring log on, the per-batch rows the runner writes as each batch runs. Bound a first-run backfill or large post-restart catch-up with `max_files_per_trigger` and `max_bytes_per_trigger` so one micro-batch does not try to read the whole table.
-
-See the worked example in [`ecs_dns_activity_continuous.yml`](../_pipelines/pipeline_configs/ecs_dns_activity_continuous.yml).
 
 ## Cluster log delivery
 
