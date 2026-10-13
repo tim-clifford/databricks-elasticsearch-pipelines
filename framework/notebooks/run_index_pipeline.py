@@ -440,8 +440,8 @@ if cfg["es_id_field"] is None:
     # connector's create-409-is-a-no-op). With no es_id_field, ES assigns a random _id per doc, so a
     # create can NEVER 409-conflict and the append-only dedup the mode promises silently never fires - a
     # replay just accumulates duplicates, exactly as op_type=index would. This warning names the cause; the
-    # connector then refuses the combination (EsWriteConfig raises on op_type=create without id_field), so
-    # the run fails before any write rather than writing duplicates. The
+    # connector (0.10.0+, the first with op_type) then refuses the combination (EsWriteConfig raises on
+    # op_type=create without id_field), so the run fails before any document is sent. The
     # config-load guard (validate_config) already fails a config that STATICALLY sets op_type: create with
     # no es_id_field; this covers the path that guard cannot see - op_type=create arriving via the
     # ${var.op_type} global default or a --params override, known only here at run time. Keyed on the

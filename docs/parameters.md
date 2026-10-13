@@ -475,8 +475,8 @@ With `create`, re-sending an existing `_id` returns a 409 the connector treats a
 the document is neither overwritten nor duplicated. Use it only for feeds that never legitimately update
 a document, since a real update is silently dropped. It requires [`es_id_field`](#es_id_field): a config
 that sets `create` without one fails at load, and `create` arriving through the global or `--params` on
-a feed without one fails the run before any write (the connector rejects it with `op_type='create' requires
-id_field ...`).
+a feed without one fails the run before any document is sent (connector 0.10.0 or later rejects it with
+`op_type='create' requires id_field ...`; an older wheel ignores `op_type` altogether).
 
 Under the default fast path, a chunk mixing new and already-indexed `_id`s can count a new document as
 deduplicated instead of written. The data is correct; only the count is off.
