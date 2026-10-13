@@ -61,8 +61,16 @@ same view and index as the regular feed:
 
 The regular feed keeps running throughout, so this is the option where the ES load of both has to fit
 together ([above](#plan-the-volume-first)). Make sure the backfill and the regular feed don't send
-conflicting versions of the same documents: give the backfill a `filter_condition` that covers only
-the range being backfilled.
+the same documents at the same time:
+
+- **A streaming regular feed** sends only new commits, so give the backfill a `filter_condition` that
+  covers only the range being backfilled.
+- **A batch regular feed** re-exports its whole view on every run, backfill range included. While the
+  backfill runs, either narrow the regular feed's own `filter_condition` so it excludes the backfilled
+  range, or pause it.
+
+This is also the option to use for a continuous feed or a job group member, whose own job can't run
+the batch method below.
 
 ## How to send the data
 
@@ -78,6 +86,12 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile> \
 ```
 
 Stop the stream before clearing its checkpoint ([Resetting a checkpoint](maintenance-jobs.md#resetting-a-checkpoint)).
+For a **continuous** feed, the always-on run holds the job's only run slot, so the commands above
+don't apply as written. Instead: pause the continuous trigger, clear the checkpoint, set
+`streaming_start: full` for the job (in the job's parameters under Option 1, or in the config of an
+Option 2 backfill job), then unpause it. The always-on run then starts from the beginning of the table.
+`streaming_start` applies only while there is no checkpoint, so it has no further effect once the stream
+has started.
 The whole table is sent, so check the total is reasonable for Spark streaming and for ES before
 starting. Bound each micro-batch with [`max_files_per_trigger`](parameters.md#max_files_per_trigger) or
 [`max_bytes_per_trigger`](parameters.md#max_bytes_per_trigger) so the stream works through the table in
@@ -98,8 +112,10 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile> \
 Choose a range size the cluster and ES handle comfortably, run the pieces in order with a pause between
 them, and check each run's summary line before starting the next
 ([Run output](monitoring.md#run-output)). A batch run doesn't touch a streaming feed's checkpoint, so
-the regular stream's position is unaffected. On a [job group](feed-configuration.md#run-time-parameters-baked-per-task),
-`--params` applies to every task in the run, so backfill a grouped feed with Option 2 instead.
+the regular stream's position is unaffected. Two cases need Option 2 instead: a **continuous** feed's
+own job rejects a batch run (a terminating run under a continuous trigger would restart in a loop),
+and on a [job group](feed-configuration.md#run-time-parameters-baked-per-task) `--params` applies to
+every task in the run.
 
 ## Before and after
 
