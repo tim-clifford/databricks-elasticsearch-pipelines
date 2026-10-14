@@ -4,6 +4,8 @@ Covers the validation contract (every fail-closed branch), the ${environment} te
 logic, and the derivations (view_substitutions, job_base_parameters).
 """
 import copy
+import os
+import re
 
 import pytest
 
@@ -14,9 +16,11 @@ from pipeline_lib.config import (
     column_present,
     job_base_parameters,
     job_parameters,
+    MIN_CONNECTOR_VERSION,
     render_view_sql,
     runtime_knob_global_refs,
     require_chunk_size,
+    require_connector_version,
     require_es_flag,
     require_filter_condition,
     require_max_bytes_per_trigger,
@@ -936,7 +940,7 @@ def test_write_config_overrides_includes_bypass_fast_path():
     assert "bypass_fast_path" not in write_config_overrides("", "", "", bypass_fast_path="")
 
 
-# --- op_type (connector 0.10.0+): bulk action, "index" (default) | "create" ------------------------
+# --- op_type: bulk action, "index" (default) | "create" ------------------------
 # op_type now follows the same three-layer pattern as the other run-time knobs: a target-wide
 # ${var.op_type} global (databricks.yml default "index") < a per-pipeline config value < a --params
 # override. The allowed set (index|create) is NOT re-enumerated here - the connector's EsWriteConfig is
@@ -986,8 +990,7 @@ def test_validate_config_op_type_passthrough_and_type_checked():
 def test_validate_config_op_type_create_requires_es_id_field():
     # Cross-field consistency (like continuous-requires-streaming): op_type: create is append-only and
     # needs an explicit _id to dedup a resend, so create WITHOUT es_id_field is rejected fail-closed at
-    # config time rather than left to fail at the connector (0.10.0+) or silently duplicate on an older
-    # wheel. create WITH es_id_field, and index without it, are both fine.
+    # config time rather than left to fail at the connector at run time. create WITH es_id_field, and index without it, are both fine.
     no_id = {k: v for k, v in _base().items() if k != "es_id_field"}
     with pytest.raises(PipelineConfigError, match="op_type: create requires es_id_field"):
         validate_config({**no_id, "op_type": "create"})
@@ -2213,3 +2216,41 @@ def test_job_group_and_postfix_carried_through_resolve():
     cfg["job_name_postfix"] = "My Group"
     out = resolve_config(validate_config(cfg), environment="")
     assert out["job_group"] == "g1" and out["job_name_postfix"] == "My Group"
+
+
+# --- connector version: one check, 0.10.0 or later --------------------------------------------------
+# The runner calls require_connector_version once on the installed wheel's __version__. Allow-list: a
+# release at or above the minimum passes; anything older, a pre-release of the minimum itself, or an
+# unrecognized/missing version fails closed.
+def test_min_connector_version_is_0_10_0():
+    assert MIN_CONNECTOR_VERSION == (0, 10, 0)
+
+
+@pytest.mark.parametrize("version", ["0.10.0", "0.10.1", "0.11.0", "1.0.0", " 0.10.0 ", "0.10.0.post1",
+                                     "0.10.0+local.1", "0.11.0.dev0", "0.11.0rc1"])
+def test_require_connector_version_accepts_supported(version):
+    assert require_connector_version(version) == version
+
+
+@pytest.mark.parametrize("version", ["0.9.7", "0.9.99", "0.1.0", "0.10.0rc1", "0.10.0.dev1", "0.10.0a1"])
+def test_require_connector_version_rejects_older(version):
+    with pytest.raises(PipelineConfigError, match=r"older than the framework's minimum 0\.10\.0"):
+        require_connector_version(version, "wheel_path")
+
+
+@pytest.mark.parametrize("version", ["unknown", "", "0.10", "v0.10.0", "0.10.0-beta", "ten", None, 10, (0, 10, 0)])
+def test_require_connector_version_rejects_unrecognized(version):
+    with pytest.raises(PipelineConfigError, match="not a recognized release version"):
+        require_connector_version(version)
+
+
+def test_runner_checks_connector_version_once_before_config_load():
+    # Wiring: the runner must call the check on the installed version, before it loads the feed config,
+    # and must no longer carry the old per-knob drop loop.
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks",
+                        "run_index_pipeline.py")
+    src = open(path).read()
+    calls = re.findall(r"^require_connector_version\(_connector_version\b", src, re.M)
+    assert len(calls) == 1
+    assert src.index("require_connector_version(_connector_version") < src.index("load_config(")
+    assert "_VERSION_GATED_KNOBS" not in src

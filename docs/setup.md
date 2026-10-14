@@ -31,8 +31,9 @@ in order. Each setting mentioned here is defined in the [Parameters Reference](p
 
 Every feed job installs the [databricks-es-connector](/../../../es-databricks-connector)
 wheel from the UC Volume path in [`wheel_path`](parameters.md#wheel_path). Keep the wheel's standard
-filename (`databricks_es_connector-<version>-py3-none-any.whl`), which carries the version. Two ways to get
-it there:
+filename (`databricks_es_connector-<version>-py3-none-any.whl`), which carries the version. The framework
+requires connector **0.10.0 or later**: every feed run checks the installed version first and fails with
+a clear message, before reading or sending anything, on an older wheel. Two ways to get it there:
 
 - **Upload a wheel** you built or downloaded, with the Catalog Explorer or the Databricks CLI.
 - **Build it in the workspace** with the `build_wheel` job. Put a copy of the connector repo in the

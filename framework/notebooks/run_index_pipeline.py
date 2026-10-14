@@ -96,8 +96,8 @@ dbutils.library.restartPython()
 # also satisfy the import), so it is an importability check, not a version-match assertion.
 import databricks_es_connector  # noqa: E402
 
-# getattr fallback: the successful import above is the real install-succeeds signal; a build that
-# happens not to expose __version__ shouldn't turn a good install into an AttributeError here.
+# getattr fallback: a build that doesn't expose __version__ reports "unknown" here, and the version
+# check after the pipeline_lib imports below then fails it with a clear message (not an AttributeError).
 _connector_version = getattr(databricks_es_connector, "__version__", "unknown")
 print(f"connector installed: databricks_es_connector {_connector_version}")
 
@@ -135,10 +135,10 @@ dbutils.widgets.text("transport_max_retries", "", "EsWriteConfig transport_max_r
 dbutils.widgets.text("max_retries_per_doc", "", "EsWriteConfig max_retries_per_doc: PER-DOCUMENT retries for rows ES rejects with a 429 (write queue full); 0 disables (empty => connector default 3)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
-dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default from ${var.bulk_stats}/config; empty => connector default off; needs connector 0.9.3+)")
-dbutils.widgets.text("retry_transport_timeout", "", "EsWriteConfig retry_transport_timeout: true|false; connector OWNS whole-request timeout retry (re-send with backoff instead of failing the batch) (default from ${var.retry_transport_timeout}/config; empty => connector default off; needs connector 0.9.7+)")
-dbutils.widgets.text("op_type", "", "EsWriteConfig op_type: index (default) | create; 'create' is append-only (a resend of an already-indexed doc is a 409 no-op, deduped not overwritten) (default from config; empty => connector default 'index'; needs connector 0.10.0+)")
-dbutils.widgets.text("bypass_fast_path", "", "EsWriteConfig bypass_fast_path: true|false; skip the errors-probe fast path and classify every chunk per-item (exact docs_deduped/written counts for op_type=create, at the cost of fast-path throughput) (default from ${var.bypass_fast_path}/config; empty => connector default off; needs connector 0.10.0+)")
+dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default from ${var.bulk_stats}/config; empty => connector default off)")
+dbutils.widgets.text("retry_transport_timeout", "", "EsWriteConfig retry_transport_timeout: true|false; connector OWNS whole-request timeout retry (re-send with backoff instead of failing the batch) (default from ${var.retry_transport_timeout}/config; empty => connector default off)")
+dbutils.widgets.text("op_type", "", "EsWriteConfig op_type: index (default) | create; 'create' is append-only (a resend of an already-indexed doc is a 409 no-op, deduped not overwritten) (default from config; empty => connector default 'index')")
+dbutils.widgets.text("bypass_fast_path", "", "EsWriteConfig bypass_fast_path: true|false; skip the errors-probe fast path and classify every chunk per-item (exact docs_deduped/written counts for op_type=create, at the cost of fast-path throughput) (default from ${var.bypass_fast_path}/config; empty => connector default off)")
 dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
 dbutils.widgets.text("max_partition_bytes", "", "spark.sql.files.maxPartitionBytes for the source read, e.g. 32m (0 leaves it unset; empty => default)")
 # Streaming-only widgets. checkpoint_base_path is a deploy-time base_parameter (bundle variable);
@@ -215,6 +215,7 @@ if FRAMEWORK_ROOT not in sys.path:
 from pipeline_lib.config import (  # noqa: E402
     load_config,
     render_view_sql,
+    require_connector_version,
     require_es_flag,
     require_filter_condition,
     require_max_bytes_per_trigger,
@@ -246,6 +247,10 @@ from pipeline_lib.observability import PROGRESS_TAG  # noqa: E402
 from pipeline_lib.checkpoint import EMPTY, HAS_OFFSET, checkpoint_offsets_state  # noqa: E402
 # The streaming wait loop (pure, duck-typed query; unit-tested off-cluster with a fake query).
 from pipeline_lib.stream_wait import await_stream as _await_stream  # noqa: E402
+
+# The framework supports connector 0.10.0 and later (MIN_CONNECTOR_VERSION). Checked once here, before any
+# config load or export work, so an older wheel fails the run with one clear message.
+require_connector_version(_connector_version, "wheel_path")
 
 # COMMAND ----------
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad
@@ -292,28 +297,6 @@ write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VER
                                          max_retries_per_doc=MAX_RETRIES_PER_DOC,
                                          retry_transport_timeout=RETRY_TRANSPORT_TIMEOUT, op_type=OP_TYPE,
                                          bypass_fast_path=BYPASS_FAST_PATH)
-# Four knobs were added to EsWriteConfig in specific connector releases: bulk_stats (0.9.3+),
-# retry_transport_timeout (0.9.7+), and op_type + bypass_fast_path (both 0.10.0+). Each is only present in write_overrides when
-# its effective value (the global ${var.*} default where one exists, a per-pipeline config value, or a
-# --params override) resolves to a non-empty setting. On an OLDER wheel, a present-but-unknown kwarg would
-# make EsWriteConfig(**write_overrides) raise TypeError and fail EVERY such run. All are OPTIONAL
-# enhancements (diagnostics; a reliability retry; an append-only bulk action), so they must never break
-# the export: if the installed EsWriteConfig lacks a field, drop it from the overrides and warn rather
-# than failing. Detected against the live dataclass's own field set (the installed wheel is the source of
-# truth), so this is correct whatever version is deployed. Dropping op_type means the feed runs as the
-# connector's default op_type ("index"): benign for append-only data (a resend re-writes identical
-# content instead of deduping), but the warning makes the downgrade visible. The other tuning knobs have
-# existed since well before this framework, so only these version-gated ones are guarded.
-_VERSION_GATED_KNOBS = {"bulk_stats": "0.9.3+", "retry_transport_timeout": "0.9.7+", "op_type": "0.10.0+", "bypass_fast_path": "0.10.0+"}
-if any(k in write_overrides for k in _VERSION_GATED_KNOBS):
-    import dataclasses  # noqa: E402
-    _es_fields = {f.name for f in dataclasses.fields(EsWriteConfig)}
-    for _knob, _min_ver in _VERSION_GATED_KNOBS.items():
-        if _knob in write_overrides and _knob not in _es_fields:
-            _dropped = write_overrides.pop(_knob)
-            print(f"WARNING: installed connector (databricks_es_connector {_connector_version}) has no "
-                  f"EsWriteConfig.{_knob} field; dropping {_knob}={_dropped} (requires {_min_ver}). "
-                  f"The export proceeds WITHOUT it.")
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
 WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repartition job parameter"))
 # - max_partition_bytes: Spark byte-size (or "0" = leave unset). Validated unconditionally; applied to
@@ -440,13 +423,12 @@ if cfg["es_id_field"] is None:
     # connector's create-409-is-a-no-op). With no es_id_field, ES assigns a random _id per doc, so a
     # create can NEVER 409-conflict and the append-only dedup the mode promises silently never fires - a
     # replay just accumulates duplicates, exactly as op_type=index would. This warning names the cause; the
-    # connector (0.10.0+, the first with op_type) then refuses the combination (EsWriteConfig raises on
-    # op_type=create without id_field), so the run fails before any document is sent. The
+    # connector then refuses the combination (EsWriteConfig raises on op_type=create without id_field), so
+    # the run fails before any document is sent. The
     # config-load guard (validate_config) already fails a config that STATICALLY sets op_type: create with
     # no es_id_field; this covers the path that guard cannot see - op_type=create arriving via the
     # ${var.op_type} global default or a --params override, known only here at run time. Keyed on the
-    # EFFECTIVE op_type in write_overrides (post version-gate), so on an older wheel where op_type was
-    # dropped fail-soft there is no create in effect and nothing to warn about.
+    # EFFECTIVE op_type in write_overrides.
     if write_overrides.get("op_type") == "create":
         print("WARNING: op_type=create with no es_id_field - creates get ES-assigned random _ids, so they "
               "never 409-conflict and the append-only dedup op_type=create promises NEVER fires; the run "

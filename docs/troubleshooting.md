@@ -157,6 +157,13 @@ Set [`wheel_path`](parameters.md#wheel_path) for the target and redeploy. If the
 install or import fails, check the file exists at that path, keeps its standard wheel filename, and that
 the job's identity can read the volume ([Environment Setup](setup.md#connector-wheel)).
 
+### Connector wheel too old
+
+`wheel_path: databricks-es-connector 0.9.7 is older than the framework's minimum 0.10.0; ...`
+
+`wheel_path` points at a connector release the framework doesn't support. Point it at a 0.10.0 or later
+wheel and redeploy ([Environment Setup](setup.md#connector-wheel)).
+
 ### Host config empty for the target
 
 `missing required parameter: es_host_url (fill in this pipeline's es_host_config values for this target in

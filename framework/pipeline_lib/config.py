@@ -45,21 +45,18 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   is empty too the connector's own default (OFF) applies. A
                                          #   config value here OVERRIDES the global default for this
                                          #   pipeline; the job parameter (--params bulk_stats=...) then
-                                         #   overrides per run. Requires connector 0.9.3+ (older wheels
-                                         #   ignore it, fail-soft).
+                                         #   overrides per run.
     retry_transport_timeout: true | false  # OPTIONAL EsWriteConfig reliability toggle: let the connector
                                          #   OWN whole-request timeout retries (re-send with backoff
                                          #   instead of failing the batch). Same layering as bulk_stats
                                          #   (config value > ${var.retry_transport_timeout} global >
-                                         #   connector default OFF). Requires connector 0.9.7+ (older
-                                         #   wheels ignore it, fail-soft).
+                                         #   connector default OFF).
     op_type: index | create             # OPTIONAL EsWriteConfig bulk-action selector. "index" (default)
                                          #   upserts over the _id; "create" is append-only (a resend of an
                                          #   already-indexed doc returns 409 and is a no-op, deduped not
-                                         #   overwritten). Unlike bulk_stats it is PER-CONFIG with NO
-                                         #   global default (a feed opts into create explicitly); omitted
-                                         #   => the connector default ("index"). Requires connector
-                                         #   0.10.0+ (older wheels ignore it, fail-soft).
+                                         #   overwritten). Same layering as bulk_stats (config value >
+                                         #   ${var.op_type} global, shipped empty > connector default
+                                         #   "index"), so a feed opts into create explicitly.
     bypass_fast_path: true | false       # OPTIONAL EsWriteConfig write-path toggle: skip the connector's
                                          #   filter_path="errors" probe and classify EVERY chunk on the
                                          #   full per-item path (one send, no whole-chunk re-ship). Makes
@@ -68,8 +65,7 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   re-ship duplication), at the cost of per-item response decode
                                          #   on clean chunks (loses the GIL-avoidance fast path). Same
                                          #   layering as bulk_stats (config value > ${var.bypass_fast_path}
-                                         #   global > connector default OFF). Requires connector 0.10.0+
-                                         #   (older wheels ignore it, fail-soft).
+                                         #   global > connector default OFF).
     streaming_start: new | full          # OPTIONAL first-run stream position: "new" (start at the source's
                                          #   current version, only new commits exported) or "full" (backfill
                                          #   the whole table). Omit => the target-wide ${var.streaming_start}
@@ -517,8 +513,7 @@ def require_op_type(value: object, where: str = "op_type") -> str:
     copy here would drift from the connector's). It only enforces that a present value is a bare,
     single-token string (lowercase letters/underscore) safe to carry as a job-parameter default; a
     non-string or a token with spaces/punctuation fails closed. Same config-default-plus-run-time-override
-    shape as the other tuning knobs. Requires connector 0.10.0+; on an older wheel the runner drops it
-    fail-soft (a warning; the feed then runs as the connector's default op_type)."""
+    shape as the other tuning knobs."""
     if value is None:
         return ""
     if not isinstance(value, str):
@@ -531,6 +526,37 @@ def require_op_type(value: object, where: str = "op_type") -> str:
             f"{where} must be a bare lowercase op_type token (e.g. 'index' or 'create'), got {value!r}"
         )
     return v
+
+
+# The oldest connector release the framework supports: the first with every EsWriteConfig field the runner
+# can pass (bulk_stats, retry_transport_timeout, op_type, bypass_fast_path).
+MIN_CONNECTOR_VERSION = (0, 10, 0)
+_CONNECTOR_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)((?:a|b|rc|\.dev)\d+)?(\.post\d+)?(\+[A-Za-z0-9.]+)?")
+
+
+def require_connector_version(version: object, where: str = "installed connector") -> str:
+    """Fail closed unless the installed databricks-es-connector is MIN_CONNECTOR_VERSION or later.
+
+    Called once by the runner on the installed package's __version__, before any export work, so an old
+    wheel fails the run with one clear message instead of failing (or quietly losing a setting) deeper in
+    the write. Allow-list: only a PEP 440 release X.Y.Z (with an optional pre/dev, post or local suffix)
+    is accepted; anything else, including a missing version ("unknown"), fails closed. A pre-release or
+    dev build of the minimum itself (0.10.0rc1, 0.10.0.dev1) sorts before it and is rejected; one of a
+    later release (0.11.0.dev0) is accepted. Returns the version string unchanged."""
+    minimum = ".".join(str(p) for p in MIN_CONNECTOR_VERSION)
+    m = _CONNECTOR_VERSION_RE.fullmatch(version.strip()) if isinstance(version, str) else None
+    if m is None:
+        raise PipelineConfigError(
+            f"{where}: databricks-es-connector version {version!r} is not a recognized release version; "
+            f"the framework requires {minimum} or later (check wheel_path)"
+        )
+    release = tuple(int(p) for p in m.group(1, 2, 3))
+    if release < MIN_CONNECTOR_VERSION or (release == MIN_CONNECTOR_VERSION and m.group(4)):
+        raise PipelineConfigError(
+            f"{where}: databricks-es-connector {version} is older than the framework's minimum {minimum}; "
+            f"point wheel_path at a {minimum} or later wheel and redeploy"
+        )
+    return version
 
 
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
@@ -552,38 +578,33 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     bulk_stats follows the same shape as the two bool knobs (canonical "true"/"false"/"" via
     require_es_flag). Its effective value normally arrives "true" (its job-parameter default is on for
     all runs), so it is included as bulk_stats=True unless explicitly overridden to false; an empty
-    value (widget cleared) falls back to the connector's own default. It requires connector 0.9.3+, so
-    the runner drops it from these overrides fail-soft when the installed EsWriteConfig lacks the field
-    (an older wheel) rather than failing the run - this function stays a pure value parser.
+    value (widget cleared) falls back to the connector's own default.
 
     retry_transport_timeout is the same shape of bool knob (canonical "true"/"false"/"" via
-    require_es_flag): when true the connector owns whole-request timeout retries. It requires connector
-    0.9.7+, so the runner drops it fail-soft on an older wheel the same way it does bulk_stats.
+    require_es_flag): when true the connector owns whole-request timeout retries.
 
     op_type is a STRING knob (index | create) parsed by require_op_type: a set value is passed through
     unchanged (the connector validates the allowed set, not this layer), an unset "" is omitted so the
-    connector's default op_type ("index") stands. Requires connector 0.10.0+, dropped fail-soft on an
-    older wheel like bulk_stats. Like the other run-time knobs it also takes the target-wide ${var.op_type}
-    global; that ships empty, so a feed still opts into create explicitly unless a target sets it.
+    connector's default op_type ("index") stands. Like the other run-time knobs it also takes the
+    target-wide ${var.op_type} global; that ships empty, so a feed still opts into create explicitly unless
+    a target sets it.
 
     bypass_fast_path is the same shape of bool knob as bulk_stats/retry_transport_timeout (canonical
     "true"/"false"/"" via require_es_flag): when true the connector skips the filter_path="errors" probe
     and classifies every chunk on the full per-item path, which makes the docs_deduped/written counts
     exact for op_type=create (and avoids auto-id re-ship duplication) at the cost of the fast path's
-    throughput. It requires connector 0.10.0+, so the runner drops it fail-soft on an older wheel the
-    same way it does bulk_stats.
+    throughput.
 
     request_timeout (positive int seconds) and transport_max_retries (non-negative int; 0 disables
     transport retries) are connection/reliability knobs inherited from EsConnection. Both are unset by
-    default (omitted => the connector's own defaults, 60s / 3 retries, stand). Unlike bulk_stats they
-    need no version guard: request_timeout has existed since the connector's first release and
-    transport_max_retries since 0.6.0, so every wheel this framework installs has both fields.
+    default (omitted => the connector's own defaults, 60s / 3 retries, stand).
 
     max_retries_per_doc (non-negative int; 0 disables per-document retries) is the PER-DOCUMENT 429
     retry count (a 429'd document is retried only by this knob, never by transport_max_retries). Unset
-    by default (omitted => the connector's own default of 3 stands). Like transport_max_retries it needs
-    no version guard: it has existed since connector 0.6.0, so every wheel this framework installs has
-    the field."""
+    by default (omitted => the connector's own default of 3 stands).
+
+    Every field set here exists on the connector releases the framework supports; the runner checks the
+    installed release with require_connector_version before any of these are passed."""
     overrides: dict = {}
 
     canonical_chunk_size = require_chunk_size(chunk_size)
@@ -622,7 +643,6 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
 
     # op_type is a STRING knob (not a bool/int): a set value is passed through as-is (the connector
     # validates index|create), an unset value ("") is omitted so the connector's default op_type stands.
-    # Requires connector 0.10.0+; the runner drops it fail-soft on an older wheel (see _VERSION_GATED_KNOBS).
     canonical_op_type = require_op_type(op_type)
     if canonical_op_type:
         overrides["op_type"] = canonical_op_type
@@ -881,15 +901,14 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # is empty too the connector's own default (OFF) stands. A config value here (`bulk_stats: true|false`)
     # OVERRIDES the global default for this pipeline; the run-time job parameter overrides it per run.
     # Stored canonical ("true"/"false"/"") like the other bool knobs, so it becomes a string job-parameter
-    # default. Requires connector 0.9.3+; on an older wheel the runner drops it fail-soft (see runner).
+    # default.
     bulk_stats = require_es_flag(raw.get("bulk_stats", ""), f"{source}: bulk_stats")
     # retry_transport_timeout is the connector-owned-timeout-retry toggle. Behaves EXACTLY like bulk_stats:
     # an absent value is "" (unset at the config level), deferring to the GLOBAL default (the generator
     # bakes the omitted job-parameter default as the ${var.retry_transport_timeout} databricks.yml variable
     # per target), and when that is empty too the connector's own default (OFF) stands. A config value here
     # (`retry_transport_timeout: true|false`) OVERRIDES the global for this pipeline; the run-time job
-    # parameter overrides it per run. Stored canonical ("true"/"false"/""). Requires connector 0.9.7+; on
-    # an older wheel the runner drops it fail-soft (see runner).
+    # parameter overrides it per run. Stored canonical ("true"/"false"/"").
     retry_transport_timeout = require_es_flag(raw.get("retry_transport_timeout", ""),
                                               f"{source}: retry_transport_timeout")
     # op_type selects the _bulk action for index writes: "index" (default, an upsert-over-_id) or
@@ -899,16 +918,14 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # defers to the connector default ("index"), so a feed opts into create explicitly unless a target
     # sets the global. Stored canonical string form (a job-parameter default). A present value is
     # passed THROUGH to the connector, which is the single source of truth for the allowed set (so it is
-    # NOT re-enumerated here); a non-string/malformed token fails closed. Requires connector 0.10.0+; on
-    # an older wheel the runner drops it fail-soft.
+    # NOT re-enumerated here); a non-string/malformed token fails closed.
     op_type = require_op_type(raw.get("op_type", ""), f"{source}: op_type")
     # bypass_fast_path is the connector write-path toggle. Behaves EXACTLY like bulk_stats: an absent value
     # is "" (unset at the config level), deferring to the GLOBAL default (the generator bakes the omitted
     # job-parameter default as the ${var.bypass_fast_path} databricks.yml variable per target), and when
     # that is empty too the connector's own default (OFF, i.e. the fast path is used) stands. A config value
     # here (`bypass_fast_path: true|false`) OVERRIDES the global for this pipeline; the run-time job
-    # parameter overrides it per run. Stored canonical ("true"/"false"/""). Requires connector 0.10.0+; on
-    # an older wheel the runner drops it fail-soft (see runner).
+    # parameter overrides it per run. Stored canonical ("true"/"false"/"").
     bypass_fast_path = require_es_flag(raw.get("bypass_fast_path", ""),
                                        f"{source}: bypass_fast_path")
     # monitoring_log_enabled is the durable-monitoring-sink toggle. It is NOT a connector setting (never
@@ -1043,8 +1060,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # 409-conflict: the resend-dedup the mode promises never fires and a replay accumulates duplicates.
     # Enforce the documented requirement fail-closed HERE (same shape as the continuous cross-field
     # checks above), so a misconfigured feed is rejected at generation/deploy rather than failing at the
-    # connector on a 0.10.0+ wheel, or silently degrading to auto-id duplication if op_type is dropped on
-    # an older wheel. A run-time --params op_type=create override bypasses this and is backstopped by the
+    # connector at run time. A run-time --params op_type=create override bypasses this and is backstopped by the
     # connector's own id_field guard. (This is a cross-field consistency check, not op_type value
     # validation, which stays the connector's single source of truth.)
     if op_type == "create" and es_id_field is None:
