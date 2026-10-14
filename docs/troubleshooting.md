@@ -1,26 +1,30 @@
 # Troubleshooting
 
-What to do when a feed fails or misbehaves, organized by what you see. For operators. Each entry gives the
-symptom, the error text where there is one (`...` marks the parts that vary), the cause, and the fix.
+What to do when a feed fails, falls behind, writes slowly, sends the wrong data, or doesn't run when it
+should, organized by what you see. For operators. Each entry gives the symptom, the error text where
+there is one (`...` marks the parts that vary), the cause, and the fix.
 
 ## First steps
 
 1. **Read the failed run's output.** Open the run in the Jobs UI. The framework fails closed with a
    specific message: almost every failure names the setting or file at fault.
 2. **Check the monitoring log**, if it's on: the run's `run_end` and `batch_end` rows carry the error type
-   and message, and a missing end row says where the run stopped ([Operations](operations.md#monitoring-log)).
-3. **For slow or failing writes, check the ES host** with
-   [`es_diagnostics`](operations.md#diagnosing-an-elasticsearch-host).
+   and message, and a missing end row says where the run stopped. For a streaming feed, the
+   `batch_summary` rows show the backlog after each batch and whether it was caught up or behind
+   ([Logging and Monitoring](monitoring.md#monitoring-log)).
+3. **For slow or failing writes, look at the ES host**, for example with
+   [`es_diagnostics`](maintenance-jobs.md#diagnosing-an-elasticsearch-host) (a work in progress).
 
 ## Symptom index
 
 | Where it fails | Entries |
 |---|---|
-| [Generating jobs](#generation-fails) | unknown key, undeclared host config, `es_host_configs_json`, cluster configs, tags, job groups, old layout, `--check` |
+| [Generating jobs](#generation-fails) | unknown key, undeclared host config, `es_host_configs_json`, cluster configs, tags, job groups, root `resources/` folder, `--check` |
 | [Deploying](#deploy-fails) | cluster policy, cluster id, cluster log path, policy conflicts |
 | [Starting a run](#run-fails-at-start) | wheel, host config, `${environment}`, checkpoint path, TLS settings, monitoring table, missing index |
-| [Writing](#writes-fail-or-are-slow) | timeouts, 429s, slow ES |
-| [The data](#data-looks-wrong) | fewer documents, duplicates, a stream that writes nothing, source updates missing |
+| [Writing](#writes-fail-or-are-slow) | timeouts, 429s, slow writes, reading the signals |
+| [Falling behind](#falling-behind) | growing backlog, skipped runs, stale index |
+| [Data issues](#data-issues) | fewer documents, duplicates, a stream that writes nothing, source updates missing |
 | [Streaming](#streaming-failures) | schema changes, continuous retry limit |
 | [Schedules](#a-scheduled-job-didnt-run) | paused, skipped |
 | [Settings](#a-committed-value-seems-ignored) | a committed value seems ignored |
@@ -98,13 +102,17 @@ A continuous feed must set `pipeline_mode: streaming` in its own config, run on 
 
 Rename the config file. The name becomes the job's resource key.
 
-### Old layout still present
+### A root resources/ folder or a stale include
 
 `the old layout's root resources/ folder (or a file of that name) still exists; delete it ...`, or
 `include (databricks.yml) must list ...`
 
-The repo was upgraded from an earlier build but not finished. Follow
-[Upgrading from earlier builds](framework-maintenance.md#upgrading-from-earlier-builds).
+The copy still has parts of an earlier repo layout, which this framework no longer supports. Job
+resources live in `framework/resources/` (the fixed jobs) and `_pipelines/resources/` (the generated
+ones), and `databricks.yml` must include exactly those two folders. Move any job of your own from a root
+`resources/` folder to `_pipelines/resources/` (the generator leaves files it didn't write alone), delete
+the root folder, set `include` to `framework/resources/*.yml` and `_pipelines/resources/*.yml`, and run
+the generator again.
 
 ### --check fails
 
@@ -132,7 +140,7 @@ A feed's [cluster config](parameters.md#cluster-configs) has an empty `cluster_i
 
 A job cluster config opts in to log delivery, but
 [`cluster_log_volume_path`](parameters.md#cluster_log_volume_path) is empty in this target. Set it, or
-remove the `cluster_log_conf` block ([Cluster log delivery](operations.md#cluster-log-delivery)).
+remove the `cluster_log_conf` block ([Cluster log delivery](monitoring.md#cluster-log-delivery)).
 
 ### A tag conflicts with the cluster policy
 
@@ -148,6 +156,13 @@ A job tag's key or value conflicts with one the workspace cluster policy fixes. 
 Set [`wheel_path`](parameters.md#wheel_path) for the target and redeploy. If the path is set but the
 install or import fails, check the file exists at that path, keeps its standard wheel filename, and that
 the job's identity can read the volume ([Environment Setup](setup.md#connector-wheel)).
+
+### Connector wheel too old
+
+`wheel_path: databricks-es-connector 0.9.7 is older than the framework's minimum 0.10.0; ...`
+
+`wheel_path` points at a connector release the framework doesn't support. Point it at a 0.10.0 or later
+wheel and redeploy ([Environment Setup](setup.md#connector-wheel)).
 
 ### Host config empty for the target
 
@@ -193,7 +208,7 @@ and give the job's identity `MODIFY` on it ([setup](setup.md#monitoring-log-tabl
 
 `index '...' does not exist. Elasticsearch would auto-create it with a ...`
 
-[`require_existing_index`](parameters.md#require_existing_index) is on (the default) and the index isn't
+[`require_existing_index`](parameters.md#require_existing_index) is on (the connector default) and the index isn't
 there. Create the index with its mapping, or check `es_index_name` for a typo.
 
 ### No config for the job
@@ -211,10 +226,12 @@ regenerating and redeploying.
 
 A bulk request took longer than [`request_timeout`](parameters.md#request_timeout). The request never
 returned per-document results, so its documents are counted as rejected (one sample with `_id: None`).
-Lower [`chunk_size`](parameters.md#chunk_size), raise `request_timeout`, and consider
-[`retry_transport_timeout`](parameters.md#retry_transport_timeout) so retries are visible. If it keeps
-happening, ES is likely overloaded: see [Throughput Tuning](throughput.md#timeouts-and-retries) and run
-`es_diagnostics`.
+Find out why before changing anything: an overloaded ES host needs less pressure (lower
+`write_concurrency` or the partition count), and requests that are too heavy need a smaller
+[`chunk_size`](parameters.md#chunk_size). Raise `request_timeout` only when the host is healthy and
+requests legitimately take longer. With
+[`retry_transport_timeout`](parameters.md#retry_transport_timeout) on (recommended), `bulk_stats` shows
+how many sends timed out. See [Throughput Tuning](throughput.md#timeouts-and-retries).
 
 ### 429 rejections
 
@@ -222,16 +239,64 @@ happening, ES is likely overloaded: see [Throughput Tuning](throughput.md#timeou
 
 ES's write queue is full. [`max_retries_per_doc`](parameters.md#max_retries_per_doc) retries those
 documents with backoff, which absorbs brief bursts. If 429s are steady, lower the pressure:
-`write_concurrency`, the partition count, or cores ([Throughput Tuning](throughput.md#reading-the-signals)).
+`write_concurrency`, the partition count, or cores ([Reading the signals](#reading-the-signals)).
 
 ### Slow writes with no errors
 
-Turn on [`bulk_stats`](parameters.md#bulk_stats) and use
-[Reading the signals](throughput.md#reading-the-signals) to tell whether ES or the client side is the
-limit. `es_diagnostics` reports the host's state; its verdicts are explained in
-[Operations](operations.md#diagnosing-an-elasticsearch-host).
+Turn on [`bulk_stats`](parameters.md#bulk_stats) and use [Reading the signals](#reading-the-signals)
+below to tell whether ES or the client side is the limit.
 
-## Data looks wrong
+### Reading the signals
+
+Turn on [`bulk_stats`](parameters.md#bulk_stats) to see what the write is doing (what each part of the
+output means is in [Logging and Monitoring](monitoring.md#reading-the-bulk_stats-output)). These
+signals tell you which side of the balance a feed is on; the levers are explained in
+[Throughput Tuning](throughput.md#the-levers):
+
+| You see | It means | Try |
+|---|---|---|
+| 429 rejections (`rejected(429=...)`), or `took_ms` rising run over run | ES is under too much pressure | lower `write_concurrency` or the partition count |
+| `es_diagnostics` (a work in progress) reports `REJECTING`, `SATURATED`, `PRESSURED` or `HEAP_GC_PRESSURE` | the ES host may be the limit | lower the pressure, or add ES capacity |
+| `rtt_ms` far above `took_ms`, no 429s, executors idle | the write is waiting on round trips | raise `write_concurrency`, or add partitions or cores |
+| `gil_wait_ms` a large share of the partition's time | a partition's threads are waiting for the GIL | lower `write_concurrency` and get parallelism from more partitions instead |
+| a high `wall_max/median` or `stragglers>2x` in the `tail:` line | uneven partitions; the slowest sets the pace | `write_repartition` for evenly sized partitions, or a smaller `max_partition_bytes` |
+| a high `docs_max/median` in the `tail:` line | rows are unevenly spread across partitions | `write_repartition` |
+| `docs/send` well below `chunk_size` | requests are smaller than you asked for | `chunk_size` is above the Arrow batch size or some other limit, so raising it does nothing; look at the other levers instead |
+| `timeout_sends` climbing (with `retry_transport_timeout` on) | requests are timing out and being retried | find out whether ES is overloaded (lower the pressure) or requests are too big (smaller `chunk_size`); raise `request_timeout` only for a healthy host |
+
+## Falling behind
+
+A feed that runs without errors can still fall behind: data reaches the index later and later, because
+the feed sends less per interval than the source receives.
+
+### How to tell
+
+- **Streaming, with the monitoring log on:** the `batch_summary` rows say whether each batch was caught
+  up or behind (`files_outstanding`, `source_latest_version`, `source_end_version`). A run of behind
+  batches, or `files_outstanding` growing batch over batch, is a feed falling behind
+  ([the query](monitoring.md#caught-up-or-behind)).
+- **Scheduled feeds:** runs that take longer than the schedule interval, so the next tick is skipped
+  (`MAX_CONCURRENT_RUNS_EXCEEDED`; see [Skipped](#skipped)).
+- **Either mode:** the newest documents in the index are older than the newest rows in the source.
+
+### Why, and what to do
+
+- **The write is slower than the arrivals.** Measure the arrival rate and set a target
+  ([Throughput Tuning: know the source](throughput.md#before-you-tune-know-the-source)), then tune the
+  write until it meets the target with headroom.
+- **The micro-batch caps are below the arrival rate.** If `max_files_per_trigger` or
+  `max_bytes_per_trigger` lets each batch read less than arrives between batches, the backlog grows
+  however fast each batch is. Raise the caps ([Streaming micro-batch size](throughput.md#streaming-micro-batch-size)).
+- **Elasticsearch is the limit.** 429s or rising `took_ms` mean more client-side parallelism won't help:
+  see [Reading the signals](#reading-the-signals).
+- **A spike, not a trend.** A source that lands a large batch hourly or daily can fall behind during the
+  spike and catch up after. That is expected if it catches up before the next one; size for the spike
+  if it doesn't.
+- **A batch feed re-exports too much.** A batch run re-sends the whole view each time, so its run time
+  grows with the table. Move a large, append-only feed to streaming, or narrow it with
+  `filter_condition`.
+
+## Data issues
 
 ### Fewer documents than source rows
 
@@ -248,13 +313,13 @@ rows can also duplicate ([Job groups](feed-configuration.md#job-groups)).
 ### A stream writes nothing after the index was rebuilt
 
 The feed runs and reports 0 rows. Its checkpoint still records everything already sent, so it only sends
-new commits. To re-send the table, [reset the checkpoint](operations.md#resetting-a-checkpoint) and run
+new commits. To re-send the table, [reset the checkpoint](maintenance-jobs.md#resetting-a-checkpoint) and run
 with `streaming_start=full`, or run the feed once in batch mode.
 
 ### A streaming_start change did nothing
 
 [`streaming_start`](parameters.md#streaming_start) applies only to a stream's first run. Once a checkpoint
-exists, it decides the position. [Reset the checkpoint](operations.md#resetting-a-checkpoint) to start
+exists, it decides the position. [Reset the checkpoint](maintenance-jobs.md#resetting-a-checkpoint) to start
 over from the new setting.
 
 ### Updates or deletes on the source are missing
@@ -269,8 +334,9 @@ run. A batch run overwrites documents by `_id`; it does not remove documents for
 
 `DELTA_SCHEMA_CHANGED_WITH_VERSION` ("Please try restarting the query")
 
-Expected once per added column: the task retry restarts the stream and it continues. The new column
-reaches ES only once you add it to the view and run `deploy_views`.
+Expected once per added column: the task retry restarts the stream and it continues. A view that names
+its columns sends the new column only once you add it to the view and run `deploy_views`; a view that
+uses `SELECT *` sends it from the restarted stream on.
 
 ### A renamed or dropped source column
 
@@ -278,7 +344,7 @@ reaches ES only once you add it to the view and run `deploy_views`.
 
 This fails on every attempt and needs an operator: the stream can't continue across that change
 ([why](technical-details.md#schema-changes-in-a-stream)). Update the view for the new schema, then decide
-how the stream should resume, for example by [resetting its checkpoint](operations.md#resetting-a-checkpoint)
+how the stream should resume, for example by [resetting its checkpoint](maintenance-jobs.md#resetting-a-checkpoint)
 and choosing `streaming_start`.
 
 ### A continuous run cancelled at its retry limit
@@ -293,10 +359,11 @@ continuous trigger starts a fresh run. Look at the earlier failures in the run t
 
 ### Paused
 
-Schedules and continuous triggers are paused unless [`schedule_pause_status`](parameters.md#schedule_pause_status)
-is `UNPAUSED` (only `prd` sets it) or the feed sets its own
-[`pause_status`](parameters.md#pause_status). Unpause it for the target or the feed and redeploy, or
-unpause the job in the UI.
+Schedules and continuous triggers are paused unless the target's
+[`schedule_pause_status`](parameters.md#schedule_pause_status) in `databricks.yml` is `UNPAUSED` or the
+feed sets its own [`pause_status`](parameters.md#pause_status) to `UNPAUSED`. Unpause it for the target
+or the feed and redeploy, or unpause the job in the UI
+([Pausing triggers](feed-configuration.md#pausing-triggers)).
 
 ### Skipped
 
@@ -304,7 +371,7 @@ unpause the job in the UI.
 
 The previous run was still going, and overlapping runs are skipped rather than queued. No work is lost:
 the next run catches up. If it happens often, the feed takes longer than its schedule interval: lengthen
-the interval or make the feed faster ([Scheduling](feed-configuration.md#scheduling)).
+the interval or make the feed faster ([Overlapping runs skipped](feed-configuration.md#overlapping-runs-skipped)).
 
 ## A committed value seems ignored
 
@@ -328,4 +395,4 @@ For a feed config change, regenerate before deploying.
   before it can write `run_end`.
 - **A second `batch_start` for the same `batch_id`:** a retry, under the retry's own `task_run_id`.
 
-See [Operations](operations.md#monitoring-log) for the row model and queries.
+See [Logging and Monitoring](monitoring.md#monitoring-log) for the row model and queries.

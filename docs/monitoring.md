@@ -1,132 +1,53 @@
-# Operations and Monitoring
+# Logging and Monitoring
 
-Running feeds day to day: deploying and running, the maintenance jobs, checkpoints, checking an Elasticsearch host, and the monitoring log. For anyone operating feeds.
+Where a feed's runs are recorded and how to read them: the run output, failure emails, the bulk-write statistics, the monitoring log, always-on feeds, and cluster logs. For anyone operating feeds. When something has gone wrong, [Troubleshooting](troubleshooting.md) starts from the symptom.
 
-- [Deploy and run](#deploy-and-run)
-- [Maintenance jobs at a glance](#maintenance-jobs-at-a-glance)
-- [Checkpoints](#checkpoints)
-- [Resetting a checkpoint](#resetting-a-checkpoint)
-- [Diagnosing an Elasticsearch host](#diagnosing-an-elasticsearch-host)
+- [Run output](#run-output)
+- [Failure emails](#failure-emails)
+- [Reading the BULK_STATS output](#reading-the-bulk_stats-output)
 - [Monitoring log](#monitoring-log)
 - [Watching an always-on feed](#watching-an-always-on-feed)
 - [Cluster log delivery](#cluster-log-delivery)
 
-## Deploy and run
+## Run output
 
-The workflow is generate, deploy, and run. Bundle variables come from the last deploy, so you fill in each target's `variables` block in `databricks.yml` once and need no `--var` on routine deploys.
+Every feed run prints a summary line at the end of its output, in the Jobs UI:
 
-Generate job definitions from your configs:
+- **Batch:** `BATCH EXPORT COMPLETE: written=<N> deleted=<N> errors=<N> ignored=<N> total_input=<N>`.
+  `written` should match `total_input` with `errors=0`. `ignored` counts documents Elasticsearch didn't
+  need to apply, such as 409s on already-indexed `_id`s under `op_type: create`.
+- **Streaming:** `STREAMING EXPORT COMPLETE: streaming_start=<new|full> batches=<N> rows_pushed=<N> ...`,
+  or `STREAMING EXPORT COMPLETE: 0 rows pushed (no new source data since the last run)` when there was
+  nothing new to send.
 
-```bash
-python framework/scripts/gen_jobs.py
-```
+An always-on (continuous) run never prints a summary line, because it never ends: see
+[Watching an always-on feed](#watching-an-always-on-feed).
 
-Deploy to your target environment (variables from `databricks.yml` or `--var`):
+## Failure emails
 
-```bash
-databricks bundle deploy -t dev -p <profile>
-```
+Every job, generated or fixed, emails the [`support_email`](parameters.md#support_email) list when a job
+or task run fails. Skipped and canceled runs don't email. Set the list per target; an empty list sends
+nothing.
 
-Create or update the views:
+## Reading the `BULK_STATS` output
 
-```bash
-databricks bundle run deploy_views -t dev -p <profile>
-```
+With [`bulk_stats`](parameters.md#bulk_stats) on, each batch logs lines tagged `BULK_STATS`:
 
-Run a feed with the defaults from its config and the last deploy:
+- **`overall`:** totals for the batch: `docs/send` (real documents per request), the round-trip time the
+  client saw (`rtt_ms`) and the time ES reports spending (`took_ms`), CPU and GIL-wait totals, and
+  rejection counts.
+- **One line per partition** (batch mode), with median, 95th percentile and maximum for the same timings.
+- **`tail:`**, a summary of the slowest partition against the median one: its wall time, sends and
+  documents, and the spread (`wall_p95`, `wall_max/median`, `stragglers>2x`, `docs_max/median`).
+  Streaming feeds log `overall` and `tail:` for each micro-batch.
 
-```bash
-databricks bundle run index_pipeline_<config_name> -t dev -p <profile>
-```
+`rtt_ms` minus `took_ms` is time spent outside ES: the network, queuing, and decoding on the client.
+Every line carries a `ts=` timestamp, which is when the batch actually ran; for streaming, the line can
+appear in the log later than that. ([Why](technical-details.md#bulk-stats-relay-timing).)
 
-Override run-time settings for a single run:
-
-```bash
-databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
-  --params filter_condition="action = 'allowed'",chunk_size=1000,max_partition_bytes=8m
-```
-
-Stream a full table backfill (instead of the default new commits only):
-
-```bash
-databricks bundle run index_pipeline_<config_name> -t dev -p <profile> \
-  --params pipeline_mode=streaming,streaming_start=full
-```
-
-You can also override bundle variables at deploy, for a one-off wheel path for example:
-
-```bash
-databricks bundle deploy -t dev -p <profile> \
-  --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
-```
-
-Bundle variables persist from one deploy to the next, so fill in each target's `variables` block in your fork's `databricks.yml` once. Prefer not to commit paths? Set per-target values in the git-ignored `.databricks/bundle/<target>/variable-overrides.json` instead; the bundle resolves them the same way.
-
-Every job grants `CAN_MANAGE_RUN` to the `users` group, so anyone in the workspace can trigger, stop or repair a run without being the job's owner. A run executes as the job's run-as identity, and a parameter override applies to that run only. See [Parameters Reference](parameters.md#how-values-are-set) for the full precedence order.
-
-## Maintenance jobs at a glance
-
-Six fixed jobs handle setup and upkeep. Run any with `databricks bundle run <resource_key> -t <target> -p <profile>`, with optional `--params` as noted.
-
-| Resource key | Display name | What it does | When to run it |
-|---|---|---|---|
-| `deploy_views` | Deploy views | Creates or updates every feed's view in the workspace. Fails closed if the schema or join logic is invalid. | Once per deploy, before the first index run. Re-run if you modify a view's SQL. |
-| `build_wheel` | Build wheel | Builds the `databricks-es-connector` wheel from a checked-out copy of the connector repo (with `--params repo_workspace_path=<path>,wheel_version=<x.x.x>`). Publishes it to the UC Volume next to your existing wheels. Does not switch your feeds to it. | On demand when you want to update the connector version. |
-| `checkpoint_clear` | Checkpoint clear | Deletes a feed's checkpoint directory (with `--params config_name=<config_name>`). The next streaming run starts fresh. Safe to run while the stream is paused. | When you wipe an index and want to backfill it, or when you change `streaming_start`. |
-| `es_diagnostics` | Diagnostics | Samples an Elasticsearch cluster twice (5 seconds apart by default) and reports a verdict on its health (with optional `--params index_name=<index>,es_host_config=<name>`). Reports load-bearing metrics: write thread-pool saturation, rejections, indexing pressure, circuit breakers, node heap/GC, and cluster state. | When writes are slow or timing out, to see if the host is saturated. |
-| `log_table_create` | Log table create | Creates the monitoring Delta table if it does not exist, or adds any new columns to an existing table. Idempotent. (See [Monitoring log](#monitoring-log) below.) | Once, before turning the monitoring log on. Re-run before deploying a build that adds a new monitoring column. |
-| `log_table_prune` | Log table prune | Deletes rows older than `monitoring_log_retention_days` (default 90), then optimizes and vacuums. Runs daily on the shared pause setting: live in `prd`, paused elsewhere. | Leave it scheduled where the log is in use; pause it in `prd` if you don't use the log there (it fails without a table). |
-
-Every maintenance job parameter is in [Parameters Reference](parameters.md#maintenance-job-parameters).
-
-## Checkpoints
-
-Each streaming feed keeps its checkpoint at `<checkpoint_base_path>/<config_name>` in the UC Volume. The checkpoint holds the stream's last read position in the source table. If you reset an index in Elasticsearch and want to backfill it from the Delta table, you must clear that checkpoint first, otherwise the stream considers those records already exported and writes nothing. Deterministic document `_id`s make a re-send an idempotent upsert, not a duplicate.
-
-Clear checkpoints with the `checkpoint_clear` job rather than by hand (see [Maintenance jobs at a glance](#maintenance-jobs-at-a-glance) above).
-
-In `dev` environments, use `mode: development` in `databricks.yml` and append `${workspace.current_user.short_name}` to `checkpoint_base_path` so each developer gets their own isolated checkpoint tree. See [Environment Setup](setup.md#per-developer-checkpoints).
-
-## Resetting a checkpoint
-
-When a stream's checkpoint is stale (the index was wiped, or you want to start from a fresh `streaming_start`), clear it with the `checkpoint_clear` job:
-
-```bash
-databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>
-```
-
-This deletes the whole checkpoint directory `<checkpoint_base_path>/<config_name>` and does nothing else. It never reads the Elasticsearch secret or writes a document. The next `streaming` run of that feed then behaves like a first run: `streaming_start=new` reseeds at the source's current version, `streaming_start=full` backfills the whole table. Clearing an already-absent checkpoint is a harmless no-op. `config_name` is required and validated (a blank or path-bearing value fails), so the job can only delete the one checkpoint that feed would use, never a shared base or another feed's checkpoint.
-
-For a **continuous** (always-on) feed, pause the continuous trigger first (or cancel the running job), run the clear, then resume, so the always-on stream does not re-establish a checkpoint while you clear it.
-
-Concurrency: unlike every other job, `checkpoint_clear` allows up to 20 concurrent runs, so you can reset several feeds' checkpoints at once. Two runs for the same config are harmless (the second finds nothing to delete). Concurrency does not make it safe to clear a checkpoint while that feed's stream is running: stop the stream first. See [technical details](technical-details.md#checkpoint-clear-concurrency) for the concurrency design.
-
-## Diagnosing an Elasticsearch host
-
-When a host looks backed up (writes slowing, requests timing out), run the read-only `es_diagnostics` job to collect an outside view of what the cluster is doing:
-
-```bash
-databricks bundle run es_diagnostics -t <target> -p <profile>                              # default host, cluster/node level
-databricks bundle run es_diagnostics -t <target> -p <profile> --params index_name=<index>  # + deep-dive on one index
-databricks bundle run es_diagnostics -t <target> -p <profile> --params es_host_config=es_host_secondary  # hit a different host
-```
-
-The job only issues `GET` requests (it never writes a document or misuses the ES secret). It connects to the host config named by `es_host_config` (default: the bundle's `default_es_host_config`), using the same endpoints and secrets the feeds use. The host is picked only by name, from the `es_host_configs_json` variable in `databricks.yml`, so someone who can run the job can't point it at another endpoint ([why](technical-details.md#diagnostics-host-by-name-security)).
-
-It gathers: write thread-pool saturation and rejections, indexing pressure, circuit breakers, node heap/GC, cluster health and pending tasks, in-flight bulk tasks, hot threads, and (when `index_name` is set) that index's `_stats`, `_settings`, `_count`, and shard placement. The job samples the counter endpoints twice (`sample_interval_secs` apart, default 5s) so rejection and GC rates reflect the window rather than lifetime totals, then prints a one-line **verdict**:
-
-- `REJECTING`: Elasticsearch is actively shedding load with 429s (write-pool / indexing-pressure / circuit-breaker rejections in the window). This is the idiomatic backpressure signal. Reduce bulk size and write concurrency, and back off on 429s.
-- `SATURATED`: the write queue is building but not yet rejecting (near capacity).
-- `PRESSURED`: indexing-pressure memory is a high fraction of its limit (rejections imminent).
-- `HEAP_GC_PRESSURE`: high heap and/or heavy GC in the window: the node is processing slowly rather than queueing. A slow `_bulk` that times out client-side (rather than a fast 429) points here or at the network.
-- `HEALTHY`: every load-bearing signal was collected and is clear.
-- `INCONCLUSIVE`: a load-bearing signal (write rejections/queue, indexing pressure) could not be collected, so the host cannot be cleared as healthy. The failed endpoints are listed.
-
-The run **fails only** when it could collect nothing at all (bad host, api_key, TLS, or egress). A verdict of "found congestion" is a successful run; reporting congestion is the job's purpose.
-
-Run parameters: `index_name` (blank checks only cluster and nodes), `es_host_config` (the named host config to check; unknown names fail), `verify_certs` (`false` for self-signed endpoints; ignored when `ca_certs` is set), `sample_interval_secs` (`0` for one snapshot: gauges only, so it can never report `HEALTHY`; use the default two-sample window to clear a host), and `request_timeout_secs` (timeout per request).
-
-By default the job runs serverless. To run it on a cluster instead (for example to match the runtime or the network path a feed's writes take), set one of the `es_diagnostics` compute variables in `databricks.yml` and redeploy. Compute is a deploy-time property. Set `diagnostics_existing_cluster_id` to run on an already-running cluster by id, or `diagnostics_job_clusters` + `diagnostics_job_cluster_key` to run on a new job cluster (copy a `_pipelines/job_cluster_configs/<key>.yml` `new_cluster` spec into the list). Set at most one path. See [Parameters Reference](parameters.md#diagnostics-compute) for details.
+What each signal says about the write, and which lever to move, is in
+[Troubleshooting: Reading the signals](troubleshooting.md#reading-the-signals). For trends across runs,
+the monitoring log below keeps each batch's write diagnostics.
 
 ## Monitoring log
 
@@ -138,7 +59,7 @@ To keep a durable record of every run and every batch for support, dashboards, a
 databricks bundle run log_table_create -t <target> -p <profile>
 ```
 
-It runs `CREATE TABLE IF NOT EXISTS` with the log's schema (from `framework/pipeline_lib/monitoring_sink.py`) and is idempotent. The identity that runs this job needs `CREATE TABLE` (and `USE CATALOG` / `USE SCHEMA`) on the target schema. Export jobs only append, so their identity needs only `MODIFY` on the table. If a table name is blank or not a three-part identifier it fails closed.
+It runs `CREATE TABLE IF NOT EXISTS` with the log's schema (from `framework/pipeline_lib/monitoring_sink.py`), then `ALTER TABLE ADD COLUMNS` for any column an existing table lacks, and is idempotent. The identity that runs this job needs `CREATE TABLE` (and `USE CATALOG` / `USE SCHEMA`) on the target schema. That identity owns the table it creates, so it can always re-run the job; a different identity re-running it on an existing table also needs `SELECT` and `MODIFY` on the table, which adding columns requires. Export jobs only append, so their identity needs only `MODIFY` on the table. If a table name is blank or not a three-part identifier it fails closed.
 
 Set up the monitoring table once per environment in [Environment Setup](setup.md#monitoring-log-table).
 
@@ -239,7 +160,7 @@ WHERE record_type = 'batch_summary' AND event_ts > current_timestamp() - INTERVA
 ORDER BY config_name, batch_id DESC;
 ```
 
-**Retention and the prune job.** The table grows without limit otherwise. The `log_table_prune` job enforces retention: it deletes rows older than `monitoring_log_retention_days` (default 90; `0` disables the delete), then optimizes (reclusters and compacts) and vacuums. It runs daily at 03:00 UTC on the same pause setting as every scheduled job ([`schedule_pause_status`](parameters.md#schedule_pause_status)), so it fires in `prd` and is paused in `dev` and `stg` until you unpause it. It fails when `monitoring_log_table` is empty, so pause it in any target where the schedule is live but the log isn't used. Run it on demand with:
+**Retention and the prune job.** The table grows without limit otherwise. The `log_table_prune` job enforces retention: it deletes rows older than `monitoring_log_retention_days` (default 90; `0` disables the delete), then optimizes (reclusters and compacts) and vacuums. It runs daily at 03:00 UTC, paused or unpaused by the target's [`schedule_pause_status`](parameters.md#schedule_pause_status) like every other trigger. It fails when `monitoring_log_table` is empty, so in any target where triggers are unpaused but the log isn't used, pause `log_table_prune` (or it fails, and emails `support_email`, every day). Run it on demand with:
 
 ```bash
 databricks bundle run log_table_prune -t <target> -p <profile>
@@ -250,8 +171,6 @@ The table is liquid-clustered on `(config_name, event_ts)` (the columns monitori
 ## Watching an always-on feed
 
 An always-on (continuous) run never reaches an end-of-run summary because it never terminates. Health comes from the Databricks Jobs continuous-run state (RUNNING, restart count, failure notifications) plus, with the monitoring log on, the per-batch rows the runner writes as each batch runs. Bound a first-run backfill or large post-restart catch-up with `max_files_per_trigger` and `max_bytes_per_trigger` so one micro-batch does not try to read the whole table.
-
-See the worked example in [`ecs_dns_activity_continuous.yml`](../_pipelines/pipeline_configs/ecs_dns_activity_continuous.yml).
 
 ## Cluster log delivery
 

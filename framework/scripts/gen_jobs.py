@@ -1207,7 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
             "the old layout's root resources/ folder (or a file of that name) still exists; delete it "
             "(the fixed jobs now live in "
             "framework/resources/, generated ones in _pipelines/resources/; move any job of your own to "
-            "_pipelines/resources/) and see \"Upgrading from earlier builds\" in docs/framework-maintenance.md",
+            "_pipelines/resources/); see \"A root resources/ folder or a stale include\" in docs/troubleshooting.md",
             file=sys.stderr,
         )
         return 1

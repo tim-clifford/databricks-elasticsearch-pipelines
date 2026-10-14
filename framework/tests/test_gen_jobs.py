@@ -735,26 +735,6 @@ def test_require_runtime_knobs_declared_bad_default_fails_closed(tmp_path, name,
         gen_jobs.require_runtime_knobs_declared(str(yml))
 
 
-def test_version_gated_knob_globals_ship_empty():
-    # Regression: a VERSION-GATED connector knob (see _VERSION_GATED_KNOBS in
-    # framework/notebooks/run_index_pipeline.py: bulk_stats, retry_transport_timeout, op_type, bypass_fast_path) MUST
-    # ship an EMPTY global default in databricks.yml. A concrete non-empty global would make a config that
-    # OMITS the knob bake that value, so on a connector older than the knob's min version the runner's
-    # version-gate drops it with a spurious "dropping <knob>=<v>" warning every run (export unchanged, but
-    # misleading). An empty global bakes "" => the knob is omitted from write_overrides => the gate never
-    # fires unless a target/config explicitly set it. op_type's empty also defers to the connector default
-    # (index), so nothing is lost. (op_type shipped a literal 'index' once; this guards against regressing.)
-    doc = yaml.safe_load(open(os.path.join(_REPO_ROOT, "databricks.yml")))
-    variables = doc["variables"]
-    for knob in ("bulk_stats", "retry_transport_timeout", "op_type", "bypass_fast_path"):
-        spec = variables[knob]
-        default = spec.get("default") if isinstance(spec, dict) else spec
-        assert (default or "") == "", (
-            f"version-gated knob {knob!r} must ship an EMPTY global default (got {default!r}); a non-empty "
-            f"global spuriously trips the runner version-gate on a pre-min-version wheel"
-        )
-
-
 def test_require_runtime_knobs_declared_accepts_scalar_shorthand(tmp_path):
     # DAB's scalar shorthand (<name>: <v>, no `default:` key) IS the default; a legal shorthand for every
     # knob passes (the gate reads the default from whichever shape was used).

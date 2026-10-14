@@ -253,7 +253,7 @@ variables:
   # storage info", seen live), and a bundle cannot omit a nested block at deploy. So a config that opts
   # in needs this set to a real path in EVERY target it deploys to (empty there fails the deploy, loudly).
   # Serverless has no cluster log delivery. Logs ACCUMULATE: nothing here deletes them. See "Cluster log
-  # delivery" in docs/operations.md (grants, contents). Simple string, so --var-settable.
+  # delivery" in docs/monitoring.md (grants, contents). Simple string, so --var-settable.
   cluster_log_volume_path:
     description: "UC Volume path job-cluster logs are delivered to, for job cluster configs that opt in with a cluster_log_conf block referencing ${var.cluster_log_volume_path}. Empty default (unused). Must be set in every target such a config deploys to. Logs accumulate; no automatic cleanup."
     default: ""

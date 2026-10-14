@@ -7,6 +7,7 @@ in order. Each setting mentioned here is defined in the [Parameters Reference](p
 - [Prerequisites](#prerequisites)
 - [Targets](#targets)
 - [Fill in databricks.yml](#fill-in-databricksyml)
+- [Defaults for the run-time knobs](#defaults-for-the-run-time-knobs)
 - [Elasticsearch host configs](#elasticsearch-host-configs)
 - [Per-developer checkpoints](#per-developer-checkpoints)
 - [Optional: the monitoring log table](#monitoring-log-table)
@@ -21,17 +22,18 @@ in order. Each setting mentioned here is defined in the [Parameters Reference](p
   create the views in (each feed config names them).
 - A UC Volume for the connector wheel, and one for streaming checkpoints if any feed streams (one volume
   can hold both).
-- Optionally, a UC Volume path for a CA bundle (if ES uses a private CA), a volume for cluster logs, and a
-  schema for the monitoring log table.
+- Optionally, a UC Volume path for a CA bundle (if ES uses a private CA) and a schema for the monitoring
+  log table.
 
 <a id="connector-wheel"></a>
 
 ### The connector wheel
 
-Every feed job installs the [databricks-es-connector](https://github.com/tim-clifford/es-databricks-connector)
+Every feed job installs the [databricks-es-connector](/../../../es-databricks-connector)
 wheel from the UC Volume path in [`wheel_path`](parameters.md#wheel_path). Keep the wheel's standard
-filename (`databricks_es_connector-<version>-py3-none-any.whl`), which carries the version. Two ways to get
-it there:
+filename (`databricks_es_connector-<version>-py3-none-any.whl`), which carries the version. The framework
+requires connector **0.10.0 or later**: every feed run checks the installed version first and fails with
+a clear message, before reading or sending anything, on an older wheel. Two ways to get it there:
 
 - **Upload a wheel** you built or downloaded, with the Catalog Explorer or the Databricks CLI.
 - **Build it in the workspace** with the `build_wheel` job. Put a copy of the connector repo in the
@@ -48,40 +50,77 @@ it there:
 
 ### Secret scopes for the ES api_keys
 
-Each Elasticsearch host's api_key lives in a Databricks secret scope; the bundle stores only the scope and
-key names. With the Databricks CLI:
+Each Elasticsearch host config has its own api_key, so there is one api_key per host the feeds write to.
+Each lives in a Databricks secret scope; the bundle stores only the scope and key names. Several keys can
+share one scope, or each host can have its own. With the Databricks CLI, for each host:
 
 ```bash
-databricks secrets create-scope <scope> -p <profile>
-databricks secrets put-secret <scope> <key> -p <profile>        # prompts for the api_key value
+databricks secrets create-scope <scope> -p <profile>            # once per scope
+databricks secrets put-secret <scope> <key> -p <profile>        # prompts for that host's api_key value
 ```
 
-The identity the jobs run as needs `READ` on the scope.
+The identity the jobs run as needs `READ` on every scope that holds one of the keys.
 
 ### Elasticsearch
 
-- The target indices, created with their mappings before a feed first writes. By default a feed fails if
-  its index doesn't exist ([`require_existing_index`](parameters.md#require_existing_index)).
-- Network access from the compute that runs the jobs (serverless, or your clusters) to each ES endpoint.
+- The target indices, created with their mappings before a feed first writes. With
+  [`require_existing_index`](parameters.md#require_existing_index) on (the connector default), a feed
+  fails if its index doesn't exist; with it off, Elasticsearch creates a missing index on the first write
+  (unless the cluster disables auto-creation).
+
+### Network access
+
+The compute that runs the jobs (serverless, or your clusters) needs network access to each ES endpoint.
+
+### Optional: a service principal to run the jobs
+
+By default every job runs as the identity that deploys the bundle. For shared and production targets, a
+service principal is the usual choice instead, so the jobs don't depend on one person's account or
+access. Either deploy as the service principal (for example from CI), or set `run_as` for the target in
+`databricks.yml`:
+
+```yaml
+targets:
+  prd:
+    run_as:
+      service_principal_name: "<service-principal-application-id>"
+```
+
+With `run_as`, the identity that deploys needs the Service Principal User role on that service
+principal. Whichever identity the jobs run as needs every grant in [Permissions](#permissions) below.
+
+### Optional prerequisites
+
+Only if you use the feature:
+
+- **A cluster policy** for job-cluster feeds: its id goes in [`cluster_policy_id`](parameters.md#cluster_policy_id).
+- **A support email address** or list for failure emails: [`support_email`](parameters.md#support_email).
+- **A UC Volume for cluster logs**, if job clusters should keep their logs:
+  [`cluster_log_volume_path`](parameters.md#cluster_log_volume_path).
+- **A UC Volume for a CA bundle**, if ES uses a certificate the system CA store doesn't trust:
+  [`ca_certs`](parameters.md#ca_certs).
+- **A schema for the monitoring log table**: [`monitoring_log_table`](parameters.md#monitoring_log_table).
 
 ### Permissions
 
-Jobs run as the identity that deploys the bundle (no job sets a different run-as). That identity needs,
-in Unity Catalog terms:
+Jobs run as the identity that deploys the bundle, or as the `run_as` service principal if you set one.
+That identity needs, in Unity Catalog terms:
 
 | For | Needs |
 |---|---|
 | `deploy_views` | `USE CATALOG` and `USE SCHEMA` on the view schema, `CREATE TABLE` there (creating a view requires it), and `SELECT` on each source and reference table |
 | Feed jobs | `SELECT` on each view, source and reference table; `READ VOLUME` on the wheel's volume (and the CA bundle's, if set); `READ VOLUME` and `WRITE VOLUME` on the checkpoint volume (streaming); `READ` on the secret scopes; `MODIFY` on the monitoring table (if the log is on) |
 | `checkpoint_clear` | `READ VOLUME` and `WRITE VOLUME` on the checkpoint volume |
-| `es_diagnostics` | `READ` on the secret scopes (and `READ VOLUME` for the CA bundle, if set) |
-| `build_wheel` | read access to the connector repo folder in the workspace, and `WRITE VOLUME` on the wheel's volume |
-| `log_table_create` | `USE CATALOG`, `USE SCHEMA` and `CREATE TABLE` on the monitoring table's schema |
+| `es_diagnostics` (a work in progress) | `READ` on the secret scopes (and `READ VOLUME` for the CA bundle, if set) |
+| `build_wheel` | `CAN_READ` on the connector repo folder in the workspace, and `WRITE VOLUME` on the wheel's volume |
+| `log_table_create` | `USE CATALOG`, `USE SCHEMA` and `CREATE TABLE` on the monitoring table's schema; to re-run it on a table another identity created, also `SELECT` and `MODIFY` on the table |
 | `log_table_prune` | `MODIFY` on the monitoring table |
 | Cluster log delivery | `READ VOLUME` and `WRITE VOLUME` on the log volume, for the identity the job cluster runs as |
 
-Every job grants `CAN_MANAGE_RUN` to the `users` group, so anyone in the workspace can start a run. A run
-still executes as the job's identity ([why that shapes the job parameters](technical-details.md#can-manage-run)).
+Every job also grants `CAN_MANAGE_RUN` to the workspace's `users` group, so anyone in the workspace can
+start a run. The grant is part of each job definition, written by the generator and in the fixed job
+files ([Who can run the jobs](deployment.md#who-can-run-the-jobs)). A run still executes as the job's
+identity ([why that shapes the job parameters](technical-details.md#can-manage-run)).
 
 ### Local tools
 
@@ -102,14 +141,16 @@ still executes as the job's identity ([why that shapes the job parameters](techn
   names prefixed by the user name.
 - **`stg`** and **`prd`** use production mode, with a shared deploy path per target.
 
-All three take the workspace from your CLI profile (`-p <profile>`) or `DATABRICKS_HOST`, so a target can
-point at any workspace. Scheduled and continuous jobs deploy paused in `dev` and `stg` and fire only in
-`prd` ([`schedule_pause_status`](parameters.md#schedule_pause_status)).
+All three take the workspace from your CLI profile (`-p <profile>`) or `DATABRICKS_HOST`. Whether
+scheduled and continuous jobs run in a target is set per target in `databricks.yml` by
+[`schedule_pause_status`](parameters.md#schedule_pause_status). The usual setup is paused in `dev` and
+`stg`, so their triggers are deployed but don't start runs, and unpaused in `prd`, where the triggers
+run.
 
 ## Fill in databricks.yml
 
-Each target's `variables` block ships with empty placeholders. Fill in the targets you deploy to; after
-that a routine deploy needs no `--var`. An empty value fails closed wherever it's required.
+Each target has a `variables` block for its environment-specific values. Fill in the targets you deploy
+to; after that a routine deploy needs no `--var`. An empty value fails closed wherever it's required.
 
 | Variable | Set it when |
 |---|---|
@@ -129,6 +170,35 @@ Two things to know:
   ignored, look for one of those ([precedence](parameters.md#bundle-variables)).
 - Declare variables and targets in `databricks.yml` only, not in an included resource file. The generator
   reads `databricks.yml` alone.
+
+## Defaults for the run-time knobs
+
+The [run-time knobs](parameters.md#run-time-knobs) (`pipeline_mode`, `request_timeout`, `op_type`,
+`bulk_stats`, `max_partition_bytes` and the rest) each have a bundle variable of the same name in
+`databricks.yml`. That variable is the target-wide default: it applies to every feed in the target that
+doesn't set the knob in its own config, and a `--params` override still beats both
+([precedence](parameters.md#run-time-knobs-one-precedence-rule)). An empty value means the connector's or
+Spark's own default.
+
+Set a knob here when most feeds in a target should share a value, and leave it empty otherwise. Set it
+at the top level for every target, or in one target's `variables` block:
+
+```yaml
+# databricks.yml
+variables:
+  pipeline_mode:
+    default: batch                 # the mode most feeds use; the run fails if nothing sets it
+  retry_transport_timeout:
+    default: "true"                # recommended for every feed
+targets:
+  prd:
+    variables:
+      monitoring_log_enabled: "true"
+```
+
+Each knob's entry in the [Parameters Reference](parameters.md#run-time-knobs) says what to weigh, and
+[Throughput Tuning](throughput.md) covers the write knobs together. Leave `filter_condition` empty: a
+global filter applies to every feed that doesn't set its own.
 
 <a id="elasticsearch-host-configs"></a>
 
@@ -158,9 +228,9 @@ Feeds that don't set `es_host_config` write to the host named by
 [`default_es_host_config`](parameters.md#default_es_host_config) (`es_host_default` out of the box). Only
 the api_key value is secret, and it stays in the secret scope.
 
-### Adding another host config
+### Adding additional host configs
 
-To send some feeds to a second ES cluster, all in `databricks.yml`:
+To send some feeds to other ES clusters, add a host config for each, all in `databricks.yml`:
 
 1. Declare another complex variable with the same three fields, and give it values in each target. The
    file has a commented `es_host_secondary` example:
@@ -191,6 +261,9 @@ To send some feeds to a second ES cluster, all in `databricks.yml`:
    fields.
 
 3. Point a feed at it with `es_host_config: es_host_secondary`.
+
+Repeat the three steps for each further host config, and add a secret for each host's api_key
+([Secret scopes](#secret-scopes-for-the-es-api_keys)).
 
 ### Keeping endpoints out of git
 
@@ -246,43 +319,47 @@ The monitoring log records every run and batch in a Delta table. To use it:
 3. Turn it on with [`monitoring_log_enabled`](parameters.md#monitoring_log_enabled), for the whole target,
    for one feed, or for a single run. When it's on, a missing or unwritable table fails the run.
 4. The `log_table_prune` job keeps the table to
-   [`monitoring_log_retention_days`](parameters.md#monitoring_log_retention_days). It runs daily, on the
-   same pause setting as every scheduled job, so it fires in `prd` and stays paused in `dev` and `stg`
-   unless you unpause it.
+   [`monitoring_log_retention_days`](parameters.md#monitoring_log_retention_days). It runs daily, paused
+   or unpaused by the target's `schedule_pause_status` like every other trigger.
 
-The prune job fails when `monitoring_log_table` is empty, and in `prd` its schedule is live. So if you
-deploy to `prd` without the monitoring log, pause `log_table_prune` there; otherwise it fails, and emails
-`support_email`, every day.
+The prune job fails when `monitoring_log_table` is empty. So in any target where triggers are unpaused but
+the monitoring log isn't used, pause `log_table_prune`; otherwise it fails, and emails `support_email`,
+every day.
 
-How to read the table is in [Operations](operations.md#monitoring-log).
+How to read the table is in [Logging and Monitoring](monitoring.md#monitoring-log).
 
 ## Optional: failure emails, job clusters, cluster logs
 
 - **Failure emails.** Set [`support_email`](parameters.md#support_email) (a list) in the targets that
-  should page someone, usually only `prd`. Skipped and canceled runs don't email.
+  should page someone, usually only production. Skipped and canceled runs don't email.
 - **Job clusters.** If any feed uses `job_cluster` compute, set
   [`cluster_policy_id`](parameters.md#cluster_policy_id) in each target it deploys to.
 - **Cluster log delivery.** To keep job-cluster logs after the cluster ends, see
-  [Cluster log delivery](operations.md#cluster-log-delivery).
+  [Cluster log delivery](monitoring.md#cluster-log-delivery).
 
 ## First deploy
 
-From the repo root:
+Run the [deploy sequence](deployment.md#the-deploy-sequence) from the repo root, the same one every
+later deploy uses:
 
 ```bash
-python framework/scripts/gen_jobs.py                       # generate a job per feed config
+pip install -r requirements.txt pytest                      # once: the generator's pinned dependency, and pytest
+python -m pytest framework/tests -q                         # after changing framework code or taking a release
+python framework/scripts/gen_jobs.py                        # generate a job per feed config
+python framework/scripts/gen_jobs.py --check                # confirm the generated jobs are current
 databricks bundle validate -t <target> -p <profile>
 databricks bundle deploy -t <target> -p <profile>
 databricks bundle run deploy_views -t <target> -p <profile>
+databricks bundle run log_table_create -t <target> -p <profile>   # optional: only if you use the monitoring log
+databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
 ```
 
 The deploy creates the feed jobs and the six maintenance jobs (`build_wheel`, `deploy_views`,
 `checkpoint_clear`, `es_diagnostics`, `log_table_create`, `log_table_prune`). Commit the files the
-generator writes under `_pipelines/resources/`.
-
-Then run one feed and check its output, as in the [quick start](quick-start.md#verify).
+generator writes under `_pipelines/resources/`. Check the feed's output as in the
+[quick start](quick-start.md#verify).
 
 If you have CI, run `python framework/scripts/gen_jobs.py --check` there: it changes nothing and fails if
 a config was edited without regenerating its job.
 
-Next: [add a feed](quick-start.md), or see [Operations](operations.md) for running feeds day to day.
+Next: [add a feed](quick-start.md), or see [Deployment](deployment.md) for running feeds day to day.

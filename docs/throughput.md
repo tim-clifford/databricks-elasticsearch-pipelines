@@ -1,13 +1,60 @@
 # Throughput Tuning
 
-How to make a feed write faster without overloading Elasticsearch. For anyone sizing a cluster or
-tuning a feed that is slower than it needs to be. Each knob is defined in the
-[Parameters Reference](parameters.md); this doc is about how they interact.
+How to send as much data to Elasticsearch as a feed needs without overloading it, on clusters no bigger
+than the job requires. For anyone sizing a cluster or tuning a feed. The goal has three sides: keep each
+feed caught up with its source, keep Elasticsearch healthy, and keep cluster cost down. Each knob is
+defined in the [Parameters Reference](parameters.md); this doc is about how they interact.
 
+- [Before you tune: know the source](#before-you-tune-know-the-source)
 - [How the write works](#how-the-write-works)
 - [The levers](#the-levers)
 - [Reading the signals](#reading-the-signals)
 - [A tuning procedure](#a-tuning-procedure)
+
+## Before you tune: know the source
+
+Start from how much data the feed has to move, not from the cluster. Work out, for each source table:
+
+- **When it changes:** how often new data lands (continuously, every few minutes, hourly, in a daily
+  load) and how predictable that is.
+- **How much each change carries:** the typical rows and bytes per update, and the largest.
+- **The shape over a day:** steady arrivals through the day, or large intermittent spikes (an hourly or
+  daily batch); and, if it applies, the difference between peak and off-peak hours.
+
+From that, set a target the feed must meet under normal conditions, over an interval that suits how
+fresh the index needs to be. For example: "this feed must send X rows (Y bytes) to Elasticsearch every 15
+minutes to stay caught up". Size for the peak interval, not the daily average, and leave headroom for
+catching up after a pause or a failure. A spiky source either needs capacity for the spike or has to
+accept falling behind during it and catching up after.
+
+The source's Delta history gives the numbers. This lists the rows and bytes added per 15 minutes, from a
+notebook. It counts every commit that reports rows written (appends, streaming writes, `COPY INTO`,
+`CREATE` or `REPLACE TABLE AS SELECT`) and the rows a `MERGE` inserts, and leaves out commits with no
+row count. The metrics differ by operation, so check the result against a few commits in the table's
+history before relying on it. It can also overstate what a feed sends: a `REPLACE TABLE AS SELECT`
+counts the whole table, a `MERGE`'s bytes include files rewritten for updates, and a streaming feed
+skips change commits (`MERGE`, `UPDATE`, `DELETE`) altogether, so for a streaming feed count only the
+append-type commits:
+
+```python
+from pyspark.sql import functions as F
+
+m = F.col("operationMetrics")
+history = spark.sql("DESCRIBE HISTORY <catalog>.<schema>.<table>")
+(history
+    .select("timestamp",
+            F.coalesce(m["numTargetRowsInserted"], m["numOutputRows"]).cast("long").alias("rows"),
+            F.coalesce(m["numTargetBytesAdded"], m["numOutputBytes"]).cast("long").alias("bytes"))
+    .where(F.col("rows").isNotNull())
+    .groupBy(F.window("timestamp", "15 minutes").alias("interval"))
+    .agg(F.count("*").alias("commits"), F.sum("rows").alias("rows"), F.sum("bytes").alias("bytes"))
+    .orderBy("interval")
+    .display())
+```
+
+The history covers the table's log retention (30 days by default). The bytes are compressed Delta file
+bytes, not the size of the JSON documents Elasticsearch receives, and the view can add or drop columns,
+so treat them as a relative measure. Rows map one to one to documents for a row-wise view.
 
 ## How the write works
 
@@ -39,6 +86,11 @@ below move that number, the size of each request, or both.
 
 ### Worker cores
 
+The cluster configuration sets the worker cores: the worker node type times the number of workers. For
+example, a job cluster of 4 `m7g.2xlarge` workers (8 vCPUs each) has 32 worker cores. The driver's
+cores don't run partitions and don't count. A job cluster's node type and worker count live in its
+[job-cluster spec](feed-configuration.md#job-cluster-specs); serverless sizes itself.
+
 More cores let more partitions write at the same time, which raises requests in flight and speeds up
 the read and the view transform.
 
@@ -56,27 +108,31 @@ without adding cores. The connector sizes its connection pool to match.
 
 - **Too low:** cores sit idle waiting on each round trip, and the write takes longer than ES needs.
 - **Too high:** more pressure on ES (429s, slower responses). The threads in one partition also share a
-  single Python interpreter, so past some point they spend time waiting for the GIL instead of sending,
-  and each thread holds a chunk of documents in memory.
+  single Python interpreter, and increasing it too high spends more time waiting for the GIL instead of
+  sending. Each thread also holds a chunk of documents in memory.
 
 Raise it in small steps and watch for 429s.
 
 ### Partitions
 
-The partition count decides how many cores can work at once. A good starting target is about 2 to 3
-times the total worker cores, which keeps every core busy and lets a fast partition's core pick up
-another one.
+The partition count decides how many cores can work at once. A good starting target is about 1x to 3x
+the total worker cores, which keeps every core busy.
 
 - **Too few:** cores sit idle, and a few large partitions become stragglers that set the pace for the
   whole batch.
-- **Too many:** per-task overhead adds up, and more partitions writing at once means more requests in
-  flight.
+- **Too many:** per-task overhead adds up, and more partitions writing at once (capped at the number of
+  cores) could mean more requests in flight.
 
-Set the count with [`max_partition_bytes`](parameters.md#max_partition_bytes) first: a smaller value
-splits the read into more partitions, and that count flows through a non-shuffling view to the write
-with no extra cost. Reach for [`write_repartition`](parameters.md#write_repartition) when that isn't
-enough: the view shuffles and resets the count, or a few large source files read into too few
-partitions. It adds a shuffle, so it costs time of its own.
+Two settings control the count:
+
+- [`max_partition_bytes`](parameters.md#max_partition_bytes) splits the read: a smaller value gives more
+  partitions, and that count flows through a non-shuffling view to the write with no extra cost. It
+  can't even out partitions when the source files are uneven, and a shuffling view resets it.
+- [`write_repartition`](parameters.md#write_repartition) sets the write's partition count directly and
+  spreads the rows evenly across them, whatever the source files or the view do. It adds a shuffle, so
+  it costs time of its own, but evenly sized partitions remove stragglers. Choose it per feed: start
+  from the worker core count and adjust from the `tail:` line in the
+  [`BULK_STATS` output](monitoring.md#reading-the-bulk_stats-output).
 
 ### `chunk_size`
 
@@ -97,14 +153,15 @@ When requests are slow rather than rejected, these decide what happens:
 
 - [`request_timeout`](parameters.md#request_timeout) is how long one request may take. Too short fails
   requests a slow-but-working ES would have finished; too long holds a thread on a request that won't
-  come back. Raising it pairs well with a smaller `chunk_size`.
-- [`transport_max_retries`](parameters.md#transport_max_retries) re-sends a whole request after a
-  connection failure or timeout. By default the ES client re-sends a timed-out request quietly, and each
-  re-send waits a full `request_timeout`, so a run of timeouts can stretch a batch a long way before it
-  fails and Spark retries the task.
-- [`retry_transport_timeout`](parameters.md#retry_transport_timeout) moves timeout retries into the
-  connector, with backoff, and makes them visible in `bulk_stats` (`timeout_sends`, `timeout_wait_ms`).
-  Turn it on for a feed that sees timeouts, so you can see how much time retries cost.
+  come back. It and `chunk_size` are separate levers: change each for its own reason.
+- [`transport_max_retries`](parameters.md#transport_max_retries) is how many times a whole request is
+  re-sent after it fails (a timeout, a connection error, or a 429 or 503 on the request). Each timed-out
+  attempt waits a full `request_timeout`, so a higher value lets a batch ride out a brief slowdown but can
+  stretch a batch a long way before it fails and Spark retries the task.
+- [`retry_transport_timeout`](parameters.md#retry_transport_timeout) decides who re-sends a timed-out
+  request: the connector, with backoff and a record in `bulk_stats` (`timeout_sends`, `timeout_wait_ms`),
+  instead of the ES client, invisibly. Turn it on for every feed: it changes nothing until a timeout
+  happens, and then shows how often requests time out and how much time retries cost.
 - [`max_retries_per_doc`](parameters.md#max_retries_per_doc) is the separate retry for documents ES
   rejects with a 429. It buys time for a briefly full queue, with backoff. It is not a capacity fix: if
   429s are steady, lower the pressure instead.
@@ -112,9 +169,16 @@ When requests are slow rather than rejected, these decide what happens:
 ### Fast path
 
 By default the connector checks each response with a quick errors-only probe and decodes per-document
-results only when something failed. That keeps clean chunks cheap, since decoding holds the GIL.
-[`bypass_fast_path`](parameters.md#bypass_fast_path) decodes every response in full, which makes counts
-exact for `op_type: create`, at some throughput cost. Leave it off unless you need those exact counts.
+results only when something failed. That keeps clean chunks cheap. But a chunk with any document-level
+error is then sent a second time to get those results.
+[`bypass_fast_path`](parameters.md#bypass_fast_path) decodes every response in full on the first send.
+Turn it on when:
+
+- **409s are expected regularly**, as with `op_type: create` and re-sends: almost every such chunk fails
+  the probe and goes out twice, so bypassing the fast path halves those sends.
+- **You need exact counts** for `op_type: create`.
+
+Leave it off for feeds whose chunks are almost always clean.
 
 ### Streaming micro-batch size
 
@@ -123,62 +187,40 @@ A streaming feed processes new data in micro-batches.
 [`max_bytes_per_trigger`](parameters.md#max_bytes_per_trigger) cap how much each one reads.
 
 - **Larger batches:** fewer fixed per-batch costs (planning, checkpoint commits and, with the
-  [monitoring log](operations.md#monitoring-log) on, its writes), so better throughput, but each batch takes
+  [monitoring log](monitoring.md#monitoring-log) on, its writes), so better throughput, but each batch takes
   longer and a retried batch re-sends more.
 - **Smaller batches:** steadier, shorter batches, at more total overhead.
 
 The caps matter most during a backfill or a catch-up after downtime, where an uncapped first batch can
-try to read the whole backlog at once. The write itself inside each batch tunes the same way as batch
-mode.
+try to read the whole backlog at once. As a rough target, set one or both so a micro-batch holds no more
+than what normally arrives in about an hour (or another period that suits the feed), from the
+[source analysis](#before-you-tune-know-the-source). A feed that falls behind then catches up in
+batches of a size the cluster and ES are known to handle, instead of one batch of everything it missed.
+Inside each micro-batch, the write is tuned with the same levers as a batch run.
 
 ## Reading the signals
 
-Turn on [`bulk_stats`](parameters.md#bulk_stats) to see what the write is doing. These signals tell you
-which side of the balance a feed is on:
-
-| You see | It means | Try |
-|---|---|---|
-| 429 rejections (`rejected(429=...)`), or `took_ms` rising run over run | ES is under too much pressure | lower `write_concurrency` or the partition count; check the host with [`es_diagnostics`](operations.md#diagnosing-an-elasticsearch-host) |
-| `es_diagnostics` reports `REJECTING`, `SATURATED`, `PRESSURED` or `HEAP_GC_PRESSURE` | the ES host is the limit | lower the pressure, or add ES capacity |
-| `rtt_ms` far above `took_ms`, no 429s, executors idle | the write is waiting on round trips | raise `write_concurrency`, or add partitions or cores |
-| `gil_wait_ms` a large share of the partition's time | a partition's threads are waiting for the GIL | lower `write_concurrency` and get parallelism from more partitions instead |
-| a high `wall_max/median` or `stragglers>2x` in the `tail:` line | uneven partitions; the slowest sets the pace | more, smaller partitions (`max_partition_bytes`, or `write_repartition` after a shuffling view) |
-| a high `docs_max/median` in the `tail:` line | rows are unevenly spread across partitions | `write_repartition` |
-| `docs/send` well below `chunk_size` | requests are smaller than you asked for | `chunk_size` is above the Arrow batch size, so raising it does nothing |
-| `timeout_sends` climbing (with `retry_transport_timeout` on) | requests are timing out and being retried | smaller `chunk_size`, higher `request_timeout`, or less pressure |
-
-### Reading the `BULK_STATS` output
-
-With `bulk_stats` on, each batch logs lines tagged `BULK_STATS`:
-
-- **`overall`:** totals for the batch: `docs/send` (real documents per request), the round-trip time the
-  client saw (`rtt_ms`) and the time ES reports spending (`took_ms`), CPU and GIL-wait totals, and
-  rejection counts.
-- **One line per partition** (batch mode), with median, 95th percentile and maximum for the same timings.
-- **`tail:`**, a summary of the slowest partition against the median one: its wall time, sends and
-  documents, and the spread (`wall_p95`, `wall_max/median`, `stragglers>2x`, `docs_max/median`).
-  Streaming feeds log `overall` and `tail:` for each micro-batch.
-
-`rtt_ms` minus `took_ms` is time spent outside ES: the network, queuing, and decoding on the client.
-Every line carries a `ts=` timestamp, which is when the batch actually ran; for streaming, the line can
-appear in the log later than that. ([Why](technical-details.md#bulk-stats-relay-timing).)
-
-For trends across runs, the [monitoring log](operations.md#monitoring-log) keeps each batch's counts and
+Turn on [`bulk_stats`](parameters.md#bulk_stats) to see what the write is doing. Which signals point to
+which lever is in [Troubleshooting: Reading the signals](troubleshooting.md#reading-the-signals), and
+what each part of the output means is in
+[Logging and Monitoring: Reading the BULK_STATS output](monitoring.md#reading-the-bulk_stats-output). For
+trends across runs, the [monitoring log](monitoring.md#monitoring-log) keeps each batch's counts and
 write diagnostics, including 429s per batch.
 
 ## A tuning procedure
 
 1. **Measure first.** Turn on `bulk_stats` for the feed (in its config, or `--params bulk_stats=true` for
-   one run) and run a representative batch.
-2. **Find the symptom** in the table above.
+   one run) and run a representative batch: one the size of the target from the
+   [source analysis](#before-you-tune-know-the-source).
+2. **Find the symptom** in [the signals table](troubleshooting.md#reading-the-signals).
 3. **Change one lever** that matches it, by a modest step, and run again. Changing two at once hides
    which one helped.
 4. **Stop raising parallelism** (cores, `write_concurrency`, partitions) as soon as 429s appear or
    `took_ms` starts climbing: ES is now the limit, and more pressure only makes batches slower and less
    reliable.
 5. **Weigh the cost.** If more cores no longer shorten the run, they're waiting on ES or the network. A
-   smaller cluster that finishes in about the same time is the better choice.
+   smaller cluster that finishes in about the same time, and still meets the target, is the better
+   choice.
 
 When nothing on the client side moves the numbers, the limit is downstream: ES capacity (nodes, write
-threads, shards and refresh settings) or the network between the cluster and ES. `es_diagnostics` is the
-place to start.
+threads, shards and refresh settings) or the network between the cluster and ES.

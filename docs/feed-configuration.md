@@ -1,17 +1,31 @@
 # Feed Configuration Guide
 
-How to shape a feed: its view, mode, compute, schedule and grouping. For anyone who has a first feed working ([New Feed Quick Start](quick-start.md)) and wants to change how it runs. Each config key is defined in the [Parameters Reference](parameters.md); this guide explains how to use them together.
+The full guide to configuring a feed: its view, mode, compute, triggers and grouping. Use it to set up a feed from the start or to change how an existing one runs. [New Feed Quick Start](quick-start.md) is the short path to a first working feed, but you don't need to go through it first. Each config key is defined in the [Parameters Reference](parameters.md); this guide explains how to use them together. Several choices here (compute, partitions, micro-batch size) also set how much a feed can send to Elasticsearch: [Throughput Tuning](throughput.md) covers how to size them.
 
+- [Feeds, tables and indices](#feeds-tables-and-indices)
 - [Views](#views)
 - [Reference tables](#reference-tables)
 - [Sharing a view across feeds](#sharing-a-view-across-feeds)
 - [Batch or streaming](#batch-or-streaming)
 - [Compute](#compute)
 - [Job tags](#job-tags)
-- [Scheduling](#scheduling)
-- [Continuous streaming](#continuous-streaming)
+- [When a feed runs](#when-a-feed-runs)
+  - [On demand](#on-demand)
+  - [CRON scheduling](#cron-scheduling)
+  - [Continuous streaming](#continuous-streaming)
+  - [Pausing triggers](#pausing-triggers)
+  - [Overlapping runs skipped](#overlapping-runs-skipped)
 - [Job groups](#job-groups)
 - [Job naming](#job-naming)
+
+## Feeds, tables and indices
+
+Each feed config maps one source table, through its view, to one Elasticsearch index. Beyond that one-to-one link, feeds can overlap on either side:
+
+- **Several feeds can read the same source table**, through one shared view or each through its own view, for example to send different columns or different subsets of rows to different indices or hosts.
+- **Several feeds can write the same index**, for example one feed per source table, or one per `filter_condition` subset of a table.
+
+Both are allowed, and neither is checked for overlap. When feeds share a source or an index, configure them so that each document comes from exactly one feed: give feeds that write one index disjoint rows (separate tables, or non-overlapping `filter_condition`s), and set [`es_id_field`](parameters.md#es_id_field) so a row that is sent twice overwrites itself instead of becoming a second document. Overlapping feeds either duplicate documents (with Elasticsearch-assigned ids) or overwrite each other's documents (with a shared `es_id_field`), and the result depends on which feed ran last. Grouped feeds writing one index add one more consideration: see [Members writing one index](#members-writing-one-index).
 
 ## Views
 
@@ -49,7 +63,7 @@ The sharing feeds must agree on the view definition: the `view:` target, the `so
 
 ## Batch or streaming
 
-A feed exports data in one of two modes, set by [`pipeline_mode`](parameters.md#pipeline_mode) (global default `batch`):
+A feed exports data in one of two modes, set by [`pipeline_mode`](parameters.md#pipeline_mode):
 
 - **Batch mode** (`pipeline_mode: batch`): Each job run re-exports the entire view. Schedule it to run periodically, or run it on demand.
 - **Streaming mode** (`pipeline_mode: streaming`): Each job run drains new commits from the source table since the last run, applies the view logic to those commits, and exports them. Schedule it to run periodically (it stops after draining available commits), or run it always-on with a `continuous` block for lower latency.
@@ -66,31 +80,19 @@ Streaming mode supports only row-wise views: projection, filters, scalar express
 
 The stream assumes the source is append-only. The runner uses `skipChangeCommits`, so non-append commits (manual `UPDATE`, `DELETE`, or `MERGE` on the source) are skipped rather than failing the stream. If you make such a change and need it reflected in the index, re-send the affected records with a `batch` run.
 
-To manage stream position, see [Operations](operations.md#resetting-a-checkpoint).
+To manage stream position, see [Maintenance Jobs](maintenance-jobs.md#resetting-a-checkpoint).
 
 ## Compute
 
-By default each feed job runs as a serverless notebook task (no cluster). Set an optional `compute` block per feed to run it elsewhere; the choice is per feed, so different feeds can run on different compute.
+By default each feed job runs as a serverless notebook task (no cluster). Set an optional `compute` block per feed to run it elsewhere; the choice is per feed, so different feeds can run on different compute. The compute a feed runs on sets how many cores it writes with, which is one of the main throughput levers: see [Throughput Tuning: Worker cores](throughput.md#worker-cores).
 
 | Type | Extra key | Runs on |
 |---|---|---|
 | `serverless` (default) | none | serverless notebook task |
-| `existing_cluster` | `cluster_config` | an existing all-purpose/interactive cluster, named by a per-target bundle variable |
 | `job_cluster` | `job_cluster_config` | a job cluster created fresh per run from a reusable spec |
+| `existing_cluster` | `cluster_config` | an existing all-purpose (interactive) cluster, named by a per-target bundle variable |
 
 The whole `compute` block is validated fail-closed: an unrecognized `type`, a missing required key, or a stray key for the chosen type is rejected at config load (and by `gen_jobs.py --check`).
-
-### Existing cluster
-
-Attach to an existing interactive cluster. A cluster id is workspace-specific, so you name a per-target bundle variable (never a literal id), allowing one config to attach to a different cluster per environment (dev/stg/prd):
-
-```yaml
-compute:
-  type: existing_cluster
-  cluster_config: interactive_primary   # -> existing_cluster_id: ${var.interactive_primary.cluster_id}
-```
-
-The `cluster_config` names a `databricks.yml` cluster config: a `type: complex` bundle variable with a single `cluster_id` field, set per target with empty placeholders on `main`. The generator emits `existing_cluster_id: ${var.<name>.cluster_id}` and the bundle resolves the right cluster id per target at deploy. This mirrors `es_host_config`: a workspace-specific value is never a literal, always a per-target variable. A `cluster_config` that names no declared cluster config fails at generation (`framework/scripts/gen_jobs.py`), before deploy.
 
 ### Job cluster
 
@@ -104,7 +106,21 @@ compute:
 
 ### Job-cluster specs
 
-Reusable job-cluster specs live in `_pipelines/job_cluster_configs/<key>.yml`. Each file is a Databricks [`new_cluster`](https://docs.databricks.com/api/workspace/jobs/create) spec (`spark_version`, `node_type_id`, `num_workers` or `autoscale`, `spark_conf`, etc.), defined once and referenced by its filename stem from any number of feeds' `compute.job_cluster_config`. The generator inlines the spec into each referencing job's `job_clusters` block, so there is no copy-paste; `databricks bundle validate` checks the spec's own fields at deploy. A job cluster is created fresh for each run and torn down after; for a single always-on cluster shared across jobs, use `existing_cluster` instead. A `job_cluster_config` that names no existing file fails the generator, so a bad reference never deploys.
+Reusable job-cluster specs live in `_pipelines/job_cluster_configs/<key>.yml`. Each file is a Databricks [`new_cluster`](https://docs.databricks.com/api/workspace/jobs/create) spec (`spark_version`, `node_type_id`, `num_workers` or `autoscale`, `spark_conf`, etc.), defined once and referenced by its filename stem from any number of feeds' `compute.job_cluster_config`. The generator inlines the spec into each referencing job's `job_clusters` block, so there is no copy-paste; `databricks bundle validate` checks the spec's own fields at deploy. A job cluster is created fresh for each run and torn down after. A `job_cluster_config` that names no existing file fails the generator, so a bad reference never deploys.
+
+The node type and worker count set the cluster's total worker cores. To choose them for a feed's volume, see [Throughput Tuning](throughput.md#worker-cores).
+
+### Existing interactive cluster
+
+Attach to an existing interactive cluster. A cluster id is workspace-specific, so you name a per-target bundle variable (never a literal id), allowing one config to attach to a different cluster per environment (dev/stg/prd):
+
+```yaml
+compute:
+  type: existing_cluster
+  cluster_config: interactive_primary   # -> existing_cluster_id: ${var.interactive_primary.cluster_id}
+```
+
+The `cluster_config` names a `databricks.yml` cluster config: a `type: complex` bundle variable with a single `cluster_id` field, set per target. The generator emits `existing_cluster_id: ${var.<name>.cluster_id}` and the bundle resolves the right cluster id per target at deploy. This mirrors `es_host_config`: a workspace-specific value is never a literal, always a per-target variable. A `cluster_config` that names no declared cluster config fails at generation (`framework/scripts/gen_jobs.py`), before deploy.
 
 ### Cluster policy and tags
 
@@ -116,7 +132,7 @@ Hardcoded `custom_tags` in a job-cluster spec pass straight through onto the clu
 
 ### Global job tags
 
-The `global_job_tags` bundle variable (a `type: complex` map, empty `{}` on `main`) is applied to every job the bundle deploys: the generated feed/group jobs and the six fixed maintenance jobs in `framework/resources/`. Set it in `databricks.yml` by replacing `default: {}` with a `key: value` mapping:
+The `global_job_tags` bundle variable (a `type: complex` map) is applied to every job the bundle deploys: the generated feed/group jobs and the six fixed maintenance jobs in `framework/resources/`. Set it in `databricks.yml` as a `key: value` mapping under `default:`:
 
 ```yaml
 global_job_tags:
@@ -137,40 +153,38 @@ In addition to the global tags, `gen_jobs.py` adds one generated tag to each gen
 
 Databricks forwards job tags to the job cluster as cluster tags, so on a `job_cluster` feed the global tags also land on the cluster alongside the spec's `custom_tags`. Serverless jobs have no cluster, so job-level tags are the only tag lever. A tag whose key or value conflicts with a value fixed by the workspace cluster policy fails at deploy, the same as any policy conflict. Tag value length is bounded by the cloud provider (AWS 255, Azure 256, GCP 63) once a tag reaches a cluster. To keep a large job group deployable, `gen_jobs.py` truncates a long `es_index_list` to a conservative cap (255), keeping whole index names in sorted order and appending a ` ...+N` marker for the count dropped (see [technical details](technical-details.md#es-index-list-tag) for why truncation matters). The global tags are independent and are never truncated.
 
-## Scheduling
+## When a feed runs
 
-By default each feed job is on-demand (run it with `bundle run` or the API). Add an optional `schedule` block per feed to run it on a [Quartz cron](https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html):
+A feed job runs in one of three ways, set in its config:
+
+| Trigger | Config | How it runs |
+|---|---|---|
+| On demand | neither `schedule` nor `continuous` | only when started (`bundle run`, the Jobs UI or the API) |
+| CRON schedule | a `schedule` block | at each tick of a Quartz cron |
+| Continuous | a `continuous` block (streaming only) | always on: one run that never ends, restarted if it stops |
+
+`schedule` and `continuous` are mutually exclusive. A scheduled feed can also be started by hand between ticks. The pause state and the skipping of overlapping runs apply to both scheduled and continuous triggers: see [Pausing triggers](#pausing-triggers) and [Overlapping runs skipped](#overlapping-runs-skipped).
+
+### On demand
+
+A feed with neither a `schedule` nor a `continuous` block is on-demand: it runs only when started. A batch feed re-exports the view each time; a streaming feed sends the commits since its last run, then stops.
+
+### CRON scheduling
+
+Add a `schedule` block to run a feed on a [Quartz cron](https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html):
 
 ```yaml
 schedule:
   quartz_cron_expression: "0 0 8 * * ?"   # 08:00 every day
 ```
 
-The timezone is always UTC (not a config field). Quartz cron has 6 or 7 fields (seconds first, optional trailing year), so a 5-field Unix cron like `0 8 * * *` is rejected at config load with a clear message rather than failing at deploy. Omitting `schedule` leaves the job on-demand.
+The timezone is always UTC (not a config field). Quartz cron has 6 or 7 fields (seconds first, optional trailing year), so a 5-field Unix cron like `0 8 * * *` is rejected at config load with a clear message rather than failing at deploy.
 
-The schedule pairs naturally with either export mode: a `batch` job re-exports the view on each tick, and a `streaming` job drains new source commits since its last run on each tick (it uses `Trigger.availableNow`, so a scheduled run processes the delta and stops).
+The schedule pairs with either export mode: a `batch` job re-exports the view on each tick, and a `streaming` job drains new source commits since its last run on each tick (it uses `Trigger.availableNow`, so a scheduled run processes the delta and stops).
 
-### Overlapping runs skipped
+### Continuous streaming
 
-Every job except `checkpoint_clear` (which allows 20 concurrent runs, one per feed) sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that fires while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. The `queue: {enabled: false}` is load-bearing (see [technical details](technical-details.md#queue-disabled)).
-
-### Where schedules fire
-
-Every generated schedule's `pause_status` is bound to the `schedule_pause_status` variable, which defaults to `PAUSED` (fail-safe), so a target controls firing without touching feed configs: `dev` and `stg` inherit the paused default, so schedules are deployed but dormant in both; only `prd` binds `UNPAUSED` and actually fires them. Unpause a single job in the UI/API for a one-off test, or set `--var=schedule_pause_status=UNPAUSED` at deploy to override.
-
-### Per-feed pause override
-
-A single feed can opt out of the target-wide default with its own top-level `pause_status: PAUSED | UNPAUSED` config key, which overrides `${var.schedule_pause_status}` for that one job's trigger. A feed that omits `pause_status` inherits the target-wide default, so this is fully backward-compatible. It applies to the job's `schedule` or `continuous` trigger, so it is only valid on a job that has one: an on-demand feed (no `schedule`, no `continuous`, and not in a `job_group`) that sets `pause_status` is rejected at config load, and a `job_group` with no trigger at all that sets it is rejected by `gen_jobs.py`.
-
-```yaml
-pause_status: UNPAUSED          # optional; overrides the target-wide schedule_pause_status default
-schedule:
-  quartz_cron_expression: "0 */10 * * * ?"
-```
-
-## Continuous streaming
-
-A scheduled `streaming` job drains new commits and stops on each tick. For lower latency you can instead run a stream as always-on with a `continuous` block (mutually exclusive with `schedule`):
+A `continuous` block runs a streaming feed always-on, so new source commits reach Elasticsearch at the cadence of its `trigger_interval` instead of waiting for the next scheduled run:
 
 ```yaml
 pipeline_mode: streaming
@@ -181,27 +195,38 @@ continuous:
   trigger_interval: 30 seconds  # Spark ProcessingTime cadence
 ```
 
-This emits a Databricks Jobs continuous trigger: the orchestrator keeps exactly one run perpetually active and restarts it on completion or failure, and the runner drives the stream with `Trigger.ProcessingTime(interval)` instead of `Trigger.availableNow`, so it never terminates. `trigger_interval` is the target gap between the start of one micro-batch and the next; batches never overlap. A shorter interval trades throughput (more, smaller bulk writes and index refreshes) for lower latency.
+This emits a Databricks Jobs continuous trigger: the orchestrator keeps exactly one run perpetually active and restarts it on completion or failure, and the runner drives the stream with `Trigger.ProcessingTime(interval)` instead of `Trigger.availableNow`, so it never terminates. `trigger_interval` is the target gap between the start of one micro-batch and the next; batches never overlap. A shorter interval trades throughput (more, smaller bulk writes and index refreshes) for lower latency; to size each micro-batch, see [Throughput Tuning: Streaming micro-batch size](throughput.md#streaming-micro-batch-size). One always-on run holds its job cluster for as long as it is unpaused, so treat it as a running-cost commitment.
 
-### Classic compute only
+#### Classic compute only
 
 Serverless notebooks support only `Trigger.availableNow`, not the `ProcessingTime` trigger an always-on stream needs. So `continuous` requires `compute.type` to be `job_cluster` or `existing_cluster`; `continuous` on serverless, `continuous` with `pipeline_mode: batch`, and `continuous` together with `schedule` are each rejected at config load (and by `gen_jobs.py --check`), before deploy. See [technical details](technical-details.md#serverless-and-continuous) for the specifics.
 
-### Pausing
+#### Failure recovery
 
-Like a schedule, the continuous trigger's `pause_status` is bound to `schedule_pause_status` (default `PAUSED`), so `dev`/`stg` deploy the always-on job dormant and only `prd` (or an explicit `--var=schedule_pause_status=UNPAUSED`) actually runs it. A single feed can override this with its own top-level `pause_status` key, which applies to the continuous trigger the same way. One always-on run holds its job cluster for as long as it is unpaused, so treat it as a running-cost commitment.
+A continuous job's per-task recovery is governed by the continuous trigger's `task_retry_mode: ON_FAILURE`, which the generator pins because recovery depends on it: when a task's stream fails, Databricks retries that task in place (with exponential backoff) as long as at least one other task in the run is still on its first attempt, so one stream can recover without disturbing the others. When that no longer holds, or the retry limit is reached, the whole run is cancelled and a fresh one started. This matters most for a job group of continuous streams (multiple tasks in one run): see [technical details](technical-details.md#task-retry-mode) for why.
 
-### Failure recovery
+#### Schema changes
 
-A continuous job's per-task recovery is governed by the continuous trigger's `task_retry_mode: ON_FAILURE`. This is pinned by the generator and is load-bearing: when a task's stream fails, Databricks retries that task in place (with exponential backoff) as long as at least one other task in the run is still on its first attempt, so one stream can recover without disturbing the others. When that no longer holds, or the retry limit is reached, the whole run is cancelled and a fresh one started. This matters most for a job group of continuous streams (multiple tasks in one run): see [technical details](technical-details.md#task-retry-mode) for why.
+An added source column fails the stream once with `DELTA_SCHEMA_CHANGED_WITH_VERSION` ("Please try restarting the query"); the task retry restarts it with the new schema and it continues. A view that names its columns sends the new column only once the view is changed to include it; a view that uses `SELECT *` sends it from the restarted stream on. A renamed or dropped column fails on every attempt with `DELTA_STREAMING_INCOMPATIBLE_SCHEMA_CHANGE_USE_SCHEMA_LOG` and needs an operator (deliberately: no `schemaTrackingLocation` is set). See [technical details](technical-details.md#schema-changes-in-a-stream) for how this interacts with the task retry limit.
 
-### Schema changes
+### Pausing triggers
 
-An added source column fails the stream once with `DELTA_SCHEMA_CHANGED_WITH_VERSION` ("Please try restarting the query"); the task retry restarts it with the new schema and it continues. The views list their columns explicitly, so a new column does not reach Elasticsearch until the view is changed to include it. A renamed or dropped column fails on every attempt with `DELTA_STREAMING_INCOMPATIBLE_SCHEMA_CHANGE_USE_SCHEMA_LOG` and needs an operator (deliberately: no `schemaTrackingLocation` is set). See [technical details](technical-details.md#schema-changes-in-a-stream) for how this interacts with the task retry limit.
+Every schedule and continuous trigger has a pause state, `PAUSED` or `UNPAUSED`. A paused trigger is deployed but starts no runs. The state is set in two layers:
 
-### Worked example
+- **Per target:** every generated trigger is bound to the [`schedule_pause_status`](parameters.md#schedule_pause_status) bundle variable, which you set per target in `databricks.yml`. That is how one set of feed configs deploys with triggers live in some targets (usually only production) and dormant in the rest.
+- **Per feed:** a feed's own top-level [`pause_status`](parameters.md#pause_status) overrides the target value for that one job. A feed that omits it inherits the target value. It is valid only on a job that has a trigger: an on-demand feed (no `schedule`, no `continuous`, and not in a `job_group`) that sets it is rejected at config load, and a `job_group` with no trigger at all that sets it is rejected by `gen_jobs.py`.
 
-See [`_pipelines/pipeline_configs/ecs_dns_activity_continuous.yml`](../_pipelines/pipeline_configs/ecs_dns_activity_continuous.yml) for a continuous streaming feed example.
+```yaml
+pause_status: UNPAUSED          # optional; overrides the target's schedule_pause_status for this job
+schedule:
+  quartz_cron_expression: "0 */10 * * * ?"
+```
+
+For a one-off test, unpause a single job in the Jobs UI or API, or deploy with `--var=schedule_pause_status=UNPAUSED` to unpause every trigger in the target that doesn't set its own `pause_status`. The next routine deploy puts back the values from `databricks.yml` and the feed configs.
+
+### Overlapping runs skipped
+
+Every job except `checkpoint_clear` (which allows 20 concurrent runs, one per feed) sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that comes while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. Without `queue: {enabled: false}` the tick would wait in a queue instead (see [technical details](technical-details.md#queue-disabled)).
 
 ## Job groups
 
@@ -212,18 +237,19 @@ By default each feed config becomes its own Databricks job (`index_pipeline_<con
 job_group: ecs_streams
 ```
 
-The generator emits a single `_pipelines/resources/group_<job_group>.job.yml` (resource key `index_pipeline_group_<job_group>`) with one task per member (`index_pipeline_<config_name>`, unchanged). The main reason to group is compute sharing: members that name the same `job_cluster_config` land on one physical job cluster (the generator deduplicates the `job_clusters` block), so N feeds run on one cluster instead of N. Members that name different cluster configs, or a mix of serverless/`existing_cluster`, still coexist as tasks in the one job. Size a shared cluster for the sum of its concurrent tasks (they run at once, and continuous members run perpetually).
+The generator emits a single `_pipelines/resources/group_<job_group>.job.yml` (resource key `index_pipeline_group_<job_group>`) with one task per member (`index_pipeline_<config_name>`, unchanged). The main reason to group is compute sharing: members that name the same `job_cluster_config` land on one physical job cluster (the generator deduplicates the `job_clusters` block), so N feeds run on one cluster instead of N. Members that name different cluster configs, or a mix of serverless/`existing_cluster`, still coexist as tasks in the one job. Size a shared cluster for the sum of its concurrent tasks (they run at once, and continuous members run perpetually); see [Throughput Tuning](throughput.md#worker-cores).
 
 ### What members must agree on
 
-All validated fail-closed at generation by `gen_jobs.py --check`:
+All validated fail-closed at generation by `gen_jobs.py --check`. For each of these, set the value on one member, or the same value on several or all of them; the members that omit it inherit it. Only different values are rejected.
 
-- **Trigger** (define-once): a Databricks job has exactly one trigger, so members must not declare conflicting ones. Any member may set a `schedule` or `continuous` block (or omit it); the group is on-demand if none declare one, adopts the single declared trigger if one or more agree, and is rejected if members declare different triggers (two different crons, or `schedule` vs `continuous`). A continuous group propagates its `trigger_interval` to every member (so a member that omitted `continuous` still runs always-on rather than draining under `availableNow`) and requires every member to be `streaming` on classic compute.
-- **`job_name_postfix`** (define-once): same rule (omit on most members and set once); conflicting values are rejected.
+- **Trigger:** a Databricks job has exactly one trigger. The group is on-demand if no member declares a `schedule` or `continuous` block, adopts the declared trigger if every member that declares one agrees, and is rejected if members declare different triggers (two different crons, or `schedule` vs `continuous`). A continuous group propagates its `trigger_interval` to every member (so a member that omitted `continuous` still runs always-on rather than draining under `availableNow`) and requires every member to be `streaming` on classic compute.
+- **`pause_status`:** the same rule.
+- **`job_name_postfix`:** the same rule.
 
 ### Members writing one index
 
-Members may target the same `es_index_name` (e.g., one task per disjoint `filter_condition` subset feeding a single index), which is allowed but deliberate. Grouped members run as concurrent tasks in one run (`max_concurrent_runs: 1` serializes job runs, not tasks within a run), so two tasks write that index at the same time. That is safe for disjoint rows; overlapping rows either duplicate (Elasticsearch auto-ids) or race on upserts (a shared `es_id_field`). Give each member a distinct `filter_condition` and set `es_id_field` for idempotency.
+Members may target the same `es_index_name` (e.g., one task per disjoint `filter_condition` subset feeding a single index), which is allowed but deliberate ([Feeds, tables and indices](#feeds-tables-and-indices) covers the general rule). Grouped members run as concurrent tasks in one run (`max_concurrent_runs: 1` serializes job runs, not tasks within a run), so two tasks write that index at the same time. That is safe for disjoint rows; overlapping rows either duplicate (Elasticsearch auto-ids) or race on upserts (a shared `es_id_field`). Give each member a distinct `filter_condition` and set `es_id_field` for idempotency.
 
 ### Run-time parameters baked per task
 
@@ -233,6 +259,5 @@ A standalone job exposes the run-time knobs (`pipeline_mode`, `filter_condition`
 
 A job's display name is `[<target>] <prefix>: <postfix>`.
 
-- **`prefix`** is the `job_name_prefix` bundle variable (`databricks.yml`), default `databricks-elasticsearch-pipelines`. The generator emits `${var.job_name_prefix}`, so you can rebrand every job name per target (or with `--var=job_name_prefix=<name>`) without regenerating. The hand-authored `deploy_views` job references the same variable, so it rebrands alongside the generated jobs.
-- **`postfix`** defaults to the config name (standalone) or the group name (group). Set an optional `job_name_postfix` on a config to override just the trailing display segment (e.g., `"ECS DNS (serverless)"`). It is purely cosmetic (it never changes any resource key or task key), so it may contain spaces and punctuation. In a group it follows the define-once rule.
-
+- **`prefix`** is the [`job_name_prefix`](parameters.md#job_name_prefix) bundle variable in `databricks.yml`.
+- **`postfix`** defaults to the config name (standalone) or the group name (group). Set an optional `job_name_postfix` on a config to override just the trailing display segment (e.g., `"ECS DNS (serverless)"`). It is purely cosmetic (it never changes any resource key or task key), so it may contain spaces and punctuation. In a group, set it on one member or the same value on several ([What members must agree on](#what-members-must-agree-on)).
