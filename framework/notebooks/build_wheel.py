@@ -76,7 +76,7 @@ if not REPO_WORKSPACE_PATH:
     raise ValueError("missing required parameter: repo_workspace_path (the /Workspace path of the connector repo to build)")
 if not REPO_WORKSPACE_PATH.startswith("/"):
     raise ValueError(
-        f"repo_workspace_path must be an absolute path (e.g. /Workspace/Users/<you>/es-databricks-connector): "
+        f"repo_workspace_path must be an absolute path (e.g. /Workspace/Users/<you>/databricks-es-connector): "
         f"{REPO_WORKSPACE_PATH!r}"
     )
 

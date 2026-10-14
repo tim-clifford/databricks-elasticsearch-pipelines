@@ -29,7 +29,7 @@ in order. Each setting mentioned here is defined in the [Parameters Reference](p
 
 ### The connector wheel
 
-Every feed job installs the [databricks-es-connector](/../../../es-databricks-connector)
+Every feed job installs the [databricks-es-connector](/../../../databricks-es-connector)
 wheel from the UC Volume path in [`wheel_path`](parameters.md#wheel_path). Keep the wheel's standard
 filename (`databricks_es_connector-<version>-py3-none-any.whl`), which carries the version. The framework
 requires connector **0.10.0 or later**: every feed run checks the installed version first and fails with
