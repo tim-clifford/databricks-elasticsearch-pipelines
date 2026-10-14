@@ -2228,20 +2228,23 @@ def test_min_connector_version_is_0_10_0():
 
 @pytest.mark.parametrize("version", ["0.10.0", "0.10.1", "0.11.0", "1.0.0", " 0.10.0 ", "0.10.0.post1",
                                      "0.10.0+local.1", "0.11.0.dev0", "0.11.0rc1", "0.10.0.1",
-                                     "0.10.0.0", "0.11.0rc1.dev1", "0.10.0.post1.dev0", "0.10.1a1"])
+                                     "0.10.0.0", "0.11.0rc1.dev1", "0.10.0.post1.dev0", "0.10.1a1",
+                                     "0.10.1rc1.post1", "0.10.0+ubuntu.2"])
 def test_require_connector_version_accepts_supported(version):
     assert require_connector_version(version) == version
 
 
 @pytest.mark.parametrize("version", ["0.9.7", "0.9.99", "0.1.0", "0.10.0rc1", "0.10.0.dev1", "0.10.0a1",
-                                     "0.10.0rc1.dev1", "0.10.0.0rc1", "0.9.7.1", "0.10.0.dev1+local"])
+                                     "0.10.0rc1.dev1", "0.10.0.0rc1", "0.9.7.1", "0.10.0.dev1+local",
+                                     "0.10.0rc1.post1", "0.10.0a1.post1.dev0"])
 def test_require_connector_version_rejects_older(version):
     with pytest.raises(PipelineConfigError, match=r"older than the framework's minimum 0\.10\.0"):
         require_connector_version(version, "wheel_path")
 
 
 @pytest.mark.parametrize("version", ["unknown", "", "0.10", "v0.10.0", "0.10.0-beta", "ten", "1!0.10.0",
-                                     "0.10.0.dev1rc1", None, 10, (0, 10, 0)])
+                                     "0.10.0.dev1rc1", "0.10.0+.", "0.10.0+a..b", "0.10.0+a.",
+                                     "0.10.0RC1", "0.10.0-rc1", None, 10, (0, 10, 0)])
 def test_require_connector_version_rejects_unrecognized(version):
     with pytest.raises(PipelineConfigError, match="not a recognized release version"):
         require_connector_version(version)

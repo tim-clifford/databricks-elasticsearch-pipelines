@@ -534,7 +534,7 @@ MIN_CONNECTOR_VERSION = (0, 10, 0)
 # PEP 440 public version (no epoch), group by group: release (X.Y.Z, optionally more segments), pre, post,
 # dev, local.
 _CONNECTOR_VERSION_RE = re.compile(
-    r"(\d+\.\d+\.\d+(?:\.\d+)*)((?:a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?(\+[A-Za-z0-9.]+)?")
+    r"(\d+\.\d+\.\d+(?:\.\d+)*)((?:a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?(\+[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)?")
 
 
 def require_connector_version(version: object, where: str = "installed connector") -> str:
@@ -543,8 +543,9 @@ def require_connector_version(version: object, where: str = "installed connector
     Called once by the runner on the installed package's __version__, before any export work, so an old
     wheel fails the run with one clear message instead of failing (or quietly losing a setting) deeper in
     the write. Allow-list: only a PEP 440 public version with an X.Y.Z (or longer) release is accepted,
-    optionally with pre, post, dev and local parts in PEP 440 order; anything else, including a missing
-    version ("unknown") or an epoch, fails closed. A pre-release or dev build of the minimum itself
+    optionally with pre, post, dev and local parts in PEP 440 order, in the normalized spelling the
+    connector's __version__ uses (lowercase, "rc1" not "RC1" or "-rc1"); anything else, including a
+    missing version ("unknown"), an epoch or a malformed local part, fails closed. A pre-release or dev build of the minimum itself
     (0.10.0rc1, 0.10.0.dev1) sorts before it and is rejected; a post-release of it (0.10.0.post1, even
     0.10.0.post1.dev0) and any build of a later release (0.11.0.dev0) are accepted. Returns the version
     string unchanged."""
