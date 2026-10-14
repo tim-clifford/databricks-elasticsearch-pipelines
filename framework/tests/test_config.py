@@ -2227,30 +2227,38 @@ def test_min_connector_version_is_0_10_0():
 
 
 @pytest.mark.parametrize("version", ["0.10.0", "0.10.1", "0.11.0", "1.0.0", " 0.10.0 ", "0.10.0.post1",
-                                     "0.10.0+local.1", "0.11.0.dev0", "0.11.0rc1"])
+                                     "0.10.0+local.1", "0.11.0.dev0", "0.11.0rc1", "0.10.0.1",
+                                     "0.10.0.0", "0.11.0rc1.dev1", "0.10.0.post1.dev0", "0.10.1a1"])
 def test_require_connector_version_accepts_supported(version):
     assert require_connector_version(version) == version
 
 
-@pytest.mark.parametrize("version", ["0.9.7", "0.9.99", "0.1.0", "0.10.0rc1", "0.10.0.dev1", "0.10.0a1"])
+@pytest.mark.parametrize("version", ["0.9.7", "0.9.99", "0.1.0", "0.10.0rc1", "0.10.0.dev1", "0.10.0a1",
+                                     "0.10.0rc1.dev1", "0.10.0.0rc1", "0.9.7.1", "0.10.0.dev1+local"])
 def test_require_connector_version_rejects_older(version):
     with pytest.raises(PipelineConfigError, match=r"older than the framework's minimum 0\.10\.0"):
         require_connector_version(version, "wheel_path")
 
 
-@pytest.mark.parametrize("version", ["unknown", "", "0.10", "v0.10.0", "0.10.0-beta", "ten", None, 10, (0, 10, 0)])
+@pytest.mark.parametrize("version", ["unknown", "", "0.10", "v0.10.0", "0.10.0-beta", "ten", "1!0.10.0",
+                                     "0.10.0.dev1rc1", None, 10, (0, 10, 0)])
 def test_require_connector_version_rejects_unrecognized(version):
     with pytest.raises(PipelineConfigError, match="not a recognized release version"):
         require_connector_version(version)
 
 
 def test_runner_checks_connector_version_once_before_config_load():
-    # Wiring: the runner must call the check on the installed version, before it loads the feed config,
-    # and must no longer carry the old per-knob drop loop.
+    # Wiring: the runner must call the check on the installed version, before it imports the connector's
+    # write names (so an old wheel gets the check's message, not an ImportError) and before it loads the
+    # feed config, and must no longer carry the old per-knob drop loop. Positions are of code lines
+    # (anchored at line start), so a comment mentioning either call can't satisfy or break the order.
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks",
                         "run_index_pipeline.py")
     src = open(path).read()
-    calls = re.findall(r"^require_connector_version\(_connector_version\b", src, re.M)
+    calls = [m.start() for m in re.finditer(r"^require_connector_version\(_connector_version\b", src, re.M)]
     assert len(calls) == 1
-    assert src.index("require_connector_version(_connector_version") < src.index("load_config(")
+    names_import = re.search(r"^from databricks_es_connector import .*\bEsWriteConfig\b", src, re.M)
+    config_load = re.search(r"^cfg = .*\bload_config\(", src, re.M)
+    assert names_import and config_load
+    assert calls[0] < names_import.start() and calls[0] < config_load.start()
     assert "_VERSION_GATED_KNOBS" not in src

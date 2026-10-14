@@ -101,14 +101,6 @@ import databricks_es_connector  # noqa: E402
 _connector_version = getattr(databricks_es_connector, "__version__", "unknown")
 print(f"connector installed: databricks_es_connector {_connector_version}")
 
-# The write surface used by the export cells below. Imported here (after the restart) so the export
-# cells read as pure orchestration. bulk_write does the mapInPandas export (returns the count dict);
-# reconcile_or_raise turns that dict into an exception when any document was rejected or any row went
-# unaccounted for. Batch calls bulk_write then reconcile_or_raise; streaming calls
-# bulk_write(..., raise_on_error=True) per micro-batch (same write+reconcile in one call) so a failed
-# batch fails the trigger and the checkpoint holds.
-from databricks_es_connector import EsWriteConfig, bulk_write, reconcile_or_raise  # noqa: E402
-
 # COMMAND ----------
 # Now read the remaining parameters (the restart above cleared any earlier Python state, so this is
 # their first and only read). config_name is required; environment may be empty (a config that uses no
@@ -251,6 +243,15 @@ from pipeline_lib.stream_wait import await_stream as _await_stream  # noqa: E402
 # The framework supports connector 0.10.0 and later (MIN_CONNECTOR_VERSION). Checked once here, before any
 # config load or export work, so an older wheel fails the run with one clear message.
 require_connector_version(_connector_version, "wheel_path")
+
+# The write surface used by the export cells below. Imported after the version check, so an older wheel
+# missing one of these names fails with the check's message rather than an ImportError, and here so the
+# export cells read as pure orchestration. bulk_write does the mapInPandas export (returns the count dict);
+# reconcile_or_raise turns that dict into an exception when any document was rejected or any row went
+# unaccounted for. Batch calls bulk_write then reconcile_or_raise; streaming calls
+# bulk_write(..., raise_on_error=True) per micro-batch (same write+reconcile in one call) so a failed
+# batch fails the trigger and the checkpoint holds.
+from databricks_es_connector import EsWriteConfig, bulk_write, reconcile_or_raise  # noqa: E402
 
 # COMMAND ----------
 # Validate the run-time job-parameter values FIRST, before the config file I/O below, so a bad

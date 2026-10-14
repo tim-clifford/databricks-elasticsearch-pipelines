@@ -531,7 +531,10 @@ def require_op_type(value: object, where: str = "op_type") -> str:
 # The oldest connector release the framework supports: the first with every EsWriteConfig field the runner
 # can pass (bulk_stats, retry_transport_timeout, op_type, bypass_fast_path).
 MIN_CONNECTOR_VERSION = (0, 10, 0)
-_CONNECTOR_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)((?:a|b|rc|\.dev)\d+)?(\.post\d+)?(\+[A-Za-z0-9.]+)?")
+# PEP 440 public version (no epoch), group by group: release (X.Y.Z, optionally more segments), pre, post,
+# dev, local.
+_CONNECTOR_VERSION_RE = re.compile(
+    r"(\d+\.\d+\.\d+(?:\.\d+)*)((?:a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?(\+[A-Za-z0-9.]+)?")
 
 
 def require_connector_version(version: object, where: str = "installed connector") -> str:
@@ -539,10 +542,12 @@ def require_connector_version(version: object, where: str = "installed connector
 
     Called once by the runner on the installed package's __version__, before any export work, so an old
     wheel fails the run with one clear message instead of failing (or quietly losing a setting) deeper in
-    the write. Allow-list: only a PEP 440 release X.Y.Z (with an optional pre/dev, post or local suffix)
-    is accepted; anything else, including a missing version ("unknown"), fails closed. A pre-release or
-    dev build of the minimum itself (0.10.0rc1, 0.10.0.dev1) sorts before it and is rejected; one of a
-    later release (0.11.0.dev0) is accepted. Returns the version string unchanged."""
+    the write. Allow-list: only a PEP 440 public version with an X.Y.Z (or longer) release is accepted,
+    optionally with pre, post, dev and local parts in PEP 440 order; anything else, including a missing
+    version ("unknown") or an epoch, fails closed. A pre-release or dev build of the minimum itself
+    (0.10.0rc1, 0.10.0.dev1) sorts before it and is rejected; a post-release of it (0.10.0.post1, even
+    0.10.0.post1.dev0) and any build of a later release (0.11.0.dev0) are accepted. Returns the version
+    string unchanged."""
     minimum = ".".join(str(p) for p in MIN_CONNECTOR_VERSION)
     m = _CONNECTOR_VERSION_RE.fullmatch(version.strip()) if isinstance(version, str) else None
     if m is None:
@@ -550,8 +555,16 @@ def require_connector_version(version: object, where: str = "installed connector
             f"{where}: databricks-es-connector version {version!r} is not a recognized release version; "
             f"the framework requires {minimum} or later (check wheel_path)"
         )
-    release = tuple(int(p) for p in m.group(1, 2, 3))
-    if release < MIN_CONNECTOR_VERSION or (release == MIN_CONNECTOR_VERSION and m.group(4)):
+    release, pre, post, dev = m.group(1, 2, 3, 4)
+    # Compare releases with trailing zeros dropped, so 0.10.0.0 equals 0.10.0 and 0.10.0.1 is later.
+    parts = [int(p) for p in release.split(".")]
+    minimum_parts = list(MIN_CONNECTOR_VERSION)
+    while parts and parts[-1] == 0:
+        parts.pop()
+    while minimum_parts and minimum_parts[-1] == 0:
+        minimum_parts.pop()
+    before_minimum = parts == minimum_parts and (pre or (dev and not post))
+    if parts < minimum_parts or before_minimum:
         raise PipelineConfigError(
             f"{where}: databricks-es-connector {version} is older than the framework's minimum {minimum}; "
             f"point wheel_path at a {minimum} or later wheel and redeploy"
