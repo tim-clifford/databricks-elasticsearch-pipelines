@@ -33,6 +33,7 @@ The bundle deploys:
 
 | If you want to | Read |
 |---|---|
+| Read about this deployment's own feeds, environments, and infrastructure | [Feeds and Infrastructure](docs/_pipelines/README.md) |
 | Set up the framework in a workspace, or add an environment | [Environment Setup](docs/setup.md) |
 | Add a new feed, the short way | [New Feed Quick Start](docs/quick-start.md) |
 | Configure a feed fully: streaming, compute, schedule, job groups, shared views, etc. | [Feed Configuration Guide](docs/feed-configuration.md) |
@@ -66,12 +67,15 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
 
 The repo has two halves. `_pipelines/` holds what you edit for your own feeds, plus the job resources
 generated from it; `framework/` holds the shared code that runs them and is not edited per feed.
-`databricks.yml` at the root carries your environment's variables and targets.
+`databricks.yml` at the root carries your environment's variables and targets. The docs split the same
+way: `docs/_pipelines/` holds your own documentation, and the rest of `docs/` documents the framework.
 
 ```
 databricks.yml                  Bundle definition: variables + targets (edit for your environment)
 requirements.txt                Off-cluster tooling deps (pinned pyyaml for the generator)
-docs/                           The documentation above
+docs/                           The framework documentation above
+  _pipelines/                   Your own documentation: feeds, environments, infrastructure
+    README.md                   Its index (edit freely)
 
 You edit these, one pair per feed:
   _pipelines/

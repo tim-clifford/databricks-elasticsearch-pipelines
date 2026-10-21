@@ -13,14 +13,14 @@ The framework is maintained by Databricks in an upstream source repo. Your deplo
 
 ## What's in framework/ vs _pipelines/
 
-`_pipelines/` holds your feeds (views, configs, job cluster specs, and the job resources generated from them); `framework/` holds the shared code that runs them and is not edited per feed. `databricks.yml` at the root is yours too: it carries your environment's values. For the complete directory layout, see [README.md#layout](../README.md#layout).
+`_pipelines/` holds your feeds (views, configs, job cluster specs, and the job resources generated from them); `framework/` holds the shared code that runs them and is not edited per feed. `databricks.yml` at the root is yours too: it carries your environment's values. The docs follow the same split: [`docs/_pipelines/`](_pipelines/README.md) holds your own documentation (your feeds, environments, and infrastructure), and the rest of `docs/` documents the framework. For the complete directory layout, see [README.md#layout](../README.md#layout).
 
 ## Taking a new release
 
 When a new framework release is published, upgrade your deployed copy in these steps:
 
 1. **Check for local changes.** If your copy has framework changes that aren't upstream ([above](#the-upstream-repo-and-your-copy)), compare them against the release and decide how each carries over.
-2. **Replace `framework/`.** Replace the entire `framework/` directory with the one from the release. Keep your `_pipelines/`, `databricks.yml`, and any `.databricks/bundle/<target>/variable-overrides.json` edits intact.
+2. **Replace `framework/` and the framework docs.** Replace the entire `framework/` directory with the one from the release, and the framework docs (`README.md` and everything in `docs/` except `docs/_pipelines/`) with the release's. Keep your `_pipelines/`, `docs/_pipelines/`, `databricks.yml`, and any `.databricks/bundle/<target>/variable-overrides.json` edits intact.
 3. **Check the new `databricks.yml`.** The release comes with its own `databricks.yml`, with its variable declarations and targets. Compare it against your current one: look for new variables (especially run-time knobs) and add them to your targets, or to the top-level `default` if you want all targets to inherit the same value.
 4. **Reinstall dependencies.** Run `pip install -r requirements.txt` to pin the new pyyaml version (see [The pyyaml pin](#the-pyyaml-pin) for why the pin matters).
 5. **Regenerate job resources.** Run `python framework/scripts/gen_jobs.py` to regenerate `_pipelines/resources/*.job.yml` with any new framework changes.
