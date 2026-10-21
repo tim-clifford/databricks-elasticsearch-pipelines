@@ -73,9 +73,9 @@ way: `docs/_pipelines/` holds your own documentation, and the rest of `docs/` do
 ```
 databricks.yml                  Bundle definition: variables + targets (edit for your environment)
 requirements.txt                Off-cluster tooling deps (pinned pyyaml for the generator)
-docs/                           The framework documentation above
-  _pipelines/                   Your own documentation: feeds, environments, infrastructure
-    README.md                   Its index (edit freely)
+docs/                           The framework documentation above, plus your own in _pipelines/
+  _pipelines/                   YOU EDIT THIS: your own documentation (feeds, environments,
+    README.md                   infrastructure), starting from this index
 
 You edit these, one pair per feed:
   _pipelines/
