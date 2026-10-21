@@ -9,7 +9,7 @@ In normal operation nobody changes the code under `framework/`: feeds are added 
 The framework is maintained by Databricks in an upstream source repo. Your deployment runs from your own copy of it, with your feeds in `_pipelines/` and your environments in `databricks.yml`.
 
 - **Make framework changes upstream first.** Change and test them in the upstream repo, then bring the new release into your copy with [Taking a new release](#taking-a-new-release), following your organization's own policies for changes and deployments.
-- **Track any change made only in your copy.** A change to `framework/` (or to the docs that describe it) that is not also made upstream is overwritten the next time you replace `framework/` with a release. Keep a record of each one (a commit you can find again, or a patch), compare it against every new release before you take it, and re-apply or retire it. Until a local change is upstream, every release has to be checked for conflicts with it.
+- **Track any change made only in your copy.** A change to `framework/` (or to the docs that describe it) that is not also made upstream is overwritten the next time you replace `framework/` and the framework docs with a release. Keep a record of each one (a commit you can find again, or a patch), compare it against every new release before you take it, and re-apply or retire it. Until a local change is upstream, every release has to be checked for conflicts with it.
 
 ## What's in framework/ vs _pipelines/
 
