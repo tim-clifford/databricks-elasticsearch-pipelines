@@ -51,7 +51,8 @@ A feed's config file name is its `config_name`, and the framework keys the feed 
 (`index_pipeline_<config_name>`), its checkpoint (`<checkpoint_base_path>/<config_name>`) and its rows in
 the [monitoring log](monitoring.md#monitoring-log). So renaming the file creates a new feed rather than
 renaming the old one. At the next generate and deploy the old job is removed and a new job takes its
-place, and the monitoring log has the feed's history under the old name and its new runs under the new
+place (for a [job group](feed-configuration.md#job-groups) member, the group's job stays and only the
+feed's task, `index_pipeline_<config_name>`, is replaced), and the monitoring log has the feed's history under the old name and its new runs under the new
 one. Renaming a `job_group` or setting `job_name_postfix` doesn't change `config_name`, so neither
 affects the checkpoint.
 
@@ -72,7 +73,10 @@ To rename a streaming feed:
 
 1. **Stop the old feed.** If it has a schedule or continuous trigger, pause it (`pause_status: PAUSED` in
    its config, then generate and deploy; see [Pausing triggers](feed-configuration.md#pausing-triggers)),
-   and let any running run finish, so it doesn't run again before the rename.
+   and let any running run finish, so it doesn't run again before the rename. A job group member has no
+   trigger of its own: pausing it pauses the group's job, so every member stops until step 4 (streaming
+   members then catch up from their checkpoints). Members must agree on `pause_status`, so change it on
+   any other member that sets it too.
 2. **Note where it stopped:** the time of its last successful run and, if the monitoring log is on, its
    last `batch_summary` row's `source_end_version` and `source_end_index`
    ([how to read them](monitoring.md#caught-up-or-behind)).
@@ -86,8 +90,8 @@ To rename a streaming feed:
      that range ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). That needs a column
      recording when each row landed. With `es_id_field` set, overlapping the range at either end is
      harmless, so err wide.
-4. **Rename the config file**, regenerate, and deploy. Then run the new feed, or let its trigger start
-   it.
+4. **Rename the config file**, put `pause_status` back to what it was before step 1 (on every config you
+   changed), regenerate, and deploy. Then run the new feed, or let its trigger start it.
 5. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. The job warns that
    no config has that name and clears it anyway. Left in place, it would be picked up by any future feed
    given the old name, which would resume from the old position and send everything since.
