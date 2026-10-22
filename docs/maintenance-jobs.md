@@ -83,10 +83,10 @@ To rename a streaming feed:
      whole group, so every member stops until step 4 (streaming members then catch up from their
      checkpoints); members must agree on `pause_status`, so change it on any other member that sets it
      too. If the group's job has no trigger, there is nothing to pause: just don't start it until step 4.
-2. **Note where it stopped:** the time of its last successful run and, if the monitoring log is on, its
+2. **Note where it stopped:** the start time of its last successful run and, if the monitoring log is on, its
    last `batch_summary` row's `source_end_version` and `source_end_index`
    ([how to read them](monitoring.md#caught-up-or-behind)). If it was behind after all, the gap starts
-   at that version's commit time (from `DESCRIBE HISTORY` on the source), not at the last run.
+   at that version (its commit time is in `DESCRIBE HISTORY` on the source), not at the last run.
 3. **Choose how to close the gap** (see [How to Backfill](backfill.md)):
    - **Re-send the whole table**, if that volume is acceptable: set `streaming_start: full` in the
      renamed config, so the new feed's first run (scheduled or not) starts at the beginning of the table
@@ -104,8 +104,11 @@ To rename a streaming feed:
      separate [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill) so they don't
      collide with the renamed feed's own runs
      ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). That needs a column recording when
-     each row landed. With `es_id_field` set, overlapping the range at either end is harmless, so err
-     wide, past the start of the new feed's first run.
+     each row landed, and that time can be earlier than its commit, so err wide: start well before the
+     point noted in step 2 and end well after the start of the new feed's first run. With `es_id_field`
+     set the overlap is harmless. Without it, every row in the overlap is written again as a duplicate
+     (rows already in the index keep their random ids), so keep the range as tight as the data allows and
+     expect some duplicates at its edges.
 6. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. The job warns that
    no config has that name and clears it anyway. Left in place, it would be picked up by any future feed
    given the old name, which would resume from the old position and send everything since.
