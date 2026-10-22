@@ -1,15 +1,16 @@
 """The streaming per-micro-batch step: the function handed to foreachBatch.
 
 make_foreach_batch builds it from injected pieces, so its ORDER and failure handling are unit-tested with fakes:
-  newest source version -> transform -> batch_start -> bulk_write -> metrics file -> batch_end
+  source version -> transform -> batch_start -> bulk_write -> metrics file -> batch_end
   -> (best-effort) source version relay -> (best-effort) BULK_STATS print relay.
-- The newest source version (and its commit time) is read FIRST, as close as possible to when Spark planned the
-  batch, and recorded on batch_start as `source_latest`. Compared with the batch's end offset (batch_summary) it
-  tells a batch that left available files behind (behind) from one whose outstanding files arrived while it ran
-  (caught up). Read only when the log is on (nothing would record it otherwise). FAIL-SOFT: a failed read is
+- The source version (and its commit time) is read FIRST, as close as possible to when Spark planned the batch, and
+  recorded on batch_start as `source_latest`: the newest commit made at least the configured look-back before the
+  read (source_latest_from_rows), so a commit landing between planning and the read does not count. Compared with
+  the batch's end offset (batch_summary) it tells a batch that left available files behind (behind) from one whose
+  outstanding files arrived while it ran (caught up). Read only when the log is on (nothing would record it otherwise). FAIL-SOFT: a failed read is
   recorded as {"error": ...} and printed, never raised, because it is a diagnostic and must not stop the export.
-  It costs one source history read per batch (median 0.7 s in a live probe on DBR 17.3), and the relay write
-  below costs about as much again (median 0.9 s); both happen before the batch's checkpoint commits. It has no
+  It costs one source history read per batch (median 0.7 s for one row in a live probe on DBR 17.3), and the relay
+  write below costs about as much again (median 0.9 s); both happen before the batch's checkpoint commits. It has no
   timeout of its own on purpose: it reads the same Delta log and metastore the batch has just read from, so a
   hang there stalls the export regardless, and a thread-based timeout inside foreachBatch adds risk for no gain.
 - batch_start is written BEFORE any of the batch's data is sent, so a log outage fails the micro-batch (and the
@@ -50,6 +51,24 @@ def source_latest_from_row(row):
     return version, _EPOCH + timedelta(microseconds=ts_us)
 
 
+def source_latest_from_rows(rows, lookback_seconds, now=None):
+    """(version, commit datetime in UTC) recorded as a batch's `source_latest`: of `rows` (the newest commits of the
+    source's history, each with `version` and `ts_us` as source_latest_from_row reads them), the newest one
+    committed at or before `now` minus `lookback_seconds`, else (none is that old) the oldest of them. Spark plans a
+    batch moments before foreachBatch reads the history, so the look-back keeps a commit that landed in between from
+    counting as one the batch left behind; the fallback is still a commit the history read saw. `now` defaults to
+    the current UTC time. Picks by version, so row order does not matter. Raises on no rows, a negative or
+    non-integer look-back, or an unusable row; the caller records that as the read's error."""
+    if isinstance(lookback_seconds, bool) or not isinstance(lookback_seconds, int) or lookback_seconds < 0:
+        raise ValueError(f"lookback_seconds must be a non-negative int, got {lookback_seconds!r}")
+    commits = [source_latest_from_row(row) for row in rows]
+    if not commits:
+        raise ValueError("the source history read returned no rows")
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=lookback_seconds)
+    old_enough = [c for c in commits if c[1] <= cutoff]
+    return max(old_enough) if old_enough else min(commits)
+
+
 # A failed newest-version read is recorded as its exception type and message, capped (a diagnostic, not the
 # batch's error).
 MAX_SOURCE_READ_ERROR_CHARS = 1000
@@ -67,7 +86,8 @@ def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name,
     - write_metrics(session, batch_id, written): persist the batch's written count (the drain summary reads it).
     - write_print_relay(session, batch_id, text) or None: hand the BULK_STATS line to the notebook's progress
       recorder; None when bulk_stats is off.
-    - read_source_latest(session) -> (version, commit datetime): the source table's newest commit. Pass None to
+    - read_source_latest(session) -> (version, commit datetime): the source commit to record (the notebook reads the
+      newest history rows and picks with source_latest_from_rows). Pass None to
       skip the read (batch_start then carries no source_latest). Anything it raises or returns that is not a
       usable (version, datetime) pair is recorded as source_latest {"error": ...}.
     - write_source_relay(session, batch_id, facts), or None: hand `source_latest` to the progress recorder.

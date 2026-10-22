@@ -61,3 +61,13 @@ def test_notebook_roots_resolve_to_the_synced_layout(path):
         assert os.path.isdir(os.path.join(roots["FILES_ROOT"], "_pipelines", "pipeline_configs"))
     if not ("from pipeline_lib" in source or '"_pipelines"' in source):
         assert not roots  # e.g. build_wheel: needs neither root
+
+
+def test_every_runtime_knob_is_a_runner_widget_that_is_read():
+    # Each run-time job parameter reaches the runner as a widget of the same name; a knob in the registry that the
+    # notebook never declares or reads would be generated into every job and silently ignored at run time.
+    from pipeline_lib.config import RUNTIME_KNOB_NAMES
+    source = open(os.path.join(_FRAMEWORK_ROOT, "notebooks", "run_index_pipeline.py")).read()
+    for name in RUNTIME_KNOB_NAMES:
+        assert f'dbutils.widgets.text("{name}",' in source, f"{name} is not declared as a widget"
+        assert f'dbutils.widgets.get("{name}")' in source, f"{name} is never read"

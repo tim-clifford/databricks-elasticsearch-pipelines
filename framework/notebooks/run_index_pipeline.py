@@ -53,8 +53,13 @@
 # MAGIC   `run_end` for the run, `batch_start` / `batch_end` for every batch (one batch in batch mode, one per
 # MAGIC   micro-batch in streaming), and per streaming batch a `batch_summary` (Spark's progress report). See
 # MAGIC   framework/pipeline_lib/monitoring_sink.py for the row model. Streaming batches also read the source table's
-# MAGIC   newest version at batch start (one `DESCRIBE HISTORY ... LIMIT 1` per batch, skipped when the log is
-# MAGIC   off), so the log can tell a batch that was behind from one whose backlog arrived while it ran.
+# MAGIC   history at batch start (one `DESCRIBE HISTORY ... LIMIT <log_monitor_source_history_rows>` per batch,
+# MAGIC   skipped when the log is off) and record the newest version committed at least
+# MAGIC   `log_monitor_source_lookback_seconds` before the read, so the log can tell a batch that was behind from
+# MAGIC   one whose backlog arrived while it ran.
+# MAGIC - `log_monitor_source_lookback_seconds` (default 60; 0 = the newest commit), `log_monitor_source_history_rows`
+# MAGIC   (default 100): that read's look-back and how many history rows it fetches (the oldest is used when none
+# MAGIC   is old enough). Streaming with the log on only.
 # MAGIC   When ON the log is part of the contract, not best-effort: an unset/malformed/unwritable table or
 # MAGIC   ANY failed append FAILS the task (so support is notified and no further data is sent unlogged).
 # MAGIC   A batch's `batch_start` row is written before its data is sent, so a log outage stops the export
@@ -144,6 +149,8 @@ dbutils.widgets.text("streaming_start", "", "Streaming start: new (only new comm
 dbutils.widgets.text("streaming_trigger_interval", "", "Continuous ProcessingTime cadence, e.g. '30 seconds' (empty => availableNow drain-and-stop)")
 dbutils.widgets.text("max_files_per_trigger", "", "Streaming: max Delta files per micro-batch (empty => Spark default 1000)")
 dbutils.widgets.text("max_bytes_per_trigger", "", "Streaming: max bytes per micro-batch, e.g. 128m (empty => no cap)")
+dbutils.widgets.text("log_monitor_source_lookback_seconds", "", "Monitoring log, streaming: per-batch source version look-back in seconds (empty => default 60)")
+dbutils.widgets.text("log_monitor_source_history_rows", "", "Monitoring log, streaming: source history rows the per-batch read fetches (empty => default 100)")
 # Durable monitoring log. monitoring_log_enabled is a run-time job parameter (true|false; default from
 # ${var.monitoring_log_enabled}/config); monitoring_log_table is a deploy-time base_parameter (the
 # ${var.monitoring_log_table} bundle variable, the shared catalog.schema.table). When enabled, the run
@@ -181,6 +188,8 @@ STREAMING_START = dbutils.widgets.get("streaming_start").strip()
 STREAMING_TRIGGER_INTERVAL = dbutils.widgets.get("streaming_trigger_interval").strip()
 MAX_FILES_PER_TRIGGER = dbutils.widgets.get("max_files_per_trigger").strip()
 MAX_BYTES_PER_TRIGGER = dbutils.widgets.get("max_bytes_per_trigger").strip()
+LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = dbutils.widgets.get("log_monitor_source_lookback_seconds").strip()
+LOG_MONITOR_SOURCE_HISTORY_ROWS = dbutils.widgets.get("log_monitor_source_history_rows").strip()
 MONITORING_LOG_ENABLED = dbutils.widgets.get("monitoring_log_enabled").strip()
 MONITORING_LOG_TABLE = dbutils.widgets.get("monitoring_log_table").strip()
 JOB_RUN_ID_PARAM = dbutils.widgets.get("job_run_id").strip()
@@ -210,6 +219,8 @@ from pipeline_lib.config import (  # noqa: E402
     require_connector_version,
     require_es_flag,
     require_filter_condition,
+    require_log_monitor_source_history_rows,
+    require_log_monitor_source_lookback_seconds,
     require_max_bytes_per_trigger,
     require_max_files_per_trigger,
     require_max_partition_bytes,
@@ -227,7 +238,7 @@ from pipeline_lib.config import (  # noqa: E402
 from pipeline_lib.batch_export import run_batch_export  # noqa: E402
 from pipeline_lib.monitoring_writer import MonitoringLog, resolve_log_table, spark_append  # noqa: E402
 from pipeline_lib.run_record import RunRecorder  # noqa: E402
-from pipeline_lib.stream_batch import make_foreach_batch, source_latest_from_row  # noqa: E402
+from pipeline_lib.stream_batch import make_foreach_batch, source_latest_from_rows  # noqa: E402
 from pipeline_lib.stream_progress import ProgressRecorder, parse_source_relay, prune_relay_dirs  # noqa: E402
 # Log-line tag for this notebook's own streaming status lines.
 import json  # noqa: E402
@@ -308,6 +319,13 @@ MAX_PARTITION_BYTES = require_max_partition_bytes(MAX_PARTITION_BYTES, "max_part
 #   below. Empty widget -> "" (leave Spark's default), so an unset knob is simply omitted from the read.
 MAX_FILES_PER_TRIGGER = require_max_files_per_trigger(MAX_FILES_PER_TRIGGER, "max_files_per_trigger job parameter")
 MAX_BYTES_PER_TRIGGER = require_max_bytes_per_trigger(MAX_BYTES_PER_TRIGGER, "max_bytes_per_trigger job parameter")
+# - log_monitor_source_lookback_seconds / log_monitor_source_history_rows: the monitoring log's per-batch source
+#   version read (streaming, log on), validated unconditionally like the rate-limits. Empty widget -> the built-in
+#   defaults via the validators.
+LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = int(require_log_monitor_source_lookback_seconds(
+    LOG_MONITOR_SOURCE_LOOKBACK_SECONDS, "log_monitor_source_lookback_seconds job parameter"))
+LOG_MONITOR_SOURCE_HISTORY_ROWS = int(require_log_monitor_source_history_rows(
+    LOG_MONITOR_SOURCE_HISTORY_ROWS, "log_monitor_source_history_rows job parameter"))
 
 # COMMAND ----------
 # MONITORING LOG setup (optional). Canonicalize the enable flag with the SAME validator the config/registry use
@@ -408,6 +426,8 @@ if PIPELINE_MODE == "streaming":
         if STREAMING_TRIGGER_INTERVAL else "availableNow (drain-and-stop)"))
     print(f"max_files_per_trigger = {MAX_FILES_PER_TRIGGER or '<unset> (Spark default)'}")
     print(f"max_bytes_per_trigger = {MAX_BYTES_PER_TRIGGER or '<unset> (no cap)'}")
+    print(f"log_monitor_source_lookback_seconds = {LOG_MONITOR_SOURCE_LOOKBACK_SECONDS}")
+    print(f"log_monitor_source_history_rows     = {LOG_MONITOR_SOURCE_HISTORY_ROWS}")
 # Loud warning for omitting es_id_field. BOTH modes are at-least-once, so a replay re-writes the same
 # source rows with fresh auto-generated _ids and the index accumulates DUPLICATES: for batch, a
 # failed-then-retried run re-exports the whole view; for streaming, micro-batch retries, stream
@@ -467,6 +487,8 @@ RECORDER.start({
     "connector_version": _connector_version, "filter_condition": FILTER_CONDITION,
     "write_overrides": write_overrides, "write_repartition": WRITE_REPARTITION,
     "streaming_start": STREAMING_START if PIPELINE_MODE == "streaming" else None,
+    "log_monitor_source_lookback_seconds": LOG_MONITOR_SOURCE_LOOKBACK_SECONDS if PIPELINE_MODE == "streaming" else None,
+    "log_monitor_source_history_rows": LOG_MONITOR_SOURCE_HISTORY_ROWS if PIPELINE_MODE == "streaming" else None,
     "checkpoint": f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{CONFIG_NAME}" if PIPELINE_MODE == "streaming" else None,
 }, spark)
 
@@ -611,12 +633,13 @@ if PIPELINE_MODE == "streaming":
         dbutils.fs.rm(print_relay_dir, recurse=True)
 
         # Per-batch SOURCE VERSION RELAY (log on only), the same mechanism: foreachBatch reads the source table's
-        # newest commit (version + commit time) at batch start, records it on batch_start, and writes it to
+        # newest commit made at least LOG_MONITOR_SOURCE_LOOKBACK_SECONDS before the read (version + commit time;
+        # see _read_source_latest) at batch start, records it on batch_start, and writes it to
         # `{source_relay_dir}/{batch_id}`; the progress recorder adds it to that batch's batch_summary and deletes
         # it. With the end offset on batch_summary it tells "caught up, new files arrived during the batch" from
         # "behind, available files were left for the next batch". BEST-EFFORT on batch_summary (batch_start always
-        # has it). COST, per batch and before its checkpoint commits: one `DESCRIBE HISTORY ... LIMIT 1` (median
-        # 0.7 s) plus one relay write after batch_end (median 0.9 s), about 1.6 s (live probes, DBR 17.3). Both are
+        # has it). COST, per batch and before its checkpoint commits: one `DESCRIBE HISTORY ... LIMIT <rows>` (median
+        # 0.7 s at LIMIT 1) plus one relay write after batch_end (median 0.9 s), about 1.6 s (live probes, DBR 17.3). Both are
         # skipped when the log is off; a knob to skip them with the log on could gate `read_source_latest` below.
         # Cleared at run start.
         source_relay_dir = f"{checkpoint_location}/_source_version_relay"
@@ -664,10 +687,14 @@ if PIPELINE_MODE == "streaming":
             return _read_relay(print_relay_dir, batch_id)
 
         def _read_source_latest(session):
-            # The newest commit is the LIMIT 1 row (history is newest-first). The commit time is read as epoch
-            # microseconds so the session time zone cannot shift it.
-            return source_latest_from_row(session.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT 1")
-                                          .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect()[0])
+            # The newest LOG_MONITOR_SOURCE_HISTORY_ROWS commits (history is newest-first), and of those the newest
+            # committed at least LOG_MONITOR_SOURCE_LOOKBACK_SECONDS before this read, else the oldest fetched
+            # (source_latest_from_rows). Spark planned the batch moments before this read, so a commit landing in
+            # between is newer than the cutoff and is not counted. The commit time is read as epoch microseconds so
+            # the session time zone cannot shift it.
+            rows = (session.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT {LOG_MONITOR_SOURCE_HISTORY_ROWS}")
+                    .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect())
+            return source_latest_from_rows(rows, LOG_MONITOR_SOURCE_LOOKBACK_SECONDS)
 
         def _prune_relays(below_batch_id):
             # Delete every batch's relay below `below_batch_id` (reports that were lost), one listing per dir.
