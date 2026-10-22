@@ -856,7 +856,8 @@ def test_source_latest_from_rows_a_commit_landing_after_planning_is_not_counted(
 
 def test_source_latest_from_rows_a_commit_exactly_at_the_cutoff_counts():
     from pipeline_lib.stream_batch import source_latest_from_rows
-    assert source_latest_from_rows([_commit(5, 59), _commit(4, 60)], 60, now=_NOW) == (4, _at(60))
+    # v3 is older still, so a strict < would pick it instead of v4 (not the fallback, which would also give v3).
+    assert source_latest_from_rows([_commit(5, 59), _commit(4, 60), _commit(3, 120)], 60, now=_NOW) == (4, _at(60))
 
 
 def test_source_latest_from_rows_no_look_back_is_the_newest_commit():
