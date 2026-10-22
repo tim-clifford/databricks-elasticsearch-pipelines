@@ -7,12 +7,16 @@ liquid clustering, and is a no-op on an existing table (clustering is set at cre
 existing table this then adds the columns the schema has and the table lacks (missing_columns: ADD COLUMNS,
 comments included; existing rows get NULL). That is the path for a column added to MONITORING_TABLE_COLUMNS
 later: re-run this job BEFORE deploying the build that writes it, because a writer fails closed on a table that
-lacks one of its columns. It never drops a column it does not know (an unknown column is warned about).
+lacks one of its columns. It also rewrites the comment of any existing column whose comment differs from the
+schema's (changed_comments: ALTER COLUMN ... COMMENT, metadata only), so a reworded comment reaches existing tables.
+It never drops a column it does not know (an unknown column is warned about).
 Everything FAILS CLOSED: a transient fault fails the job and a re-run retries.
 """
 from pipeline_lib.monitoring_sink import (
     MONITORING_TABLE_COLUMNS,
     alter_add_columns_sql,
+    alter_column_comment_sql,
+    changed_comments,
     create_table_sql,
     missing_columns,
     validate_table_name,
@@ -37,8 +41,9 @@ def create_or_migrate(spark, table_name, printer=print):
 
 
 def _migrate(spark, table, printer):
-    """Bring an existing table up to the current column set; returns the outcome token for the summary."""
-    existing_cols = [f.name for f in spark.table(table).schema]
+    """Bring an existing table up to the current column set and comments; returns the outcome token for the summary."""
+    fields = list(spark.table(table).schema)
+    existing_cols = [f.name for f in fields]
 
     to_add = missing_columns(existing_cols)
     added = [name for name, _type, _comment in to_add]
@@ -48,11 +53,20 @@ def _migrate(spark, table, printer):
         printer(f"  {add_sql}")
         spark.sql(add_sql)
 
+    recommented = []
+    for name, comment in changed_comments({f.name: (f.metadata or {}).get("comment") for f in fields}):
+        comment_sql = alter_column_comment_sql(table, name, comment)
+        printer(f"updating the comment of column {name}")
+        printer(f"  {comment_sql}")
+        spark.sql(comment_sql)
+        recommented.append(name)
+
     expected = [name for name, _type, _comment in MONITORING_TABLE_COLUMNS]
     extra = [c for c in existing_cols if c not in expected]
     if extra:
         printer(f"WARNING: existing table {table!r} has columns {extra} not in the expected schema. Left as-is "
                 f"(never dropped); remove them deliberately if they are obsolete.")
 
-    return f"MIGRATED(added={added})" if added else "ALREADY_EXISTS"
+    changes = ([f"added={added}"] if added else []) + ([f"comments={recommented}"] if recommented else [])
+    return f"MIGRATED({', '.join(changes)})" if changes else "ALREADY_EXISTS"
 
