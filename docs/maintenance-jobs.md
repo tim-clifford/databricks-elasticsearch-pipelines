@@ -88,7 +88,7 @@ To rename a streaming feed:
    - the start time of its last successful run (for a continuous feed, of its last successful batch:
      that `batch_end` row's `start_ts` in the monitoring log);
    - if the monitoring log is on, that batch's `batch_summary` row (matched to the `batch_end` by
-     `job_run_id` and `batch_id`): its `source_end_version` and `source_end_index`
+     `job_run_id`, `task_run_id` and `batch_id`): its `source_end_version` and `source_end_index`
      ([how to read them](monitoring.md#caught-up-or-behind)). A summary can be missing; then go by the
      `batch_end` row's `start_ts` and widen the backfill window.
 
@@ -102,20 +102,22 @@ To rename a streaming feed:
      first run (step 5).
 4. **Rename the config file**, put `pause_status` back to what it was before step 1 (on every config you
    changed), regenerate, and deploy. Then run the new feed, or let its trigger start it.
-5. **Once the new feed has completed its first batch** (a successful run, or a successful `batch_end`
-   row in the monitoring log; for a continuous feed, its first successful batch):
-   - If you set `streaming_start: full`, remove it again, then regenerate and deploy, so a later
-     checkpoint reset doesn't re-send the whole table. Removing it before a batch has completed would
-     let a failed first run restart with `new` and skip the re-send.
-   - If you're backfilling the gap, send the rows in it with batch runs filtered to that range, from a
-     separate [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill) so they don't
-     collide with the renamed feed's own runs
-     ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). That needs a column recording when
-     each row landed, and that time can be earlier than its commit, so err wide: start well before the
-     point noted in step 2 and end well after the start of the new feed's first run. With `es_id_field`
-     set the overlap is harmless. Without it, every row in the overlap is written again as a duplicate
-     (rows already in the index keep their random ids), so keep the range as tight as the data allows and
-     expect some duplicates at its edges.
+5. **After the new feed starts:**
+   - If you set `streaming_start: full`, wait until it has completed its first batch (a successful run,
+     or a successful `batch_end` row in the monitoring log; for a continuous feed, its first successful
+     batch). Then remove the key, regenerate and deploy, so a later checkpoint reset doesn't re-send the
+     whole table. Removing it before a batch has completed would let a failed first run restart with
+     `new` and skip the re-send.
+   - If you're backfilling the gap, wait until the new feed's first run has succeeded (for a continuous
+     feed, until its run is up): the gap ends at the start of that run. Then send the rows in the gap with
+     batch runs filtered to that range, from a separate
+     [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill) so they don't collide with
+     the renamed feed's own runs ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). That
+     needs a column recording when each row landed, and that time can be earlier than its commit, so err
+     wide: start well before the point noted in step 2 and end well after the start of that run. With
+     `es_id_field` set the overlap is harmless. Without it, every row in the overlap is written again as
+     a duplicate (rows already in the index keep their random ids), so keep the range as tight as the
+     data allows and expect some duplicates at its edges.
 6. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. First check that no
    current config has the old name: the job deletes that name's checkpoint either way, and if a feed uses
    the name, that checkpoint is live. (With no such config, the job warns and clears it anyway.) Left in place, it would be picked up by any future feed
