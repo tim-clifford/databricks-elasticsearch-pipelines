@@ -84,18 +84,22 @@ To rename a streaming feed:
 3. **Choose how to close the gap** (see [How to Backfill](backfill.md)):
    - **Re-send the whole table**, if that volume is acceptable: set `streaming_start: full` in the
      renamed config, so the new feed's first run (scheduled or not) starts at the beginning of the table
-     ([Method 1](backfill.md#method-1-streaming-from-the-start-of-the-table-streaming-feeds-only)). Remove
-     the key once the stream has started, so a later checkpoint reset doesn't re-send everything again.
-   - **Backfill only the gap:** leave `streaming_start` at `new`, and after the new feed's first run send
-     the rows that arrived between the old feed's last batch and that run with batch runs filtered to
-     that range ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces); for a job group member or a
+     ([Method 1](backfill.md#method-1-streaming-from-the-start-of-the-table-streaming-feeds-only)).
+   - **Backfill only the gap:** leave `streaming_start` at `new`, and fill the gap after the new feed's
+     first run (step 5).
+4. **Rename the config file**, put `pause_status` back to what it was before step 1 (on every config you
+   changed), regenerate, and deploy. Then run the new feed, or let its trigger start it.
+5. **After the new feed's first run:**
+   - If you set `streaming_start: full`, remove it again, then regenerate and deploy, so a later
+     checkpoint reset doesn't re-send the whole table.
+   - If you're backfilling the gap, send the rows that arrived between the old feed's last batch and the
+     new feed's first run with batch runs filtered to that range
+     ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces); for a job group member or a
      continuous feed, run them from a separate
      [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill)). That needs a column
      recording when each row landed. With `es_id_field` set, overlapping the range at either end is
      harmless, so err wide.
-4. **Rename the config file**, put `pause_status` back to what it was before step 1 (on every config you
-   changed), regenerate, and deploy. Then run the new feed, or let its trigger start it.
-5. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. The job warns that
+6. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. The job warns that
    no config has that name and clears it anyway. Left in place, it would be picked up by any future feed
    given the old name, which would resume from the old position and send everything since.
 
