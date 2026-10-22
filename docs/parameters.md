@@ -612,63 +612,63 @@ above at deploy.
 
 ## Summary table
 
-Every parameter on this page, with where it is set and what happens when it is left empty ("set it"
-marks the ones that need a value: leaving them empty isn't a supported setting). "Bundle"
+Every parameter on this page, with where it is set and what it does. Follow a parameter's link for its
+default, what happens when it is left empty, and what to weigh when you change it. "Bundle"
 means a `databricks.yml` variable, "Config" a feed config key, "Knob" a run-time knob (bundle global,
 feed config, or `--params`), and "Job" a maintenance job's `--params`.
 
-| Parameter | Kind | Set in | Left empty |
+| Parameter | Kind | Set in | Description |
 |---|---|---|---|
-| [`environment`](#environment) | Bundle | per target | fine unless a config name uses `${environment}` |
-| [`wheel_path`](#wheel_path) | Bundle | per target | every feed run fails |
-| [`checkpoint_base_path`](#checkpoint_base_path) | Bundle | per target | streaming runs fail |
-| [`cluster_policy_id`](#cluster_policy_id) | Bundle | per target | deploy fails for `job_cluster` feeds |
-| [`ca_certs`](#ca_certs) | Bundle | per target | the system CA store is used |
-| [`cluster_log_volume_path`](#cluster_log_volume_path) | Bundle | per target | deploy fails for opted-in cluster configs |
-| [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | set it |
-| [`global_job_tags`](#global_job_tags) | Bundle | top level (keys), values may vary | no tags |
-| [`schedule_pause_status`](#schedule_pause_status) | Bundle | top level and per target | set it (`PAUSED` or `UNPAUSED`) |
-| [`support_email`](#support_email) | Bundle | per target | no failure emails |
-| [`monitoring_log_table`](#monitoring_log_table) | Bundle | per target | the log can't be turned on; `log_table_prune` fails |
-| [`monitoring_log_retention_days`](#monitoring_log_retention_days) | Bundle | per target | `log_table_prune` fails (`0` keeps everything) |
-| [`es_host_default`](#es_host_default) and other host configs | Bundle | per target | runs that use the host fail |
-| [`es_host_configs_json`](#es_host_configs_json) | Bundle | top level only | generation fails |
-| [`default_es_host_config`](#default_es_host_config) | Bundle | top level only | generation fails |
-| [Cluster configs](#cluster-configs) | Bundle | per target | deploy fails for feeds that use them |
-| [`diagnostics_existing_cluster_id`](#diagnostics_existing_cluster_id) | Bundle | per target | `es_diagnostics` runs serverless |
-| [`diagnostics_job_cluster_key`](#diagnostics_job_cluster_key) | Bundle | per target | `es_diagnostics` runs serverless |
-| [`diagnostics_job_clusters`](#diagnostics_job_clusters) | Bundle | per target | `es_diagnostics` runs serverless |
-| [`es_index_name`](#es_index_name) | Config | feed config | required |
-| [`es_id_field`](#es_id_field) | Config | feed config | Elasticsearch assigns random ids |
-| [`es_host_config`](#es_host_config) | Config | feed config | `default_es_host_config` |
-| [`view`](#view) | Config | feed config | required |
-| [`source`](#source) | Config | feed config | required |
-| [`reference_tables`](#reference_tables) | Config | feed config | no joins |
-| [`compute`](#compute) | Config | feed config | serverless |
-| [`schedule`](#schedule) | Config | feed config | no schedule |
-| [`continuous`](#continuous) | Config | feed config | not always-on |
-| [`pause_status`](#pause_status) | Config | feed config | `schedule_pause_status` |
-| [`job_group`](#job_group) | Config | feed config | the feed gets its own job |
-| [`job_name_postfix`](#job_name_postfix) | Config | feed config | the config or group name |
-| [`pipeline_mode`](#pipeline_mode) | Knob | global, config, `--params` | the run fails |
-| [`filter_condition`](#filter_condition) | Knob | global, config, `--params` | no filter |
-| [`streaming_start`](#streaming_start) | Knob | global, config, `--params` | `new` |
-| [`chunk_size`](#chunk_size) | Knob | global, config, `--params` | `500` |
-| [`write_concurrency`](#write_concurrency) | Knob | global, config, `--params` | `1` |
-| [`request_timeout`](#request_timeout) | Knob | global, config, `--params` | `60` seconds |
-| [`transport_max_retries`](#transport_max_retries) | Knob | global, config, `--params` | `3` |
-| [`max_retries_per_doc`](#max_retries_per_doc) | Knob | global, config, `--params` | `3` |
-| [`retry_transport_timeout`](#retry_transport_timeout) | Knob | global, config, `--params` | off |
-| [`op_type`](#op_type) | Knob | global, config, `--params` | `index` |
-| [`bypass_fast_path`](#bypass_fast_path) | Knob | global, config, `--params` | off |
-| [`require_existing_index`](#require_existing_index) | Knob | global, config, `--params` | on |
-| [`verify_certs`](#verify_certs) | Knob | global, config, `--params` | on |
-| [`bulk_stats`](#bulk_stats) | Knob | global, config, `--params` | off |
-| [`monitoring_log_enabled`](#monitoring_log_enabled) | Knob | global, config, `--params` | off |
-| [`max_partition_bytes`](#max_partition_bytes) | Knob | global, config, `--params` | `2m` |
-| [`write_repartition`](#write_repartition) | Knob | global, config, `--params` | off |
-| [`max_files_per_trigger`](#max_files_per_trigger) | Knob | global, config, `--params` | `1000` (Spark) |
-| [`max_bytes_per_trigger`](#max_bytes_per_trigger) | Knob | global, config, `--params` | no cap |
-| `config_name` | Job | `checkpoint_clear` | required |
-| `es_host_config`, `index_name`, `verify_certs`, `sample_interval_secs`, `request_timeout_secs` | Job | `es_diagnostics` | see [Maintenance job parameters](#maintenance-job-parameters) |
-| `repo_workspace_path`, `wheel_version` | Job | `build_wheel` | required |
+| [`environment`](#environment) | Bundle | per target | the value substituted for `${environment}` in feed catalog and schema names |
+| [`wheel_path`](#wheel_path) | Bundle | per target | the UC Volume path of the connector wheel every index job installs |
+| [`checkpoint_base_path`](#checkpoint_base_path) | Bundle | per target | the UC Volume base path for streaming checkpoints, one folder per feed |
+| [`cluster_policy_id`](#cluster_policy_id) | Bundle | per target | the cluster policy applied to every job cluster |
+| [`ca_certs`](#ca_certs) | Bundle | per target | a CA bundle for verifying the ES server's TLS certificate |
+| [`cluster_log_volume_path`](#cluster_log_volume_path) | Bundle | per target | where job-cluster logs are delivered, for cluster configs that opt in |
+| [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | the prefix in every job's display name |
+| [`global_job_tags`](#global_job_tags) | Bundle | top level (keys), values may vary | tags applied to every job and its job clusters |
+| [`schedule_pause_status`](#schedule_pause_status) | Bundle | top level and per target | the target-wide pause state of scheduled and continuous triggers |
+| [`support_email`](#support_email) | Bundle | per target | who is emailed when a job or task run fails |
+| [`monitoring_log_table`](#monitoring_log_table) | Bundle | per target | the shared monitoring Delta table that runs and batches are logged to |
+| [`monitoring_log_retention_days`](#monitoring_log_retention_days) | Bundle | per target | how many days of history `log_table_prune` keeps |
+| [`es_host_default`](#es_host_default) and other host configs | Bundle | per target | an ES endpoint plus the secret scope and key holding its api_key |
+| [`es_host_configs_json`](#es_host_configs_json) | Bundle | top level only | every host config in one JSON object, so `es_diagnostics` can check any host |
+| [`default_es_host_config`](#default_es_host_config) | Bundle | top level only | the host config a feed uses when it omits `es_host_config` |
+| [Cluster configs](#cluster-configs) | Bundle | per target | an existing cluster's id, which a feed's `compute` can name |
+| [`diagnostics_existing_cluster_id`](#diagnostics_existing_cluster_id) | Bundle | per target | runs `es_diagnostics` on an existing cluster |
+| [`diagnostics_job_cluster_key`](#diagnostics_job_cluster_key) | Bundle | per target | runs `es_diagnostics` on this job cluster from `diagnostics_job_clusters` |
+| [`diagnostics_job_clusters`](#diagnostics_job_clusters) | Bundle | per target | the job cluster specs `es_diagnostics` can run on |
+| [`es_index_name`](#es_index_name) | Config | feed config | the Elasticsearch index the feed writes to |
+| [`es_id_field`](#es_id_field) | Config | feed config | the view column used as each document's `_id` |
+| [`es_host_config`](#es_host_config) | Config | feed config | which host config the feed writes to |
+| [`view`](#view) | Config | feed config | the view the feed exports |
+| [`source`](#source) | Config | feed config | the source table the view reads |
+| [`reference_tables`](#reference_tables) | Config | feed config | lookup tables the view joins |
+| [`compute`](#compute) | Config | feed config | where the job runs: serverless, an existing cluster, or a job cluster |
+| [`schedule`](#schedule) | Config | feed config | a Quartz cron schedule, in UTC |
+| [`continuous`](#continuous) | Config | feed config | runs the feed always-on at a trigger interval |
+| [`pause_status`](#pause_status) | Config | feed config | this job's pause state, overriding `schedule_pause_status` |
+| [`job_group`](#job_group) | Config | feed config | merges feeds into one job, with a task per feed |
+| [`job_name_postfix`](#job_name_postfix) | Config | feed config | replaces the last part of the job's display name |
+| [`pipeline_mode`](#pipeline_mode) | Knob | global, config, `--params` | `batch` (re-export the whole view) or `streaming` (only new source commits) |
+| [`filter_condition`](#filter_condition) | Knob | global, config, `--params` | a SQL predicate that filters rows before they are written |
+| [`streaming_start`](#streaming_start) | Knob | global, config, `--params` | where a streaming feed's first run starts: `new` or `full` |
+| [`chunk_size`](#chunk_size) | Knob | global, config, `--params` | documents per bulk request |
+| [`write_concurrency`](#write_concurrency) | Knob | global, config, `--params` | bulk requests in flight at once per write partition |
+| [`request_timeout`](#request_timeout) | Knob | global, config, `--params` | the per-request ES client timeout, in seconds |
+| [`transport_max_retries`](#transport_max_retries) | Knob | global, config, `--params` | retries of a whole bulk request after a transport failure |
+| [`max_retries_per_doc`](#max_retries_per_doc) | Knob | global, config, `--params` | retries of a single document ES rejects with a 429 |
+| [`retry_transport_timeout`](#retry_transport_timeout) | Knob | global, config, `--params` | has the connector retry timed-out bulk requests itself, with backoff |
+| [`op_type`](#op_type) | Knob | global, config, `--params` | `index` (overwrite by `_id`) or `create` (append only) |
+| [`bypass_fast_path`](#bypass_fast_path) | Knob | global, config, `--params` | checks every document's result on the first send |
+| [`require_existing_index`](#require_existing_index) | Knob | global, config, `--params` | fails the run if the ES index doesn't exist, instead of letting ES create it |
+| [`verify_certs`](#verify_certs) | Knob | global, config, `--params` | verifies the ES server's TLS certificate |
+| [`bulk_stats`](#bulk_stats) | Knob | global, config, `--params` | logs per-partition bulk-send diagnostics |
+| [`monitoring_log_enabled`](#monitoring_log_enabled) | Knob | global, config, `--params` | records every run and batch in the monitoring table |
+| [`max_partition_bytes`](#max_partition_bytes) | Knob | global, config, `--params` | the source read's partition size, which sets how many partitions the write gets |
+| [`write_repartition`](#write_repartition) | Knob | global, config, `--params` | repartitions the write input into this many partitions |
+| [`max_files_per_trigger`](#max_files_per_trigger) | Knob | global, config, `--params` | the most Delta files one streaming micro-batch reads |
+| [`max_bytes_per_trigger`](#max_bytes_per_trigger) | Knob | global, config, `--params` | a soft cap on bytes per streaming micro-batch |
+| [`config_name`](#maintenance-job-parameters) | Job | `checkpoint_clear` | the feed whose checkpoint to delete |
+| [`es_host_config`, `index_name`, `verify_certs`, `sample_interval_secs`, `request_timeout_secs`](#maintenance-job-parameters) | Job | `es_diagnostics` | which host (and optionally index) to check, and how to sample it |
+| [`repo_workspace_path`, `wheel_version`](#maintenance-job-parameters) | Job | `build_wheel` | the connector repo to build and the version to build |
