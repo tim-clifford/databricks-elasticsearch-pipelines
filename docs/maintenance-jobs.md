@@ -62,25 +62,31 @@ A batch feed loses nothing: every run re-exports the whole view.
 a first run and [`streaming_start`](parameters.md#streaming_start) decides where it begins. The old
 checkpoint is left where it was, unused.
 
-- **`new`** (the default) starts at the source's version at the time of that first run. Commits that
-  landed after the old feed's last batch and up to that version are never sent, leaving a **gap** in the
-  index that only a backfill fills.
+- **`new`** (the default) starts at the source's version as of the start of that first run. Everything
+  after the point the old feed had reached, up to then, is never sent, leaving a **gap** in the index
+  that only a backfill fills. The gap starts where the old stream ended, not when it last ran: if the old
+  feed was behind, the rows it hadn't reached yet are in the gap too.
 - **`full`** re-sends the whole table. That leaves no gap, but it is a full
   [backfill](backfill.md) in size, and without [`es_id_field`](parameters.md#es_id_field) every document
   already in the index is written again as a duplicate.
 
 To rename a streaming feed:
 
-1. **Stop the old feed.** If it has a schedule or continuous trigger, pause it (`pause_status: PAUSED` in
-   its config, then generate and deploy; see [Pausing triggers](feed-configuration.md#pausing-triggers)),
-   and let any running run finish, so it doesn't run again before the rename. A job group member has no
-   trigger of its own. If the group's job has one, pausing it pauses the whole group, so every member
-   stops until step 4 (streaming members then catch up from their checkpoints); members must agree on
-   `pause_status`, so change it on any other member that sets it too. If the group's job has no trigger,
-   there is nothing to pause: just don't start it until step 4.
+1. **Stop the old feed once it is caught up.** Check that its last batch was caught up, not behind
+   ([Caught up or behind](monitoring.md#caught-up-or-behind), if the monitoring log is on), so the gap
+   starts at its last run. Then, if it has a schedule or continuous trigger, pause it
+   (`pause_status: PAUSED` in its config, then generate and deploy; see
+   [Pausing triggers](feed-configuration.md#pausing-triggers)), and let any running run finish. A
+   continuous feed's run doesn't finish on its own: once the trigger is paused, cancel the run if it is
+   still going, and check that it has stopped.
+   - A job group member has no trigger of its own. If the group's job has one, pausing it pauses the
+     whole group, so every member stops until step 4 (streaming members then catch up from their
+     checkpoints); members must agree on `pause_status`, so change it on any other member that sets it
+     too. If the group's job has no trigger, there is nothing to pause: just don't start it until step 4.
 2. **Note where it stopped:** the time of its last successful run and, if the monitoring log is on, its
    last `batch_summary` row's `source_end_version` and `source_end_index`
-   ([how to read them](monitoring.md#caught-up-or-behind)).
+   ([how to read them](monitoring.md#caught-up-or-behind)). If it was behind after all, the gap starts
+   at that version's commit time (from `DESCRIBE HISTORY` on the source), not at the last run.
 3. **Choose how to close the gap** (see [How to Backfill](backfill.md)):
    - **Re-send the whole table**, if that volume is acceptable: set `streaming_start: full` in the
      renamed config, so the new feed's first run (scheduled or not) starts at the beginning of the table
@@ -89,16 +95,17 @@ To rename a streaming feed:
      first run (step 5).
 4. **Rename the config file**, put `pause_status` back to what it was before step 1 (on every config you
    changed), regenerate, and deploy. Then run the new feed, or let its trigger start it.
-5. **After the new feed's first run:**
+5. **Once the new feed has completed its first batch** (a successful run, or a successful `batch_end`
+   row in the monitoring log; for a continuous feed, its first successful batch):
    - If you set `streaming_start: full`, remove it again, then regenerate and deploy, so a later
-     checkpoint reset doesn't re-send the whole table.
-   - If you're backfilling the gap, send the rows that arrived between the old feed's last batch and the
-     new feed's first run with batch runs filtered to that range
-     ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces); for a job group member or a
-     continuous feed, run them from a separate
-     [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill)). That needs a column
-     recording when each row landed. With `es_id_field` set, overlapping the range at either end is
-     harmless, so err wide.
+     checkpoint reset doesn't re-send the whole table. Removing it before a batch has completed would
+     let a failed first run restart with `new` and skip the re-send.
+   - If you're backfilling the gap, send the rows in it with batch runs filtered to that range, from a
+     separate [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill) so they don't
+     collide with the renamed feed's own runs
+     ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). That needs a column recording when
+     each row landed. With `es_id_field` set, overlapping the range at either end is harmless, so err
+     wide, past the start of the new feed's first run.
 6. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. The job warns that
    no config has that name and clears it anyway. Left in place, it would be picked up by any future feed
    given the old name, which would resume from the old position and send everything since.
