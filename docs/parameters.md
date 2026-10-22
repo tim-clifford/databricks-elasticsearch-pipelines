@@ -442,7 +442,9 @@ See [Throughput Tuning](throughput.md#chunk_size).
 Bulk requests in flight at once within each write partition. A positive integer. Connector default `1`.
 
 Raise it when the write is waiting on round trips (executors idle, ES not busy). It multiplies with the
-number of partitions running at once, so raise it gradually and watch for 429s. The connection pool is
+number of partitions running at once, so raise it gradually and watch for 429s. The threads share one
+Python GIL per partition, so past a point more threads wait instead of sending
+([Python threads and the GIL](throughput.md#python-threads-and-the-gil)). The connection pool is
 sized to it automatically. See [Throughput Tuning](throughput.md#write_concurrency).
 
 ### `request_timeout`
@@ -519,7 +521,9 @@ chunk is done in one send with very little to decode. A chunk with any document-
   it sends them once. It also makes the `create` counts exact, and avoids the second send duplicating a
   chunk's good documents when the feed has no `es_id_field`.
 - **It costs** on a feed whose chunks are almost always clean: every response then carries and decodes
-  a result per document, which takes more time for no benefit.
+  a result per document, which takes more time for no benefit. That decoding is Python work under the
+  GIL, so it also lowers the `write_concurrency` a partition can use
+  ([Python threads and the GIL](throughput.md#python-threads-and-the-gil)).
 
 Turn on [`bulk_stats`](#bulk_stats) to see which case a feed is in.
 

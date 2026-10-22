@@ -7,6 +7,7 @@ defined in the [Parameters Reference](parameters.md); this doc is about how they
 
 - [Before you tune: know the source](#before-you-tune-know-the-source)
 - [How the write works](#how-the-write-works)
+- [Python threads and the GIL](#python-threads-and-the-gil)
 - [The levers](#the-levers)
 - [Reading the signals](#reading-the-signals)
 - [A tuning procedure](#a-tuning-procedure)
@@ -82,6 +83,55 @@ time waiting on round trips, so batches take longer than they need to. Too many 
 queue fills: it starts rejecting documents with 429s, or slows down so requests time out. Most levers
 below move that number, the size of each request, or both.
 
+## Python threads and the GIL
+
+The other limit is on the Spark side, in Python. Each partition's write runs in its own Python worker
+process: Spark starts one for each task it runs at the same time. Every process has its own global
+interpreter lock (GIL), which lets only one of its threads run Python code at a time. A partition's
+threads are its `write_concurrency` senders plus the thread that hands them chunks, and they all share
+that one GIL.
+
+Most of the write doesn't need the GIL:
+
+- **Building the documents:** Spark serializes each row to its JSON action line in the JVM, before the
+  rows reach Python, and the senders pass those lines through without re-encoding them.
+- **Compressing the request** and **waiting on the network and ES:** a sender waiting for its response
+  doesn't hold the GIL, so the other senders can run.
+
+What does need it is the Python work around each request: handing the lines to the senders, the ES
+client's work to send each request, and reading each response. Under the [fast path](#fast-path) a clean
+chunk's response is just its `errors` flag, which is cheap. A chunk that takes the full path (any
+document-level error, such as a 409 or 429, or every chunk with `bypass_fast_path` on) has its response
+decoded and checked document by document, which is the heaviest GIL work in the write.
+
+What follows from that:
+
+- **More `write_concurrency` stops helping once the GIL is busy.** While the senders mostly wait on ES,
+  the GIL is free and each extra sender adds requests in flight. Once the senders' Python work keeps the
+  GIL busy, a sender whose response has arrived has to wait for the GIL before it can read it. That wait
+  counts in the request's round trip (`rtt_ms`), so the client looks slow in the same way a slow ES
+  does, while ES's own `took_ms` stays flat. Past that point, more `write_concurrency` adds waiting, not
+  throughput, and a longer `request_timeout` or more retries don't help, because the delay is in the
+  client.
+- **Cores add GILs.** Every partition running at the same time has its own process and GIL, so the way
+  to more parallelism past the GIL limit is more partitions running at once: more
+  [worker cores](#worker-cores), with [enough partitions](#partitions) to use them.
+- **Node shape doesn't change it.** The same total cores as many small workers or fewer large ones runs
+  the same number of GILs, each with the same contention. What node shape does change is what a node's
+  partitions share: its network bandwidth and memory.
+- **The full path costs GIL time.** A feed whose chunks often take the full path (routine 409s or
+  429s, or `bypass_fast_path` on) does more Python work per request, so it reaches the GIL limit at a
+  lower `write_concurrency`.
+
+**How to tell.** With [`bulk_stats`](parameters.md#bulk_stats) on, each partition's process runs a small
+probe thread that sleeps 5 ms at a time and records how late it wakes, which is almost all time spent
+waiting for the GIL; `gil_wait_ms` is that delay. Compare `gil_wait_ms_total` with `wall_ms` on the `tail:` line (the slowest partition), or the
+per-partition `gil_wait_ms(total=...)` with how long the batch's write took. A small share means the
+round trips are a real wait on the network or ES. A large share, together with `rtt_ms` rising while
+`took_ms` doesn't, means the partition is limited by its GIL: lower `write_concurrency` and get the
+parallelism from more cores instead. The [monitoring log](monitoring.md#monitoring-log) keeps these
+figures for each batch (in `batch_end`'s `es` field), so you can follow them across runs.
+
 ## The levers
 
 ### Worker cores
@@ -92,7 +142,10 @@ cores don't run partitions and don't count. A job cluster's node type and worker
 [job-cluster spec](feed-configuration.md#job-cluster-specs); serverless sizes itself.
 
 More cores let more partitions write at the same time, which raises requests in flight and speeds up
-the read and the view transform.
+the read and the view transform. Each of those partitions also has its own GIL, so cores, not
+`write_concurrency`, are the way past the [GIL limit](#python-threads-and-the-gil). How the cores are
+split into nodes doesn't change that; it changes only what each node's partitions share (network and
+memory).
 
 - **Too few:** partitions wait their turn and batches take longer.
 - **Too many:** more pressure on ES (the same 429 and timeout risk as raising `write_concurrency`), and
@@ -107,11 +160,12 @@ already on the wire, so the partition isn't idle during the round trip. It raise
 without adding cores. The connector sizes its connection pool to match.
 
 - **Too low:** cores sit idle waiting on each round trip, and the write takes longer than ES needs.
-- **Too high:** more pressure on ES (429s, slower responses). The threads in one partition also share a
-  single Python interpreter, and increasing it too high spends more time waiting for the GIL instead of
-  sending. Each thread also holds a chunk of documents in memory.
+- **Too high:** more pressure on ES (429s, slower responses). The threads in one partition also share
+  one GIL, so past a point extra threads spend their time waiting for it instead of sending
+  ([Python threads and the GIL](#python-threads-and-the-gil)). Each thread also holds a chunk of
+  documents in memory.
 
-Raise it in small steps and watch for 429s.
+Raise it in small steps and watch for 429s and `gil_wait_ms`.
 
 ### Partitions
 
@@ -178,7 +232,9 @@ Turn it on when:
   the probe and goes out twice, so bypassing the fast path halves those sends.
 - **You need exact counts** for `op_type: create`.
 
-Leave it off for feeds whose chunks are almost always clean.
+Leave it off for feeds whose chunks are almost always clean: decoding every response in full is
+Python work under the GIL, so it lowers the `write_concurrency` a partition can use
+([Python threads and the GIL](#python-threads-and-the-gil)).
 
 ### Streaming micro-batch size
 
@@ -217,7 +273,8 @@ write diagnostics, including 429s per batch.
    which one helped.
 4. **Stop raising parallelism** (cores, `write_concurrency`, partitions) as soon as 429s appear or
    `took_ms` starts climbing: ES is now the limit, and more pressure only makes batches slower and less
-   reliable.
+   reliable. Stop raising `write_concurrency` alone when `gil_wait_ms` grows and `rtt_ms` rises without
+   `took_ms`: the partitions are limited by their GILs, and more cores are the lever.
 5. **Weigh the cost.** If more cores no longer shorten the run, they're waiting on ES or the network. A
    smaller cluster that finishes in about the same time, and still meets the target, is the better
    choice.
