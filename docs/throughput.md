@@ -125,8 +125,8 @@ What follows from that:
 
 **How to tell.** With [`bulk_stats`](parameters.md#bulk_stats) on, each partition's process runs a small
 probe thread that sleeps 5 ms at a time and records how late it wakes, which is almost all time spent
-waiting for the GIL; `gil_wait_ms` is that delay (`n/a` from a connector without the probe). Compare `gil_wait_ms_total` with `wall_ms` on the `tail:` line (the slowest partition), or the
-per-partition `gil_wait_ms(total=...)` with how long the batch's write took. A small share means the
+waiting for the GIL; `gil_wait_ms` is that delay (`n/a` from a connector without the probe). Compare `gil_wait_ms_total` with `wall_ms` on the `tail:` line, which reports both for the slowest
+partition. A small share means the
 round trips are a real wait on the network or ES. A large share, together with `rtt_ms` rising while
 `took_ms` doesn't, means the partition is limited by its GIL: lower `write_concurrency` and get the
 parallelism from more cores instead. The [monitoring log](monitoring.md#monitoring-log) keeps these

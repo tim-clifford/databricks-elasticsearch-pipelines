@@ -79,7 +79,8 @@ To rename a streaming feed:
    [Pausing triggers](feed-configuration.md#pausing-triggers)), and let any running run finish. A
    continuous feed's run doesn't finish on its own: once the trigger is paused, cancel the run if it is
    still going, and check that it has stopped.
-   - A job group member has no trigger of its own. If the group's job has one, pausing it pauses the
+   - A job group shares one trigger, declared in one member's config (possibly the one you're renaming,
+     in which case the trigger moves with the file). If the group's job has one, pausing it pauses the
      whole group, so every member stops until step 4 (streaming members then catch up from their
      checkpoints); members must agree on `pause_status`, so change it on any other member that sets it
      too. If the group's job has no trigger, there is nothing to pause: just don't start it until step 4.
@@ -110,8 +111,9 @@ To rename a streaming feed:
      set the overlap is harmless. Without it, every row in the overlap is written again as a duplicate
      (rows already in the index keep their random ids), so keep the range as tight as the data allows and
      expect some duplicates at its edges.
-6. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. The job warns that
-   no config has that name and clears it anyway. Left in place, it would be picked up by any future feed
+6. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. First check that no
+   current config has the old name: the job deletes that name's checkpoint either way, and if a feed uses
+   the name, that checkpoint is live. (With no such config, the job warns and clears it anyway.) Left in place, it would be picked up by any future feed
    given the old name, which would resume from the old position and send everything since.
 
 ## Diagnosing an Elasticsearch host
