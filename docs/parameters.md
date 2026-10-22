@@ -120,7 +120,7 @@ gets its own checkpoint folder.
 
 ### `cluster_policy_id`
 
-The workspace's cluster policy id, injected into every job cluster (with
+The workspace's cluster policy id, injected into every feed's job cluster (with
 `apply_policy_default_values: true`).
 
 - **Set:** per target, or `--var`. Default empty.
@@ -626,7 +626,7 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`environment`](#environment) | Bundle | per target | the value substituted for `${environment}` in feed catalog and schema names |
 | [`wheel_path`](#wheel_path) | Bundle | per target | the UC Volume path of the connector wheel every index job installs |
 | [`checkpoint_base_path`](#checkpoint_base_path) | Bundle | per target | the UC Volume base path for streaming checkpoints, one folder per feed |
-| [`cluster_policy_id`](#cluster_policy_id) | Bundle | per target | the cluster policy applied to every job cluster |
+| [`cluster_policy_id`](#cluster_policy_id) | Bundle | per target | the cluster policy applied to every feed's job cluster |
 | [`ca_certs`](#ca_certs) | Bundle | per target | a CA bundle for verifying the ES server's TLS certificate |
 | [`cluster_log_volume_path`](#cluster_log_volume_path) | Bundle | per target | where job-cluster logs are delivered, for cluster configs that opt in |
 | [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | the prefix in every job's display name |

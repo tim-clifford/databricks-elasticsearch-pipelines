@@ -83,7 +83,8 @@ To rename a streaming feed:
      whole group, so every member stops until step 4 (streaming members then catch up from their
      checkpoints); members must agree on `pause_status`, so change it on any other member that sets it
      too. If the group's job has no trigger, there is nothing to pause: just don't start it until step 4.
-2. **Note where it stopped:** the start time of its last successful run and, if the monitoring log is on, its
+2. **Note where it stopped:** the start time of its last successful run (for a continuous feed, of its
+   last successful batch: that `batch_end` row's `start_ts` in the monitoring log) and, if the monitoring log is on, its
    last `batch_summary` row's `source_end_version` and `source_end_index`
    ([how to read them](monitoring.md#caught-up-or-behind)). If it was behind after all, the gap starts
    at that version (its commit time is in `DESCRIBE HISTORY` on the source), not at the last run.
