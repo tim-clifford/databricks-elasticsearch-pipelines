@@ -74,9 +74,10 @@ To rename a streaming feed:
 1. **Stop the old feed.** If it has a schedule or continuous trigger, pause it (`pause_status: PAUSED` in
    its config, then generate and deploy; see [Pausing triggers](feed-configuration.md#pausing-triggers)),
    and let any running run finish, so it doesn't run again before the rename. A job group member has no
-   trigger of its own: pausing it pauses the group's job, so every member stops until step 4 (streaming
-   members then catch up from their checkpoints). Members must agree on `pause_status`, so change it on
-   any other member that sets it too.
+   trigger of its own. If the group's job has one, pausing it pauses the whole group, so every member
+   stops until step 4 (streaming members then catch up from their checkpoints); members must agree on
+   `pause_status`, so change it on any other member that sets it too. If the group's job has no trigger,
+   there is nothing to pause: just don't start it until step 4.
 2. **Note where it stopped:** the time of its last successful run and, if the monitoring log is on, its
    last `batch_summary` row's `source_end_version` and `source_end_index`
    ([how to read them](monitoring.md#caught-up-or-behind)).
