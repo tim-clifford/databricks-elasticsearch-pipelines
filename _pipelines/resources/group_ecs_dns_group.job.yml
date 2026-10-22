@@ -66,6 +66,8 @@ resources:
             max_files_per_trigger: ${var.max_files_per_trigger}
             max_bytes_per_trigger: ${var.max_bytes_per_trigger}
             monitoring_log_enabled: ${var.monitoring_log_enabled}
+            log_monitor_source_lookback_seconds: ${var.log_monitor_source_lookback_seconds}
+            log_monitor_source_history_rows: ${var.log_monitor_source_history_rows}
         email_notifications:
           on_failure: ${var.support_email}
         notification_settings:
@@ -108,6 +110,8 @@ resources:
             max_files_per_trigger: ${var.max_files_per_trigger}
             max_bytes_per_trigger: ${var.max_bytes_per_trigger}
             monitoring_log_enabled: ${var.monitoring_log_enabled}
+            log_monitor_source_lookback_seconds: ${var.log_monitor_source_lookback_seconds}
+            log_monitor_source_history_rows: ${var.log_monitor_source_history_rows}
         email_notifications:
           on_failure: ${var.support_email}
         notification_settings:

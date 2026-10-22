@@ -57,6 +57,10 @@ resources:
         default: ${var.max_bytes_per_trigger}
       - name: monitoring_log_enabled
         default: ${var.monitoring_log_enabled}
+      - name: log_monitor_source_lookback_seconds
+        default: ${var.log_monitor_source_lookback_seconds}
+      - name: log_monitor_source_history_rows
+        default: ${var.log_monitor_source_history_rows}
       continuous:
         pause_status: ${var.schedule_pause_status}
         task_retry_mode: ON_FAILURE
