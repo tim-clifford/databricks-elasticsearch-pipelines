@@ -100,7 +100,9 @@ A continuous feed must set `pipeline_mode: streaming` in its own config, run on 
 `...: config name '...' is not a valid resource key; use only letters, digits, '_' and '-' ...`, or
 `... must not start with '_' ...`
 
-Rename the config file. The name becomes the job's resource key.
+Rename the config file. The name becomes the job's resource key. Renaming a streaming feed that has
+already run starts it from a new checkpoint: see [Renaming a feed](maintenance-jobs.md#renaming-a-feed)
+first.
 
 ### A root resources/ folder or a stale include
 
@@ -258,7 +260,7 @@ signals tell you which side of the balance a feed is on; the levers are explaine
 | 429 rejections (`rejected(429=...)`), or `took_ms` rising run over run | ES is under too much pressure | lower `write_concurrency` or the partition count |
 | `es_diagnostics` (a work in progress) reports `REJECTING`, `SATURATED`, `PRESSURED` or `HEAP_GC_PRESSURE` | the ES host may be the limit | lower the pressure, or add ES capacity |
 | `rtt_ms` far above `took_ms`, no 429s, executors idle | the write is waiting on round trips | raise `write_concurrency`, or add partitions or cores |
-| `gil_wait_ms` a large share of the partition's time | a partition's threads are waiting for the GIL | lower `write_concurrency` and get parallelism from more partitions instead |
+| `gil_wait_ms_total` a large share of `wall_ms` on the `tail:` line, with `rtt_ms` rising while `took_ms` doesn't on the `overall` line | a partition's threads are waiting for the GIL, not for ES ([why](throughput.md#python-threads-and-the-gil)) | lower `write_concurrency` and get the parallelism from more cores (with enough partitions to use them) instead |
 | a high `wall_max/median` or `stragglers>2x` in the `tail:` line | uneven partitions; the slowest sets the pace | `write_repartition` for evenly sized partitions, or a smaller `max_partition_bytes` |
 | a high `docs_max/median` in the `tail:` line | rows are unevenly spread across partitions | `write_repartition` |
 | `docs/send` well below `chunk_size` | requests are smaller than you asked for | `chunk_size` is above the Arrow batch size or some other limit, so raising it does nothing; look at the other levers instead |

@@ -162,7 +162,7 @@ Batch runs emit bulk statistics under the `BULK_STATS` tag with an `overall` rol
 
 Every line carries a `ts=<UTC>` wall-clock token so a batch can be placed in real time. This matters because a micro-batch's write runs server-side (its log output does not reach the notebook cell), so each batch's line is written to a small per-batch file and re-emitted by the notebook's progress recorder (best-effort), appearing alongside the `STREAM_PROGRESS` line (in the notebook cell for an interactive run, in the driver log for a job run) **LATER** than the batch actually ran, so the ambient log timestamp is the relay time and the embedded `ts=` is the true batch time.
 
-The `rtt_ms - took_ms` is the network/queue overhead and `docs/send` is the real docs-per-bulk, so this is the tool for diagnosing whether more `write_concurrency` or cores would help; `gil_wait_ms` (from the connector's GIL-acquisition probe, on connectors that emit it, else `n/a`) separates a slow round trip that is a genuine socket/Elasticsearch wait from one inflated by GIL starvation under a high `write_concurrency`.
+The `rtt_ms - took_ms` is the network/queue overhead and `docs/send` is the real docs-per-bulk, so this is the tool for diagnosing whether more `write_concurrency` or cores would help; `gil_wait_ms` (from the connector's GIL-acquisition probe, on connectors that emit it, else `n/a`) separates a slow round trip that is a genuine socket/Elasticsearch wait from one inflated by GIL starvation under a high `write_concurrency` ([Python threads and the GIL](throughput.md#python-threads-and-the-gil)).
 
 <a id="liquid-clustering"></a>
 ### Monitoring table layout

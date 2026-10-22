@@ -34,8 +34,8 @@ nothing.
 With [`bulk_stats`](parameters.md#bulk_stats) on, each batch logs lines tagged `BULK_STATS`:
 
 - **`overall`:** totals for the batch: `docs/send` (real documents per request), the round-trip time the
-  client saw (`rtt_ms`) and the time ES reports spending (`took_ms`), CPU and GIL-wait totals, and
-  rejection counts.
+  client saw (`rtt_ms`) and the time ES reports spending (`took_ms`), CPU and GIL-wait totals
+  ([what GIL wait means](throughput.md#python-threads-and-the-gil)), and rejection counts.
 - **One line per partition** (batch mode), with median, 95th percentile and maximum for the same timings.
 - **`tail:`**, a summary of the slowest partition against the median one: its wall time, sends and
   documents, and the spread (`wall_p95`, `wall_max/median`, `stragglers>2x`, `docs_max/median`).

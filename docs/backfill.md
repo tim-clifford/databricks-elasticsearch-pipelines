@@ -1,7 +1,8 @@
 # How to Backfill
 
-A guide to re-sending a feed's existing data to Elasticsearch, for example after an index is rebuilt or a
-new feed starts on a table that already has history.
+A guide to re-sending a feed's existing data to Elasticsearch, for example after an index is rebuilt, a
+new feed starts on a table that already has history, or a streaming feed is
+[renamed](maintenance-jobs.md#renaming-a-feed).
 
 > **Work in progress.** This guide is still being written. It covers the approaches in use today; more
 > detail and worked procedures will follow.

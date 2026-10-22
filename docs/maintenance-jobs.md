@@ -5,6 +5,7 @@ The fixed jobs that set up and look after the feeds: views, checkpoints, the con
 - [Maintenance jobs at a glance](#maintenance-jobs-at-a-glance)
 - [Checkpoints](#checkpoints)
 - [Resetting a checkpoint](#resetting-a-checkpoint)
+- [Renaming a feed](#renaming-a-feed)
 - [Diagnosing an Elasticsearch host](#diagnosing-an-elasticsearch-host)
 
 ## Maintenance jobs at a glance
@@ -43,6 +44,84 @@ This deletes the whole checkpoint directory `<checkpoint_base_path>/<config_name
 For a **continuous** (always-on) feed, pause the continuous trigger first (or cancel the running job), run the clear, then resume, so the always-on stream does not re-establish a checkpoint while you clear it.
 
 Concurrency: unlike every other job, `checkpoint_clear` allows up to 20 concurrent runs, so you can reset several feeds' checkpoints at once. Two runs for the same config are harmless (the second finds nothing to delete). Concurrency does not make it safe to clear a checkpoint while that feed's stream is running: stop the stream first. See [technical details](technical-details.md#checkpoint-clear-concurrency) for the concurrency design.
+
+## Renaming a feed
+
+A feed's config file name is its `config_name`, and the framework keys the feed by it: its job
+(`index_pipeline_<config_name>`), its checkpoint (`<checkpoint_base_path>/<config_name>`) and its rows in
+the [monitoring log](monitoring.md#monitoring-log). So renaming the file creates a new feed rather than
+renaming the old one. At the next generate and deploy the old job is removed and a new job takes its
+place (for a [job group](feed-configuration.md#job-groups) member, the group's job stays and only the
+feed's task, `index_pipeline_<config_name>`, is replaced), and the monitoring log has the feed's history under the old name and its new runs under the new
+one. Renaming a `job_group` or setting `job_name_postfix` doesn't change `config_name`, so neither
+affects the checkpoint.
+
+A batch feed loses nothing: every run re-exports the whole view.
+
+**A streaming feed's position does not carry over.** The new name has no checkpoint, so its first run is
+a first run and [`streaming_start`](parameters.md#streaming_start) decides where it begins. The old
+checkpoint is left where it was, unused.
+
+- **`new`** (the default) starts at the source's version as of the start of that first run. Everything
+  after the point the old feed had reached, up to then, is never sent, leaving a **gap** in the index
+  that only a backfill fills. The gap starts where the old stream ended, not when it last ran: if the old
+  feed was behind, the rows it hadn't reached yet are in the gap too.
+- **`full`** re-sends the whole table. That leaves no gap, but it is a full
+  [backfill](backfill.md) in size, and without [`es_id_field`](parameters.md#es_id_field) every document
+  already in the index is written again as a duplicate.
+
+To rename a streaming feed:
+
+1. **Stop the old feed once it is caught up.** Check that its last batch was caught up, not behind
+   ([Caught up or behind](monitoring.md#caught-up-or-behind), if the monitoring log is on), so the gap
+   starts at its last run. Then, if it has a schedule or continuous trigger, pause it
+   (`pause_status: PAUSED` in its config, then generate and deploy; see
+   [Pausing triggers](feed-configuration.md#pausing-triggers)), and let any running run finish. A
+   continuous feed's run doesn't finish on its own: once the trigger is paused, cancel the run if it is
+   still going, and check that it has stopped.
+   - A job group shares one trigger, declared in one or more members' configs (if the member you're
+     renaming is the only one, the trigger moves with the file). If the group's job has one, pausing it pauses the
+     whole group, so every member stops until step 4 (streaming members then catch up from their
+     checkpoints); members must agree on `pause_status`, so change it on any other member that sets it
+     too. If the group's job has no trigger, there is nothing to pause: just don't start it until step 4.
+2. **Note where it stopped:**
+   - the start time of its last successful run (for a continuous feed, of its last successful batch:
+     that `batch_end` row's `start_ts` in the monitoring log);
+   - if the monitoring log is on, that batch's `batch_summary` row (matched to the `batch_end` by
+     `job_run_id`, `task_run_id` and `batch_id`): its `source_end_version` and `source_end_index`
+     ([how to read them](monitoring.md#caught-up-or-behind)). A summary can be missing; then go by the
+     `batch_end` row's `start_ts` and widen the backfill window.
+
+   If the old feed was behind after all, the gap starts at that `source_end_version` (its commit time is
+   in `DESCRIBE HISTORY` on the source), not at the last run.
+3. **Choose how to close the gap** (see [How to Backfill](backfill.md)):
+   - **Re-send the whole table**, if that volume is acceptable: set `streaming_start: full` in the
+     renamed config, so the new feed's first run (scheduled or not) starts at the beginning of the table
+     ([Method 1](backfill.md#method-1-streaming-from-the-start-of-the-table-streaming-feeds-only)).
+   - **Backfill only the gap:** leave `streaming_start` at `new`, and fill the gap after the new feed's
+     first run (step 5).
+4. **Rename the config file**, put `pause_status` back to what it was before step 1 (on every config you
+   changed), regenerate, and deploy. Then run the new feed, or let its trigger start it.
+5. **After the new feed starts:**
+   - If you set `streaming_start: full`, wait until it has completed its first batch (a successful run,
+     or a successful `batch_end` row in the monitoring log; for a continuous feed, its first successful
+     batch). Then remove the key, regenerate and deploy, so a later checkpoint reset doesn't re-send the
+     whole table. Removing it before a batch has completed would let a failed first run restart with
+     `new` and skip the re-send.
+   - If you're backfilling the gap, wait until the new feed's first run has succeeded (for a continuous
+     feed, until its run is up): the gap ends at the start of that run. Then send the rows in the gap with
+     batch runs filtered to that range, from a separate
+     [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill) so they don't collide with
+     the renamed feed's own runs ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). That
+     needs a column recording when each row landed, and that time can be earlier than its commit, so err
+     wide: start well before the point noted in step 2 and end well after the start of that run. With
+     `es_id_field` set the overlap is harmless. Without it, every row in the overlap is written again as
+     a duplicate (rows already in the index keep their random ids), so keep the range as tight as the
+     data allows and expect some duplicates at its edges.
+6. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. First check that no
+   current config has the old name: the job deletes that name's checkpoint either way, and if a feed uses
+   the name, that checkpoint is live. (With no such config, the job warns and clears it anyway.) Left in place, it would be picked up by any future feed
+   given the old name, which would resume from the old position and send everything since.
 
 ## Diagnosing an Elasticsearch host
 

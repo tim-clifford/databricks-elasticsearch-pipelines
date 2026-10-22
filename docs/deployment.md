@@ -48,6 +48,7 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
 | You changed | Run |
 |---|---|
 | a feed config | generate, check, deploy; also `deploy_views` if the change touches the view, source or reference tables |
+| a feed config's file name | the same, but a streaming feed starts over from a new checkpoint: see [Renaming a feed](maintenance-jobs.md#renaming-a-feed) first |
 | a view's `.sql` file | deploy, then `deploy_views` |
 | `databricks.yml` | deploy (generate first if the change is to a value the generator reads: see [Read at generation](parameters.md#bundle-variables)) |
 | a job-cluster spec | generate, check, deploy |
