@@ -5,6 +5,7 @@ The fixed jobs that set up and look after the feeds: views, checkpoints, the con
 - [Maintenance jobs at a glance](#maintenance-jobs-at-a-glance)
 - [Checkpoints](#checkpoints)
 - [Resetting a checkpoint](#resetting-a-checkpoint)
+- [Renaming a feed](#renaming-a-feed)
 - [Diagnosing an Elasticsearch host](#diagnosing-an-elasticsearch-host)
 
 ## Maintenance jobs at a glance
@@ -43,6 +44,53 @@ This deletes the whole checkpoint directory `<checkpoint_base_path>/<config_name
 For a **continuous** (always-on) feed, pause the continuous trigger first (or cancel the running job), run the clear, then resume, so the always-on stream does not re-establish a checkpoint while you clear it.
 
 Concurrency: unlike every other job, `checkpoint_clear` allows up to 20 concurrent runs, so you can reset several feeds' checkpoints at once. Two runs for the same config are harmless (the second finds nothing to delete). Concurrency does not make it safe to clear a checkpoint while that feed's stream is running: stop the stream first. See [technical details](technical-details.md#checkpoint-clear-concurrency) for the concurrency design.
+
+## Renaming a feed
+
+A feed's config file name is its `config_name`, and the framework keys the feed by it: its job
+(`index_pipeline_<config_name>`), its checkpoint (`<checkpoint_base_path>/<config_name>`) and its rows in
+the [monitoring log](monitoring.md#monitoring-log). So renaming the file creates a new feed rather than
+renaming the old one. At the next generate and deploy the old job is removed and a new job takes its
+place, and the monitoring log has the feed's history under the old name and its new runs under the new
+one. Renaming a `job_group` or setting `job_name_postfix` doesn't change `config_name`, so neither
+affects the checkpoint.
+
+A batch feed loses nothing: every run re-exports the whole view.
+
+**A streaming feed's position does not carry over.** The new name has no checkpoint, so its first run is
+a first run and [`streaming_start`](parameters.md#streaming_start) decides where it begins. The old
+checkpoint is left where it was, unused.
+
+- **`new`** (the default) starts at the source's version at the time of that first run. Commits that
+  landed after the old feed's last batch and up to that version are never sent, leaving a **gap** in the
+  index that only a backfill fills.
+- **`full`** re-sends the whole table. That leaves no gap, but it is a full
+  [backfill](backfill.md) in size, and without [`es_id_field`](parameters.md#es_id_field) every document
+  already in the index is written again as a duplicate.
+
+To rename a streaming feed:
+
+1. **Stop the old feed.** If it has a schedule or continuous trigger, pause it (`pause_status: PAUSED` in
+   its config, then generate and deploy; see [Pausing triggers](feed-configuration.md#pausing-triggers)),
+   and let any running run finish, so it doesn't run again before the rename.
+2. **Note where it stopped:** the time of its last successful run and, if the monitoring log is on, its
+   last `batch_summary` row's `source_end_version` and `source_end_index`
+   ([how to read them](monitoring.md#caught-up-or-behind)).
+3. **Choose how to close the gap** (see [How to Backfill](backfill.md)):
+   - **Re-send the whole table**, if that volume is acceptable: set `streaming_start: full` in the
+     renamed config, so the new feed's first run (scheduled or not) starts at the beginning of the table
+     ([Method 1](backfill.md#method-1-streaming-from-the-start-of-the-table-streaming-feeds-only)). Remove
+     the key once the stream has started, so a later checkpoint reset doesn't re-send everything again.
+   - **Backfill only the gap:** leave `streaming_start` at `new`, and after the new feed's first run send
+     the rows that arrived between the old feed's last batch and that run with batch runs filtered to
+     that range ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). That needs a column
+     recording when each row landed. With `es_id_field` set, overlapping the range at either end is
+     harmless, so err wide.
+4. **Rename the config file**, regenerate, and deploy. Then run the new feed, or let its trigger start
+   it.
+5. **Clear the old checkpoint** with `checkpoint_clear` and `config_name=<old name>`. The job warns that
+   no config has that name and clears it anyway. Left in place, it would be picked up by any future feed
+   given the old name, which would resume from the old position and send everything since.
 
 ## Diagnosing an Elasticsearch host
 
