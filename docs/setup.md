@@ -10,6 +10,7 @@ in order. Each setting mentioned here is defined in the [Parameters Reference](p
 - [Defaults for the run-time knobs](#defaults-for-the-run-time-knobs)
 - [Elasticsearch host configs](#elasticsearch-host-configs)
 - [Per-developer checkpoints](#per-developer-checkpoints)
+- [Per-developer views](#per-developer-views)
 - [Optional: the monitoring log table](#monitoring-log-table)
 - [Optional: failure emails, job clusters, cluster logs](#optional-failure-emails-job-clusters-cluster-logs)
 - [First deploy](#first-deploy)
@@ -108,13 +109,14 @@ That identity needs, in Unity Catalog terms:
 
 | For | Needs |
 |---|---|
-| `deploy_views` | `USE CATALOG` and `USE SCHEMA` on the view schema, `CREATE TABLE` there (creating a view requires it), and `SELECT` on each source and reference table |
+| `deploy_views` | `USE CATALOG` and `USE SCHEMA` on the view schema, `CREATE TABLE` there (creating a view requires it), and `SELECT` on each source and reference table. With [per-developer views](#per-developer-views) on, also `CREATE SCHEMA` on the view catalog |
 | Feed jobs | `SELECT` on each view, source and reference table; `READ VOLUME` on the wheel's volume (and the CA bundle's, if set); `READ VOLUME` and `WRITE VOLUME` on the checkpoint volume (streaming); `READ` on the secret scopes; `MODIFY` on the monitoring table (if the log is on) |
 | `checkpoint_clear` | `READ VOLUME` and `WRITE VOLUME` on the checkpoint volume |
 | `es_diagnostics` (a work in progress) | `READ` on the secret scopes (and `READ VOLUME` for the CA bundle, if set) |
 | `build_wheel` | `CAN_READ` on the connector repo folder in the workspace, and `WRITE VOLUME` on the wheel's volume |
 | `log_table_create` | `USE CATALOG`, `USE SCHEMA` and `CREATE TABLE` on the monitoring table's schema; to re-run it on a table another identity created, also `SELECT` and `MODIFY` on the table |
 | `log_table_prune` | `MODIFY` on the monitoring table |
+| `cluster_log_prune` | `READ VOLUME` and `WRITE VOLUME` on the cluster log volume |
 | Cluster log delivery | `READ VOLUME` and `WRITE VOLUME` on the log volume, for the identity the job cluster runs as |
 
 Every job also grants `CAN_MANAGE_RUN` to the workspace's `users` group, so anyone in the workspace can
@@ -302,6 +304,31 @@ targets:
 The bundle resolves `${workspace.current_user.short_name}` at deploy, and the runner adds `/<config_name>`
 for each feed.
 
+<a id="per-developer-views"></a>
+
+## Per-developer views
+
+Views live in Unity Catalog, so without this two developers deploying to one `dev` workspace would
+overwrite each other's views, and one could fail to replace a view the other owns. With
+[`view_schema_per_user`](parameters.md#view_schema_per_user) set to `true` (the `dev` target's
+setting), `deploy_views` creates every view in `<view schema>_<your short name>` (for example
+`es_poc_jane_doe`), creating the schema if it's missing, and every feed job reads its view from there.
+Each developer owns their own copy.
+
+- Only the view moves. Source and reference tables keep their configured names, so every developer
+  reads the same inputs.
+- It needs `CREATE SCHEMA` on the view catalog (see [Permissions](#permissions)).
+- To test against the real view schema for one deploy, turn it off:
+  `databricks bundle deploy -t dev -p <profile> --var view_schema_per_user=false`, then run
+  `deploy_views`. The next deploy without the flag turns it back on.
+- With it on, a missing or illegal user name fails `deploy_views` and the feed runs, rather than
+  falling back to the shared schema.
+
+Developers still share the Elasticsearch indices their feeds write and the
+[monitoring log table](#monitoring-log-table). The log is safe to share (every row carries its job and
+task run ids); two developers writing one index are not, so agree who runs which feed, or point dev
+feeds at separate indices.
+
 <a id="monitoring-log-table"></a>
 
 ## Optional: the monitoring log table
@@ -335,7 +362,8 @@ How to read the table is in [Logging and Monitoring](monitoring.md#monitoring-lo
 - **Job clusters.** If any feed uses `job_cluster` compute, set
   [`cluster_policy_id`](parameters.md#cluster_policy_id) in each target it deploys to.
 - **Cluster log delivery.** To keep job-cluster logs after the cluster ends, see
-  [Cluster log delivery](monitoring.md#cluster-log-delivery).
+  [Cluster log delivery](monitoring.md#cluster-log-delivery). The `cluster_log_prune` job deletes them
+  after [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days) (default 30).
 
 ## First deploy
 
@@ -354,8 +382,8 @@ databricks bundle run log_table_create -t <target> -p <profile>   # optional: on
 databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
 ```
 
-The deploy creates the feed jobs and the six maintenance jobs (`build_wheel`, `deploy_views`,
-`checkpoint_clear`, `es_diagnostics`, `log_table_create`, `log_table_prune`). Commit the files the
+The deploy creates the feed jobs and the seven maintenance jobs (`build_wheel`, `deploy_views`,
+`checkpoint_clear`, `es_diagnostics`, `log_table_create`, `log_table_prune`, `cluster_log_prune`). Commit the files the
 generator writes under `_pipelines/resources/`. Check the feed's output as in the
 [quick start](quick-start.md#verify).
 

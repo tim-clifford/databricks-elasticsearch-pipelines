@@ -26,8 +26,9 @@ The bundle deploys:
   [`framework/notebooks/run_index_pipeline.py`](framework/notebooks/run_index_pipeline.py), with its own
   config, in `batch` mode (re-export the view) or `streaming` mode (send only new source commits).
 - **Maintenance jobs**: creating or replacing the views (`deploy_views`), clearing a streaming
-  checkpoint, checking an Elasticsearch host (a work in progress), building the connector wheel, and
-  creating and pruning the optional monitoring log, a Delta table that records every run and batch.
+  checkpoint, checking an Elasticsearch host (a work in progress), building the connector wheel,
+  creating and pruning the optional monitoring log, a Delta table that records every run and batch, and
+  pruning delivered cluster logs.
 
 ## Documentation
 
@@ -99,13 +100,15 @@ Shared framework (not edited per feed):
       deploy_views.py           Renders each view's parameters from its config, then runs
                                 CREATE OR REPLACE VIEW
       ...                       plus the maintenance notebooks (build_wheel, checkpoint_clear,
-                                es_diagnostics, log_table_create, log_table_prune)
+                                es_diagnostics, log_table_create, log_table_prune,
+                                cluster_log_prune)
     pipeline_lib/               The shared library (used by the generator and the notebooks)
       config.py                 Loads and validates a feed config; the single source of truth for
                                 config keys and run-time knobs
       monitoring_sink.py        Schema and row builders for the monitoring log
       log_table_migration.py    The log table's create-or-add-columns step
       stream_wait.py            The streaming wait loop, so a failed stream always fails its task
+      cluster_log_prune.py      The allow-listed delete plan for the cluster logs prune job
     scripts/
       gen_jobs.py               Generates _pipelines/resources/*.job.yml from the configs
                                 (--check guards drift)
@@ -116,6 +119,7 @@ Shared framework (not edited per feed):
       _es_diagnostics.job.yml     es_diagnostics
       _log_table_create.job.yml   log_table_create
       _log_table_prune.job.yml    log_table_prune (daily; follows schedule_pause_status)
+      _cluster_log_prune.job.yml  cluster_log_prune (daily; follows schedule_pause_status)
     tests/                      Offline unit tests: python -m pytest framework/tests
 
 Config names and job_group names may not start with `_` (checked at generation), so they never collide

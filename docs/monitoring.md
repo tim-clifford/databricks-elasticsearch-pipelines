@@ -205,6 +205,6 @@ The generator inlines the spec verbatim, so every job using that config gets it.
 
 **Permissions.** The identity the job cluster runs as needs `READ VOLUME` and `WRITE VOLUME` on the volume (plus `USE CATALOG` and `USE SCHEMA`).
 
-**They accumulate.** There is no automatic retention: every cluster (every continuous restart, every scheduled run) adds a directory. Prune the volume yourself (or add a cleanup job) if storage matters. See why this is opt-in in [technical details](technical-details.md#cluster-log-delivery-opt-in).
+**Retention.** Every cluster (every continuous restart, every scheduled run) adds a directory. The `cluster_log_prune` job deletes files older than [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days) (default 30) and the directories that leaves empty, daily, paused or unpaused by `schedule_pause_status`. It only touches the `<destination>/<cluster-id>/<log kind>/` layout and leaves anything else on the volume alone ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)). See why delivery is opt-in in [technical details](technical-details.md#cluster-log-delivery-opt-in).
 
 **Sensitive contents.** The logs hold everything the notebook prints and the driver and executors log: config, host URLs, error messages and stack traces. Secret values read through `dbutils.secrets` are redacted in notebook output, but don't assume the same for the delivered files: treat the volume as sensitive and restrict who can read it.
