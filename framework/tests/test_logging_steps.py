@@ -952,7 +952,9 @@ def test_read_source_latest_fetches_the_configured_rows_and_applies_the_look_bac
     assert read_source_latest(session, "c.s.src", 4, 60, now=_NOW) == (11, _at(61))
     assert session.calls == [("sql", "DESCRIBE HISTORY c.s.src LIMIT 4"),
                              ("selectExpr", ("version", "unix_micros(timestamp) AS ts_us"))]
-    assert read_source_latest(_HistorySession(_HISTORY), "c.s.src", 4, 0, now=_NOW)[0] == 13
+    no_look_back = _HistorySession(_HISTORY[:1])
+    assert read_source_latest(no_look_back, "c.s.src", 4, 0, now=_NOW)[0] == 13
+    assert no_look_back.calls[0] == ("sql", "DESCRIBE HISTORY c.s.src LIMIT 1")  # no look-back: one row is enough
 
 
 @pytest.mark.parametrize("rows", [0, -1, 1.5, True, "100", None])
@@ -973,3 +975,7 @@ def test_runner_reads_the_source_version_through_read_source_latest_with_both_kn
     assert ("return read_source_latest(session, SOURCE_FQN, LOG_MONITOR_SOURCE_HISTORY_ROWS,\n"
             "                                      LOG_MONITOR_SOURCE_LOOKBACK_SECONDS)") in source
     assert "DESCRIBE HISTORY" not in source.split("def _read_source_latest", 1)[1].split("def _prune_relays", 1)[0]
+    # The validators return canonical strings; read_source_latest takes ints (a string would make every batch record
+    # source_latest as an error, fail-soft).
+    assert "LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = int(require_log_monitor_source_lookback_seconds(" in source
+    assert "LOG_MONITOR_SOURCE_HISTORY_ROWS = int(require_log_monitor_source_history_rows(" in source

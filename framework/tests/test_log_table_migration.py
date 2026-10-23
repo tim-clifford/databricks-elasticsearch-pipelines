@@ -23,7 +23,11 @@ TABLE = "cat.sch.mon"
 class Field:
     def __init__(self, name, comment):
         self.name = name
-        self.metadata = {"comment": comment} if comment is not None else {}
+        # NO_METADATA stands for a field whose metadata is None rather than a dict.
+        self.metadata = None if comment is NO_METADATA else {"comment": comment} if comment is not None else {}
+
+
+NO_METADATA = object()
 
 
 class FakeSpark:
@@ -134,6 +138,14 @@ def test_a_missing_comment_is_set_and_reported_with_added_columns():
     assert spark.kinds() == ["CREATE", "ADD", "COMMENT source_latest_ts"]
     assert spark.columns == current
     assert "outcome=MIGRATED(added=['docs_written'], comments=['source_latest_ts'])" in summary
+
+
+def test_a_column_with_no_metadata_reads_as_uncommented_and_gets_its_comment():
+    spark = FakeSpark({**_current(), "source_end_index": NO_METADATA})
+    summary = create_or_migrate(spark, TABLE, printer=_quiet())
+    assert spark.kinds() == ["CREATE", "COMMENT source_end_index"]
+    assert spark.columns == _current()
+    assert "outcome=MIGRATED(comments=['source_end_index'])" in summary
 
 
 def test_an_unknown_columns_comment_is_never_touched():

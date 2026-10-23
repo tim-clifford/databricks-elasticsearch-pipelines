@@ -563,7 +563,8 @@ non-negative integer; built-in default `60`. Each batch records the newest sourc
 this long before the read (`source_latest_version`), so a commit that lands between Spark planning the
 batch and the read doesn't make a caught-up batch look [behind](monitoring.md#caught-up-or-behind).
 The trade-off: data committed within this window just before a batch doesn't count as left behind, so
-keep it short next to how far behind matters to you. `0` records the newest commit.
+keep it short next to how far behind matters to you. `0` records the newest commit and reads only one
+history row, whatever [`log_monitor_source_history_rows`](#log_monitor_source_history_rows) is set to.
 
 ### `log_monitor_source_history_rows`
 

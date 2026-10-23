@@ -75,11 +75,13 @@ def source_latest_from_rows(rows, lookback_seconds, now=None):
 def read_source_latest(session, table, history_rows, lookback_seconds, now=None):
     """The batch's `source_latest` (version, commit datetime in UTC) from a live read: the newest `history_rows`
     commits of `table`'s history (`DESCRIBE HISTORY ... LIMIT`, newest first; the commit time as epoch microseconds
-    so the session time zone cannot shift it), picked by source_latest_from_rows with `lookback_seconds`.
+    so the session time zone cannot shift it), picked by source_latest_from_rows with `lookback_seconds`. With no
+    look-back the newest commit is the answer, so it fetches one row (the cost of the read before the look-back).
     `table` is the config's validated source name. Raises on a non-positive or non-integer `history_rows`."""
     if isinstance(history_rows, bool) or not isinstance(history_rows, int) or history_rows < 1:
         raise ValueError(f"history_rows must be a positive int, got {history_rows!r}")
-    rows = (session.sql(f"DESCRIBE HISTORY {table} LIMIT {history_rows}")
+    limit = 1 if lookback_seconds == 0 else history_rows
+    rows = (session.sql(f"DESCRIBE HISTORY {table} LIMIT {limit}")
             .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect())
     return source_latest_from_rows(rows, lookback_seconds, now)
 
