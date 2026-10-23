@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from pipeline_lib.cluster_log_prune import (
-    CLUSTER_ID, LOG_KINDS, PrunePlan, cutoff_ms, execute_plan, parse_retention_days, plan_prune, validate_log_root,
+    CLUSTER_ID, LOG_KINDS, PrunePlan, cutoff_ms, execute_plan, parse_retention_days, plan_prune, run_prune,
+    validate_log_root,
 )
 from pipeline_lib.config import PipelineConfigError
 
@@ -560,3 +561,52 @@ def test_execute_dir_gone_with_its_parent_climbs_to_the_root():
         return []
     assert execute_plan(_plan([], [d]), _Rm(fail=[d]), dry_run=False, ls=ls, root=ROOT) == (0, 1, 0, [])
     assert len(execute_plan(_plan([], [d]), _Rm(fail=[d]), dry_run=False, ls=ls)[3]) == 1
+
+
+# --------------------------------------------------------------------------- run_prune
+
+
+def _never(*a, **k):
+    raise AssertionError("must not be called")
+
+
+def test_run_prune_skips_when_unset_or_disabled():
+    assert "reason=path unset" in run_prune("", 30, CUTOFF, False, _never, _never, log=_never)
+    assert "reason=retention disabled" in run_prune(ROOT, 0, None, False, _never, _never, log=_never)
+
+
+def test_run_prune_dry_run_deletes_nothing_and_lists_the_plan():
+    lines = []
+    summary = run_prune(ROOT, 30, CUTOFF, True, _fs({CID: {"driver": {"a": OLD}}}), _never, log=lines.append)
+    assert "dry_run=True" in summary and "planned_files=1" in summary and "deleted_files=0" in summary
+    assert any(f"would delete {ROOT}/{CID}/driver/a" in l for l in lines)
+    assert any(f"would remove directory {ROOT}/{CID}" in l for l in lines)
+
+
+def test_run_prune_deletes_and_summarizes():
+    rm = _Rm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs({CID: {"driver": {"a": OLD}}, "x.txt": OLD}), rm, log=lambda l: None)
+    assert "deleted_files=1" in summary and "deleted_dirs=2" in summary and "skipped=1" in summary
+    assert [p for p, _ in rm.calls] == [f"{ROOT}/{CID}/driver/a", f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}"]
+
+
+def test_run_prune_raises_after_trying_everything():
+    bad = f"{ROOT}/{CID}/driver/a"
+    rm = _Rm(fail=[bad])
+    tree = {CID: {"driver": {"a": OLD}}, CID2: {"driver": {"b": OLD}}}
+    with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
+        run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lambda l: None)
+    assert f"{ROOT}/{CID2}/driver/b" in [p for p, _ in rm.calls]   # the other cluster was still pruned
+
+
+def test_run_prune_warns_on_a_missing_root():
+    lines = []
+    summary = run_prune(ROOT, 30, CUTOFF, False, _root_ls(FileNotFoundError(ROOT), []), _never, log=lines.append)
+    assert "root_missing=True" in summary and any("does not exist yet" in l for l in lines)
+
+
+def test_run_prune_caps_long_lists():
+    tree = {f"stray{i}.txt": OLD for i in range(250)}
+    lines = []
+    run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _never, log=lines.append)
+    assert sum("SKIPPED" in l for l in lines) == 200 and any("50 more skipped" in l for l in lines)

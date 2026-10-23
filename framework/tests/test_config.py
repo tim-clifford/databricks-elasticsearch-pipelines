@@ -41,9 +41,11 @@ from pipeline_lib.config import (
     require_write_repartition,
     resolve_config,
     describe_schema_rows,
+    ensure_per_user_schema,
     per_user_preflight_problem,
     per_user_schema_collisions,
     schema_owner_problem,
+    selected_config_labels,
     selected_view_files,
     resolve_name,
     select_views,
@@ -740,6 +742,49 @@ def test_describe_schema_rows():
         raise RuntimeError("[PERMISSION_DENIED] User does not have USE SCHEMA on Schema 'cat.s'")
     with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
         describe_schema_rows(denied, "cat.s")
+
+
+class _Sql:
+    """Fake spark.sql(...).collect(): DESCRIBE returns the owner rows in `owners` order (None = not found)."""
+    def __init__(self, *owners):
+        self.owners, self.statements = list(owners), []
+
+    def __call__(self, stmt):
+        self.statements.append(stmt.split(" ")[0])
+        if stmt.startswith("DESCRIBE"):
+            owner = self.owners.pop(0)
+            if owner is None:
+                raise RuntimeError("[SCHEMA_NOT_FOUND] The schema cannot be found.")
+            return [("Owner", owner)]
+        return []
+
+
+def test_ensure_per_user_schema_creates_and_rechecks():
+    sql = _Sql(None, _ME)                      # absent, then ours after the create
+    ensure_per_user_schema("cat.s_me", _ME, sql)
+    assert sql.statements == ["DESCRIBE", "CREATE", "DESCRIBE"]
+    sql = _Sql(_ME, _ME)                       # already ours
+    ensure_per_user_schema("cat.s_me", _ME, sql)
+    assert sql.statements == ["DESCRIBE", "CREATE", "DESCRIBE"]
+
+
+def test_ensure_per_user_schema_refuses_someone_elses():
+    sql = _Sql("jane@x.com")                   # exists, not ours: refused before any CREATE
+    with pytest.raises(ValueError, match="owned by 'jane@x.com'"):
+        ensure_per_user_schema("cat.s_me", _ME, sql)
+    assert sql.statements == ["DESCRIBE"]
+    sql = _Sql(None, "jane@x.com")             # someone else created it between our check and our create
+    with pytest.raises(ValueError, match="owned by 'jane@x.com'"):
+        ensure_per_user_schema("cat.s_me", _ME, sql)
+    sql = _Sql(None, None)                     # can't be described even after the create: fail closed
+    with pytest.raises(ValueError, match="owner can't be read"):
+        ensure_per_user_schema("cat.s_me", _ME, sql)
+
+
+def test_selected_config_labels():
+    cbv = {"a_view": [("a.yml", {}), ("a2.yml", {})], "b_view": [("b.yml", {})]}
+    assert selected_config_labels(["a_view.sql"], cbv) == {"a.yml", "a2.yml"}
+    assert selected_config_labels(["a_view.sql", "b_view.sql"], cbv) == {"a.yml", "a2.yml", "b.yml"}
 
 
 def test_selected_view_files():

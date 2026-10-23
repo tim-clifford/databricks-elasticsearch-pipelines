@@ -304,3 +304,50 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") ->
             else:
                 failures.append(f"remove dir {path}: {type(exc).__name__}: {exc}")
     return deleted_files, deleted_dirs, raced_dirs, failures
+
+
+def _print_capped(log, items, fmt, what, cap=200):
+    for item in items[:cap]:
+        log(fmt(item))
+    if len(items) > cap:
+        log(f"  ... and {len(items) - cap} more {what}")
+
+
+def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log=print) -> str:
+    """The whole prune run: returns the summary line, or raises RuntimeError when anything failed.
+
+    - root unset ("") or retention disabled (cutoff None): nothing to do; a skipped-run summary.
+    - Otherwise plan (plan_prune), print the plan (each list capped at 200 lines; counts stay complete), then
+      execute_plan (no rm call at all on a dry run). Any listing or delete failure raises after every item has
+      been tried, so a partial prune never reports green.
+    """
+    if not root or cutoff is None:
+        return (f"cluster_logs_prune path={root!r} retention_days={retention_days} skipped_run=True "
+                f"reason={'path unset' if not root else 'retention disabled'}")
+    plan = plan_prune(root, ls, cutoff)
+    delete_bytes = sum(size for _, size in plan.delete_files)
+    log(f"  plan: delete {len(plan.delete_files)} file(s) ({delete_bytes} bytes) and {len(plan.delete_dirs)} "
+        f"empty dir(s); keep {plan.kept_files} file(s) ({plan.kept_bytes} bytes)")
+    _print_capped(log, plan.skipped, lambda x: f"  SKIPPED (left untouched, {x[1]}): {x[0]}", "skipped")
+    _print_capped(log, plan.list_errors, lambda x: f"  LIST FAILED (left untouched): {x[0]}: {x[1]}",
+                  "listing failures")
+    if plan.root_missing:
+        log(f"  WARNING: {root!r} does not exist yet (no cluster has delivered logs there); nothing to prune")
+    if dry_run:
+        _print_capped(log, plan.delete_files, lambda x: f"  would delete {x[0]} ({x[1]} bytes)", "file(s)")
+        _print_capped(log, plan.delete_dirs, lambda x: f"  would remove directory {x}", "directories")
+    # Files, then directories deepest first, all non-recursive; a directory that gained a fresh log since the
+    # listing is kept and counted as raced, not a failure.
+    deleted_files, deleted_dirs, raced_dirs, failures = execute_plan(plan, rm, dry_run, ls, root)
+    summary = (
+        f"cluster_logs_prune path={root!r} retention_days={retention_days} dry_run={dry_run} "
+        f"planned_files={len(plan.delete_files)} planned_bytes={delete_bytes} planned_dirs={len(plan.delete_dirs)} "
+        f"deleted_files={deleted_files} deleted_dirs={deleted_dirs} raced_dirs={raced_dirs} "
+        f"kept_files={plan.kept_files} skipped={len(plan.skipped)} root_missing={plan.root_missing} "
+        f"failures={len(failures)}"
+    )
+    if failures:
+        for f in failures[:50]:
+            log(f"  FAILED: {f}")
+        raise RuntimeError(f"cluster_logs_prune FAILED ({len(failures)} failure(s)): {summary}")
+    return summary

@@ -44,9 +44,8 @@ if FRAMEWORK_ROOT not in sys.path:
 
 from pipeline_lib.cluster_log_prune import (  # noqa: E402
     cutoff_ms,
-    execute_plan,
     parse_retention_days,
-    plan_prune,
+    run_prune,
     validate_log_root,
 )
 from pipeline_lib.config import require_es_flag  # noqa: E402
@@ -67,52 +66,9 @@ print(f"  dry_run = {DRY_RUN}")
 # delivery layout), then delete the planned files and the directories that leaves empty, deepest first.
 # A failed delete or an unlistable directory is collected and fails the run at the end, after every other
 # item has been tried, so a partial prune never reports green.
-SUMMARY = None
-if not ROOT or CUTOFF_MS is None:
-    SUMMARY = (
-        f"cluster_logs_prune path={ROOT!r} retention_days={RETENTION_DAYS} "
-        f"skipped_run=True reason={'path unset' if not ROOT else 'retention disabled'}"
-    )
-else:
-    plan = plan_prune(ROOT, dbutils.fs.ls, CUTOFF_MS)
-    delete_bytes = sum(size for _, size in plan.delete_files)
-    print(f"  plan: delete {len(plan.delete_files)} file(s) ({delete_bytes} bytes) and "
-          f"{len(plan.delete_dirs)} empty dir(s); keep {plan.kept_files} file(s) ({plan.kept_bytes} bytes)")
-    # Each list is capped in the output (a path set to a busy shared volume could otherwise flood the log);
-    # the counts below are always complete.
-    for path, reason in plan.skipped[:200]:
-        print(f"  SKIPPED (left untouched, {reason}): {path}")
-    if len(plan.skipped) > 200:
-        print(f"  ... and {len(plan.skipped) - 200} more skipped")
-    for path, err in plan.list_errors[:200]:
-        print(f"  LIST FAILED (left untouched): {path}: {err}")
-    if len(plan.list_errors) > 200:
-        print(f"  ... and {len(plan.list_errors) - 200} more listing failures")
-    if plan.root_missing:
-        print(f"  WARNING: {ROOT!r} does not exist yet (no cluster has delivered logs there); nothing to prune")
-    if DRY_RUN:
-        for path, size in plan.delete_files[:200]:
-            print(f"  would delete {path} ({size} bytes)")
-        if len(plan.delete_files) > 200:
-            print(f"  ... and {len(plan.delete_files) - 200} more file(s)")
-        for path in plan.delete_dirs[:200]:
-            print(f"  would remove directory {path}")
-        if len(plan.delete_dirs) > 200:
-            print(f"  ... and {len(plan.delete_dirs) - 200} more directories")
-    # Files, then directories deepest first, all non-recursive (see pipeline_lib.cluster_log_prune.execute_plan).
-    # A directory that gained a fresh log since the listing is kept and counted as raced, not a failure.
-    deleted_files, deleted_dirs, raced_dirs, failures = execute_plan(plan, dbutils.fs.rm, DRY_RUN, dbutils.fs.ls, ROOT)
-    SUMMARY = (
-        f"cluster_logs_prune path={ROOT!r} retention_days={RETENTION_DAYS} dry_run={DRY_RUN} "
-        f"planned_files={len(plan.delete_files)} planned_bytes={delete_bytes} planned_dirs={len(plan.delete_dirs)} "
-        f"deleted_files={deleted_files} deleted_dirs={deleted_dirs} raced_dirs={raced_dirs} kept_files={plan.kept_files} "
-        f"skipped={len(plan.skipped)} root_missing={plan.root_missing} failures={len(failures)}"
-    )
-    if failures:
-        for f in failures[:50]:
-            print(f"  FAILED: {f}")
-        raise RuntimeError(f"cluster_logs_prune FAILED ({len(failures)} failure(s)): {SUMMARY}")
-
+# See pipeline_lib.cluster_log_prune.run_prune: skip when the path is unset or retention is off, print the
+# plan, delete (unless dry_run), and raise when anything failed.
+SUMMARY = run_prune(ROOT, RETENTION_DAYS, CUTOFF_MS, DRY_RUN, dbutils.fs.ls, dbutils.fs.rm)
 print(f"CLUSTER LOGS PRUNE COMPLETE: {SUMMARY}")
 
 # COMMAND ----------

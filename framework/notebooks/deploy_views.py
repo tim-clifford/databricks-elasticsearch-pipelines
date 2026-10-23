@@ -56,10 +56,10 @@ print("files root:", FILES_ROOT)
 from pipeline_lib.config import (  # noqa: E402
     column_present,
     load_config,
-    describe_schema_rows,
+    ensure_per_user_schema,
     per_user_preflight_problem,
     render_view_sql,
-    schema_owner_problem,
+    selected_config_labels,
     selected_view_files,
     shared_view_conflict,
     view_schema_fqn,
@@ -127,7 +127,7 @@ if len(_selected) < len(sql_files):
 if VIEW_SCHEMA_USER:
     _problem = per_user_preflight_problem(
         [entry for entries in configs_by_view.values() for entry in entries],
-        {label for f in sql_files for label, _ in configs_by_view[os.path.splitext(f)[0]]},
+        selected_config_labels(sql_files, configs_by_view),
         ENVIRONMENT, VIEW_SCHEMA_USER)
     if _problem:
         raise ValueError(_problem)
@@ -247,17 +247,8 @@ for filename in sql_files:
         if VIEW_SCHEMA_USER:
             _schema = view_schema_fqn(subs["view"])
             if _schema not in _schemas_created:
-                _describe = lambda sql: spark.sql(sql).collect()  # noqa: E731
-                _owner_problem = schema_owner_problem(describe_schema_rows(_describe, _schema), _ME, _schema)
-                if _owner_problem:
-                    raise ValueError(_owner_problem)
-                print(f"    CREATE SCHEMA IF NOT EXISTS {_schema}")
-                spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_schema}")
-                # Check again now that it exists: another identity could have created it since the first check
-                # (IF NOT EXISTS would then succeed silently on their schema).
-                _owner_problem = schema_owner_problem(describe_schema_rows(_describe, _schema) or [], _ME, _schema)
-                if _owner_problem:
-                    raise ValueError(_owner_problem)
+                print(f"    CREATE SCHEMA IF NOT EXISTS {_schema} (checking it is ours before and after)")
+                ensure_per_user_schema(_schema, _ME, lambda stmt: spark.sql(stmt).collect())
                 _schemas_created.add(_schema)
         # Print the substitutions and the fully-rendered SQL that is about to run (all ${...}
         # substituted, ${environment} folded in) so the exact CREATE OR REPLACE is visible in the job

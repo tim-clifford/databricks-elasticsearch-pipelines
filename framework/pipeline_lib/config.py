@@ -1816,6 +1816,28 @@ def describe_schema_rows(describe, schema: str):
         raise
 
 
+def ensure_per_user_schema(schema: str, me: str, sql) -> None:
+    """Create per-user `schema` if needed, making sure it is ours before and after. `sql(statement) -> rows`.
+
+    Before: an existing schema owned by anyone else is refused (schema_owner_problem). Then CREATE SCHEMA IF
+    NOT EXISTS, and check again: another identity could have created it in between, and IF NOT EXISTS would
+    then succeed silently on their schema. A schema that can't be described after the create fails closed.
+    Raises ValueError with the reason."""
+    problem = schema_owner_problem(describe_schema_rows(sql, schema), me, schema)
+    if problem:
+        raise ValueError(problem)
+    sql(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+    problem = schema_owner_problem(describe_schema_rows(sql, schema) or [], me, schema)
+    if problem:
+        raise ValueError(problem)
+
+
+def selected_config_labels(sql_files: list, configs_by_view: dict) -> set:
+    """Labels of every config whose view is in `sql_files` (view .sql file names); `configs_by_view` maps a view
+    name to its list of (label, config)."""
+    return {label for f in sql_files for label, _ in configs_by_view[f[:-len(".sql")] if f.endswith(".sql") else f]}
+
+
 def selected_view_files(requested: object, sql_files: list) -> list:
     """The view .sql files deploy_views deploys: `sql_files` narrowed by the `views` parameter (see
     select_views), as file names, in `sql_files` order."""
