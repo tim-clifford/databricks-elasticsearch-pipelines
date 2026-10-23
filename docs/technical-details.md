@@ -128,7 +128,7 @@ A failure while recording a failure never hides the original error (the log faul
 
 `files_outstanding` / `bytes_outstanding` at zero means caught up, but a non-zero backlog is ambiguous: Spark measures it **after** the batch, against the table as it is then, so files that landed while the batch ran count too. Spark's own `latestOffset` would settle it, but the Delta source always reports it as null (seen live on DBR 17.3).
 
-Each streaming batch reads the source's newest commit at its start (`source_latest_version`), and `batch_summary` carries both that and where the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** (it left files that were already there for the next batch) when
+Each streaming batch records the source's newest commit made at least `log_monitor_source_lookback_seconds` (default 60) before its start (`source_latest_version`, from the newest `log_monitor_source_history_rows` history rows, default 100), and `batch_summary` carries both that and where the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** (it left files that were already there for the next batch) when
 
 ```
 source_latest_version >= source_end_version AND files_outstanding > 0
@@ -138,14 +138,29 @@ and otherwise it was caught up (anything outstanding arrived while it ran).
 
 **How to read the end offset:** with `source_end_index = -1` every source version **below** `source_end_version` was sent (five commits v1 to v5 end at version 6, index -1); with an index of 0 or more the batch stopped inside version `source_end_version` after that file (a cap that split one large commit), which the `>=` also counts as behind. A fully sent version is always reported as the next version with index -1, including an initial snapshot (seen in every case on DBR 17.3; Delta never writes its internal end-of-version index into an offset). Commits the reader sends nothing for (table maintenance such as OPTIMIZE, VACUUM and property changes, and the UPDATE / DELETE commits `skipChangeCommits` skips) do not read as behind: the Delta source moves its end offset past them, before or during a batch.
 
-**Where it misreads (always toward behind, and the next batch corrects it):** the newest version is read when the batch starts running, after Spark planned it. Commits landing between the two count as available, so if one carries data, or carries none while other data arrives during the batch (`files_outstanding > 0`), a caught-up batch reads as behind. Normally that gap is sub-second. It is longer for a batch **replayed after a restart**: Spark re-runs the last planned, uncommitted batch with its original end offset, but the read happens at replay time, so anything committed during the downtime counts. A replay shows as a second `batch_start` for the same `batch_id` (under the new attempt's `task_run_id`). A NULL `source_latest_version` (the read failed, or the relay to `batch_summary` was lost; `batch_start` still has it) leaves the batch unclassified.
+**Why the look-back:** Spark plans a batch (fixing its end offset) before the batch starts running and reads the history. A commit landing in that gap is newer than anything the batch could send, so with no look-back it counts as available: if it carries data, or carries none while other data arrives during the batch (`files_outstanding > 0`), a caught-up batch reads as behind. The gap is the offset log write, the call into `foreachBatch`, and the history read itself, usually one to three seconds. The look-back skips every commit newer than the cutoff, so commits in the gap don't count.
+
+**Where it misreads:**
+
+- **Toward caught up:** data committed inside the look-back just before Spark planned the batch doesn't count. If a cap left only such data behind, the batch reads as caught up; the next batch reads as behind if the feed stays over capacity. Keep the look-back short next to how far behind matters to you.
+- **Toward behind, when the source is busier than the fetch:** if more than `log_monitor_source_history_rows` commits land within the look-back, none of the fetched rows is old enough and the oldest one is used. That commit can be newer than the planning point, so a caught-up batch can read as behind. Raise the row count if this happens.
+- **Toward behind, for a batch replayed after a restart:** Spark re-runs the last planned, uncommitted batch with its original end offset, but the read happens at replay time, so anything committed during downtime longer than the look-back counts. A replay shows as a second `batch_start` for the same `batch_id` (under the new attempt's `task_run_id`). A NULL `source_latest_version` (the read failed, or the relay to `batch_summary` was lost; `batch_start` still has it) leaves the batch unclassified.
 
 <a id="source-version-read-cost"></a>
 ### Cost of the source version read
 
-Two steps per batch, both inside the batch before its checkpoint commits, add about 1.6 seconds per batch at the median (live probes on DBR 17.3, standard-mode job cluster):
+Two steps per batch, both inside the batch before its checkpoint commits, add about 3 seconds per batch at the median with the default 100 history rows (live probes on DBR 17.3, standard-mode job cluster):
 
-- The `DESCRIBE HISTORY <source> LIMIT 1` read before the data is sent (median 0.7 seconds, first call on a cluster about 3.7 seconds).
+- The `DESCRIBE HISTORY <source> LIMIT <log_monitor_source_history_rows>` read before the data is sent. Its median grows with the row count (live probe, source with 150 commits, 12 reads each):
+
+  | Rows | Serverless | DBR 17.3 job cluster |
+  |---|---|---|
+  | 1 | 0.60 s | 0.75 s |
+  | 10 | 0.67 s | 0.87 s |
+  | 50 | 0.94 s | 1.39 s |
+  | 100 (default) | 1.32 s | 2.17 s |
+
+  The first call on a cluster is slower (about 3.7 seconds at one row).
 - The relay write that hands the value to `batch_summary`, one small text write to the checkpoint Volume after `batch_end` (median 0.9 seconds, p90 1.1 seconds, first write about 10 seconds).
 
 Both run only for streaming with the log on. There is no knob to skip them with the log on; one could be added by gating `read_source_latest` in `run_index_pipeline.py` (the code already handles a batch without it, and then writes no relay).
