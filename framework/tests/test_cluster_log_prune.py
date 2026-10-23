@@ -443,3 +443,16 @@ def test_missing_root_several_levels_deep_is_an_empty_plan():
             return [SimpleNamespace(name="checkpoints/", size=0, modificationTime=0)]
         raise AssertionError(f"listed above the volume: {path}")
     assert plan_prune(root, ls, CUTOFF).root_missing is True
+
+
+def test_missing_volume_never_climbs_above_it():
+    # The root's volume is itself missing: the climb stops at the volume, so a schema listing that happens
+    # not to contain the volume can't make the root look merely "not created yet".
+    root = "/Volumes/cat/sch/vol/a"
+
+    def ls(path):
+        if path in (root, "/Volumes/cat/sch/vol"):
+            raise FileNotFoundError(path)
+        return [SimpleNamespace(name="other_vol/", size=0, modificationTime=0)]
+    plan = plan_prune(root, ls, CUTOFF)
+    assert plan.root_missing is False and [p for p, _ in plan.list_errors] == [root]

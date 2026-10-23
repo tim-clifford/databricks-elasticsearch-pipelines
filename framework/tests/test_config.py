@@ -665,6 +665,15 @@ def test_per_user_schema_collisions():
     assert per_user_schema_collisions([shared, short], "", "") == []
 
 
+def test_per_user_schema_collisions_skips_unresolvable_configs():
+    # A config needing ${environment} with none given can't resolve: skipped here (deploy_views fails that
+    # view on its own), so it can't abort the whole run before any view deploys.
+    needs_env = validate_config(_with_env())
+    shared = validate_config(_base())
+    short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
+    assert per_user_schema_collisions([needs_env, shared, short], "", "poc") == ["cat.es_poc"]
+
+
 def test_view_schema_fqn_of_per_user_substitution():
     # What deploy_views creates in per-user mode: the suffixed schema, never the catalog or the shared schema.
     subs = view_substitutions(validate_config(_with_env()), "catalog", view_schema_user="tim_clifford")
