@@ -174,7 +174,6 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
             list_errors.append((path, f"{type(exc).__name__}: {exc}"))
             continue
         cluster_clean, cluster_old, cluster_dirs = True, False, []
-        files_before = len(delete_files) + kept["files"]
         for k in kinds:
             kpath = _join(path, k)
             if not (_is_dir(k) and _name(k) in LOG_KINDS):
@@ -184,11 +183,10 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
             k_clean, k_old, k_dirs = walk_log_tree(kpath)
             cluster_dirs += k_dirs + [(kpath, k_clean, k_old, _old(k, cutoff))]
             cluster_clean, cluster_old = cluster_clean and k_clean, cluster_old or k_old
-        # A cluster with no files at all but an eventlog/ directory (Databricks delivers eventlog/ only at
-        # termination) is a terminated cluster's leftover, e.g. from an earlier run that stopped partway.
-        no_files = len(delete_files) + kept["files"] == files_before
-        terminated_leftover = no_files and any(_is_dir(k) and _name(k) == "eventlog" for k in kinds)
-        if cluster_clean and (cluster_old or _old(e, cutoff) or terminated_leftover):
+        # eventlog/ is delivered only at termination, so a clean cluster holding it has terminated. That covers
+        # the one case with no age evidence at all: a file-less tree left by an earlier run that stopped partway.
+        terminated = any(_is_dir(k) and _name(k) == "eventlog" for k in kinds)
+        if cluster_clean and (cluster_old or _old(e, cutoff) or terminated):
             delete_dirs += [d for d, *_ in cluster_dirs] + [path]
         else:
             # Post-order, so each directory's children are decided first; one is removed only when it is
