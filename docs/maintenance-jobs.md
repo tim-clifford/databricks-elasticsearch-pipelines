@@ -201,5 +201,6 @@ databricks bundle run cluster_log_prune -t <target> -p <profile> --params dry_ru
   reported and fails the run after everything else has been tried. A directory is removed only if it is
   still empty, so a log that lands mid-run is never deleted.
 - **Unset path.** With `cluster_log_volume_path` empty the run succeeds without doing anything, so the
-  job can stay scheduled in targets that don't deliver cluster logs.
+  job can stay scheduled in targets that don't deliver cluster logs. A path that is set but doesn't exist
+  yet (no cluster has delivered logs there) also succeeds, with a warning in the run output.
 - **Grants.** The job's identity needs `READ VOLUME` and `WRITE VOLUME` on the volume.

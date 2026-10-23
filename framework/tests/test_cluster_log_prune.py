@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from pipeline_lib.cluster_log_prune import CLUSTER_ID, LOG_KINDS, cutoff_ms, plan_prune, validate_log_root
+from pipeline_lib.cluster_log_prune import (
+    CLUSTER_ID, LOG_KINDS, PrunePlan, cutoff_ms, execute_plan, plan_prune, validate_log_root,
+)
 from pipeline_lib.config import PipelineConfigError
 
 ROOT = "/Volumes/cat/sch/vol/cluster_logs"
@@ -128,15 +130,43 @@ def test_listing_errors_leave_the_subtree_alone_and_are_reported():
 
 
 def test_unlistable_root_is_a_list_error():
+    # Anything other than a positive "not found" (here, a permission error) is a real failure.
     def ls(path):
-        raise FileNotFoundError(path)
+        raise PermissionError(f"denied: {path}")
     plan = plan_prune(ROOT, ls, CUTOFF)
     assert plan.list_errors and plan.list_errors[0][0] == ROOT and plan.delete_files == []
+    assert plan.root_missing is False
+
+
+@pytest.mark.parametrize("exc", [
+    FileNotFoundError("/Volumes/cat/sch/vol/cluster_logs"),
+    RuntimeError("java.io.FileNotFoundException: /Volumes/cat/sch/vol/cluster_logs does not exist"),
+    RuntimeError("ExecutionError: No such file or directory: /Volumes/cat/sch/vol/cluster_logs"),
+])
+def test_missing_root_is_an_empty_plan_not_a_failure(exc):
+    # A configured path no cluster has delivered to yet: nothing to prune, so the scheduled run must not fail.
+    def ls(path):
+        raise exc
+    plan = plan_prune(ROOT, ls, CUTOFF)
+    assert plan.root_missing is True
+    assert plan.list_errors == [] and plan.delete_files == [] and plan.delete_dirs == []
 
 
 def test_empty_root_plans_nothing():
     plan = plan_prune(ROOT, _fs({}), CUTOFF)
-    assert plan == (([], [], 0, 0, [], []))
+    assert plan == PrunePlan([], [], 0, 0, [], [], root_missing=False)
+
+
+def test_empty_cluster_dir_is_removed_but_never_the_root():
+    plan = plan_prune(ROOT, _fs({CID: {}}), CUTOFF)
+    assert plan.delete_dirs == [f"{ROOT}/{CID}"]
+    plan = plan_prune(ROOT, _fs({CID: {"driver": {"stdout": OLD}}, CID2: {}}), CUTOFF)
+    assert ROOT not in plan.delete_dirs
+
+
+def test_cutoff_before_the_epoch_fails_closed():
+    with pytest.raises(PipelineConfigError, match="before 1970"):
+        cutoff_ms(NOW, 10**9)
 
 
 def test_constants():
@@ -173,3 +203,59 @@ def test_validate_log_root_rejects(path):
 def test_validate_log_root_rejects_non_string():
     with pytest.raises(PipelineConfigError, match="must be a string"):
         validate_log_root(42)
+
+
+# --------------------------------------------------------------------------- execute_plan
+
+
+class _Rm:
+    """Records rm calls; raises for the paths in `fail`."""
+    def __init__(self, fail=()):
+        self.calls, self.fail = [], set(fail)
+
+    def __call__(self, path, recurse=None):
+        self.calls.append((path, recurse))
+        if path in self.fail:
+            raise OSError(f"cannot delete {path}")
+        return True
+
+
+def _plan(files, dirs, list_errors=()):
+    return PrunePlan([(f, 10) for f in files], list(dirs), 0, 0, [], list(list_errors))
+
+
+def test_execute_dry_run_deletes_nothing():
+    rm = _Rm()
+    plan = _plan([f"{ROOT}/{CID}/driver/a"], [f"{ROOT}/{CID}/driver"], [(f"{ROOT}/x", "boom")])
+    assert execute_plan(plan, rm, dry_run=True) == (0, 0, [f"list {ROOT}/x: boom"])
+    assert rm.calls == []
+
+
+def test_execute_deletes_files_then_dirs_non_recursively():
+    rm = _Rm()
+    files = [f"{ROOT}/{CID}/driver/a", f"{ROOT}/{CID}/executor/app/0/b"]
+    dirs = [f"{ROOT}/{CID}/executor/app/0", f"{ROOT}/{CID}/executor/app", f"{ROOT}/{CID}/driver"]
+    assert execute_plan(_plan(files, dirs), rm, dry_run=False) == (2, 3, [])
+    assert rm.calls == [(p, False) for p in files + dirs]
+
+
+def test_execute_keeps_going_and_skips_dirs_above_a_failed_file():
+    bad = f"{ROOT}/{CID}/executor/app/0/b"
+    rm = _Rm(fail=[bad])
+    files = [bad, f"{ROOT}/{CID}/driver/a"]
+    dirs = [f"{ROOT}/{CID}/executor/app/0", f"{ROOT}/{CID}/executor/app", f"{ROOT}/{CID}/executor",
+            f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}"]
+    deleted_files, deleted_dirs, failures = execute_plan(_plan(files, dirs), rm, dry_run=False)
+    # The good file and its directory still go; every ancestor of the failed file is skipped, so the one
+    # failure is reported once.
+    assert (deleted_files, deleted_dirs) == (1, 1)
+    assert failures == [f"delete {bad}: OSError: cannot delete {bad}"]
+    assert [p for p, _ in rm.calls] == files + [f"{ROOT}/{CID}/driver"]
+
+
+def test_execute_reports_a_failed_dir_and_its_ancestors_are_skipped():
+    d = f"{ROOT}/{CID}/driver"
+    rm = _Rm(fail=[d])
+    _, deleted_dirs, failures = execute_plan(_plan([], [d, f"{ROOT}/{CID}"]), rm, dry_run=False)
+    assert deleted_dirs == 0 and failures == [f"remove dir {d}: OSError: cannot delete {d}"]
+    assert [p for p, _ in rm.calls] == [d]

@@ -42,7 +42,7 @@ FRAMEWORK_ROOT = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))  # ..
 if FRAMEWORK_ROOT not in sys.path:
     sys.path.insert(0, FRAMEWORK_ROOT)
 
-from pipeline_lib.cluster_log_prune import cutoff_ms, plan_prune, validate_log_root  # noqa: E402
+from pipeline_lib.cluster_log_prune import cutoff_ms, execute_plan, plan_prune, validate_log_root  # noqa: E402
 from pipeline_lib.config import require_es_flag  # noqa: E402
 
 ROOT = validate_log_root(CLUSTER_LOG_VOLUME_PATH)
@@ -82,34 +82,20 @@ else:
         print(f"  SKIPPED (left untouched, {reason}): {path}")
     for path, err in plan.list_errors:
         print(f"  LIST FAILED (left untouched): {path}: {err}")
-
-    failures = [f"list {p}: {e}" for p, e in plan.list_errors]
-    deleted_files = deleted_dirs = 0
+    if plan.root_missing:
+        print(f"  WARNING: {ROOT!r} does not exist yet (no cluster has delivered logs there); nothing to prune")
     if DRY_RUN:
         for path, size in plan.delete_files[:200]:
             print(f"  would delete {path} ({size} bytes)")
         if len(plan.delete_files) > 200:
             print(f"  ... and {len(plan.delete_files) - 200} more file(s)")
-    else:
-        for path, _ in plan.delete_files:
-            try:
-                dbutils.fs.rm(path)
-                deleted_files += 1
-            except Exception as exc:  # noqa: BLE001 - collected; keep going
-                failures.append(f"delete {path}: {type(exc).__name__}: {exc}")
-        for path in plan.delete_dirs:
-            try:
-                # Non-recursive: the directory was planned empty, so a new file landing in it since the
-                # listing makes this fail rather than deleting a fresh log.
-                dbutils.fs.rm(path, recurse=False)
-                deleted_dirs += 1
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"remove dir {path}: {type(exc).__name__}: {exc}")
+    # Files, then directories deepest first, all non-recursive (see pipeline_lib.cluster_log_prune.execute_plan).
+    deleted_files, deleted_dirs, failures = execute_plan(plan, dbutils.fs.rm, DRY_RUN)
     SUMMARY = (
         f"cluster_logs_prune path={ROOT!r} retention_days={RETENTION_DAYS} dry_run={DRY_RUN} "
         f"planned_files={len(plan.delete_files)} planned_bytes={delete_bytes} planned_dirs={len(plan.delete_dirs)} "
         f"deleted_files={deleted_files} deleted_dirs={deleted_dirs} kept_files={plan.kept_files} "
-        f"skipped={len(plan.skipped)} failures={len(failures)}"
+        f"skipped={len(plan.skipped)} root_missing={plan.root_missing} failures={len(failures)}"
     )
     if failures:
         for f in failures[:50]:

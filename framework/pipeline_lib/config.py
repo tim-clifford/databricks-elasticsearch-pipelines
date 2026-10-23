@@ -134,6 +134,7 @@ bad environment value (a hyphen, say) fails closed at resolve time rather than p
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import NamedTuple
 
@@ -1563,9 +1564,14 @@ def view_schema_user(per_user: object, user_name: object) -> str:
     if not _VALID_IDENTIFIER.match(name):
         raise PipelineConfigError(
             f"view_schema_user_name {name!r} is not a legal SQL identifier, so it cannot be appended to "
-            f"a view schema"
+            f"a view schema. A service principal's short name is usually not one: deploy as a service "
+            f"principal (CI) with --var view_schema_per_user=false"
         )
     return name
+
+
+# Unity Catalog's limit on a catalog, schema, or table name.
+_UC_NAME_MAX_CHARS = 255
 
 
 def apply_view_schema_user(resolved: dict, user: str) -> dict:
@@ -1582,6 +1588,11 @@ def apply_view_schema_user(resolved: dict, user: str) -> dict:
     schema = f"{view['schema']}_{user}"
     if not _VALID_IDENTIFIER.match(schema):
         raise PipelineConfigError(f"view schema with user name {schema!r} is not a legal SQL identifier")
+    if len(schema) > _UC_NAME_MAX_CHARS:
+        raise PipelineConfigError(
+            f"view schema with user name {schema!r} is {len(schema)} characters, over Unity Catalog's "
+            f"{_UC_NAME_MAX_CHARS}-character limit"
+        )
     view["schema"] = schema
     return {**resolved, "view": view}
 
@@ -1661,8 +1672,14 @@ def shared_view_conflict(cfgs: list, environment: str, view_schema_user: str = "
 # to start a run over it ("The provided job parameters (in json representation) are too long"; proven on
 # FEVM 2026-10-23: a 10,010-char value was refused at 10,018). `{"views":""}` takes 12 of those, so a
 # `views` value alone can be at most 9,988 characters, and less if other parameters ride the same run.
+# select_views measures the JSON form, so a character that JSON escapes counts at its escaped length.
 JOB_PARAMETERS_JSON_MAX_CHARS = 10_000
 VIEWS_PARAM_MAX_CHARS = JOB_PARAMETERS_JSON_MAX_CHARS - len('{"views":""}')
+
+
+def _views_json_chars(requested: str) -> int:
+    """Characters `{"views": requested}` takes as compact JSON (non-ASCII escaped, the larger form)."""
+    return len(json.dumps({"views": requested}, separators=(",", ":"), ensure_ascii=True))
 
 
 def select_views(requested: object, available: list) -> list:
@@ -1682,7 +1699,7 @@ def select_views(requested: object, available: list) -> list:
         requested = ""
     if not isinstance(requested, str):
         raise PipelineConfigError(f"views must be a string, got {type(requested).__name__}")
-    if len(requested) > VIEWS_PARAM_MAX_CHARS:
+    if _views_json_chars(requested) > JOB_PARAMETERS_JSON_MAX_CHARS:
         raise PipelineConfigError(
             f"views is {len(requested)} characters, over the {VIEWS_PARAM_MAX_CHARS}-character limit (the Jobs "
             f"API caps a run's job parameters at {JOB_PARAMETERS_JSON_MAX_CHARS} characters as JSON); leave "
@@ -1701,6 +1718,15 @@ def select_views(requested: object, available: list) -> list:
         )
     wanted = set(names)
     return [n for n in available if n in wanted]
+
+
+def view_schema_fqn(view_fqn: str) -> str:
+    """`catalog.schema` of a fully-qualified `catalog.schema.name` view (what deploy_views creates in
+    per-user mode)."""
+    parts = view_fqn.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise PipelineConfigError(f"expected a catalog.schema.name view, got {view_fqn!r}")
+    return f"{parts[0]}.{parts[1]}"
 
 
 # The ${token} pattern a view .sql may reference. Shared by every renderer so the substitution rule

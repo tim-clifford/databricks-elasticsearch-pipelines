@@ -170,7 +170,8 @@ leaves empty ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)).
 
 - **Set:** per target, or `--var`. Default `30`.
 - **Takes effect:** at deploy.
-- **Values:** an integer; `0` (or negative) disables the delete. A non-integer fails the run.
+- **Values:** an integer; `0` (or negative) disables the delete. A non-integer, or a number of days that
+  reaches back before 1970 (so nothing could ever be deleted), fails the run.
 
 ### `job_name_prefix`
 

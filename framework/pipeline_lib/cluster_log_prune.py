@@ -35,6 +35,17 @@ class PrunePlan(NamedTuple):
     kept_bytes: int
     skipped: list         # (path, reason) of entries outside the layout, never touched
     list_errors: list     # (path, error) of directories that could not be listed (left alone)
+    root_missing: bool = False  # the root itself does not exist yet (no cluster has delivered logs)
+
+
+# How a listing reports a path that does not exist: Python's FileNotFoundError, or the Java
+# FileNotFoundException that dbutils.fs.ls surfaces inside its error text. Only these mean "absent"; any
+# other listing error is a real failure.
+_NOT_FOUND_MARKERS = ("FileNotFoundException", "No such file or directory")
+
+
+def _is_not_found(exc: Exception) -> bool:
+    return isinstance(exc, FileNotFoundError) or any(m in str(exc) for m in _NOT_FOUND_MARKERS)
 
 
 def validate_log_root(path: object) -> str:
@@ -61,10 +72,19 @@ def validate_log_root(path: object) -> str:
 
 
 def cutoff_ms(now_ms: int, retention_days: int) -> int | None:
-    """Files modified before this epoch-ms are deleted. None when retention is disabled (days <= 0)."""
+    """Files modified before this epoch-ms are deleted. None when retention is disabled (days <= 0).
+
+    Fails closed on a retention so large the cutoff falls at or before the epoch: no file could ever be
+    older, so the job would delete nothing while reporting success."""
     if retention_days <= 0:
         return None
-    return now_ms - retention_days * _MS_PER_DAY
+    cutoff = now_ms - retention_days * _MS_PER_DAY
+    if cutoff <= 0:
+        raise PipelineConfigError(
+            f"cluster_log_retention_days={retention_days} puts the cutoff before 1970, so nothing could ever "
+            f"be deleted; use a realistic number of days, or 0 to disable the delete"
+        )
+    return cutoff
 
 
 def _is_dir(entry) -> bool:
@@ -119,6 +139,9 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
     try:
         top = list(ls(root))
     except Exception as exc:  # noqa: BLE001
+        if _is_not_found(exc):
+            # Configured but not created yet: no cluster has delivered logs, so there is nothing to prune.
+            return PrunePlan([], [], 0, 0, [], [], root_missing=True)
         list_errors.append((root, f"{type(exc).__name__}: {exc}"))
         top = []
     for e in top:
@@ -145,3 +168,38 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
         if cluster_empty:
             delete_dirs.append(path)
     return PrunePlan(delete_files, delete_dirs, kept["files"], kept["bytes"], skipped, list_errors)
+
+
+def execute_plan(plan: PrunePlan, rm, dry_run: bool) -> tuple:
+    """Carry out `plan` with `rm(path, recurse=False)` (dbutils.fs.rm). Returns
+    (deleted_files, deleted_dirs, failures), where failures is a list of messages.
+
+    - dry_run: no rm call at all; the counts are 0 and failures only carry the plan's listing errors.
+    - Files first, then directories in plan order (deepest first). Every rm is non-recursive, so a
+      directory that gained a file since the listing fails to delete instead of taking the new log with it.
+    - Every item is tried even after a failure; failures are collected for the caller to raise on.
+    - A directory above a file that failed to delete is skipped (it can't be empty), so one bad file is
+      reported once rather than once per ancestor directory.
+    """
+    failures = [f"list {p}: {e}" for p, e in plan.list_errors]
+    if dry_run:
+        return 0, 0, failures
+    deleted_files = deleted_dirs = 0
+    failed_paths = []
+    for path, _ in plan.delete_files:
+        try:
+            rm(path, recurse=False)
+            deleted_files += 1
+        except Exception as exc:  # noqa: BLE001 - collected; keep going
+            failures.append(f"delete {path}: {type(exc).__name__}: {exc}")
+            failed_paths.append(path)
+    for path in plan.delete_dirs:
+        if any(f.startswith(path + "/") for f in failed_paths):
+            continue
+        try:
+            rm(path, recurse=False)
+            deleted_dirs += 1
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"remove dir {path}: {type(exc).__name__}: {exc}")
+            failed_paths.append(path)
+    return deleted_files, deleted_dirs, failures

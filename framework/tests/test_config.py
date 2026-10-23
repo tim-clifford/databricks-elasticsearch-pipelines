@@ -44,6 +44,7 @@ from pipeline_lib.config import (
     select_views,
     shared_view_conflict,
     validate_config,
+    view_schema_fqn,
     view_schema_user,
     view_select_body,
     view_substitutions,
@@ -622,6 +623,39 @@ def test_apply_view_schema_user_empty_returns_input():
     assert apply_view_schema_user(resolved, "") is resolved
 
 
+def test_view_schema_user_illegal_name_hints_at_service_principals():
+    with pytest.raises(PipelineConfigError, match="--var view_schema_per_user=false"):
+        view_schema_user("true", "1a2b3c4d-0000")
+
+
+def test_apply_view_schema_user_rejects_over_long_schema():
+    resolved = resolve_config(validate_config(_base()), "")   # view schema es_poc (6 chars)
+    ok = "u" * (255 - len("es_poc_"))
+    assert apply_view_schema_user(resolved, ok)["view"]["schema"] == f"es_poc_{ok}"
+    with pytest.raises(PipelineConfigError, match="over Unity Catalog's 255-character limit"):
+        apply_view_schema_user(resolved, ok + "u")
+
+
+@pytest.mark.parametrize("fqn,expected", [
+    ("acme_catalog.es_poc_tim_clifford.ecs_dns_activity", "acme_catalog.es_poc_tim_clifford"),
+    ("c.s.v", "c.s"),
+])
+def test_view_schema_fqn(fqn, expected):
+    assert view_schema_fqn(fqn) == expected
+
+
+@pytest.mark.parametrize("fqn", ["c.s", "c.s.v.x", "c..v", "", "s.v"])
+def test_view_schema_fqn_rejects_non_three_part(fqn):
+    with pytest.raises(PipelineConfigError, match="catalog.schema.name"):
+        view_schema_fqn(fqn)
+
+
+def test_view_schema_fqn_of_per_user_substitution():
+    # What deploy_views creates in per-user mode: the suffixed schema, never the catalog or the shared schema.
+    subs = view_substitutions(validate_config(_with_env()), "catalog", view_schema_user="tim_clifford")
+    assert view_schema_fqn(subs["view"]) == "acme_catalog.es_poc_tim_clifford"
+
+
 def test_apply_view_schema_user_rejects_illegal_result():
     # Defense in depth: even if a caller skips view_schema_user, an illegal result fails closed.
     resolved = resolve_config(validate_config(_base()), "")
@@ -671,6 +705,14 @@ def test_select_views_length_limit_is_the_jobs_api_budget():
     # The length check comes first, so even a blank-padded over-long value fails rather than meaning "all".
     with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
         select_views(" " * (VIEWS_PARAM_MAX_CHARS + 1), _VIEWS)
+
+
+def test_select_views_length_counts_json_escapes():
+    # The API limit is on the JSON form: a quote or backslash costs 2 characters, a non-ASCII char up to 6.
+    with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
+        select_views('"' * 5_000, _VIEWS)
+    with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
+        select_views("\u00e9" * 2_000, _VIEWS)
 
 
 def test_select_views_non_string_fails():

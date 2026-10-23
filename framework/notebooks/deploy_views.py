@@ -59,6 +59,7 @@ from pipeline_lib.config import (  # noqa: E402
     render_view_sql,
     select_views,
     shared_view_conflict,
+    view_schema_fqn,
     view_schema_user,
     view_substitutions,
 )
@@ -117,18 +118,9 @@ if len(_selected) < len(sql_files):
     sql_files = [f"{name}.sql" for name in _selected]
     print(f"deploying the requested subset: {len(sql_files)} view(s): {', '.join(sql_files)}")
 
-# Per-user mode: create each target schema (<configured schema>_<user>) the selected views land in, once,
-# before deploying. Needs CREATE SCHEMA on the catalog. A failure here fails the run before any view is
-# touched (a missing schema would otherwise fail every view the same way).
-if VIEW_SCHEMA_USER:
-    _schemas = sorted({
-        view_substitutions(configs_by_view[os.path.splitext(f)[0]][0][1], ENVIRONMENT,
-                           view_schema_user=VIEW_SCHEMA_USER)["view"].rsplit(".", 1)[0]
-        for f in sql_files
-    })
-    for _schema in _schemas:
-        print(f"CREATE SCHEMA IF NOT EXISTS {_schema}")
-        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_schema}")
+# Per-user mode creates each view's schema (<configured schema>_<user>) inside the per-view loop below,
+# once per schema, so a view whose config fails to resolve fails on its own like any other view error.
+_schemas_created = set()
 
 # COMMAND ----------
 # Render each view's ${parameter} tokens from its config and run it. The token substitution itself
@@ -233,6 +225,13 @@ for filename in sql_files:
         subs = view_substitutions(cfg, ENVIRONMENT, view_schema_user=VIEW_SCHEMA_USER)
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
             rendered = render_view_sql(fh.read(), subs, filename)
+        # Per-user mode: create the view's schema first, once per schema (needs CREATE SCHEMA on the catalog).
+        if VIEW_SCHEMA_USER:
+            _schema = view_schema_fqn(subs["view"])
+            if _schema not in _schemas_created:
+                print(f"    CREATE SCHEMA IF NOT EXISTS {_schema}")
+                spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_schema}")
+                _schemas_created.add(_schema)
         # Print the substitutions and the fully-rendered SQL that is about to run (all ${...}
         # substituted, ${environment} folded in) so the exact CREATE OR REPLACE is visible in the job
         # output for debugging - but only until the cumulative budget is reached, so many views can't

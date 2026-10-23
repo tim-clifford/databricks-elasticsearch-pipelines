@@ -323,6 +323,8 @@ Each developer owns their own copy.
   `deploy_views`. The next deploy without the flag turns it back on.
 - With it on, a missing or illegal user name fails `deploy_views` and the feed runs, rather than
   falling back to the shared schema.
+- A service principal's short name (a CI deploy) is usually not a legal schema name, so deploy to `dev`
+  as a service principal with `--var view_schema_per_user=false`.
 
 Developers still share the Elasticsearch indices their feeds write and the
 [monitoring log table](#monitoring-log-table). The log is safe to share (every row carries its job and
