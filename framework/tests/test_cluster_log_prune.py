@@ -511,3 +511,39 @@ def test_execute_other_rm_errors_on_a_non_empty_dir_are_failures():
     ls = lambda p: [SimpleNamespace(name="stdout", size=1, modificationTime=NEW)]  # noqa: E731
     _, _, raced, failures = execute_plan(_plan([], [d]), _Rm(fail=[d]), dry_run=False, ls=ls)
     assert raced == 0 and failures == [f"remove dir {d}: OSError: cannot delete {d}"]
+
+
+def test_execute_not_empty_by_exception_type_is_a_race():
+    class PathIsNotEmptyDirectoryException(Exception):
+        pass
+    d = f"{ROOT}/{CID}/driver"
+
+    def rm(path, recurse=None):
+        raise PathIsNotEmptyDirectoryException("refused")
+    ls = lambda p: [SimpleNamespace(name="stdout", size=1, modificationTime=NEW)]  # noqa: E731
+    assert execute_plan(_plan([], [d]), rm, dry_run=False, ls=ls) == (0, 0, 1, [])
+
+
+def test_execute_not_empty_refusal_that_relists_empty_is_a_failure():
+    d = f"{ROOT}/{CID}/driver"
+    _, _, raced, failures = execute_plan(_plan([], [d]), _NotEmptyRm(fail=[d]), dry_run=False, ls=lambda p: [])
+    assert raced == 0 and len(failures) == 1
+
+
+def test_execute_dir_rm_returning_false_on_a_non_empty_dir_is_a_race():
+    d = f"{ROOT}/{CID}/driver"
+    ls = lambda p: [SimpleNamespace(name="stdout", size=1, modificationTime=NEW)] if p == d else []  # noqa: E731
+    assert execute_plan(_plan([], [d]), _Rm(false=[d]), dry_run=False, ls=ls) == (0, 0, 1, [])
+
+
+def test_execute_file_gone_with_its_parent_climbs_to_the_root():
+    # A concurrent cleanup took the file AND its directory: the climb (bounded by root) proves it gone.
+    f = f"{ROOT}/{CID}/driver/a"
+
+    def ls(p):
+        if p in (f"{ROOT}/{CID}/driver",):
+            raise FileNotFoundError(p)
+        return []   # the cluster dir lists without driver/
+    assert execute_plan(_plan([f], []), _Rm(fail=[f]), dry_run=False, ls=ls, root=ROOT) == (1, 0, 0, [])
+    # Without a root the climb doesn't go up, so it is not proven gone.
+    assert len(execute_plan(_plan([f], []), _Rm(fail=[f]), dry_run=False, ls=ls)[3]) == 1

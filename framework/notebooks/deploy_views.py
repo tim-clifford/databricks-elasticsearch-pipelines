@@ -56,9 +56,10 @@ print("files root:", FILES_ROOT)
 from pipeline_lib.config import (  # noqa: E402
     column_present,
     load_config,
-    per_user_schema_collisions,
+    per_user_preflight_problem,
     render_view_sql,
-    select_views,
+    schema_owner_problem,
+    selected_view_files,
     shared_view_conflict,
     view_schema_fqn,
     view_schema_user,
@@ -114,31 +115,23 @@ print(f"found {len(sql_files)} view file(s): {', '.join(sql_files)}")
 # Narrow to the requested subset (empty `views` => all). Validated against the view files found above,
 # fail closed on an unknown name, an empty entry, or an over-long value, BEFORE anything deploys. The
 # pairing checks above still cover every file, so a subset run still catches a wiring mistake anywhere.
-_selected = select_views(VIEWS, [os.path.splitext(f)[0] for f in sql_files])
+_selected = selected_view_files(VIEWS, sql_files)
 if len(_selected) < len(sql_files):
-    sql_files = [f"{name}.sql" for name in _selected]
+    sql_files = _selected
     print(f"deploying the requested subset: {len(sql_files)} view(s): {', '.join(sql_files)}")
 
-# Per-user mode: fail closed if a per-user schema is also some config's real view schema (a plain
-# concatenation like es + poc = es_poc could land on it), before anything deploys.
+# Per-user mode pre-flight, before anything deploys: fail closed if a per-user schema is also a configured
+# schema, or a config outside this subset can't be resolved (so its schemas can't be checked).
+# See pipeline_lib.config.per_user_preflight_problem.
 if VIEW_SCHEMA_USER:
-    _collisions, _unresolved = per_user_schema_collisions(
-        [entry for entries in configs_by_view.values() for entry in entries], ENVIRONMENT, VIEW_SCHEMA_USER)
-    # A config that can't resolve has unknown schemas, so the check is incomplete for it. One in this run's
-    # subset fails its own view below; one outside it would be reported by nothing, so fail closed here.
-    _selected_labels = {label for f in sql_files for label, _ in configs_by_view[os.path.splitext(f)[0]]}
-    _unchecked = [label for label in _unresolved if label not in _selected_labels]
-    if _unchecked:
-        raise ValueError(
-            f"per-user mode can't check for schema collisions: config(s) {', '.join(_unchecked)} (not in this "
-            f"run's views) fail to resolve; fix them, include their views in the run, or deploy with "
-            f"--var view_schema_per_user=false"
-        )
-    if _collisions:
-        raise ValueError(
-            f"per-user view schema(s) {', '.join(_collisions)} are also configured view schemas, so per-user "
-            f"views would replace shared ones; rename the view schema or deploy with --var view_schema_per_user=false"
-        )
+    _problem = per_user_preflight_problem(
+        [entry for entries in configs_by_view.values() for entry in entries],
+        {label for f in sql_files for label, _ in configs_by_view[os.path.splitext(f)[0]]},
+        ENVIRONMENT, VIEW_SCHEMA_USER)
+    if _problem:
+        raise ValueError(_problem)
+    # The deploying identity, to check that an existing per-user schema is really ours (see the loop below).
+    _ME = spark.sql("SELECT current_user()").first()[0]
 
 # Per-user mode creates each view's schema (<configured schema>_<user>) inside the per-view loop below,
 # once per schema, so a view whose config fails to resolve fails on its own like any other view error.
@@ -248,9 +241,20 @@ for filename in sql_files:
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
             rendered = render_view_sql(fh.read(), subs, filename)
         # Per-user mode: create the view's schema first, once per schema (needs CREATE SCHEMA on the catalog).
+        # An existing schema must be owned by the deploying identity: one owned by anyone else is a real shared
+        # schema (or another developer's) whose name happens to match, and per-user views must not go there.
         if VIEW_SCHEMA_USER:
             _schema = view_schema_fqn(subs["view"])
             if _schema not in _schemas_created:
+                try:
+                    _rows = [(r[0], r[1]) for r in spark.sql(f"DESCRIBE SCHEMA EXTENDED {_schema}").collect()]
+                except Exception as _exc:  # noqa: BLE001 - only "not found" means "create it"
+                    if "SCHEMA_NOT_FOUND" not in str(_exc):
+                        raise
+                    _rows = None
+                _owner_problem = schema_owner_problem(_rows, _ME, _schema)
+                if _owner_problem:
+                    raise ValueError(_owner_problem)
                 print(f"    CREATE SCHEMA IF NOT EXISTS {_schema}")
                 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_schema}")
                 _schemas_created.add(_schema)

@@ -40,7 +40,10 @@ from pipeline_lib.config import (
     require_write_concurrency,
     require_write_repartition,
     resolve_config,
+    per_user_preflight_problem,
     per_user_schema_collisions,
+    schema_owner_problem,
+    selected_view_files,
     resolve_name,
     select_views,
     shared_view_conflict,
@@ -694,6 +697,42 @@ def test_per_user_schema_collisions_skips_any_resolve_error():
     shared = validate_config(_base())
     short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
     assert _collisions([{}, shared, short], "", "poc") == ["cat.es_poc"]
+
+
+def test_per_user_preflight_problem():
+    shared = ("shared.yml", validate_config(_base()))   # view schema es_poc
+    short = ("short.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}}))
+    broken = ("broken.yml", {})
+    assert per_user_preflight_problem([shared, short], {"short.yml"}, "", "") is None          # off
+    assert per_user_preflight_problem([shared], {"shared.yml"}, "", "tim_clifford") is None
+    assert "cat.es_poc" in per_user_preflight_problem([shared, short], {"short.yml"}, "", "poc")
+    # A broken config outside the subset blocks the run (its schemas can't be checked) ...
+    msg = per_user_preflight_problem([shared, broken], {"shared.yml"}, "", "tim_clifford")
+    assert msg and "broken.yml" in msg and "can't check" in msg
+    # ... but one inside the subset is left to fail its own view.
+    assert per_user_preflight_problem([shared, broken], {"shared.yml", "broken.yml"}, "", "tim_clifford") is None
+
+
+_ME = "tim.clifford@databricks.com"
+
+
+def test_schema_owner_problem():
+    s = "cat.es_poc_tim_clifford"
+    assert schema_owner_problem(None, _ME, s) is None                                  # doesn't exist yet
+    assert schema_owner_problem([("Namespace Name", "x"), ("Owner", _ME)], _ME, s) is None
+    assert schema_owner_problem([("Owner", "Tim.Clifford@Databricks.com")], _ME, s) is None   # case-insensitive
+    msg = schema_owner_problem([("Owner", "jane@x.com")], _ME, s)
+    assert msg and "owned by 'jane@x.com'" in msg and "--var view_schema_per_user=false" in msg
+    for rows in ([("Namespace Name", "x")], [("Owner", "")], [("Owner", _ME), ("Owner", _ME)]):
+        assert "owner can't be read" in schema_owner_problem(rows, _ME, s)
+
+
+def test_selected_view_files():
+    files = ["a_view.sql", "b_view.sql", "c_view.sql"]
+    assert selected_view_files("", files) == files
+    assert selected_view_files("c_view,a_view", files) == ["a_view.sql", "c_view.sql"]
+    with pytest.raises(PipelineConfigError, match="unknown view"):
+        selected_view_files("a_view.sql", files)
 
 
 def test_per_user_schema_collisions_reports_unresolved_labels():

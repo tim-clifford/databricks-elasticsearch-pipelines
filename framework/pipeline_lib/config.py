@@ -1738,8 +1738,9 @@ def per_user_schema_collisions(entries: list, environment: str, user: str) -> tu
     failure, and fails closed on one outside it (nothing else would report it).
 
     `entries` is every loaded (label, config), not just a subset run's, since any of them may own the shared
-    schema. Not detectable here: two DEVELOPERS whose suffixed names coincide (schema `es` + user `poc_jane` and
-    schema `es_poc` + user `jane` are both `es_poc_jane`); each deploy sees only its own user."""
+    schema. Two DEVELOPERS whose suffixed names coincide (schema `es` + user `poc_jane` and schema `es_poc` +
+    user `jane` are both `es_poc_jane`) aren't visible here; deploy_views catches that, and any other shared
+    schema, with the owner check (schema_owner_problem)."""
     if not user:
         return [], []
     configured, per_user, unresolved = set(), set(), []
@@ -1757,6 +1758,57 @@ def per_user_schema_collisions(entries: list, environment: str, user: str) -> tu
         per_user.add(mine)
     collisions = sorted({s.lower() for s in per_user} & {s.lower() for s in configured})
     return collisions, sorted(unresolved)
+
+
+def per_user_preflight_problem(entries: list, selected_labels: set, environment: str, user: str) -> str | None:
+    """The reason per-user mode must not deploy, or None. Off (no user) => None.
+
+    - Some per-user schema is also a configured schema (see per_user_schema_collisions).
+    - Some config outside this run's subset (`selected_labels`) fails to resolve: its schemas can't be
+      checked and nothing else would report it. One inside the subset fails only its own view, later."""
+    collisions, unresolved = per_user_schema_collisions(entries, environment, user)
+    unchecked = [label for label in unresolved if label not in selected_labels]
+    if unchecked:
+        return (
+            f"per-user mode can't check for schema collisions: config(s) {', '.join(unchecked)} (not in this "
+            f"run's views) fail to resolve; fix them, include their views in the run, or deploy with "
+            f"--var view_schema_per_user=false"
+        )
+    if collisions:
+        return (
+            f"per-user view schema(s) {', '.join(collisions)} are also configured schemas, so per-user views "
+            f"would replace shared ones; rename the view schema or deploy with --var view_schema_per_user=false"
+        )
+    return None
+
+
+def schema_owner_problem(describe_rows, me: str, schema: str) -> str | None:
+    """Per-user mode guard before deploy_views creates/uses `schema`: None when it doesn't exist yet
+    (`describe_rows` None) or `me` owns it; otherwise the reason to fail that view.
+
+    `describe_rows` are `DESCRIBE SCHEMA EXTENDED` rows as (item, value) pairs, with an `Owner` item. A per-user
+    schema owned by anyone else is somebody's real schema (a shared one, or another developer's whose name
+    happens to concatenate the same), so per-user views must not go there. Owner comparison is
+    case-insensitive; a schema with no readable owner fails closed."""
+    if describe_rows is None:
+        return None
+    owners = [str(value) for item, value in describe_rows if str(item).strip().lower() == "owner"]
+    if len(owners) != 1 or not owners[0].strip():
+        return f"per-user schema {schema} exists but its owner can't be read; not deploying per-user views there"
+    if owners[0].strip().lower() != me.strip().lower():
+        return (
+            f"per-user schema {schema} already exists and is owned by {owners[0]!r}, not you ({me!r}): it is "
+            f"someone else's schema, so per-user views won't go there; deploy with --var view_schema_per_user=false "
+            f"or rename the view schema"
+        )
+    return None
+
+
+def selected_view_files(requested: object, sql_files: list) -> list:
+    """The view .sql files deploy_views deploys: `sql_files` narrowed by the `views` parameter (see
+    select_views), as file names, in `sql_files` order."""
+    by_name = {f[:-len(".sql")]: f for f in sql_files if f.endswith(".sql")}
+    return [by_name[n] for n in select_views(requested, [f[:-len(".sql")] for f in sql_files])]
 
 
 def view_schema_fqn(view_fqn: str) -> str:

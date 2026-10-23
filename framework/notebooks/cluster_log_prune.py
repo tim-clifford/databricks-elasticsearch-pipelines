@@ -101,7 +101,7 @@ else:
             print(f"  ... and {len(plan.delete_dirs) - 200} more directories")
     # Files, then directories deepest first, all non-recursive (see pipeline_lib.cluster_log_prune.execute_plan).
     # A directory that gained a fresh log since the listing is kept and counted as raced, not a failure.
-    deleted_files, deleted_dirs, raced_dirs, failures = execute_plan(plan, dbutils.fs.rm, DRY_RUN, dbutils.fs.ls)
+    deleted_files, deleted_dirs, raced_dirs, failures = execute_plan(plan, dbutils.fs.rm, DRY_RUN, dbutils.fs.ls, ROOT)
     SUMMARY = (
         f"cluster_logs_prune path={ROOT!r} retention_days={RETENTION_DAYS} dry_run={DRY_RUN} "
         f"planned_files={len(plan.delete_files)} planned_bytes={delete_bytes} planned_dirs={len(plan.delete_dirs)} "

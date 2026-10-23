@@ -328,9 +328,9 @@ Each developer owns their own copy.
   `deploy_views` fails before deploying. It also fails when a config outside a `views` subset run can't
   be resolved, since its schemas can't be checked; a broken config inside the subset fails only its own
   view.
-- The suffix is a plain `_<short name>`, so two developers can still land in one schema when their names
-  line up with schema names (`es` + `poc_jane` and `es_poc` + `jane` are both `es_poc_jane`). No deploy
-  can see another developer's, so avoid view schemas that are prefixes of each other.
+- If the per-user schema already exists, it must be owned by you. One owned by anyone else (a shared
+  schema with a matching name, or another developer's whose name happens to concatenate the same, such as
+  `es` + `poc_jane` and `es_poc` + `jane`) fails that view instead of deploying into it.
 - A service principal's short name (a CI deploy) is usually not a legal schema name, so deploy to `dev`
   as a service principal with `--var view_schema_per_user=false`.
 

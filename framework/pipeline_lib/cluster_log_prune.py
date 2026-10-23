@@ -235,7 +235,7 @@ def parse_retention_days(raw: object) -> int:
         ) from None
 
 
-def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
+def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") -> tuple:
     """Carry out `plan` with `rm(path, recurse=False)` (dbutils.fs.rm, which returns True on success).
     Returns (deleted_files, deleted_dirs, raced_dirs, failures), failures a list of messages.
 
@@ -272,7 +272,8 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
             deleted_files += 1
         except Exception as exc:  # noqa: BLE001 - collected; keep going
             # Already gone (e.g. a concurrent cleanup), on positive evidence: the parent lists without it.
-            if ls is not None and _absent_from_parent(path, ls):
+            # The climb stops at `root` (the prune root), so a parent removed concurrently still counts.
+            if ls is not None and _absent_from_parent(path, ls, floor=root):
                 deleted_files += 1
                 continue
             failures.append(f"delete {path}: {type(exc).__name__}: {exc}")
@@ -287,7 +288,8 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
             gone = raced = False
             # A race is only the "directory not empty" refusal (seen live as PathIsNotEmptyDirectoryException)
             # on a directory that now lists non-empty; any other remove error (permissions, I/O) is a failure.
-            not_empty = "NotEmpty" in type(exc).__name__ or "PathIsNotEmptyDirectory" in str(exc)
+            not_empty = ("NotEmpty" in type(exc).__name__ or "PathIsNotEmptyDirectory" in str(exc)
+                         or "rm returned False" in str(exc))
             try:
                 raced = ls is not None and len(list(ls(path))) > 0 and not_empty
             except Exception as list_exc:  # noqa: BLE001 - can't tell unless it's positively gone
