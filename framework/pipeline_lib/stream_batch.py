@@ -64,9 +64,9 @@ def source_latest_from_rows(rows, lookback_seconds, now=None):
     batch moments before foreachBatch reads the history, so the look-back keeps a commit that landed in between from
     counting as one the batch left behind; the fallback is still a commit the history read saw. `now` defaults to
     the current UTC time. The cutoff compares the reader's clock with the commit times the source's writers
-    recorded, so clock skew between them shifts the effective look-back by the skew (normally milliseconds). Picks
-    by version, so row order does not matter. Raises on no rows, a negative or non-integer look-back, or an unusable
-    row; the caller records that as the read's error."""
+    recorded, so skew between them shifts the effective look-back by the skew, and commit times rounded to the
+    second by about a second more. Picks by version, so row order does not matter. Raises on no rows, a negative or
+    non-integer look-back, or an unusable row; the caller records that as the read's error."""
     _require_lookback_seconds(lookback_seconds)
     commits =[source_latest_from_row(row) for row in rows]
     if not commits:
