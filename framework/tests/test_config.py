@@ -826,6 +826,12 @@ def test_view_schema_fqn_of_per_user_substitution():
     assert view_schema_fqn(subs["view"]) == "acme_catalog.es_poc_tim_clifford"
 
 
+def test_apply_view_schema_user_rejects_a_trailing_newline():
+    resolved = resolve_config(validate_config(_base()), "")
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        apply_view_schema_user(resolved, "tim\n")
+
+
 def test_apply_view_schema_user_rejects_illegal_result():
     # Defense in depth: even if a caller skips view_schema_user, an illegal result fails closed.
     resolved = resolve_config(validate_config(_base()), "")

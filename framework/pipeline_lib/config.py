@@ -140,7 +140,7 @@ from typing import NamedTuple
 
 # A resolved value substituted into SQL as a bare (unquoted) identifier: a letter/underscore, then
 # letters, digits, underscores. Rejects a hyphen, space, dot, quote, or reserved punctuation.
-_VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")   # \Z, not $: no trailing newline
 
 # The ${environment} substitution token, the only token allowed inside a catalog/schema template.
 _ENV_TOKEN = "${environment}"

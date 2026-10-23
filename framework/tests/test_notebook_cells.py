@@ -139,15 +139,23 @@ def test_job_notebook_params_found():
 
 
 
+def _file_ast(path):
+    """The whole notebook as one module (cell separators are comments; magic lines commented out), so line
+    numbers are file-wide and calls in different cells can be ordered."""
+    src = open(path).read()
+    return ast.parse("\n".join(("#" + line) if line.lstrip().startswith("%") else line for line in src.split("\n")))
+
+
 def _calls(path, func_name):
-    """Every call to `func_name(...)` in a notebook (parsed cell by cell), as ast.Call nodes."""
-    out = []
-    for cell in _cells(path):
-        code = "\n".join(("#" + line) if line.lstrip().startswith("%") else line for line in cell.split("\n"))
-        for node in ast.walk(ast.parse(code)):
-            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == func_name:
-                out.append(node)
-    return out
+    """Every call to `func_name(...)` in a notebook, as ast.Call nodes with file-wide line numbers."""
+    return [n for n in ast.walk(_file_ast(path))
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == func_name]
+
+
+def _attr_calls(path, attr):
+    """Every `<x>.<attr>(...)` call in a notebook, with file-wide line numbers."""
+    return [n for n in ast.walk(_file_ast(path))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == attr]
 
 
 def _passes(call, name):
@@ -163,7 +171,14 @@ def test_deploy_views_threads_the_per_user_suffix():
     for fn in ("view_substitutions", "shared_view_conflict", "per_user_preflight_problem"):
         calls = _calls(nb, fn)
         assert calls and all(_passes(c, "VIEW_SCHEMA_USER") for c in calls), fn
-    assert _calls(nb, "ensure_per_user_schema") and _calls(nb, "view_schema_user")
+    (vsu,) = _calls(nb, "view_schema_user")
+    assert [a.id for a in vsu.args] == ["VIEW_SCHEMA_PER_USER", "VIEW_SCHEMA_USER_NAME"]
+    # Order: the pre-flight before anything deploys; the schema guard before the view's CREATE.
+    (pre,) = _calls(nb, "per_user_preflight_problem")
+    (ensure,) = _calls(nb, "ensure_per_user_schema")
+    creates = [c for c in _attr_calls(nb, "sql") if c.args and getattr(c.args[0], "id", None) == "rendered"]
+    loop = min(c.lineno for c in _calls(nb, "shared_view_conflict"))
+    assert creates and pre.lineno < loop and ensure.lineno < creates[0].lineno
 
 
 def test_runner_applies_the_per_user_suffix_exactly_once():

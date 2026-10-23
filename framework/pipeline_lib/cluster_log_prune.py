@@ -165,8 +165,10 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
         top = []
     # Listing a FILE returns just that file: a log path that points at a file is a misconfiguration, not an
     # empty volume, so fail instead of reporting a green run that pruned nothing.
+    # A single same-named file is ambiguous (a directory can hold a file named like itself), so confirm from the
+    # parent's listing that the root itself is a file.
     root_name = root.rstrip("/").rsplit("/", 1)[-1]
-    if len(top) == 1 and not _is_dir(top[0]) and _name(top[0]) == root_name:
+    if len(top) == 1 and not _is_dir(top[0]) and _name(top[0]) == root_name and _listed_as_file(root, ls):
         list_errors.append((root, "the path is a file, not a directory"))
         top = []
     for e in top:
@@ -207,6 +209,15 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
                     removable.add(d)
                     delete_dirs.append(d)
     return PrunePlan(delete_files, delete_dirs, kept["files"], kept["bytes"], skipped, list_errors)
+
+
+def _listed_as_file(path: str, ls) -> bool:
+    """True when the parent lists `path` as a file (no trailing '/'). Unreadable parent => False."""
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        return any(e.name == name for e in ls(_parent(path)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _absent_from_parent(path: str, ls, floor: str = "") -> bool:

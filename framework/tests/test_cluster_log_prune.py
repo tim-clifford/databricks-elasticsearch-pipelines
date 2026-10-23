@@ -278,10 +278,20 @@ def test_non_ascii_or_padded_cluster_ids_are_skipped(name):
 
 
 def test_a_root_that_is_a_file_fails():
+    # Listing a file returns that file; the parent lists it without a trailing '/'.
     def ls(path):
         return [SimpleNamespace(name="cluster_logs", size=5, modificationTime=OLD)]
     plan = plan_prune(ROOT, ls, CUTOFF)
     assert plan.list_errors == [(ROOT, "the path is a file, not a directory")] and plan.skipped == []
+
+
+def test_a_directory_holding_one_same_named_file_is_a_directory():
+    def ls(path):
+        if path == ROOT:
+            return [SimpleNamespace(name="cluster_logs", size=5, modificationTime=OLD)]
+        return [SimpleNamespace(name="cluster_logs/", size=0, modificationTime=0)]   # the parent: a directory
+    plan = plan_prune(ROOT, ls, CUTOFF)
+    assert plan.list_errors == [] and [p for p, _ in plan.skipped] == [f"{ROOT}/cluster_logs"]
 
 
 def test_cutoff_ms():

@@ -17,6 +17,11 @@ resources:
       # Never run two copies at once, consistent with every other job.
       max_concurrent_runs: 1
 
+      # A first run against months of accumulated logs makes one delete call per file; cap it at 4 hours so a
+      # run that can't finish fails (and emails) instead of running unnoticed. Rerunning is safe: it re-plans
+      # from a fresh listing and carries on.
+      timeout_seconds: 14400
+
       # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
       # rather than queued, matching every generated job and the other maintenance jobs.
       queue:
