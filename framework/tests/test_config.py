@@ -780,6 +780,15 @@ def test_shared_view_conflict_view_schema_user_is_shared_by_all_sharers():
     assert shared_view_conflict([("a.yml", a), ("b.yml", b)], "", "tim_clifford") is None
 
 
+def test_shared_view_conflict_reports_the_per_user_view():
+    # Sharers that disagree (different sources) in per-user mode: the message names the suffixed view, i.e.
+    # the user is passed through to view_substitutions rather than dropped.
+    a = validate_config(_base())
+    b = validate_config({**_base(), "source": {"catalog": "cat", "schema": "ocsf", "table": "other"}})
+    msg = shared_view_conflict([("a.yml", a), ("b.yml", b)], "", "tim_clifford")
+    assert msg is not None and "cat.es_poc_tim_clifford.ecs_dns_activity" in msg
+
+
 def test_shared_view_conflict_single_config_is_none():
     # The trivial case (one pipeline owns the view) is never a conflict.
     assert shared_view_conflict([("a.yml", validate_config(_base()))], "") is None
