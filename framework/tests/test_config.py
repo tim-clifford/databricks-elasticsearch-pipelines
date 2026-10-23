@@ -2173,25 +2173,27 @@ def test_job_parameters_rate_limits_default_from_config():
 # ------------------------------------- log_monitor_source_lookback_seconds / log_monitor_source_history_rows
 
 
-@pytest.mark.parametrize("value,expected", [(0, "0"), ("0", "0"), (90, "90"), (" 15 ", "15"), ("", "60"), (None, "60")])
+@pytest.mark.parametrize("value,expected", [(0, "0"), ("0", "0"), (90, "90"), (" 15 ", "15"), (86400, "86400"),
+                                            ("", "60"), (None, "60")])
 def test_require_log_monitor_source_lookback_seconds_canonical(value, expected):
     # A non-negative int; 0 (no look-back) is a real value, empty => the built-in default 60.
     assert require_log_monitor_source_lookback_seconds(value) == expected
 
 
-@pytest.mark.parametrize("bad", [-1, "-5", 1.5, True, False, "abc", "12.5", [60]])
+@pytest.mark.parametrize("bad", [-1, "-5", 1.5, True, False, "abc", "12.5", [60], 86401, "10" * 12])
 def test_require_log_monitor_source_lookback_seconds_fails_closed(bad):
     with pytest.raises(PipelineConfigError, match="log_monitor_source_lookback_seconds must be a non-negative"):
         require_log_monitor_source_lookback_seconds(bad)
 
 
-@pytest.mark.parametrize("value,expected", [(1, "1"), ("1", "1"), (250, "250"), ("", "100"), (None, "100")])
+@pytest.mark.parametrize("value,expected", [(1, "1"), ("1", "1"), (250, "250"), (10000, "10000"), ("", "100"),
+                                            (None, "100")])
 def test_require_log_monitor_source_history_rows_canonical(value, expected):
     # A positive int; empty => the built-in default 100.
     assert require_log_monitor_source_history_rows(value) == expected
 
 
-@pytest.mark.parametrize("bad", [0, "0", -1, 1.5, True, "abc", "12.5", [100]])
+@pytest.mark.parametrize("bad", [0, "0", -1, 1.5, True, "abc", "12.5", [100], 10001])
 def test_require_log_monitor_source_history_rows_fails_closed(bad):
     with pytest.raises(PipelineConfigError, match="log_monitor_source_history_rows must be a positive"):
         require_log_monitor_source_history_rows(bad)

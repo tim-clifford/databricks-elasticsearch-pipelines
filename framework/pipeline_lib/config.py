@@ -281,6 +281,11 @@ _DEFAULT_WRITE_REPARTITION = 0
 # accepted trade-off. 0 seconds and 1 row is the newest commit (no look-back).
 _DEFAULT_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = 60
 _DEFAULT_LOG_MONITOR_SOURCE_HISTORY_ROWS = 100
+# Upper bounds, so a mistyped value fails at config or run start instead of on every batch: a look-back past a day
+# no longer separates caught up from behind (and a huge one overflows the cutoff, which the fail-soft read would
+# only record as an error), and the history read's cost grows with its row count.
+_MAX_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = 86400
+_MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS = 10000
 
 
 class PipelineConfigError(ValueError):
@@ -796,10 +801,10 @@ def require_max_bytes_per_trigger(value: object, where: str = "max_bytes_per_tri
     raise PipelineConfigError(f"{where} must be a Spark byte-size like '128m' (or empty to leave unset), got {value!r}")
 
 
-def _require_int(value: object, where: str, minimum: int, default: int, rule: str) -> str:
-    """An integer of at least `minimum`, returned as a canonical string; empty/absent returns `default`. Accepts a
+def _require_int(value: object, where: str, minimum: int, maximum: int, default: int, rule: str) -> str:
+    """An integer from `minimum` to `maximum`, returned as a canonical string; empty/absent returns `default`. Accepts a
     YAML int (config value) or a string (run-time override). A bool (int subclass), a float, a non-numeric string,
-    or a value below `minimum` is rejected (fail closed). `rule` names the requirement in the error."""
+    or a value out of range is rejected (fail closed). `rule` names the requirement in the error."""
     if isinstance(value, str):
         value = value.strip()
     if value is None or value == "":
@@ -815,7 +820,7 @@ def _require_int(value: object, where: str, minimum: int, default: int, rule: st
             raise PipelineConfigError(f"{where} must be {rule}, got {value!r}")
     else:
         raise PipelineConfigError(f"{where} must be {rule}, got {value!r}")
-    if parsed < minimum:
+    if not minimum <= parsed <= maximum:
         raise PipelineConfigError(f"{where} must be {rule}, got {value!r}")
     return str(parsed)
 
@@ -823,19 +828,25 @@ def _require_int(value: object, where: str, minimum: int, default: int, rule: st
 def require_log_monitor_source_lookback_seconds(value: object,
                                                 where: str = "log_monitor_source_lookback_seconds") -> str:
     """OPTIONAL monitoring log knob (streaming, log on): how many seconds before its read the per-batch source
-    version read looks back, a NON-NEGATIVE integer as a canonical string. Empty/absent returns the default
-    (_DEFAULT_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS); 0 means no look-back (the newest commit). See the defaults'
-    comment for why it exists. Fail closed on a bool, float, non-numeric or negative value."""
-    return _require_int(value, where, 0, _DEFAULT_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS, "a non-negative integer")
+    version read looks back, an integer from 0 to _MAX_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS as a canonical string.
+    Empty/absent returns the default (_DEFAULT_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS); 0 means no look-back (the newest
+    commit). See the defaults' comment for why it exists. Fail closed on a bool, float, non-numeric or out-of-range
+    value."""
+    return _require_int(value, where, 0, _MAX_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS,
+                        _DEFAULT_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS,
+                        f"a non-negative integer of at most {_MAX_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS}")
 
 
 def require_log_monitor_source_history_rows(value: object,
                                             where: str = "log_monitor_source_history_rows") -> str:
     """OPTIONAL monitoring log knob (streaming, log on): how many of the source's newest history rows the
-    per-batch source version read fetches, a POSITIVE integer as a canonical string. Empty/absent returns the
-    default (_DEFAULT_LOG_MONITOR_SOURCE_HISTORY_ROWS). When none of them is old enough for the look-back, the
-    oldest one is used. Fail closed on a bool, float, non-numeric, zero or negative value."""
-    return _require_int(value, where, 1, _DEFAULT_LOG_MONITOR_SOURCE_HISTORY_ROWS, "a positive integer")
+    per-batch source version read fetches, an integer from 1 to _MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS as a canonical
+    string. Empty/absent returns the default (_DEFAULT_LOG_MONITOR_SOURCE_HISTORY_ROWS). When none of them is old
+    enough for the look-back, the oldest one is used. Fail closed on a bool, float, non-numeric or out-of-range
+    value."""
+    return _require_int(value, where, 1, _MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS,
+                        _DEFAULT_LOG_MONITOR_SOURCE_HISTORY_ROWS,
+                        f"a positive integer of at most {_MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS}")
 
 
 def _require_es_index(value: object, where: str) -> str:

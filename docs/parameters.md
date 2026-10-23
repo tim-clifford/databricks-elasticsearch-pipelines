@@ -559,7 +559,7 @@ without a record. See [Logging and Monitoring](monitoring.md#monitoring-log).
 ### `log_monitor_source_lookback_seconds`
 
 Streaming with the monitoring log on: how far back, in seconds, each batch's source version read looks. A
-non-negative integer; built-in default `60`. Each batch records the newest source commit made at least
+integer from 0 to 86400 (a day); built-in default `60`. Each batch records the newest source commit made at least
 this long before the read (`source_latest_version`), so a commit that lands between Spark planning the
 batch and the read doesn't make a caught-up batch look [behind](monitoring.md#caught-up-or-behind).
 The trade-off: data committed within this window just before a batch doesn't count as left behind, so
@@ -569,7 +569,7 @@ history row, whatever [`log_monitor_source_history_rows`](#log_monitor_source_hi
 ### `log_monitor_source_history_rows`
 
 Streaming with the monitoring log on: how many of the source's newest history rows that read fetches. A
-positive integer; built-in default `100`. If none of them is older than the look-back (the source
+integer from 1 to 10000; built-in default `100`. If none of them is older than the look-back (the source
 committed more often than this within the window), the oldest one fetched is used, so a caught-up
 batch can again read as behind. Larger values make the read slower
 ([cost](technical-details.md#source-version-read-cost)).

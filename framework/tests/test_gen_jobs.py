@@ -726,7 +726,8 @@ def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
     ("pipeline_mode", "turbo"), ("op_type", "has space"), ("streaming_start", "sideways"),
     ("write_repartition", "-5"), ("max_partition_bytes", "32x"), ("chunk_size", "0"),
     ("monitoring_log_enabled", "maybe"), ("log_monitor_source_lookback_seconds", "-1"),
-    ("log_monitor_source_history_rows", "0"),
+    ("log_monitor_source_history_rows", "0"), ("log_monitor_source_history_rows", "10001"),
+    ("log_monitor_source_lookback_seconds", "86401"),
 ])
 def test_require_runtime_knobs_declared_bad_default_fails_closed(tmp_path, name, bad):
     # The registry wires each knob's OWN validator (the same require_* helper the runner applies to the

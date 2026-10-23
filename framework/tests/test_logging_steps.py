@@ -991,3 +991,25 @@ def test_runner_reads_the_source_version_through_read_source_latest_with_both_kn
     # run_start records the effective knobs for a streaming run (None in batch mode, where they do nothing).
     for knob in ("log_monitor_source_lookback_seconds", "log_monitor_source_history_rows"):
         assert f'"{knob}": {knob.upper()} if PIPELINE_MODE == "streaming" else None,' in source
+
+
+def test_read_source_latest_takes_the_cutoff_clock_before_the_read(monkeypatch):
+    # A commit landing while the history read runs is newer than the read's start; with the clock taken after a
+    # slow read (here 5 s) and a 3 s look-back it would count. Taken before, it does not. The fake read advances the
+    # fake clock, so the test tells the two orders apart.
+    import pipeline_lib.stream_batch as sb
+    clock = [_NOW]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    class SlowRead(_HistorySession):
+        def collect(self):
+            clock[0] = _NOW + timedelta(seconds=5)
+            return self.rows
+
+    monkeypatch.setattr(sb, "datetime", Clock)
+    rows = [_commit(9, -1), _commit(8, 10)]  # v9 landed 1 s into the read
+    assert sb.read_source_latest(SlowRead(rows), "c.s.src", 2, 3)[0] == 8

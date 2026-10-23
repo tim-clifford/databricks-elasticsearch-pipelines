@@ -86,6 +86,9 @@ def read_source_latest(session, table, history_rows, lookback_seconds, now=None)
     if isinstance(history_rows, bool) or not isinstance(history_rows, int) or history_rows < 1:
         raise ValueError(f"history_rows must be a positive int, got {history_rows!r}")
     _require_lookback_seconds(lookback_seconds)
+    # The clock is read BEFORE the history: the history's snapshot is taken during the read, so a cutoff taken
+    # after it would shorten the look-back by the read's duration.
+    now = now or datetime.now(timezone.utc)
     limit = 1 if lookback_seconds == 0 else history_rows
     rows = (session.sql(f"DESCRIBE HISTORY {table} LIMIT {limit}")
             .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect())
