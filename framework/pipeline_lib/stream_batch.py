@@ -9,8 +9,9 @@ make_foreach_batch builds it from injected pieces, so its ORDER and failure hand
   the batch's end offset (batch_summary) it tells a batch that left available files behind (behind) from one whose
   outstanding files arrived while it ran (caught up). Read only when the log is on (nothing would record it otherwise). FAIL-SOFT: a failed read is
   recorded as {"error": ...} and printed, never raised, because it is a diagnostic and must not stop the export.
-  It costs one source history read per batch (median 0.7 s for one row in a live probe on DBR 17.3), and the relay
-  write below costs about as much again (median 0.9 s); both happen before the batch's checkpoint commits. It has no
+  It costs one source history read per batch (median 2.2 s at the default 100 rows, 0.75 s at one row, in a live
+  probe on a DBR 17.3 job cluster), and the relay write below about 0.9 s more; both happen before the batch's
+  checkpoint commits (docs/technical-details.md, "Cost of the source version read"). It has no
   timeout of its own on purpose: it reads the same Delta log and metastore the batch has just read from, so a
   hang there stalls the export regardless, and a thread-based timeout inside foreachBatch adds risk for no gain.
 - batch_start is written BEFORE any of the batch's data is sent, so a log outage fails the micro-batch (and the
@@ -57,8 +58,10 @@ def source_latest_from_rows(rows, lookback_seconds, now=None):
     committed at or before `now` minus `lookback_seconds`, else (none is that old) the oldest of them. Spark plans a
     batch moments before foreachBatch reads the history, so the look-back keeps a commit that landed in between from
     counting as one the batch left behind; the fallback is still a commit the history read saw. `now` defaults to
-    the current UTC time. Picks by version, so row order does not matter. Raises on no rows, a negative or
-    non-integer look-back, or an unusable row; the caller records that as the read's error."""
+    the current UTC time. The cutoff compares the reader's clock with the commit times the source's writers
+    recorded, so clock skew between them shifts the effective look-back by the skew (normally milliseconds). Picks
+    by version, so row order does not matter. Raises on no rows, a negative or non-integer look-back, or an unusable
+    row; the caller records that as the read's error."""
     if isinstance(lookback_seconds, bool) or not isinstance(lookback_seconds, int) or lookback_seconds < 0:
         raise ValueError(f"lookback_seconds must be a non-negative int, got {lookback_seconds!r}")
     commits = [source_latest_from_row(row) for row in rows]
@@ -67,6 +70,18 @@ def source_latest_from_rows(rows, lookback_seconds, now=None):
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=lookback_seconds)
     old_enough = [c for c in commits if c[1] <= cutoff]
     return max(old_enough) if old_enough else min(commits)
+
+
+def read_source_latest(session, table, history_rows, lookback_seconds, now=None):
+    """The batch's `source_latest` (version, commit datetime in UTC) from a live read: the newest `history_rows`
+    commits of `table`'s history (`DESCRIBE HISTORY ... LIMIT`, newest first; the commit time as epoch microseconds
+    so the session time zone cannot shift it), picked by source_latest_from_rows with `lookback_seconds`.
+    `table` is the config's validated source name. Raises on a non-positive or non-integer `history_rows`."""
+    if isinstance(history_rows, bool) or not isinstance(history_rows, int) or history_rows < 1:
+        raise ValueError(f"history_rows must be a positive int, got {history_rows!r}")
+    rows = (session.sql(f"DESCRIBE HISTORY {table} LIMIT {history_rows}")
+            .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect())
+    return source_latest_from_rows(rows, lookback_seconds, now)
 
 
 # A failed newest-version read is recorded as its exception type and message, capped (a diagnostic, not the
@@ -86,8 +101,8 @@ def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name,
     - write_metrics(session, batch_id, written): persist the batch's written count (the drain summary reads it).
     - write_print_relay(session, batch_id, text) or None: hand the BULK_STATS line to the notebook's progress
       recorder; None when bulk_stats is off.
-    - read_source_latest(session) -> (version, commit datetime): the source commit to record (the notebook reads the
-      newest history rows and picks with source_latest_from_rows). Pass None to
+    - read_source_latest(session) -> (version, commit datetime): the source commit to record (the notebook binds
+      this module's read_source_latest to its source and knobs). Pass None to
       skip the read (batch_start then carries no source_latest). Anything it raises or returns that is not a
       usable (version, datetime) pair is recorded as source_latest {"error": ...}.
     - write_source_relay(session, batch_id, facts), or None: hand `source_latest` to the progress recorder.

@@ -886,11 +886,17 @@ def test_source_latest_from_rows_does_not_depend_on_row_order():
 
 
 def test_source_latest_from_rows_defaults_now_to_the_current_time():
+    # v2 (two minutes old) is picked only when the cutoff really is now minus 60 s: a default in the past leaves no
+    # row old enough (the fallback gives v1), one in the future admits v3.
     from pipeline_lib.stream_batch import source_latest_from_rows
     real_now = datetime.now(timezone.utc)
-    old = {"version": 1, "ts_us": (real_now - timedelta(hours=1) - _EPOCH) // timedelta(microseconds=1)}
-    new = {"version": 2, "ts_us": (real_now - _EPOCH) // timedelta(microseconds=1)}
-    assert source_latest_from_rows([new, old], 60)[0] == 1
+
+    def at(age):
+        return (real_now - age - _EPOCH) // timedelta(microseconds=1)
+
+    rows = [{"version": 3, "ts_us": at(timedelta(0))}, {"version": 2, "ts_us": at(timedelta(minutes=2))},
+            {"version": 1, "ts_us": at(timedelta(hours=1))}]
+    assert source_latest_from_rows(rows, 60)[0] == 2
 
 
 @pytest.mark.parametrize("lookback", [-1, 1.5, True, "60", None])
@@ -919,3 +925,51 @@ def test_foreach_batch_records_the_look_back_pick_on_batch_start():
     assert json.loads(start["payload"]) == {"mode": "streaming", "source_latest": expected}
     assert start["source_latest_version"] == 11
     assert ev.items[-1] == ("source_relay", 4, expected)
+
+
+class _HistorySession:
+    """Records the history read's SQL and projection and returns `rows`."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def sql(self, stmt):
+        self.calls.append(("sql", stmt))
+        return self
+
+    def selectExpr(self, *exprs):
+        self.calls.append(("selectExpr", exprs))
+        return self
+
+    def collect(self):
+        return self.rows
+
+
+def test_read_source_latest_fetches_the_configured_rows_and_applies_the_look_back():
+    from pipeline_lib.stream_batch import read_source_latest
+    session = _HistorySession(_HISTORY)
+    assert read_source_latest(session, "c.s.src", 4, 60, now=_NOW) == (11, _at(61))
+    assert session.calls == [("sql", "DESCRIBE HISTORY c.s.src LIMIT 4"),
+                             ("selectExpr", ("version", "unix_micros(timestamp) AS ts_us"))]
+    assert read_source_latest(_HistorySession(_HISTORY), "c.s.src", 4, 0, now=_NOW)[0] == 13
+
+
+@pytest.mark.parametrize("rows", [0, -1, 1.5, True, "100", None])
+def test_read_source_latest_rejects_a_bad_row_count_before_reading(rows):
+    from pipeline_lib.stream_batch import read_source_latest
+    session = _HistorySession(_HISTORY)
+    with pytest.raises(ValueError, match="history_rows"):
+        read_source_latest(session, "c.s.src", rows, 60, now=_NOW)
+    assert session.calls == []
+
+
+def test_runner_reads_the_source_version_through_read_source_latest_with_both_knobs():
+    # The notebook glue: its read binds the source, the row count and the look-back, in that order, so neither knob
+    # can be dropped or swapped without this failing.
+    import os
+    nb = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks", "run_index_pipeline.py")
+    source = open(nb).read()
+    assert ("return read_source_latest(session, SOURCE_FQN, LOG_MONITOR_SOURCE_HISTORY_ROWS,\n"
+            "                                      LOG_MONITOR_SOURCE_LOOKBACK_SECONDS)") in source
+    assert "DESCRIBE HISTORY" not in source.split("def _read_source_latest", 1)[1].split("def _prune_relays", 1)[0]

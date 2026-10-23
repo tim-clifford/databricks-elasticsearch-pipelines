@@ -238,7 +238,7 @@ from pipeline_lib.config import (  # noqa: E402
 from pipeline_lib.batch_export import run_batch_export  # noqa: E402
 from pipeline_lib.monitoring_writer import MonitoringLog, resolve_log_table, spark_append  # noqa: E402
 from pipeline_lib.run_record import RunRecorder  # noqa: E402
-from pipeline_lib.stream_batch import make_foreach_batch, source_latest_from_rows  # noqa: E402
+from pipeline_lib.stream_batch import make_foreach_batch, read_source_latest  # noqa: E402
 from pipeline_lib.stream_progress import ProgressRecorder, parse_source_relay, prune_relay_dirs  # noqa: E402
 # Log-line tag for this notebook's own streaming status lines.
 import json  # noqa: E402
@@ -639,8 +639,9 @@ if PIPELINE_MODE == "streaming":
         # it. With the end offset on batch_summary it tells "caught up, new files arrived during the batch" from
         # "behind, available files were left for the next batch". BEST-EFFORT on batch_summary (batch_start always
         # has it). COST, per batch and before its checkpoint commits: one `DESCRIBE HISTORY ... LIMIT <rows>` (median
-        # 0.7 s at LIMIT 1) plus one relay write after batch_end (median 0.9 s), about 1.6 s (live probes, DBR 17.3). Both are
-        # skipped when the log is off; a knob to skip them with the log on could gate `read_source_latest` below.
+        # 2.2 s at the default 100 rows, 0.75 s at 1) plus one relay write after batch_end (median 0.9 s), about 3 s at
+        # the default (live probes, DBR 17.3 job cluster; docs/technical-details.md). Both are skipped when the log is
+        # off; a knob to skip them with the log on could gate `read_source_latest` below.
         # Cleared at run start.
         source_relay_dir = f"{checkpoint_location}/_source_version_relay"
         dbutils.fs.rm(source_relay_dir, recurse=True)
@@ -687,14 +688,12 @@ if PIPELINE_MODE == "streaming":
             return _read_relay(print_relay_dir, batch_id)
 
         def _read_source_latest(session):
-            # The newest LOG_MONITOR_SOURCE_HISTORY_ROWS commits (history is newest-first), and of those the newest
-            # committed at least LOG_MONITOR_SOURCE_LOOKBACK_SECONDS before this read, else the oldest fetched
-            # (source_latest_from_rows). Spark planned the batch moments before this read, so a commit landing in
-            # between is newer than the cutoff and is not counted. The commit time is read as epoch microseconds so
-            # the session time zone cannot shift it.
-            rows = (session.sql(f"DESCRIBE HISTORY {SOURCE_FQN} LIMIT {LOG_MONITOR_SOURCE_HISTORY_ROWS}")
-                    .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect())
-            return source_latest_from_rows(rows, LOG_MONITOR_SOURCE_LOOKBACK_SECONDS)
+            # The newest LOG_MONITOR_SOURCE_HISTORY_ROWS commits, and of those the newest committed at least
+            # LOG_MONITOR_SOURCE_LOOKBACK_SECONDS before this read, else the oldest fetched
+            # (pipeline_lib.stream_batch.read_source_latest). Spark planned the batch moments before this read, so a
+            # commit landing in between is newer than the cutoff and is not counted.
+            return read_source_latest(session, SOURCE_FQN, LOG_MONITOR_SOURCE_HISTORY_ROWS,
+                                      LOG_MONITOR_SOURCE_LOOKBACK_SECONDS)
 
         def _prune_relays(below_batch_id):
             # Delete every batch's relay below `below_batch_id` (reports that were lost), one listing per dir.
