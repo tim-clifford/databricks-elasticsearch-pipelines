@@ -196,6 +196,14 @@ def test_fresh_empty_dirs_are_kept_old_empty_dirs_removed():
     assert plan.delete_dirs == [f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}/executor", f"{ROOT}/{CID}"]
 
 
+def test_fresh_empty_dir_deep_in_a_log_kind_is_kept():
+    # executor/app2/ is a just-started application's empty directory: it stays, so executor/ and the cluster
+    # stay too, while the fully old executor/app/ subtree goes.
+    tree = {CID: {"executor": {"app": {"0": {"stderr": OLD}}, "app2": {}}}}
+    plan = plan_prune(ROOT, _fs(tree), CUTOFF)
+    assert plan.delete_dirs == [f"{ROOT}/{CID}/executor/app/0", f"{ROOT}/{CID}/executor/app"]
+
+
 def test_the_root_is_never_removed():
     plan = plan_prune(ROOT, _fs({CID: {"driver": {"stdout": OLD}}, CID2: {"__mtime__": OLD}}), CUTOFF)
     assert ROOT not in plan.delete_dirs and f"{ROOT}/{CID}" in plan.delete_dirs
