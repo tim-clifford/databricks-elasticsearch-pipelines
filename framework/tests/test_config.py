@@ -665,6 +665,25 @@ def test_per_user_schema_collisions():
     assert per_user_schema_collisions([shared, short], "", "") == []
 
 
+def test_per_user_schema_collisions_include_source_and_reference_schemas():
+    # View schema "src" + user "dev" is "src_dev", the source table's schema: views would land among the
+    # source tables.
+    cfg = validate_config({**_base(), "view": {"catalog": "cat", "schema": "src", "name": "v"},
+                           "source": {"catalog": "cat", "schema": "src_dev", "table": "t"}})
+    assert per_user_schema_collisions([cfg], "", "dev") == ["cat.src_dev"]
+    # _with_env joins acme_catalog.ocsf_validation_catalog (a reference table): view schema "ocsf" + user
+    # "validation_catalog" lands on it.
+    ref = validate_config({**_with_env(), "view": {"catalog": "acme_${environment}", "schema": "ocsf", "name": "v"}})
+    assert per_user_schema_collisions([ref], "catalog", "validation_catalog") == ["acme_catalog.ocsf_validation_catalog"]
+
+
+def test_per_user_schema_collisions_skips_any_resolve_error():
+    # Not only PipelineConfigError: a malformed config dict (KeyError) is also left to the per-view loop.
+    shared = validate_config(_base())
+    short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
+    assert per_user_schema_collisions([{}, shared, short], "", "poc") == ["cat.es_poc"]
+
+
 def test_per_user_schema_collisions_skips_unresolvable_configs():
     # A config needing ${environment} with none given can't resolve: skipped here (deploy_views fails that
     # view on its own), so it can't abort the whole run before any view deploys.

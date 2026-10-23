@@ -1724,20 +1724,29 @@ def select_views(requested: object, available: list) -> list:
 
 
 def per_user_schema_collisions(cfgs: list, environment: str, user: str) -> list:
-    """Per-user view schemas that are ALSO a configured (unsuffixed) view schema, sorted. Empty when off.
+    """Per-user view schemas that are ALSO a configured schema (any config's view, source or reference
+    table schema), sorted. Empty when off.
 
     `<view schema>_<user>` is a plain concatenation, so e.g. schema `es` + user `poc` is `es_poc`, which may
     be another feed's real, shared view schema; deploy_views fails closed rather than replace views there.
     `cfgs` is every loaded config (not just a subset run's), since any of them may own the shared schema.
-    A config that fails to resolve is skipped here: deploy_views reports it as that view's own failure."""
+    A config that fails to resolve (any error) is skipped here: deploy_views reports it as that view's own
+    failure, so this pre-check never aborts the run on its own.
+
+    Not detectable here: two DEVELOPERS whose suffixed names coincide (schema `es` + user `poc_jane` and
+    schema `es_poc` + user `jane` are both `es_poc_jane`); each deploy sees only its own user."""
     if not user:
         return []
     configured, per_user = set(), set()
     for c in cfgs:
         try:
-            configured.add(view_schema_fqn(view_substitutions(c, environment)["view"]))
+            resolved = resolve_config(c, environment)
+            configured.add(f"{resolved['view']['catalog']}.{resolved['view']['schema']}")
+            configured.add(f"{resolved['source']['catalog']}.{resolved['source']['schema']}")
+            for spec in resolved["reference_tables"].values():
+                configured.add(f"{spec['catalog']}.{spec['schema']}")
             per_user.add(view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"]))
-        except PipelineConfigError:
+        except Exception:  # noqa: BLE001 - reported per view by deploy_views
             continue
     return sorted(per_user & configured)
 

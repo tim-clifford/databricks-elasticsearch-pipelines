@@ -456,3 +456,18 @@ def test_missing_volume_never_climbs_above_it():
         return [SimpleNamespace(name="other_vol/", size=0, modificationTime=0)]
     plan = plan_prune(root, ls, CUTOFF)
     assert plan.root_missing is False and [p for p, _ in plan.list_errors] == [root]
+
+
+def test_execute_file_already_gone_counts_as_deleted():
+    # The file vanished between listing and delete (rm raises or returns False) and the parent lists
+    # without it: counted as deleted, not a failure, and its directory is still removed.
+    f, d = f"{ROOT}/{CID}/driver/a", f"{ROOT}/{CID}/driver"
+    for rm in (_Rm(fail=[f]), _Rm(false=[f])):
+        assert execute_plan(_plan([f], [d]), rm, dry_run=False, ls=lambda p: []) == (1, 1, 0, [])
+
+
+def test_execute_file_rm_failure_with_file_still_listed_is_a_failure():
+    f, d = f"{ROOT}/{CID}/driver/a", f"{ROOT}/{CID}/driver"
+    ls = lambda p: [SimpleNamespace(name="a", size=1, modificationTime=OLD)]  # noqa: E731
+    deleted_files, deleted_dirs, _, failures = execute_plan(_plan([f], [d]), _Rm(fail=[f]), dry_run=False, ls=ls)
+    assert (deleted_files, deleted_dirs, len(failures)) == (0, 0, 1)

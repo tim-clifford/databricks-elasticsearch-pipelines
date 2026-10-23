@@ -241,7 +241,8 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
       directory that gained a file since the listing fails to delete instead of taking the new log with it.
     - A directory whose remove fails but which `ls` now shows non-empty is a race with a fresh delivery,
       not a failure: it is counted in raced_dirs and kept (so a live cluster doesn't page support).
-    - An rm that returns False deleted nothing, so it is a failure, not a success.
+    - An rm that returns False deleted nothing, so it is a failure, not a success, unless `ls` shows the
+      file or directory positively gone (the parent lists without it), which counts as removed.
     - Every item is tried even after a failure; failures are collected for the caller to raise on.
     - A directory above a file or directory that failed (or raced) is skipped (it can't be empty), so one
       problem is reported once rather than once per ancestor directory.
@@ -267,6 +268,10 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
             _rm(path)
             deleted_files += 1
         except Exception as exc:  # noqa: BLE001 - collected; keep going
+            # Already gone (e.g. a concurrent cleanup), on positive evidence: the parent lists without it.
+            if ls is not None and _absent_from_parent(path, ls):
+                deleted_files += 1
+                continue
             failures.append(f"delete {path}: {type(exc).__name__}: {exc}")
             _block(path)
     for path in plan.delete_dirs:

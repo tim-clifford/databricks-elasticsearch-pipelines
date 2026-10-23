@@ -1420,6 +1420,18 @@ def test_shipped_databricks_yml_declares_global_job_tags():
     assert gen_jobs.load_global_job_tags() == {}  # ships empty on main
 
 
+def test_shipped_databricks_yml_per_user_views_and_cluster_log_retention():
+    # Per-user view schemas are off by default and ON in dev (dropping the dev override would put every
+    # developer back in one shared view schema); cluster log retention defaults to 30 days.
+    with open(os.path.join(_REPO_ROOT, "databricks.yml")) as fh:
+        bundle = yaml.safe_load(fh)
+    assert bundle["variables"]["view_schema_per_user"]["default"] == "false"
+    assert bundle["targets"]["dev"]["variables"]["view_schema_per_user"] == "true"
+    for target in ("stg", "prd"):
+        assert "view_schema_per_user" not in bundle["targets"][target].get("variables", {})
+    assert bundle["variables"]["cluster_log_retention_days"]["default"] == "30"
+
+
 @pytest.mark.parametrize("filename,job_key", [
     ("_deploy_views.job.yml", "deploy_views"),
     ("_checkpoint_clear.job.yml", "checkpoint_clear"),

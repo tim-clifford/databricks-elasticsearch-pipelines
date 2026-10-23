@@ -205,7 +205,8 @@ databricks bundle run cluster_log_prune -t <target> -p <profile> --params dry_ru
   directories emptied by the deletes go, so its new, still-empty directories are left alone. Removal
   never deletes contents: a directory that gained a log since the listing stays, counted as
   `raced_dirs` in the summary rather than as a failure.
-- **Unset path.** With `cluster_log_volume_path` empty the run succeeds without doing anything, so the
+- **Unset path.** With `cluster_log_volume_path` empty the run succeeds without doing anything
+  (`cluster_log_retention_days` is still validated, so a malformed value fails even then), so the
   job can stay scheduled in targets that don't deliver cluster logs. A path that is set but doesn't exist
   yet (no cluster has delivered logs there) also succeeds, with a warning in the run output. A missing
   volume fails the run, since log delivery can't create one.
