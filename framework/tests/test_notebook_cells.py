@@ -189,3 +189,26 @@ def test_runner_applies_the_per_user_suffix_exactly_once():
     assert len(applies) == 1 and _passes(applies[0], "VIEW_SCHEMA_USER")
     for c in _calls(nb, "view_substitutions"):
         assert not _passes(c, "VIEW_SCHEMA_USER") and not any(k.arg == "view_schema_user" for k in c.keywords)
+
+
+
+def test_cluster_log_prune_passes_its_parameters_through():
+    # dry_run=true must reach run_prune (a literal False there would delete on a dry run), and root/cutoff
+    # must be passed in the right positions.
+    nb = os.path.join(_FRAMEWORK_ROOT, "notebooks", "cluster_log_prune.py")
+    (call,) = _calls(nb, "run_prune")
+    names = [getattr(a, "id", None) for a in call.args[:4]]
+    assert names == ["ROOT", "RETENTION_DAYS", "CUTOFF_MS", "DRY_RUN"]
+    assert [ast.unparse(a) for a in call.args[4:6]] == ["dbutils.fs.ls", "dbutils.fs.rm"]
+
+
+def test_deploy_views_deploys_only_the_selected_files():
+    # The subset is applied by reassigning sql_files before the deploy loop iterates it.
+    nb = os.path.join(_FRAMEWORK_ROOT, "notebooks", "deploy_views.py")
+    tree = _file_ast(nb)
+    (sel,) = _calls(nb, "selected_view_files")
+    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", None) == "sql_files" for t in n.targets)
+               and getattr(n.value, "id", None) == "_selected"]
+    loops = [n for n in ast.walk(tree) if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "sql_files"]
+    assert len(assigns) == 1 and loops and sel.lineno < assigns[0].lineno < min(l.lineno for l in loops)

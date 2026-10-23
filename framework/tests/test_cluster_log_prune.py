@@ -641,3 +641,13 @@ def test_run_prune_a_listing_failure_alone_fails_the_run():
     with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
         run_prune(ROOT, 30, CUTOFF, False, _fs({CID: PermissionError("denied")}), _Rm(), log=lines.append)
     assert any(f"LIST FAILED (left untouched): {ROOT}/{CID}" in l for l in lines)
+
+
+def test_a_same_named_file_with_an_unreadable_parent_is_not_called_a_file_root():
+    # Can't confirm the root is a file, so it stays a directory: its one entry is skipped, nothing is deleted.
+    def ls(path):
+        if path == ROOT:
+            return [SimpleNamespace(name="cluster_logs", size=5, modificationTime=OLD)]
+        raise PermissionError("denied")
+    plan = plan_prune(ROOT, ls, CUTOFF)
+    assert plan.list_errors == [] and plan.delete_files == [] and [p for p, _ in plan.skipped] == [f"{ROOT}/cluster_logs"]
