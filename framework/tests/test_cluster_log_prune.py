@@ -268,7 +268,20 @@ def test_cutoff_before_the_epoch_fails_closed():
 
 def test_constants():
     assert LOG_KINDS == ("driver", "executor", "eventlog", "init_scripts")
-    assert CLUSTER_ID.match(CID) and not CLUSTER_ID.match("checkpoints")
+    assert CLUSTER_ID.fullmatch(CID) and not CLUSTER_ID.fullmatch("checkpoints")
+
+
+@pytest.mark.parametrize("name", ["\u0661\u0660\u0662\u0663-200712-abcd1234", CID + "\n", CID + "x!", "x" + CID])
+def test_non_ascii_or_padded_cluster_ids_are_skipped(name):
+    plan = plan_prune(ROOT, _fs({name: {"driver": {"stdout": OLD}}}), CUTOFF)
+    assert plan.delete_files == [] and [p for p, _ in plan.skipped] == [f"{ROOT}/{name}"]
+
+
+def test_a_root_that_is_a_file_fails():
+    def ls(path):
+        return [SimpleNamespace(name="cluster_logs", size=5, modificationTime=OLD)]
+    plan = plan_prune(ROOT, ls, CUTOFF)
+    assert plan.list_errors == [(ROOT, "the path is a file, not a directory")] and plan.skipped == []
 
 
 def test_cutoff_ms():

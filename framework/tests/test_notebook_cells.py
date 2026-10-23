@@ -136,3 +136,41 @@ def test_job_notebook_params_found():
                      ("cluster_log_prune.py", "dry_run"), ("cluster_log_prune.py", "cluster_log_retention_days")]:
         assert expected in names
     assert len(params) > 100   # 5 generated feed jobs (one task each, plus a 2-task group) x ~37 params + fixed jobs
+
+
+
+def _calls(path, func_name):
+    """Every call to `func_name(...)` in a notebook (parsed cell by cell), as ast.Call nodes."""
+    out = []
+    for cell in _cells(path):
+        code = "\n".join(("#" + line) if line.lstrip().startswith("%") else line for line in cell.split("\n"))
+        for node in ast.walk(ast.parse(code)):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == func_name:
+                out.append(node)
+    return out
+
+
+def _passes(call, name):
+    """Does `call` pass the variable `name` (positionally or as any keyword)?"""
+    args = list(call.args) + [k.value for k in call.keywords]
+    return any(isinstance(a, ast.Name) and a.id == name for a in args)
+
+
+def test_deploy_views_threads_the_per_user_suffix():
+    # deploy_views must create views where the jobs read them: every view_substitutions / shared_view_conflict
+    # call gets the suffix, and the per-user pre-flight and schema guard both run.
+    nb = os.path.join(_FRAMEWORK_ROOT, "notebooks", "deploy_views.py")
+    for fn in ("view_substitutions", "shared_view_conflict", "per_user_preflight_problem"):
+        calls = _calls(nb, fn)
+        assert calls and all(_passes(c, "VIEW_SCHEMA_USER") for c in calls), fn
+    assert _calls(nb, "ensure_per_user_schema") and _calls(nb, "view_schema_user")
+
+
+def test_runner_applies_the_per_user_suffix_exactly_once():
+    # The runner moves the view once (apply_view_schema_user) and never passes the suffix to
+    # view_substitutions again, which would make it <schema>_<user>_<user>.
+    nb = os.path.join(_FRAMEWORK_ROOT, "notebooks", "run_index_pipeline.py")
+    applies = _calls(nb, "apply_view_schema_user")
+    assert len(applies) == 1 and _passes(applies[0], "VIEW_SCHEMA_USER")
+    for c in _calls(nb, "view_substitutions"):
+        assert not _passes(c, "VIEW_SCHEMA_USER") and not any(k.arg == "view_schema_user" for k in c.keywords)

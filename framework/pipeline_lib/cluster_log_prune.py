@@ -20,7 +20,7 @@ from typing import NamedTuple
 from pipeline_lib.config import PipelineConfigError
 
 # Databricks cluster ids, e.g. 1023-200712-abcd1234: MMDD-HHMMSS-<lowercase alphanumeric>.
-CLUSTER_ID = re.compile(r"^\d{4}-\d{6}-[a-z0-9]+$")
+CLUSTER_ID = re.compile(r"[0-9]{4}-[0-9]{6}-[a-z0-9]+")   # ASCII only; always matched with fullmatch
 
 # The log kinds Databricks delivers under each cluster id directory.
 LOG_KINDS = ("driver", "executor", "eventlog", "init_scripts")
@@ -163,9 +163,15 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
             return PrunePlan([], [], 0, 0, [], [], root_missing=True)
         list_errors.append((root, f"{type(exc).__name__}: {exc}"))
         top = []
+    # Listing a FILE returns just that file: a log path that points at a file is a misconfiguration, not an
+    # empty volume, so fail instead of reporting a green run that pruned nothing.
+    root_name = root.rstrip("/").rsplit("/", 1)[-1]
+    if len(top) == 1 and not _is_dir(top[0]) and _name(top[0]) == root_name:
+        list_errors.append((root, "the path is a file, not a directory"))
+        top = []
     for e in top:
         path = _join(root, e)
-        if not (_is_dir(e) and CLUSTER_ID.match(_name(e))):
+        if not (_is_dir(e) and CLUSTER_ID.fullmatch(_name(e))):
             skipped.append((path, "not a cluster id directory"))
             continue
         try:
