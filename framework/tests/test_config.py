@@ -573,6 +573,15 @@ def test_view_substitutions_view_schema_user_moves_only_the_view():
     assert streamed["source"] == "__batch_src"
 
 
+def test_runner_composition_keeps_a_single_suffix():
+    # The runner applies the suffix once (apply_view_schema_user on the resolved config), then renders the
+    # streaming SELECT with view_substitutions on that config and no user: the view keeps exactly one suffix.
+    cfg = apply_view_schema_user(resolve_config(validate_config(_with_env()), "catalog"), "tim_clifford")
+    subs = view_substitutions(cfg, "catalog", source_override="__batch_src")
+    assert subs["view"] == "acme_catalog.es_poc_tim_clifford.ecs_dns_activity"
+    assert subs["source"] == "__batch_src"
+
+
 def test_view_substitutions_view_schema_user_empty_is_unchanged():
     cfg = validate_config(_with_env())
     assert view_substitutions(cfg, "catalog", view_schema_user="") == view_substitutions(cfg, "catalog")

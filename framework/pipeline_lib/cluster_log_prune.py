@@ -223,16 +223,15 @@ def _absent_from_parent(path: str, ls, floor: str = "") -> bool:
 
 
 def parse_retention_days(raw: object) -> int:
-    """cluster_log_retention_days as an int. Fails closed on anything that isn't a plain integer."""
-    text = raw.strip() if isinstance(raw, str) else raw
-    if isinstance(text, bool) or text in (None, ""):
-        raise PipelineConfigError(f"cluster_log_retention_days must be an integer, got {raw!r}")
-    try:
-        return int(text)
-    except (TypeError, ValueError):
-        raise PipelineConfigError(
-            f"cluster_log_retention_days must be an integer, got {raw!r} (0 disables the delete)"
-        ) from None
+    """cluster_log_retention_days as an int. Fails closed on anything that isn't a plain integer: an int (not a
+    bool or float), or a string of optional sign plus digits (no underscores, decimals or units)."""
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and re.fullmatch(r"[+-]?\d+", raw.strip()):
+        return int(raw.strip())
+    raise PipelineConfigError(
+        f"cluster_log_retention_days must be an integer, got {raw!r} (0 disables the delete)"
+    )
 
 
 def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") -> tuple:

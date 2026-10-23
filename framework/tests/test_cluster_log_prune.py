@@ -255,7 +255,7 @@ def test_parse_retention_days(raw, expected):
     assert parse_retention_days(raw) == expected
 
 
-@pytest.mark.parametrize("raw", ["", "  ", None, "abc", "3.5", "30d", True])
+@pytest.mark.parametrize("raw", ["", "  ", None, "abc", "3.5", "30d", True, "1_000", 3.5, "3e1"])
 def test_parse_retention_days_fails_closed(raw):
     with pytest.raises(PipelineConfigError, match="must be an integer"):
         parse_retention_days(raw)
