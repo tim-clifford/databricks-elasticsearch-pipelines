@@ -1725,33 +1725,38 @@ def select_views(requested: object, available: list) -> list:
     return [n for n in available if n in wanted]
 
 
-def per_user_schema_collisions(cfgs: list, environment: str, user: str) -> list:
-    """Per-user view schemas that are ALSO a configured schema (any config's view, source or reference
-    table schema), sorted. Empty when off.
+def per_user_schema_collisions(entries: list, environment: str, user: str) -> tuple:
+    """(collisions, unresolved) for per-user mode; ([], []) when off.
 
-    `<view schema>_<user>` is a plain concatenation, so e.g. schema `es` + user `poc` is `es_poc`, which may
-    be another feed's real, shared view schema; deploy_views fails closed rather than replace views there.
-    `cfgs` is every loaded config (not just a subset run's), since any of them may own the shared schema.
-    A config that fails to resolve (any error) is skipped here: deploy_views reports it as that view's own
-    failure, so this pre-check never aborts the run on its own.
+    collisions: per-user view schemas that are ALSO a configured schema (any config's view, source or
+    reference table schema), sorted, compared lowercased (Unity Catalog names are case-insensitive).
+    `<view schema>_<user>` is a plain concatenation, so e.g. schema `es` + user `poc` is `es_poc`, which may be
+    another feed's real, shared schema; deploy_views fails closed rather than replace views there.
 
-    Not detectable here: two DEVELOPERS whose suffixed names coincide (schema `es` + user `poc_jane` and
+    unresolved: labels of the configs that failed to resolve (any error), sorted. Their schemas are unknown, so
+    the check is incomplete for them: deploy_views reports one in the subset being deployed as that view's own
+    failure, and fails closed on one outside it (nothing else would report it).
+
+    `entries` is every loaded (label, config), not just a subset run's, since any of them may own the shared
+    schema. Not detectable here: two DEVELOPERS whose suffixed names coincide (schema `es` + user `poc_jane` and
     schema `es_poc` + user `jane` are both `es_poc_jane`); each deploy sees only its own user."""
     if not user:
-        return []
-    configured, per_user = set(), set()
-    for c in cfgs:
+        return [], []
+    configured, per_user, unresolved = set(), set(), []
+    for label, c in entries:
         try:
             resolved = resolve_config(c, environment)
-            configured.add(f"{resolved['view']['catalog']}.{resolved['view']['schema']}")
-            configured.add(f"{resolved['source']['catalog']}.{resolved['source']['schema']}")
-            for spec in resolved["reference_tables"].values():
-                configured.add(f"{spec['catalog']}.{spec['schema']}")
-            per_user.add(view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"]))
-        except Exception:  # noqa: BLE001 - reported per view by deploy_views
+            schemas = {f"{resolved['view']['catalog']}.{resolved['view']['schema']}",
+                       f"{resolved['source']['catalog']}.{resolved['source']['schema']}"}
+            schemas |= {f"{spec['catalog']}.{spec['schema']}" for spec in resolved["reference_tables"].values()}
+            mine = view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"])
+        except Exception:  # noqa: BLE001 - reported per view (or fails closed) by deploy_views
+            unresolved.append(label)
             continue
-    # Unity Catalog names are case-insensitive (ES_poc and es_poc are one schema), so compare lowercased.
-    return sorted({s.lower() for s in per_user} & {s.lower() for s in configured})
+        configured |= schemas
+        per_user.add(mine)
+    collisions = sorted({s.lower() for s in per_user} & {s.lower() for s in configured})
+    return collisions, sorted(unresolved)
 
 
 def view_schema_fqn(view_fqn: str) -> str:

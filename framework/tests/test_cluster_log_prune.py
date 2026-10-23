@@ -358,11 +358,20 @@ def test_execute_reports_a_failed_dir_and_its_ancestors_are_skipped():
     assert [p for p, _ in rm.calls] == [d]
 
 
+class _NotEmptyRm(_Rm):
+    """rm that refuses the `fail` paths the way a non-empty directory does (the exception seen live)."""
+    def __call__(self, path, recurse=None):
+        self.calls.append((path, recurse))
+        if path in self.fail:
+            raise RuntimeError(f"org.apache.hadoop.fs.PathIsNotEmptyDirectoryException: `{path}`: Directory is not empty")
+        return True
+
+
 def test_execute_a_dir_that_gained_a_file_is_a_race_not_a_failure():
-    # A fresh log landed after the listing: the non-recursive remove refuses, ls shows it non-empty, so the
-    # directory is kept and counted as raced; its ancestors are skipped; nothing fails.
+    # A fresh log landed after the listing: the non-recursive remove refuses (not empty), ls shows it non-empty,
+    # so the directory is kept and counted as raced; its ancestors are skipped; nothing fails.
     d = f"{ROOT}/{CID}/driver"
-    rm = _Rm(fail=[d])
+    rm = _NotEmptyRm(fail=[d])
     ls = lambda p: [SimpleNamespace(name="stdout", size=1, modificationTime=NOW)] if p == d else []  # noqa: E731
     assert execute_plan(_plan([], [d, f"{ROOT}/{CID}"]), rm, dry_run=False, ls=ls) == (0, 0, 1, [])
     assert [p for p, _ in rm.calls] == [d]
@@ -494,3 +503,11 @@ def test_terminated_leftover_with_no_files_is_removed():
     assert plan_prune(ROOT, _fs({CID: {"driver": {}, "executor": {"app": {}}}}), CUTOFF).delete_dirs == []
     # A file-less cluster holding a current file elsewhere is not a leftover.
     assert plan_prune(ROOT, _fs({CID: {"driver": {"live": NEW}, "eventlog": {}}}), CUTOFF).delete_dirs == []
+
+
+def test_execute_other_rm_errors_on_a_non_empty_dir_are_failures():
+    # A permission or I/O error is not a race even if the directory lists non-empty.
+    d = f"{ROOT}/{CID}/driver"
+    ls = lambda p: [SimpleNamespace(name="stdout", size=1, modificationTime=NEW)]  # noqa: E731
+    _, _, raced, failures = execute_plan(_plan([], [d]), _Rm(fail=[d]), dry_run=False, ls=ls)
+    assert raced == 0 and failures == [f"remove dir {d}: OSError: cannot delete {d}"]

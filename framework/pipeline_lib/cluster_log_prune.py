@@ -285,8 +285,11 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
             deleted_dirs += 1
         except Exception as exc:  # noqa: BLE001
             gone = raced = False
+            # A race is only the "directory not empty" refusal (seen live as PathIsNotEmptyDirectoryException)
+            # on a directory that now lists non-empty; any other remove error (permissions, I/O) is a failure.
+            not_empty = "NotEmpty" in type(exc).__name__ or "PathIsNotEmptyDirectory" in str(exc)
             try:
-                raced = ls is not None and len(list(ls(path))) > 0
+                raced = ls is not None and len(list(ls(path))) > 0 and not_empty
             except Exception as list_exc:  # noqa: BLE001 - can't tell unless it's positively gone
                 # Gone only on positive evidence: the not-found text AND the parent listing without it.
                 gone = _is_not_found(list_exc) and _absent_from_parent(path, ls)

@@ -101,9 +101,31 @@ def test_every_job_parameter_is_a_notebook_widget_that_is_read(job_file, noteboo
     # A job passes each parameter to its notebook as a widget of the same name. A name that drifts on either
     # side silently falls back to the widget's "" default (for view_schema_per_user that means "off": the jobs
     # would read the shared view schema while deploy_views writes the per-user one), so pin every pairing.
-    source = open(notebook).read()
-    assert f'dbutils.widgets.text("{name}",' in source, f"{job_file}: {name} is not a widget in {notebook}"
-    assert f'dbutils.widgets.get("{name}")' in source, f"{job_file}: {name} is never read in {notebook}"
+    calls = _widget_calls(notebook)
+    assert ("text", name) in calls, f"{job_file}: {name} is not a widget in {notebook}"
+    assert ("get", name) in calls, f"{job_file}: {name} is never read in {notebook}"
+
+
+def _widget_calls(path):
+    """{(method, name)} for every real `dbutils.widgets.<method>("<name>", ...)` call in a notebook, parsed cell
+    by cell, so a call that only appears in a comment or a string doesn't count."""
+    calls = set()
+    for cell in _cells(path):
+        code = "\n".join(("#" + line) if line.lstrip().startswith("%") else line for line in cell.split("\n"))
+        for node in ast.walk(ast.parse(code)):
+            f = getattr(node, "func", None)
+            if (isinstance(node, ast.Call) and isinstance(f, ast.Attribute) and isinstance(f.value, ast.Attribute)
+                    and f.value.attr == "widgets" and isinstance(f.value.value, ast.Name)
+                    and f.value.value.id == "dbutils" and node.args and isinstance(node.args[0], ast.Constant)):
+                calls.add((f.attr, node.args[0].value))
+    return calls
+
+
+def test_widget_calls_ignore_comments_and_strings(tmp_path):
+    nb = tmp_path / "nb.py"
+    nb.write_text('# dbutils.widgets.text("a", "")\nx = \'dbutils.widgets.get("a")\'\n'
+                  'dbutils.widgets.text("b", "")\nB = dbutils.widgets.get("b")\n')
+    assert _widget_calls(str(nb)) == {("text", "b"), ("get", "b")}
 
 
 def test_job_notebook_params_found():

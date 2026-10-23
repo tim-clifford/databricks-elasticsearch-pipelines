@@ -325,7 +325,9 @@ Each developer owns their own copy.
   falling back to the shared schema.
 - If a per-user schema would be one of the configured schemas (a view, source or reference table schema,
   for example view schema `es` and user `poc` against a feed whose view schema is `es_poc`),
-  `deploy_views` fails before deploying.
+  `deploy_views` fails before deploying. It also fails when a config outside a `views` subset run can't
+  be resolved, since its schemas can't be checked; a broken config inside the subset fails only its own
+  view.
 - The suffix is a plain `_<short name>`, so two developers can still land in one schema when their names
   line up with schema names (`es` + `poc_jane` and `es_poc` + `jane` are both `es_poc_jane`). No deploy
   can see another developer's, so avoid view schemas that are prefixes of each other.

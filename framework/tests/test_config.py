@@ -656,13 +656,18 @@ def test_view_schema_fqn_rejects_non_three_part(fqn):
         view_schema_fqn(fqn)
 
 
+def _collisions(cfgs, environment, user):
+    """per_user_schema_collisions' collision list, labelling the configs c0.yml, c1.yml, ..."""
+    return per_user_schema_collisions([(f"c{i}.yml", c) for i, c in enumerate(cfgs)], environment, user)[0]
+
+
 def test_per_user_schema_collisions():
     # es + poc = es_poc: a per-user schema that is another config's real view schema is reported.
     shared = validate_config(_base())   # view schema es_poc
     short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
-    assert per_user_schema_collisions([shared, short], "", "poc") == ["cat.es_poc"]
-    assert per_user_schema_collisions([shared, short], "", "tim_clifford") == []
-    assert per_user_schema_collisions([shared, short], "", "") == []
+    assert _collisions([shared, short], "", "poc") == ["cat.es_poc"]
+    assert _collisions([shared, short], "", "tim_clifford") == []
+    assert _collisions([shared, short], "", "") == []
 
 
 def test_per_user_schema_collisions_include_source_and_reference_schemas():
@@ -670,25 +675,32 @@ def test_per_user_schema_collisions_include_source_and_reference_schemas():
     # source tables.
     cfg = validate_config({**_base(), "view": {"catalog": "cat", "schema": "src", "name": "v"},
                            "source": {"catalog": "cat", "schema": "src_dev", "table": "t"}})
-    assert per_user_schema_collisions([cfg], "", "dev") == ["cat.src_dev"]
+    assert _collisions([cfg], "", "dev") == ["cat.src_dev"]
     # _with_env joins acme_catalog.ocsf_validation_catalog (a reference table): view schema "ocsf" + user
     # "validation_catalog" lands on it.
     ref = validate_config({**_with_env(), "view": {"catalog": "acme_${environment}", "schema": "ocsf", "name": "v"}})
-    assert per_user_schema_collisions([ref], "catalog", "validation_catalog") == ["acme_catalog.ocsf_validation_catalog"]
+    assert _collisions([ref], "catalog", "validation_catalog") == ["acme_catalog.ocsf_validation_catalog"]
 
 
 def test_per_user_schema_collisions_ignore_case():
     # UC names are case-insensitive: view schema ES + user poc is the shared es_poc.
     shared = validate_config(_base())   # view schema es_poc
     upper = validate_config({**_base(), "view": {"catalog": "cat", "schema": "ES", "name": "other"}})
-    assert per_user_schema_collisions([shared, upper], "", "poc") == ["cat.es_poc"]
+    assert _collisions([shared, upper], "", "poc") == ["cat.es_poc"]
 
 
 def test_per_user_schema_collisions_skips_any_resolve_error():
     # Not only PipelineConfigError: a malformed config dict (KeyError) is also left to the per-view loop.
     shared = validate_config(_base())
     short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
-    assert per_user_schema_collisions([{}, shared, short], "", "poc") == ["cat.es_poc"]
+    assert _collisions([{}, shared, short], "", "poc") == ["cat.es_poc"]
+
+
+def test_per_user_schema_collisions_reports_unresolved_labels():
+    needs_env = validate_config(_with_env())
+    entries = [("needs_env.yml", needs_env), ("bad.yml", {}), ("ok.yml", validate_config(_base()))]
+    assert per_user_schema_collisions(entries, "", "poc") == ([], ["bad.yml", "needs_env.yml"])
+    assert per_user_schema_collisions(entries, "", "") == ([], [])
 
 
 def test_per_user_schema_collisions_skips_unresolvable_configs():
@@ -697,7 +709,7 @@ def test_per_user_schema_collisions_skips_unresolvable_configs():
     needs_env = validate_config(_with_env())
     shared = validate_config(_base())
     short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
-    assert per_user_schema_collisions([needs_env, shared, short], "", "poc") == ["cat.es_poc"]
+    assert _collisions([needs_env, shared, short], "", "poc") == ["cat.es_poc"]
 
 
 def test_view_schema_fqn_of_per_user_substitution():

@@ -122,8 +122,18 @@ if len(_selected) < len(sql_files):
 # Per-user mode: fail closed if a per-user schema is also some config's real view schema (a plain
 # concatenation like es + poc = es_poc could land on it), before anything deploys.
 if VIEW_SCHEMA_USER:
-    _collisions = per_user_schema_collisions(
-        [cfg for entries in configs_by_view.values() for _, cfg in entries], ENVIRONMENT, VIEW_SCHEMA_USER)
+    _collisions, _unresolved = per_user_schema_collisions(
+        [entry for entries in configs_by_view.values() for entry in entries], ENVIRONMENT, VIEW_SCHEMA_USER)
+    # A config that can't resolve has unknown schemas, so the check is incomplete for it. One in this run's
+    # subset fails its own view below; one outside it would be reported by nothing, so fail closed here.
+    _selected_labels = {label for f in sql_files for label, _ in configs_by_view[os.path.splitext(f)[0]]}
+    _unchecked = [label for label in _unresolved if label not in _selected_labels]
+    if _unchecked:
+        raise ValueError(
+            f"per-user mode can't check for schema collisions: config(s) {', '.join(_unchecked)} (not in this "
+            f"run's views) fail to resolve; fix them, include their views in the run, or deploy with "
+            f"--var view_schema_per_user=false"
+        )
     if _collisions:
         raise ValueError(
             f"per-user view schema(s) {', '.join(_collisions)} are also configured view schemas, so per-user "
