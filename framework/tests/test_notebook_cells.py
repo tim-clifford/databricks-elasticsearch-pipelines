@@ -71,3 +71,46 @@ def test_every_runtime_knob_is_a_runner_widget_that_is_read():
     for name in RUNTIME_KNOB_NAMES:
         assert f'dbutils.widgets.text("{name}",' in source, f"{name} is not declared as a widget"
         assert f'dbutils.widgets.get("{name}")' in source, f"{name} is never read"
+
+
+def _shipped_job_notebook_params():
+    """(job file, notebook file, parameter name) for every base_parameter and job-level parameter of every task
+    in every shipped job: the hand-authored framework/resources jobs and the generated _pipelines/resources jobs."""
+    import yaml
+    repo_root = os.path.dirname(_FRAMEWORK_ROOT)
+    out = []
+    for job_file in sorted(glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml"))
+                           + glob.glob(os.path.join(repo_root, "_pipelines", "resources", "*.job.yml"))):
+        with open(job_file) as fh:
+            jobs = yaml.safe_load(fh)["resources"]["jobs"]
+        for job in jobs.values():
+            job_params = [p["name"] for p in job.get("parameters", [])]
+            for task in job["tasks"]:
+                nb = task.get("notebook_task")
+                if not nb:
+                    continue
+                notebook = os.path.normpath(os.path.join(os.path.dirname(job_file), nb["notebook_path"]))
+                for name in list(nb.get("base_parameters", {})) + job_params:
+                    out.append((os.path.relpath(job_file, repo_root), notebook, name))
+    return out
+
+
+@pytest.mark.parametrize("job_file,notebook,name", _shipped_job_notebook_params(),
+                         ids=lambda v: os.path.basename(v) if isinstance(v, str) and os.sep in v else v)
+def test_every_job_parameter_is_a_notebook_widget_that_is_read(job_file, notebook, name):
+    # A job passes each parameter to its notebook as a widget of the same name. A name that drifts on either
+    # side silently falls back to the widget's "" default (for view_schema_per_user that means "off": the jobs
+    # would read the shared view schema while deploy_views writes the per-user one), so pin every pairing.
+    source = open(notebook).read()
+    assert f'dbutils.widgets.text("{name}",' in source, f"{job_file}: {name} is not a widget in {notebook}"
+    assert f'dbutils.widgets.get("{name}")' in source, f"{job_file}: {name} is never read in {notebook}"
+
+
+def test_job_notebook_params_found():
+    params = _shipped_job_notebook_params()
+    names = {(os.path.basename(nb), n) for _, nb, n in params}
+    for expected in [("run_index_pipeline.py", "view_schema_per_user"), ("run_index_pipeline.py", "view_schema_user_name"),
+                     ("deploy_views.py", "view_schema_per_user"), ("deploy_views.py", "views"),
+                     ("cluster_log_prune.py", "dry_run"), ("cluster_log_prune.py", "cluster_log_retention_days")]:
+        assert expected in names
+    assert len(params) > 100   # 5 generated feed jobs (one task each, plus a 2-task group) x ~37 params + fixed jobs
