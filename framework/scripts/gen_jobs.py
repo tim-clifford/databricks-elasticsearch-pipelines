@@ -749,6 +749,8 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
         "${var.ca_certs}",
         "${var.monitoring_log_table}",
         streaming_trigger_interval,
+        "${var.view_schema_per_user}",
+        "${workspace.current_user.short_name}",
     )
     if include_run_time_knobs:
         for p in job_parameters(cfg, _RUNTIME_KNOB_GLOBAL_REFS):

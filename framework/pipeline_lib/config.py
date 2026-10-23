@@ -1544,7 +1544,51 @@ def column_present(column: str, columns: list) -> bool:
     return column.lower() in {c.lower() for c in columns}
 
 
-def view_substitutions(cfg: dict, environment: str, source_override: str | None = None) -> dict:
+def view_schema_user(per_user: object, user_name: object) -> str:
+    """The developer name to append to every view schema, or "" when per-user view schemas are off.
+
+    `per_user` is the `view_schema_per_user` bundle variable (canonical "true"/"false", or "" for unset,
+    which means off; anything else fails closed via require_es_flag). `user_name` is the deploying user's
+    `${workspace.current_user.short_name}`. When on, the name must be non-empty and a legal identifier,
+    because it becomes part of a schema name: a missing or illegal name fails closed instead of quietly
+    deploying into the shared schema. When off, `user_name` is ignored.
+    """
+    if require_es_flag(per_user, "view_schema_per_user") != "true":
+        return ""
+    name = user_name.strip() if isinstance(user_name, str) else ""
+    if not name:
+        raise PipelineConfigError(
+            "view_schema_per_user is true but no user name was provided (view_schema_user_name is empty)"
+        )
+    if not _VALID_IDENTIFIER.match(name):
+        raise PipelineConfigError(
+            f"view_schema_user_name {name!r} is not a legal SQL identifier, so it cannot be appended to "
+            f"a view schema"
+        )
+    return name
+
+
+def apply_view_schema_user(resolved: dict, user: str) -> dict:
+    """Return `resolved` (a resolve_config result) with `_<user>` appended to the VIEW's schema only.
+
+    "" (per-user view schemas off) returns `resolved` unchanged. Only the view moves: the source and
+    reference tables are shared inputs every developer reads, so they keep their names. Apply this ONCE
+    to a resolved config (the runner) or let view_substitutions apply it (deploy_views); applying it to
+    an already-suffixed config would append the name twice.
+    """
+    if not user:
+        return resolved
+    view = dict(resolved["view"])
+    schema = f"{view['schema']}_{user}"
+    if not _VALID_IDENTIFIER.match(schema):
+        raise PipelineConfigError(f"view schema with user name {schema!r} is not a legal SQL identifier")
+    view["schema"] = schema
+    return {**resolved, "view": view}
+
+
+def view_substitutions(
+    cfg: dict, environment: str, source_override: str | None = None, view_schema_user: str = "",
+) -> dict:
     """The ${...} tokens a view .sql may reference, with ${environment} folded in.
 
     - view / source: the fully-qualified object, e.g. `catalog.schema.name`.
@@ -1561,8 +1605,11 @@ def view_substitutions(cfg: dict, environment: str, source_override: str | None 
 
     Join tuning (a broadcast hint, etc.) is the view author's responsibility, written directly in the
     SQL like the rest of the join - the framework only resolves table locations.
+
+    `view_schema_user` (from view_schema_user(); "" when off) appends `_<user>` to the view's schema,
+    so `${view}` names the developer's own copy; `${source}` and every `ref_<alias>` are unaffected.
     """
-    resolved = resolve_config(cfg, environment)
+    resolved = apply_view_schema_user(resolve_config(cfg, environment), view_schema_user)
     subs = {
         "view": _fqn(resolved["view"], "name"),
         "source": source_override if source_override is not None else _fqn(resolved["source"], "table"),
@@ -1572,7 +1619,7 @@ def view_substitutions(cfg: dict, environment: str, source_override: str | None 
     return subs
 
 
-def shared_view_conflict(cfgs: list, environment: str) -> str | None:
+def shared_view_conflict(cfgs: list, environment: str, view_schema_user: str = "") -> str | None:
     """Detect a conflicting view DEFINITION among configs that share one view name. Fail-closed helper for
     deploy_views, which allows N pipelines to share a view.
 
@@ -1589,11 +1636,12 @@ def shared_view_conflict(cfgs: list, environment: str) -> str | None:
     Returns None when every config renders an IDENTICAL view definition (including the trivial single-config
     case); otherwise a human-readable message naming each distinct definition and the configs that produced
     it. Pure (uses view_substitutions; no Spark), so deploy_views calls it per shared view and collects the
-    message into its per-view failures.
+    message into its per-view failures. `view_schema_user` is passed through to view_substitutions (the
+    same name for every sharer, so it never creates a conflict by itself).
     """
     by_subs: dict = {}
     for label, cfg in cfgs:
-        subs = view_substitutions(cfg, environment)
+        subs = view_substitutions(cfg, environment, view_schema_user=view_schema_user)
         key = tuple(sorted(subs.items()))  # hashable, order-independent identity of the view definition
         by_subs.setdefault(key, []).append(label)
     if len(by_subs) <= 1:
@@ -1607,6 +1655,52 @@ def shared_view_conflict(cfgs: list, environment: str) -> str | None:
         f"share a view must agree on the view target, source, and reference-table joins; they may differ "
         f"only on es_index_name / es_host_config / es_id_field / filter_condition / pipeline_mode."
     )
+
+
+# The Jobs API caps the JSON form of ALL job parameters passed to one run at 10,000 characters and refuses
+# to start a run over it ("The provided job parameters (in json representation) are too long"; proven on
+# FEVM 2026-10-23: a 10,010-char value was refused at 10,018). `{"views":""}` takes 12 of those, so a
+# `views` value alone can be at most 9,988 characters, and less if other parameters ride the same run.
+JOB_PARAMETERS_JSON_MAX_CHARS = 10_000
+VIEWS_PARAM_MAX_CHARS = JOB_PARAMETERS_JSON_MAX_CHARS - len('{"views":""}')
+
+
+def select_views(requested: object, available: list) -> list:
+    """The view names (view .sql basenames, no extension) deploy_views should deploy, in `available` order.
+
+    `requested` is the `views` job parameter: "" (or only whitespace) => every available view (the default,
+    and the only way to say "all"); otherwise a comma-separated list of view names. Fail closed, before
+    anything deploys, on:
+    - a value longer than VIEWS_PARAM_MAX_CHARS (the Jobs API limit; see above), so an over-long list is
+      a clear error here even if it reached the notebook some other way;
+    - an empty entry (e.g. "a,,b" or a trailing comma), which is more likely a typo than intent;
+    - any name not in `available` (allow-list: a misspelled or `.sql`-suffixed name must not be
+      silently skipped, which would report a green deploy of fewer views than asked for).
+    A name listed twice is deployed once.
+    """
+    if requested is None:
+        requested = ""
+    if not isinstance(requested, str):
+        raise PipelineConfigError(f"views must be a string, got {type(requested).__name__}")
+    if len(requested) > VIEWS_PARAM_MAX_CHARS:
+        raise PipelineConfigError(
+            f"views is {len(requested)} characters, over the {VIEWS_PARAM_MAX_CHARS}-character limit (the Jobs "
+            f"API caps a run's job parameters at {JOB_PARAMETERS_JSON_MAX_CHARS} characters as JSON); leave "
+            f"views empty to deploy every view, or deploy the list in smaller runs"
+        )
+    if not requested.strip():
+        return list(available)
+    names = [n.strip() for n in requested.split(",")]
+    if any(not n for n in names):
+        raise PipelineConfigError(f"views has an empty entry (check for doubled or trailing commas): {requested!r}")
+    unknown = sorted(set(names) - set(available))
+    if unknown:
+        raise PipelineConfigError(
+            f"views names unknown view(s): {', '.join(unknown)}. Use view .sql file names without the "
+            f".sql extension; available: {', '.join(sorted(available))}"
+        )
+    wanted = set(names)
+    return [n for n in available if n in wanted]
 
 
 # The ${token} pattern a view .sql may reference. Shared by every renderer so the substitution rule
@@ -1676,6 +1770,8 @@ def job_base_parameters(
     ca_certs_ref: str,
     monitoring_log_table_ref: str = "",
     streaming_trigger_interval: str = "",
+    view_schema_per_user_ref: str = "",
+    view_schema_user_name_ref: str = "",
 ) -> dict:
     """The DEPLOY-TIME values the generated per-index job passes to run_index_pipeline.py as widgets.
 
@@ -1709,6 +1805,10 @@ def job_base_parameters(
       Trigger.availableNow (drain-and-stop, today's behavior), scheduled or on-demand. A deploy-time
       property, not overridable per run (continuous is a per-pipeline config choice), so it is a
       base_parameter, not a job parameter. Ignored by a batch run.
+    - `view_schema_per_user_ref` (e.g. "${var.view_schema_per_user}") and `view_schema_user_name_ref`
+      (e.g. "${workspace.current_user.short_name}"): when the first resolves to true, the runner reads the
+      view from `<schema>_<user name>`, the developer's own copy that deploy_views created (see
+      view_schema_user). Deploy-time, like environment, so deploy_views and every job agree.
     - `job_run_id` / `task_run_id`: the Jobs dynamic value references {{job.run_id}} / {{task.run_id}},
       constant here and resolved by the Jobs service per run, so the monitoring log groups a run's rows
       by the PLATFORM run id (the notebook context does not expose it on every compute type: on
@@ -1730,6 +1830,8 @@ def job_base_parameters(
         "ca_certs": ca_certs_ref,
         "monitoring_log_table": monitoring_log_table_ref,
         "streaming_trigger_interval": streaming_trigger_interval,
+        "view_schema_per_user": view_schema_per_user_ref,
+        "view_schema_user_name": view_schema_user_name_ref,
         "job_run_id": "{{job.run_id}}",
         "task_run_id": "{{task.run_id}}",
     }

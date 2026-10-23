@@ -88,6 +88,9 @@ variables:
   # the only tag lever there. A tag whose key/value conflicts with a FIXED cluster-policy rule fails closed
   # at DEPLOY (like any policy conflict). Complex, so NOT settable via --var; override a target through
   # .databricks/bundle/<target>/variable-overrides.json.
+  view_schema_per_user:
+    description: "true => deploy_views creates every view in <view schema>_<deploying user's short name> (creating the schema if missing; needs CREATE SCHEMA on the catalog) and every job reads from there, so developers sharing a workspace don't overwrite each other's views. Only the view moves; source and reference tables are unchanged. Default false; the dev target sets true. Simple string, so --var view_schema_per_user=false turns it off for one deploy (to test against the real schema). Takes effect at deploy."
+    default: "false"
   global_job_tags:
     type: complex
     description: "Global tags (map of key -> value string) applied to every job. Empty {} = no tags (omitted). To add tags replace {} with an indented block, e.g. environment: \"${var.environment}\". Fixed jobs resolve it per target at deploy; generated jobs bake the top-level default (+ an es_index_list tag) at generation. Job tags forward to job clusters. type: complex, so NOT --var-settable; override via variable-overrides.json."
@@ -539,6 +542,7 @@ targets:
     default: true
     mode: development
     variables:
+      view_schema_per_user: "true"  # each developer's views go to <schema>_<short name>; --var view_schema_per_user=false to use the real schema
       # DEV deploy-time values. All ship EMPTY on main - fill in for your environment (or override any of
       # them at deploy with --var=<name>=<value>). An empty value fails closed where it is required
       # (wheel_path for index runs, checkpoint_base_path for streaming, cluster_policy_id for job clusters).

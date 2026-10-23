@@ -11,6 +11,12 @@
 # MAGIC Parameter (set by the DAB job as a widget):
 # MAGIC - `environment`: folded into any config name that contains `${environment}` (e.g.
 # MAGIC   `ocsf_${environment}` -> `ocsf_prod`). May be empty when no config name uses the token.
+# MAGIC - `view_schema_per_user`, `view_schema_user_name` (deploy-time): when the first is true, every view is
+# MAGIC   created in `<view schema>_<user name>` (the schema is created if missing) instead of the configured
+# MAGIC   schema, so developers sharing a workspace each get their own copy. Off => the configured schema.
+# MAGIC - `views` (job parameter, per run): a comma-separated list of view names (`.sql` file names without the
+# MAGIC   extension) to deploy only those. Empty (the default) deploys every view. At most 9,988 characters:
+# MAGIC   the Jobs API caps a run's job parameters at 10,000 characters as JSON.
 
 # COMMAND ----------
 # Read the environment. Unlike catalog/schema (which now live in each config), environment MAY be
@@ -20,6 +26,14 @@
 dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
 print(f"environment = {ENVIRONMENT!r}")
+dbutils.widgets.text("view_schema_per_user", "", "true => create views in <view schema>_<view_schema_user_name> (empty/false => off)")
+dbutils.widgets.text("view_schema_user_name", "", "Deploying user's short name appended to the view schema when view_schema_per_user is true")
+dbutils.widgets.text("views", "", "Comma-separated view names to deploy (empty => all)")
+VIEW_SCHEMA_PER_USER = dbutils.widgets.get("view_schema_per_user").strip()
+VIEW_SCHEMA_USER_NAME = dbutils.widgets.get("view_schema_user_name").strip()
+VIEWS = dbutils.widgets.get("views")
+print(f"view_schema_per_user = {VIEW_SCHEMA_PER_USER!r}, view_schema_user_name = {VIEW_SCHEMA_USER_NAME!r}")
+print(f"views = {VIEWS!r}" if len(VIEWS) <= 2_000 else f"views = <{len(VIEWS)} characters>")
 
 # COMMAND ----------
 # Resolve the synced bundle root so we can read both _pipelines/pipeline_views/ and
@@ -39,7 +53,20 @@ VIEWS_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_views")
 CONFIG_DIR = os.path.join(FILES_ROOT, "_pipelines", "pipeline_configs")
 print("files root:", FILES_ROOT)
 
-from pipeline_lib.config import column_present, load_config, render_view_sql, shared_view_conflict, view_substitutions  # noqa: E402
+from pipeline_lib.config import (  # noqa: E402
+    column_present,
+    load_config,
+    render_view_sql,
+    select_views,
+    shared_view_conflict,
+    view_schema_user,
+    view_substitutions,
+)
+
+# Fail closed up front: per-user mode with a missing or illegal user name must not deploy into the shared
+# schema. "" when per-user view schemas are off.
+VIEW_SCHEMA_USER = view_schema_user(VIEW_SCHEMA_PER_USER, VIEW_SCHEMA_USER_NAME)
+print(f"view schema user suffix = {('_' + VIEW_SCHEMA_USER) if VIEW_SCHEMA_USER else '(off: configured schemas)'}")
 
 # COMMAND ----------
 # Load every pipeline definition and GROUP them by the view name each declares, so a view .sql file can be
@@ -81,6 +108,27 @@ if missing_config:
 if missing_sql:
     raise ValueError(f"pipeline definition(s) with no matching view .sql file: {', '.join(missing_sql)}")
 print(f"found {len(sql_files)} view file(s): {', '.join(sql_files)}")
+
+# Narrow to the requested subset (empty `views` => all). Validated against the view files found above,
+# fail closed on an unknown name, an empty entry, or an over-long value, BEFORE anything deploys. The
+# pairing checks above still cover every file, so a subset run still catches a wiring mistake anywhere.
+_selected = select_views(VIEWS, [os.path.splitext(f)[0] for f in sql_files])
+if len(_selected) < len(sql_files):
+    sql_files = [f"{name}.sql" for name in _selected]
+    print(f"deploying the requested subset: {len(sql_files)} view(s): {', '.join(sql_files)}")
+
+# Per-user mode: create each target schema (<configured schema>_<user>) the selected views land in, once,
+# before deploying. Needs CREATE SCHEMA on the catalog. A failure here fails the run before any view is
+# touched (a missing schema would otherwise fail every view the same way).
+if VIEW_SCHEMA_USER:
+    _schemas = sorted({
+        view_substitutions(configs_by_view[os.path.splitext(f)[0]][0][1], ENVIRONMENT,
+                           view_schema_user=VIEW_SCHEMA_USER)["view"].rsplit(".", 1)[0]
+        for f in sql_files
+    })
+    for _schema in _schemas:
+        print(f"CREATE SCHEMA IF NOT EXISTS {_schema}")
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_schema}")
 
 # COMMAND ----------
 # Render each view's ${parameter} tokens from its config and run it. The token substitution itself
@@ -177,12 +225,12 @@ for filename in sql_files:
         # Fail closed (per-view) if pipelines sharing this view render CONFLICTING definitions: they must
         # agree on the view target/source/reference joins, differing only on the ES-write side. None for
         # the single-config case and for a benign share. See pipeline_lib.config.shared_view_conflict.
-        conflict = shared_view_conflict(entries, ENVIRONMENT)
+        conflict = shared_view_conflict(entries, ENVIRONMENT, VIEW_SCHEMA_USER)
         if conflict is not None:
             raise ValueError(conflict)
         # Every sharer renders the same definition (just proven), so deploy from a representative config.
         _rep_label, cfg = entries[0]
-        subs = view_substitutions(cfg, ENVIRONMENT)
+        subs = view_substitutions(cfg, ENVIRONMENT, view_schema_user=VIEW_SCHEMA_USER)
         with open(os.path.join(VIEWS_DIR, filename)) as fh:
             rendered = render_view_sql(fh.read(), subs, filename)
         # Print the substitutions and the fully-rendered SQL that is about to run (all ${...}

@@ -124,6 +124,10 @@ def test_render_wires_global_deploy_vars():
     assert bp["ca_certs"] == "${var.ca_certs}"
     # monitoring_log_table is threaded the same way (deploy-time global, not a per-run job parameter).
     assert bp["monitoring_log_table"] == "${var.monitoring_log_table}"
+    # The per-user view schema toggle and the deploying user's short name, the same pair deploy_views gets,
+    # so every job reads the view copy deploy_views created.
+    assert bp["view_schema_per_user"] == "${var.view_schema_per_user}"
+    assert bp["view_schema_user_name"] == "${workspace.current_user.short_name}"
 
 
 def test_render_all_jobs_max_concurrent_runs_1():
@@ -807,6 +811,23 @@ def test_shipped_deploy_views_job_disables_queue():
         job = yaml.safe_load(fh)["resources"]["jobs"]["deploy_views"]
     assert job["max_concurrent_runs"] == 1
     assert job["queue"] == {"enabled": False}
+
+
+def test_shipped_deploy_views_job_wires_subset_and_per_user_schema():
+    # `views` is a run-time job parameter defaulting to "" (all views); the per-user view schema pair is
+    # deploy-time and must match what gen_jobs gives every index job, or deploy_views and the jobs would
+    # disagree on where the views live.
+    path = os.path.join(_FRAMEWORK_ROOT, "resources", "_deploy_views.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["deploy_views"]
+    assert job["parameters"] == [{"name": "views", "default": ""}]
+    bp = job["tasks"][0]["notebook_task"]["base_parameters"]
+    generated = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", _cfg(), None)
+    gbp = yaml.safe_load(generated)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]["tasks"][0][
+        "notebook_task"]["base_parameters"]
+    for key in ("view_schema_per_user", "view_schema_user_name"):
+        assert bp[key] == gbp[key]
+    assert bp["view_schema_per_user"] == "${var.view_schema_per_user}"
 
 
 @pytest.mark.parametrize("filename,job_key", [

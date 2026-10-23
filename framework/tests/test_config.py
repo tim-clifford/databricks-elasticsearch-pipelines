@@ -12,7 +12,9 @@ import pytest
 from pipeline_lib.config import (
     _RUNTIME_KNOBS,
     RUNTIME_KNOB_NAMES,
+    VIEWS_PARAM_MAX_CHARS,
     PipelineConfigError,
+    apply_view_schema_user,
     column_present,
     job_base_parameters,
     job_parameters,
@@ -39,8 +41,10 @@ from pipeline_lib.config import (
     require_write_repartition,
     resolve_config,
     resolve_name,
+    select_views,
     shared_view_conflict,
     validate_config,
+    view_schema_user,
     view_select_body,
     view_substitutions,
     write_config_overrides,
@@ -548,7 +552,140 @@ def test_view_substitutions_source_override_none_is_real_source():
     assert subs["source"] == "cat.ocsf.dns_activity"
 
 
+def test_view_substitutions_view_schema_user_moves_only_the_view():
+    # Per-user view schemas: ${view} lands in <schema>_<user>; ${source} and ${ref_*} are shared inputs and
+    # keep their real names, with or without the streaming source_override.
+    subs = view_substitutions(validate_config(_with_env()), environment="catalog", view_schema_user="tim_clifford")
+    assert subs["view"] == "acme_catalog.es_poc_tim_clifford.ecs_dns_activity"
+    assert subs["source"] == "acme_catalog.ocsf.dns_activity"
+    assert subs["ref_validation"] == "acme_catalog.ocsf_validation_catalog.dns_activity validation"
+    streamed = view_substitutions(validate_config(_with_env()), environment="catalog",
+                                  source_override="__batch_src", view_schema_user="tim_clifford")
+    assert streamed["view"] == "acme_catalog.es_poc_tim_clifford.ecs_dns_activity"
+    assert streamed["source"] == "__batch_src"
+
+
+def test_view_substitutions_view_schema_user_empty_is_unchanged():
+    cfg = validate_config(_with_env())
+    assert view_substitutions(cfg, "catalog", view_schema_user="") == view_substitutions(cfg, "catalog")
+
+
+# --------------------------------------------------------------------------- view_schema_user
+
+
+@pytest.mark.parametrize("flag", ["", "false", "FALSE", " false ", None, False])
+def test_view_schema_user_off_ignores_the_name(flag):
+    # Off (or unset) never uses the name, even an empty or illegal one: the configured schemas apply.
+    assert view_schema_user(flag, "tim_clifford") == ""
+    assert view_schema_user(flag, "") == ""
+    assert view_schema_user(flag, "not legal!") == ""
+
+
+@pytest.mark.parametrize("flag", ["true", "TRUE", " true ", True])
+def test_view_schema_user_on_returns_the_name(flag):
+    assert view_schema_user(flag, "tim_clifford") == "tim_clifford"
+    assert view_schema_user(flag, "  tim_clifford  ") == "tim_clifford"
+
+
+@pytest.mark.parametrize("name", ["", "   ", None])
+def test_view_schema_user_on_without_a_name_fails(name):
+    # Fail closed: per-user mode with no name must not fall back to the shared schema.
+    with pytest.raises(PipelineConfigError, match="no user name"):
+        view_schema_user("true", name)
+
+
+@pytest.mark.parametrize("name", ["tim.clifford", "tim-clifford", "1tim", "tim clifford", "tim;drop"])
+def test_view_schema_user_on_with_illegal_name_fails(name):
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        view_schema_user("true", name)
+
+
+@pytest.mark.parametrize("flag", ["yes", "1", "on", "t"])
+def test_view_schema_user_bad_flag_fails(flag):
+    # Allow-list: only true/false/"" are accepted, so a truthy-looking typo can't silently mean either.
+    with pytest.raises(PipelineConfigError, match="view_schema_per_user must be 'true' or 'false'"):
+        view_schema_user(flag, "tim_clifford")
+
+
+def test_apply_view_schema_user_moves_only_the_view_schema():
+    resolved = resolve_config(validate_config(_with_env()), "catalog")
+    out = apply_view_schema_user(resolved, "tim_clifford")
+    assert out["view"] == {**resolved["view"], "schema": "es_poc_tim_clifford"}
+    assert out["source"] == resolved["source"]
+    assert out["reference_tables"] == resolved["reference_tables"]
+    # The input is not mutated (the runner keeps one resolved config).
+    assert resolved["view"]["schema"] == "es_poc"
+
+
+def test_apply_view_schema_user_empty_returns_input():
+    resolved = resolve_config(validate_config(_base()), "")
+    assert apply_view_schema_user(resolved, "") is resolved
+
+
+def test_apply_view_schema_user_rejects_illegal_result():
+    # Defense in depth: even if a caller skips view_schema_user, an illegal result fails closed.
+    resolved = resolve_config(validate_config(_base()), "")
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        apply_view_schema_user(resolved, "x.y")
+
+
+# --------------------------------------------------------------------------- select_views
+
+_VIEWS = ["a_view", "b_view", "c_view"]
+
+
+@pytest.mark.parametrize("requested", ["", "   ", None])
+def test_select_views_empty_means_all(requested):
+    assert select_views(requested, _VIEWS) == _VIEWS
+
+
+def test_select_views_subset_keeps_available_order_and_dedupes():
+    assert select_views("c_view, a_view", _VIEWS) == ["a_view", "c_view"]
+    assert select_views("b_view,b_view", _VIEWS) == ["b_view"]
+
+
+@pytest.mark.parametrize("requested,missing", [
+    ("a_view,typo_view", "typo_view"),
+    ("a_view.sql", "a_view.sql"),   # names, not file names: the .sql suffix is not silently stripped
+    ("A_VIEW", "A_VIEW"),           # exact match only
+])
+def test_select_views_unknown_name_fails_closed(requested, missing):
+    with pytest.raises(PipelineConfigError, match=f"unknown view\\(s\\): {re.escape(missing)}"):
+        select_views(requested, _VIEWS)
+
+
+@pytest.mark.parametrize("requested", ["a_view,,b_view", "a_view,", ",a_view", "a_view, ,b_view"])
+def test_select_views_empty_entry_fails(requested):
+    with pytest.raises(PipelineConfigError, match="empty entry"):
+        select_views(requested, _VIEWS)
+
+
+def test_select_views_length_limit_is_the_jobs_api_budget():
+    # The Jobs API refuses a run whose job parameters exceed 10,000 characters as JSON; {"views":""} uses 12.
+    assert VIEWS_PARAM_MAX_CHARS == 9_988
+    at_limit = "v" * VIEWS_PARAM_MAX_CHARS
+    assert select_views(at_limit, [at_limit]) == [at_limit]
+    over = "v" * (VIEWS_PARAM_MAX_CHARS + 1)
+    with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
+        select_views(over, [over])
+    # The length check comes first, so even a blank-padded over-long value fails rather than meaning "all".
+    with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
+        select_views(" " * (VIEWS_PARAM_MAX_CHARS + 1), _VIEWS)
+
+
+def test_select_views_non_string_fails():
+    with pytest.raises(PipelineConfigError, match="must be a string"):
+        select_views(["a_view"], _VIEWS)
+
+
 # --------------------------------------------------------------------------- shared_view_conflict
+
+
+def test_shared_view_conflict_view_schema_user_is_shared_by_all_sharers():
+    # The same user suffix applies to every sharer, so it never creates a conflict on its own.
+    a = validate_config(_base())
+    b = validate_config({**_base(), "es_index_name": "other-index"})
+    assert shared_view_conflict([("a.yml", a), ("b.yml", b)], "", "tim_clifford") is None
 
 
 def test_shared_view_conflict_single_config_is_none():
@@ -683,6 +820,9 @@ def test_job_base_parameters():
         "ca_certs": "${var.ca_certs}",
         "monitoring_log_table": "${var.monitoring_log_table}",
         "streaming_trigger_interval": "",
+        # Per-user view schema toggle + user name: "" when the caller passes no refs (off).
+        "view_schema_per_user": "",
+        "view_schema_user_name": "",
         # Jobs dynamic value references, resolved per run by the Jobs service (monitoring log run id).
         "job_run_id": "{{job.run_id}}",
         "task_run_id": "{{task.run_id}}",
