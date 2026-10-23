@@ -56,6 +56,7 @@ print("files root:", FILES_ROOT)
 from pipeline_lib.config import (  # noqa: E402
     column_present,
     load_config,
+    describe_schema_rows,
     per_user_preflight_problem,
     render_view_sql,
     schema_owner_problem,
@@ -246,17 +247,17 @@ for filename in sql_files:
         if VIEW_SCHEMA_USER:
             _schema = view_schema_fqn(subs["view"])
             if _schema not in _schemas_created:
-                try:
-                    _rows = [(r[0], r[1]) for r in spark.sql(f"DESCRIBE SCHEMA EXTENDED {_schema}").collect()]
-                except Exception as _exc:  # noqa: BLE001 - only "not found" means "create it"
-                    if "SCHEMA_NOT_FOUND" not in str(_exc):
-                        raise
-                    _rows = None
-                _owner_problem = schema_owner_problem(_rows, _ME, _schema)
+                _describe = lambda sql: spark.sql(sql).collect()  # noqa: E731
+                _owner_problem = schema_owner_problem(describe_schema_rows(_describe, _schema), _ME, _schema)
                 if _owner_problem:
                     raise ValueError(_owner_problem)
                 print(f"    CREATE SCHEMA IF NOT EXISTS {_schema}")
                 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_schema}")
+                # Check again now that it exists: another identity could have created it since the first check
+                # (IF NOT EXISTS would then succeed silently on their schema).
+                _owner_problem = schema_owner_problem(describe_schema_rows(_describe, _schema) or [], _ME, _schema)
+                if _owner_problem:
+                    raise ValueError(_owner_problem)
                 _schemas_created.add(_schema)
         # Print the substitutions and the fully-rendered SQL that is about to run (all ${...}
         # substituted, ${environment} folded in) so the exact CREATE OR REPLACE is visible in the job

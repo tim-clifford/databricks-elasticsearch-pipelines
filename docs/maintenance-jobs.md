@@ -204,7 +204,9 @@ databricks bundle run cluster_log_prune -t <target> -p <profile> --params dry_ru
   cluster that has delivered nothing for the whole retention window is assumed to have terminated. An
   empty tree left by an earlier run that stopped partway is removed once it holds `eventlog/` (which
   Databricks delivers only when a cluster terminates); without it, the empty tree stays until removed by
-  hand. Such a leftover only follows a run that already failed and emailed. For a cluster still delivering, only
+  hand. Such a leftover only follows a run that already failed and emailed. (An all-purpose
+  cluster restarted under the same id keeps its old `eventlog/`, so its still-empty new directories can
+  be removed; removal is never recursive, so no log is lost. Job clusters get a new id every run.) For a cluster still delivering, only
   directories emptied by the deletes go, so its new, still-empty directories are left alone. Removal
   never deletes contents: a directory that gained a log since the listing stays, counted as
   `raced_dirs` in the summary rather than as a failure.

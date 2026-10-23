@@ -1804,6 +1804,18 @@ def schema_owner_problem(describe_rows, me: str, schema: str) -> str | None:
     return None
 
 
+def describe_schema_rows(describe, schema: str):
+    """`DESCRIBE SCHEMA EXTENDED` rows of `schema` as (item, value) pairs via `describe(sql) -> rows`, or None
+    when the schema doesn't exist. Only a SCHEMA_NOT_FOUND error means "doesn't exist"; any other error (a
+    permission problem, a transient failure) is re-raised, so the owner guard is never silently skipped."""
+    try:
+        return [(r[0], r[1]) for r in describe(f"DESCRIBE SCHEMA EXTENDED {schema}")]
+    except Exception as exc:  # noqa: BLE001 - classified below
+        if "SCHEMA_NOT_FOUND" in str(exc):
+            return None
+        raise
+
+
 def selected_view_files(requested: object, sql_files: list) -> list:
     """The view .sql files deploy_views deploys: `sql_files` narrowed by the `views` parameter (see
     select_views), as file names, in `sql_files` order."""

@@ -547,3 +547,16 @@ def test_execute_file_gone_with_its_parent_climbs_to_the_root():
     assert execute_plan(_plan([f], []), _Rm(fail=[f]), dry_run=False, ls=ls, root=ROOT) == (1, 0, 0, [])
     # Without a root the climb doesn't go up, so it is not proven gone.
     assert len(execute_plan(_plan([f], []), _Rm(fail=[f]), dry_run=False, ls=ls)[3]) == 1
+
+
+def test_execute_dir_gone_with_its_parent_climbs_to_the_root():
+    # A concurrent run removed the whole cluster directory: driver/ and the cluster dir are both not found,
+    # and the root lists without the cluster, so driver/ counts as removed (root bounds the climb).
+    d = f"{ROOT}/{CID}/driver"
+
+    def ls(p):
+        if p in (d, f"{ROOT}/{CID}"):
+            raise FileNotFoundError(p)
+        return []
+    assert execute_plan(_plan([], [d]), _Rm(fail=[d]), dry_run=False, ls=ls, root=ROOT) == (0, 1, 0, [])
+    assert len(execute_plan(_plan([], [d]), _Rm(fail=[d]), dry_run=False, ls=ls)[3]) == 1

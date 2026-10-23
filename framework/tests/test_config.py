@@ -40,6 +40,7 @@ from pipeline_lib.config import (
     require_write_concurrency,
     require_write_repartition,
     resolve_config,
+    describe_schema_rows,
     per_user_preflight_problem,
     per_user_schema_collisions,
     schema_owner_problem,
@@ -725,6 +726,20 @@ def test_schema_owner_problem():
     assert msg and "owned by 'jane@x.com'" in msg and "--var view_schema_per_user=false" in msg
     for rows in ([("Namespace Name", "x")], [("Owner", "")], [("Owner", _ME), ("Owner", _ME)]):
         assert "owner can't be read" in schema_owner_problem(rows, _ME, s)
+
+
+def test_describe_schema_rows():
+    rows = describe_schema_rows(lambda sql: [("Owner", _ME), ("Namespace Name", "x")], "cat.s")
+    assert rows == [("Owner", _ME), ("Namespace Name", "x")]
+
+    def missing(sql):
+        raise RuntimeError("[SCHEMA_NOT_FOUND] The schema `cat`.`s` cannot be found.")
+    assert describe_schema_rows(missing, "cat.s") is None
+
+    def denied(sql):
+        raise RuntimeError("[PERMISSION_DENIED] User does not have USE SCHEMA on Schema 'cat.s'")
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        describe_schema_rows(denied, "cat.s")
 
 
 def test_selected_view_files():

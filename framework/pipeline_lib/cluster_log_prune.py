@@ -294,7 +294,7 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") ->
                 raced = ls is not None and len(list(ls(path))) > 0 and not_empty
             except Exception as list_exc:  # noqa: BLE001 - can't tell unless it's positively gone
                 # Gone only on positive evidence: the not-found text AND the parent listing without it.
-                gone = _is_not_found(list_exc) and _absent_from_parent(path, ls)
+                gone = _is_not_found(list_exc) and _absent_from_parent(path, ls, floor=root)
             if gone:
                 deleted_dirs += 1   # removed after all (e.g. by a concurrent run): nothing left to fail on
                 continue
