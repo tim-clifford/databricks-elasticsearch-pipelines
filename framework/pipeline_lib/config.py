@@ -1728,11 +1728,17 @@ def per_user_schema_collisions(cfgs: list, environment: str, user: str) -> list:
 
     `<view schema>_<user>` is a plain concatenation, so e.g. schema `es` + user `poc` is `es_poc`, which may
     be another feed's real, shared view schema; deploy_views fails closed rather than replace views there.
-    `cfgs` is every loaded config (not just a subset run's), since any of them may own the shared schema."""
+    `cfgs` is every loaded config (not just a subset run's), since any of them may own the shared schema.
+    A config that fails to resolve is skipped here: deploy_views reports it as that view's own failure."""
     if not user:
         return []
-    configured = {view_schema_fqn(view_substitutions(c, environment)["view"]) for c in cfgs}
-    per_user = {view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"]) for c in cfgs}
+    configured, per_user = set(), set()
+    for c in cfgs:
+        try:
+            configured.add(view_schema_fqn(view_substitutions(c, environment)["view"]))
+            per_user.add(view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"]))
+        except PipelineConfigError:
+            continue
     return sorted(per_user & configured)
 
 

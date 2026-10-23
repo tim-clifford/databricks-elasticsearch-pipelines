@@ -200,7 +200,8 @@ databricks bundle run cluster_log_prune -t <target> -p <profile> --params dry_ru
 - **Failures.** A file or directory that can't be deleted, or a directory that can't be listed, is
   reported and fails the run after everything else has been tried.
 - **Directories.** A finished cluster (every file under it past the cutoff, nothing else there) is
-  removed whole, including empty directories it never used. For a cluster still delivering, only
+  removed whole, including empty directories it never used. "Finished" is judged by file age alone: a
+  cluster that has delivered nothing for the whole retention window is assumed to have terminated. For a cluster still delivering, only
   directories emptied by the deletes go, so its new, still-empty directories are left alone. Removal
   never deletes contents: a directory that gained a log since the listing stays, counted as
   `raced_dirs` in the summary rather than as a failure.

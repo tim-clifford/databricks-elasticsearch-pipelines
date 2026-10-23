@@ -157,7 +157,8 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
     except Exception as exc:  # noqa: BLE001
         # A volume can't be created by log delivery, so a missing volume is a misconfiguration, not "no logs yet".
         deeper_than_volume = len(root.rstrip("/").split("/")) > 5
-        if deeper_than_volume and _is_not_found(exc) and _absent_from_parent(root, ls):
+        volume = "/".join(root.rstrip("/").split("/")[:5])
+        if deeper_than_volume and _is_not_found(exc) and _absent_from_parent(root, ls, floor=volume):
             # Configured but not created yet: no cluster has delivered logs, so there is nothing to prune.
             return PrunePlan([], [], 0, 0, [], [], root_missing=True)
         list_errors.append((root, f"{type(exc).__name__}: {exc}"))
@@ -188,23 +189,34 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
             # Post-order, so each directory's children are decided first; one is removed only when it is
             # clean, has age evidence, and every child directory is being removed too (a kept child means it
             # won't be empty).
+            children = {}
+            for c, *_ in cluster_dirs:
+                children.setdefault(_parent(c), []).append(c)
             removable = set()
             for d, d_clean, d_old, d_own_old in cluster_dirs:
-                children = [c for c, *_ in cluster_dirs if _parent(c) == d]
-                if d_clean and (d_old or d_own_old) and all(c in removable for c in children):
+                if d_clean and (d_old or d_own_old) and all(c in removable for c in children.get(d, ())):
                     removable.add(d)
                     delete_dirs.append(d)
     return PrunePlan(delete_files, delete_dirs, kept["files"], kept["bytes"], skipped, list_errors)
 
 
-def _absent_from_parent(path: str, ls) -> bool:
-    """True only when the parent lists and does not contain `path`: positive evidence it doesn't exist, so a
-    not-found message from some other cause can't pass for a missing root."""
-    name = path.rstrip("/").rsplit("/", 1)[-1]
-    try:
-        return not any(_name(e) == name for e in ls(_parent(path)))
-    except Exception:  # noqa: BLE001 - can't confirm absence => not missing (the caller records the error)
-        return False
+def _absent_from_parent(path: str, ls, floor: str = "") -> bool:
+    """True only when the nearest ancestor that lists does not contain the next component toward `path`:
+    positive evidence it doesn't exist, so a not-found message from some other cause can't pass for it.
+    Climbs past ancestors that are themselves positively not found (a path missing several levels deep),
+    but never above `floor` (default: just the parent). Any other listing error => not proven absent."""
+    child = path.rstrip("/")
+    ancestor = _parent(child)
+    while True:
+        try:
+            listing = list(ls(ancestor))
+        except Exception as exc:  # noqa: BLE001
+            if not _is_not_found(exc) or not floor or ancestor == floor or len(ancestor) <= len(floor):
+                return False
+            child, ancestor = ancestor, _parent(ancestor)
+            continue
+        name = child.rsplit("/", 1)[-1]
+        return not any(_name(e) == name for e in listing)
 
 
 def parse_retention_days(raw: object) -> int:
@@ -238,7 +250,13 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
     if dry_run:
         return 0, 0, 0, failures
     deleted_files = deleted_dirs = raced_dirs = 0
-    stuck = []  # paths that are still there, so no directory above them can be empty
+    blocked = set()  # every ancestor of a path that is still there: those directories can't be empty
+
+    def _block(path):
+        p = _parent(path)
+        while p and p not in blocked:
+            blocked.add(p)
+            p = _parent(p) if "/" in p else ""
 
     def _rm(path):
         if rm(path, recurse=False) is False:
@@ -250,24 +268,25 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
             deleted_files += 1
         except Exception as exc:  # noqa: BLE001 - collected; keep going
             failures.append(f"delete {path}: {type(exc).__name__}: {exc}")
-            stuck.append(path)
+            _block(path)
     for path in plan.delete_dirs:
-        if any(f.startswith(path + "/") for f in stuck):
+        if path in blocked:
             continue
         try:
             _rm(path)
             deleted_dirs += 1
         except Exception as exc:  # noqa: BLE001
-            stuck.append(path)
             gone = raced = False
             try:
                 raced = ls is not None and len(list(ls(path))) > 0
             except Exception as list_exc:  # noqa: BLE001 - can't tell unless it's positively gone
-                gone = _is_not_found(list_exc)
+                # Gone only on positive evidence: the not-found text AND the parent listing without it.
+                gone = _is_not_found(list_exc) and _absent_from_parent(path, ls)
             if gone:
                 deleted_dirs += 1   # removed after all (e.g. by a concurrent run): nothing left to fail on
-                stuck.pop()
-            elif raced:
+                continue
+            _block(path)
+            if raced:
                 raced_dirs += 1
             else:
                 failures.append(f"remove dir {path}: {type(exc).__name__}: {exc}")

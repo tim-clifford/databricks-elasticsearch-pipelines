@@ -391,13 +391,55 @@ def test_execute_dir_rm_returning_false_is_a_failure():
         0, 0, 0, [f"remove dir {d}: OSError: rm returned False (nothing deleted)"])
 
 
-def test_execute_dir_already_gone_counts_as_removed():
-    # The remove failed but the directory is positively gone (e.g. a concurrent run took it): not a failure,
-    # and its parent is still tried.
+@pytest.mark.parametrize("not_found", [
+    FileNotFoundError("gone"),
+    RuntimeError("java.io.FileNotFoundException: /Volumes/cat/sch/vol/cluster_logs/x does not exist"),
+])
+def test_execute_dir_already_gone_counts_as_removed(not_found):
+    # The remove failed but the directory is positively gone (its listing is not-found AND the parent lists
+    # without it, e.g. a concurrent run took it): not a failure, and its parent is still tried.
     d, parent = f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}"
 
     def ls(p):
-        raise FileNotFoundError(p)
+        if p == d:
+            raise not_found
+        return []
     rm = _Rm(fail=[d])
     assert execute_plan(_plan([], [d, parent]), rm, dry_run=False, ls=ls) == (0, 2, 0, [])
     assert [p for p, _ in rm.calls] == [d, parent]
+
+
+def test_execute_not_found_text_without_absence_is_still_a_failure():
+    # The relisting says not-found but the parent still shows the directory: not proven gone.
+    d = f"{ROOT}/{CID}/driver"
+
+    def ls(p):
+        if p == d:
+            raise RuntimeError("caused by FileNotFoundException: something else")
+        return [SimpleNamespace(name="driver/", size=0, modificationTime=0)]
+    _, deleted_dirs, raced, failures = execute_plan(_plan([], [d]), _Rm(fail=[d]), dry_run=False, ls=ls)
+    assert (deleted_dirs, raced, len(failures)) == (0, 0, 1)
+
+
+def test_execute_without_ls_a_failed_dir_is_a_failure():
+    d = f"{ROOT}/{CID}/driver"
+    _, _, raced, failures = execute_plan(_plan([], [d]), _Rm(fail=[d]), dry_run=False)
+    assert raced == 0 and failures == [f"remove dir {d}: OSError: cannot delete {d}"]
+
+
+def test_active_cluster_removes_a_dir_by_its_own_old_timestamp():
+    tree = {CID: {"driver": {"live": NEW}, "executor": {"app": {"__mtime__": OLD}, "app2": {}}}}
+    assert plan_prune(ROOT, _fs(tree), CUTOFF).delete_dirs == [f"{ROOT}/{CID}/executor/app"]
+
+
+def test_missing_root_several_levels_deep_is_an_empty_plan():
+    # /Volumes/cat/sch/vol/a/b where a/ doesn't exist either: climb to the volume, which lists without a/.
+    root = "/Volumes/cat/sch/vol/a/b"
+
+    def ls(path):
+        if path in (root, "/Volumes/cat/sch/vol/a"):
+            raise FileNotFoundError(path)
+        if path == "/Volumes/cat/sch/vol":
+            return [SimpleNamespace(name="checkpoints/", size=0, modificationTime=0)]
+        raise AssertionError(f"listed above the volume: {path}")
+    assert plan_prune(root, ls, CUTOFF).root_missing is True
