@@ -1675,6 +1675,8 @@ def shared_view_conflict(cfgs: list, environment: str, view_schema_user: str = "
 # FEVM 2026-10-23: a 10,010-char value was refused at 10,018). `{"views":""}` takes 12 of those, so a
 # `views` value alone can be at most 9,988 characters, and less if other parameters ride the same run.
 # select_views measures the JSON form, so a character that JSON escapes counts at its escaped length.
+# Non-ASCII is counted as its 6-character \uXXXX escape, deliberately conservative: whether the API counts
+# it escaped is unverified, and view names (.sql file names) are normally plain ASCII.
 JOB_PARAMETERS_JSON_MAX_CHARS = 10_000
 VIEWS_PARAM_MAX_CHARS = JOB_PARAMETERS_JSON_MAX_CHARS - len('{"views":""}')
 
@@ -1748,7 +1750,8 @@ def per_user_schema_collisions(cfgs: list, environment: str, user: str) -> list:
             per_user.add(view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"]))
         except Exception:  # noqa: BLE001 - reported per view by deploy_views
             continue
-    return sorted(per_user & configured)
+    # Unity Catalog names are case-insensitive (ES_poc and es_poc are one schema), so compare lowercased.
+    return sorted({s.lower() for s in per_user} & {s.lower() for s in configured})
 
 
 def view_schema_fqn(view_fqn: str) -> str:

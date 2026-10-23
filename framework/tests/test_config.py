@@ -677,6 +677,13 @@ def test_per_user_schema_collisions_include_source_and_reference_schemas():
     assert per_user_schema_collisions([ref], "catalog", "validation_catalog") == ["acme_catalog.ocsf_validation_catalog"]
 
 
+def test_per_user_schema_collisions_ignore_case():
+    # UC names are case-insensitive: view schema ES + user poc is the shared es_poc.
+    shared = validate_config(_base())   # view schema es_poc
+    upper = validate_config({**_base(), "view": {"catalog": "cat", "schema": "ES", "name": "other"}})
+    assert per_user_schema_collisions([shared, upper], "", "poc") == ["cat.es_poc"]
+
+
 def test_per_user_schema_collisions_skips_any_resolve_error():
     # Not only PipelineConfigError: a malformed config dict (KeyError) is also left to the per-view loop.
     shared = validate_config(_base())

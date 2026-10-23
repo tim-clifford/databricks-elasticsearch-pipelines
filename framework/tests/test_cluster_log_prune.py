@@ -471,3 +471,26 @@ def test_execute_file_rm_failure_with_file_still_listed_is_a_failure():
     ls = lambda p: [SimpleNamespace(name="a", size=1, modificationTime=OLD)]  # noqa: E731
     deleted_files, deleted_dirs, _, failures = execute_plan(_plan([f], [d]), _Rm(fail=[f]), dry_run=False, ls=ls)
     assert (deleted_files, deleted_dirs, len(failures)) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("parent_exc", [PermissionError("denied"), FileNotFoundError("parent gone")])
+def test_execute_file_rm_failure_with_unlistable_parent_is_a_failure(parent_exc):
+    # An unreadable parent is not proof the file is gone (and the no-floor check must not climb further).
+    f = f"{ROOT}/{CID}/driver/a"
+
+    def ls(p):
+        raise parent_exc
+    deleted_files, _, _, failures = execute_plan(_plan([f], []), _Rm(fail=[f]), dry_run=False, ls=ls)
+    assert deleted_files == 0 and len(failures) == 1
+
+
+def test_terminated_leftover_with_no_files_is_removed():
+    # An earlier run deleted every file but stopped before removing the directories: no files, no readable
+    # age, but eventlog/ shows the cluster terminated, so the leftover tree goes.
+    tree = {CID: {"driver": {}, "executor": {"app": {}}, "eventlog": {"x": {}}}}
+    plan = plan_prune(ROOT, _fs(tree), CUTOFF)
+    assert plan.delete_dirs[-1] == f"{ROOT}/{CID}" and len(plan.delete_dirs) == 6
+    # Without eventlog/ (a cluster that hasn't delivered yet), the same empty tree stays.
+    assert plan_prune(ROOT, _fs({CID: {"driver": {}, "executor": {"app": {}}}}), CUTOFF).delete_dirs == []
+    # A file-less cluster holding a current file elsewhere is not a leftover.
+    assert plan_prune(ROOT, _fs({CID: {"driver": {"live": NEW}, "eventlog": {}}}), CUTOFF).delete_dirs == []
