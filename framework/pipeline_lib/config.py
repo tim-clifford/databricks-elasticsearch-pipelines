@@ -1723,6 +1723,19 @@ def select_views(requested: object, available: list) -> list:
     return [n for n in available if n in wanted]
 
 
+def per_user_schema_collisions(cfgs: list, environment: str, user: str) -> list:
+    """Per-user view schemas that are ALSO a configured (unsuffixed) view schema, sorted. Empty when off.
+
+    `<view schema>_<user>` is a plain concatenation, so e.g. schema `es` + user `poc` is `es_poc`, which may
+    be another feed's real, shared view schema; deploy_views fails closed rather than replace views there.
+    `cfgs` is every loaded config (not just a subset run's), since any of them may own the shared schema."""
+    if not user:
+        return []
+    configured = {view_schema_fqn(view_substitutions(c, environment)["view"]) for c in cfgs}
+    per_user = {view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"]) for c in cfgs}
+    return sorted(per_user & configured)
+
+
 def view_schema_fqn(view_fqn: str) -> str:
     """`catalog.schema` of a fully-qualified `catalog.schema.name` view (what deploy_views creates in
     per-user mode)."""

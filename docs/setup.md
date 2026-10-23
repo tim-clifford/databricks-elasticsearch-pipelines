@@ -323,6 +323,8 @@ Each developer owns their own copy.
   `deploy_views`. The next deploy without the flag turns it back on.
 - With it on, a missing or illegal user name fails `deploy_views` and the feed runs, rather than
   falling back to the shared schema.
+- If a per-user schema would be one of the configured view schemas (for example view schema `es` and
+  user `poc` against a feed whose view schema is `es_poc`), `deploy_views` fails before deploying.
 - A service principal's short name (a CI deploy) is usually not a legal schema name, so deploy to `dev`
   as a service principal with `--var view_schema_per_user=false`.
 

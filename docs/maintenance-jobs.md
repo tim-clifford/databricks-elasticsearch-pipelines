@@ -199,11 +199,13 @@ databricks bundle run cluster_log_prune -t <target> -p <profile> --params dry_ru
   logs, or after changing `cluster_log_volume_path`.
 - **Failures.** A file or directory that can't be deleted, or a directory that can't be listed, is
   reported and fails the run after everything else has been tried.
-- **Directories.** A directory is removed only once old files under it have been deleted (or its own
-  timestamp is past the cutoff), so a running cluster's new, still-empty directory is left alone.
-  Removal never deletes contents: a directory that gained a log since the listing stays, counted as
+- **Directories.** A finished cluster (every file under it past the cutoff, nothing else there) is
+  removed whole, including empty directories it never used. For a cluster still delivering, only
+  directories emptied by the deletes go, so its new, still-empty directories are left alone. Removal
+  never deletes contents: a directory that gained a log since the listing stays, counted as
   `raced_dirs` in the summary rather than as a failure.
 - **Unset path.** With `cluster_log_volume_path` empty the run succeeds without doing anything, so the
   job can stay scheduled in targets that don't deliver cluster logs. A path that is set but doesn't exist
-  yet (no cluster has delivered logs there) also succeeds, with a warning in the run output.
+  yet (no cluster has delivered logs there) also succeeds, with a warning in the run output. A missing
+  volume fails the run, since log delivery can't create one.
 - **Grants.** The job's identity needs `READ VOLUME` and `WRITE VOLUME` on the volume.

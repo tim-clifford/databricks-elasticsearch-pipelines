@@ -56,6 +56,7 @@ print("files root:", FILES_ROOT)
 from pipeline_lib.config import (  # noqa: E402
     column_present,
     load_config,
+    per_user_schema_collisions,
     render_view_sql,
     select_views,
     shared_view_conflict,
@@ -117,6 +118,17 @@ _selected = select_views(VIEWS, [os.path.splitext(f)[0] for f in sql_files])
 if len(_selected) < len(sql_files):
     sql_files = [f"{name}.sql" for name in _selected]
     print(f"deploying the requested subset: {len(sql_files)} view(s): {', '.join(sql_files)}")
+
+# Per-user mode: fail closed if a per-user schema is also some config's real view schema (a plain
+# concatenation like es + poc = es_poc could land on it), before anything deploys.
+if VIEW_SCHEMA_USER:
+    _collisions = per_user_schema_collisions(
+        [cfg for entries in configs_by_view.values() for _, cfg in entries], ENVIRONMENT, VIEW_SCHEMA_USER)
+    if _collisions:
+        raise ValueError(
+            f"per-user view schema(s) {', '.join(_collisions)} are also configured view schemas, so per-user "
+            f"views would replace shared ones; rename the view schema or deploy with --var view_schema_per_user=false"
+        )
 
 # Per-user mode creates each view's schema (<configured schema>_<user>) inside the per-view loop below,
 # once per schema, so a view whose config fails to resolve fails on its own like any other view error.

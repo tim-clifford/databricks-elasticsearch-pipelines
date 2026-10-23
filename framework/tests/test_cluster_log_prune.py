@@ -171,6 +171,32 @@ def test_missing_root_is_an_empty_plan_not_a_failure(exc):
     assert plan.list_errors == [] and plan.delete_files == [] and plan.delete_dirs == []
 
 
+def test_missing_volume_is_a_failure_not_an_empty_plan():
+    # Log delivery can't create a volume, so a missing volume is a misconfiguration even if the schema
+    # positively lacks it.
+    vol = "/Volumes/cat/sch/vol"
+
+    def ls(path):
+        if path == vol:
+            raise FileNotFoundError(path)
+        return [SimpleNamespace(name="other_vol/", size=0, modificationTime=0)]
+    plan = plan_prune(vol, ls, CUTOFF)
+    assert plan.root_missing is False and [p for p, _ in plan.list_errors] == [vol]
+
+
+def test_missing_file_size_counts_as_zero():
+    def ls(path):
+        if path == ROOT:
+            return [SimpleNamespace(name=f"{CID}/", size=0, modificationTime=0)]
+        if path.endswith(CID):
+            return [SimpleNamespace(name="driver/", size=0, modificationTime=0)]
+        return [SimpleNamespace(name="new", size=None, modificationTime=NEW),
+                SimpleNamespace(name="old", modificationTime=OLD)]
+    plan = plan_prune(ROOT, ls, CUTOFF)
+    assert plan.kept_files == 1 and plan.kept_bytes == 0
+    assert plan.delete_files == [(f"{ROOT}/{CID}/driver/old", 0)]
+
+
 @pytest.mark.parametrize("parent", [["cluster_logs/"], PermissionError("denied")])
 def test_not_found_text_without_positive_absence_is_a_failure(parent):
     # The root is present in its parent (or the parent can't be read), so a not-found message must come from
@@ -184,24 +210,38 @@ def test_empty_root_plans_nothing():
     assert plan == PrunePlan([], [], 0, 0, [], [], root_missing=False)
 
 
-def test_fresh_empty_dirs_are_kept_old_empty_dirs_removed():
-    # A cluster that hasn't delivered yet has a fresh (or 0-dated) empty directory: leave it. One whose own
-    # modificationTime is old, or that empties because old files go, is removed.
+def test_empty_dirs_with_no_age_evidence_are_kept():
+    # A cluster that hasn't delivered yet: an empty (0- or fresh-dated) directory stays; one whose own
+    # timestamp is old goes.
     assert plan_prune(ROOT, _fs({CID: {}}), CUTOFF).delete_dirs == []
     assert plan_prune(ROOT, _fs({CID: {"__mtime__": NEW}}), CUTOFF).delete_dirs == []
+    assert plan_prune(ROOT, _fs({CID: {"driver": {}}}), CUTOFF).delete_dirs == []
     assert plan_prune(ROOT, _fs({CID: {"__mtime__": OLD}}), CUTOFF).delete_dirs == [f"{ROOT}/{CID}"]
-    plan = plan_prune(ROOT, _fs({CID: {"driver": {"a": OLD}, "executor": {}}}), CUTOFF)
-    assert plan.delete_dirs == [f"{ROOT}/{CID}/driver"]   # executor is fresh and empty, so the cluster stays
-    plan = plan_prune(ROOT, _fs({CID: {"driver": {"a": OLD}, "executor": {"__mtime__": OLD}}}), CUTOFF)
-    assert plan.delete_dirs == [f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}/executor", f"{ROOT}/{CID}"]
 
 
-def test_fresh_empty_dir_deep_in_a_log_kind_is_kept():
-    # executor/app2/ is a just-started application's empty directory: it stays, so executor/ and the cluster
-    # stay too, while the fully old executor/app/ subtree goes.
-    tree = {CID: {"executor": {"app": {"0": {"stderr": OLD}}, "app2": {}}}}
+def test_finished_cluster_goes_whole_including_never_used_dirs():
+    # Every file under the cluster is old and nothing else is there: the cluster has finished, so its
+    # never-used empty directories (executor/app2, eventlog) go with it.
+    tree = {CID: {"driver": {"a": OLD}, "executor": {"app": {"0": {"stderr": OLD}}, "app2": {}}, "eventlog": {}}}
+    plan = plan_prune(ROOT, _fs(tree), CUTOFF)
+    assert set(plan.delete_dirs) == {f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}/executor/app/0",
+                                     f"{ROOT}/{CID}/executor/app", f"{ROOT}/{CID}/executor/app2",
+                                     f"{ROOT}/{CID}/executor", f"{ROOT}/{CID}/eventlog", f"{ROOT}/{CID}"}
+    assert plan.delete_dirs[-1] == f"{ROOT}/{CID}"
+
+
+def test_active_cluster_keeps_fresh_empty_dirs():
+    # A cluster still delivering (driver has a current file): only directories emptied by old-file deletes
+    # go; its fresh empty directories stay, and so does the cluster.
+    tree = {CID: {"driver": {"log4j-active.log": NEW, "old.gz": OLD},
+                  "executor": {"app": {"0": {"stderr": OLD}}, "app2": {}}, "eventlog": {}}}
     plan = plan_prune(ROOT, _fs(tree), CUTOFF)
     assert plan.delete_dirs == [f"{ROOT}/{CID}/executor/app/0", f"{ROOT}/{CID}/executor/app"]
+
+
+def test_a_skipped_entry_keeps_an_otherwise_finished_cluster():
+    plan = plan_prune(ROOT, _fs({CID: {"driver": {"a": OLD}, "executor": {}, "notes": OLD}}), CUTOFF)
+    assert plan.delete_dirs == [f"{ROOT}/{CID}/driver"]
 
 
 def test_the_root_is_never_removed():
@@ -343,3 +383,21 @@ def test_execute_rm_returning_false_is_a_failure():
         _plan([f], [f"{ROOT}/{CID}/driver"]), _Rm(false=[f]), dry_run=False)
     assert (deleted_files, deleted_dirs) == (0, 0)
     assert failures == [f"delete {f}: OSError: rm returned False (nothing deleted)"]
+
+
+def test_execute_dir_rm_returning_false_is_a_failure():
+    d = f"{ROOT}/{CID}/driver"
+    assert execute_plan(_plan([], [d]), _Rm(false=[d]), dry_run=False, ls=lambda p: []) == (
+        0, 0, 0, [f"remove dir {d}: OSError: rm returned False (nothing deleted)"])
+
+
+def test_execute_dir_already_gone_counts_as_removed():
+    # The remove failed but the directory is positively gone (e.g. a concurrent run took it): not a failure,
+    # and its parent is still tried.
+    d, parent = f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}"
+
+    def ls(p):
+        raise FileNotFoundError(p)
+    rm = _Rm(fail=[d])
+    assert execute_plan(_plan([], [d, parent]), rm, dry_run=False, ls=ls) == (0, 2, 0, [])
+    assert [p for p, _ in rm.calls] == [d, parent]

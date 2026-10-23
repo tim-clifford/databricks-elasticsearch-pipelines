@@ -95,6 +95,10 @@ else:
             print(f"  would delete {path} ({size} bytes)")
         if len(plan.delete_files) > 200:
             print(f"  ... and {len(plan.delete_files) - 200} more file(s)")
+        for path in plan.delete_dirs[:200]:
+            print(f"  would remove directory {path}")
+        if len(plan.delete_dirs) > 200:
+            print(f"  ... and {len(plan.delete_dirs) - 200} more directories")
     # Files, then directories deepest first, all non-recursive (see pipeline_lib.cluster_log_prune.execute_plan).
     # A directory that gained a fresh log since the listing is kept and counted as raced, not a failure.
     deleted_files, deleted_dirs, raced_dirs, failures = execute_plan(plan, dbutils.fs.rm, DRY_RUN, dbutils.fs.ls)

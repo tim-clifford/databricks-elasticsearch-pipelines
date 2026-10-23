@@ -40,6 +40,7 @@ from pipeline_lib.config import (
     require_write_concurrency,
     require_write_repartition,
     resolve_config,
+    per_user_schema_collisions,
     resolve_name,
     select_views,
     shared_view_conflict,
@@ -653,6 +654,15 @@ def test_view_schema_fqn(fqn, expected):
 def test_view_schema_fqn_rejects_non_three_part(fqn):
     with pytest.raises(PipelineConfigError, match="catalog.schema.name"):
         view_schema_fqn(fqn)
+
+
+def test_per_user_schema_collisions():
+    # es + poc = es_poc: a per-user schema that is another config's real view schema is reported.
+    shared = validate_config(_base())   # view schema es_poc
+    short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
+    assert per_user_schema_collisions([shared, short], "", "poc") == ["cat.es_poc"]
+    assert per_user_schema_collisions([shared, short], "", "tim_clifford") == []
+    assert per_user_schema_collisions([shared, short], "", "") == []
 
 
 def test_view_schema_fqn_of_per_user_substitution():
