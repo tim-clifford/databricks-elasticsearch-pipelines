@@ -311,7 +311,7 @@ for each feed.
 Views live in Unity Catalog, so without this two developers deploying to one `dev` workspace would
 overwrite each other's views, and one could fail to replace a view the other owns. With
 [`view_schema_per_user`](parameters.md#view_schema_per_user) set to `true` (the `dev` target's
-setting), `deploy_views` creates every view in `<view schema>_<your short name>` (for example
+setting), `deploy_views` creates every view in `<view schema>_<your short name>`, lowercased (for example
 `es_poc_jane_doe`), creating the schema if it's missing, and every feed job reads its view from there.
 Each developer owns their own copy.
 

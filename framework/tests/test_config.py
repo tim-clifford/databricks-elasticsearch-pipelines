@@ -623,6 +623,11 @@ def test_apply_view_schema_user_empty_returns_input():
     assert apply_view_schema_user(resolved, "") is resolved
 
 
+def test_view_schema_user_lowercases():
+    # UC names are case-insensitive: Tim_Clifford and tim_clifford must land in the same (one) schema name.
+    assert view_schema_user("true", "Tim_Clifford") == "tim_clifford"
+
+
 def test_view_schema_user_illegal_name_hints_at_service_principals():
     with pytest.raises(PipelineConfigError, match="--var view_schema_per_user=false"):
         view_schema_user("true", "1a2b3c4d-0000")
@@ -709,7 +714,7 @@ def test_select_views_length_limit_is_the_jobs_api_budget():
 
 def test_select_views_length_counts_json_escapes():
     # The API limit is on the JSON form: a quote or backslash costs 2 characters, a non-ASCII char up to 6.
-    with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
+    with pytest.raises(PipelineConfigError, match=r"5000 characters \(10012 as JSON\), over the 9988"):
         select_views('"' * 5_000, _VIEWS)
     with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
         select_views("\u00e9" * 2_000, _VIEWS)

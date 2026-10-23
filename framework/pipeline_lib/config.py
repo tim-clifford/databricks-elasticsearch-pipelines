@@ -1567,7 +1567,9 @@ def view_schema_user(per_user: object, user_name: object) -> str:
             f"a view schema. A service principal's short name is usually not one: deploy as a service "
             f"principal (CI) with --var view_schema_per_user=false"
         )
-    return name
+    # Lowercase: Unity Catalog names are case-insensitive and stored lowercase, so two short names that
+    # differ only in case would otherwise land in one schema (the collision this feature exists to avoid).
+    return name.lower()
 
 
 # Unity Catalog's limit on a catalog, schema, or table name.
@@ -1701,8 +1703,9 @@ def select_views(requested: object, available: list) -> list:
         raise PipelineConfigError(f"views must be a string, got {type(requested).__name__}")
     if _views_json_chars(requested) > JOB_PARAMETERS_JSON_MAX_CHARS:
         raise PipelineConfigError(
-            f"views is {len(requested)} characters, over the {VIEWS_PARAM_MAX_CHARS}-character limit (the Jobs "
-            f"API caps a run's job parameters at {JOB_PARAMETERS_JSON_MAX_CHARS} characters as JSON); leave "
+            f"views is {len(requested)} characters ({_views_json_chars(requested)} as JSON), over the "
+            f"{VIEWS_PARAM_MAX_CHARS}-character limit (the Jobs API caps a run's job parameters at "
+            f"{JOB_PARAMETERS_JSON_MAX_CHARS} characters as JSON); leave "
             f"views empty to deploy every view, or deploy the list in smaller runs"
         )
     if not requested.strip():

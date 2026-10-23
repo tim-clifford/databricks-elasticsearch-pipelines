@@ -99,47 +99,62 @@ def _join(parent: str, entry) -> str:
     return f"{parent}/{_name(entry)}"
 
 
+def _old(entry, cutoff: int) -> bool:
+    """A positive integer modificationTime below the cutoff. Anything else (0, missing, not an int) is not old."""
+    mtime = getattr(entry, "modificationTime", None)
+    return isinstance(mtime, int) and not isinstance(mtime, bool) and 0 < mtime < cutoff
+
+
+def _parent(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[0]
+
+
 def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
     """Walk `root` and classify every entry. `ls(path)` returns entries with `.name` (a directory's name
     ends in '/'), `.size` and `.modificationTime` (epoch ms), and raises if the path can't be listed.
 
     Only files under `<root>/<cluster id>/<log kind>/` are candidates; one is deleted when its
     modificationTime is a positive number below `cutoff`, otherwise kept. A directory is removed only
-    when everything under it is being deleted (so a directory that still holds a kept or skipped entry,
-    or failed to list, stays)."""
+    when nothing under it is kept, skipped, or unreadable, AND either old files under it are being deleted
+    or its own modificationTime is old: a fresh empty directory (a cluster that hasn't delivered yet)
+    stays. The root itself is never removed. A root that doesn't exist yet is an empty plan with
+    root_missing set, but only when the parent's listing positively shows it absent."""
     delete_files, delete_dirs, skipped, list_errors = [], [], [], []
     kept = {"files": 0, "bytes": 0}
 
-    def walk_log_tree(path: str) -> bool:
-        """Classify everything under an allow-listed log directory. True if it ends up empty."""
+    def walk_log_tree(path: str) -> tuple:
+        """Classify everything under an allow-listed log directory. Returns (empty, emptied): empty when
+        nothing under it stays, emptied when that is because old files under it are being deleted."""
         try:
             entries = list(ls(path))
         except Exception as exc:  # noqa: BLE001 - recorded; the subtree is left alone
             list_errors.append((path, f"{type(exc).__name__}: {exc}"))
-            return False
-        empty = True
+            return False, False
+        empty, emptied = True, False
         for e in entries:
             child = _join(path, e)
             if _is_dir(e):
-                if walk_log_tree(child):
+                sub_empty, sub_emptied = walk_log_tree(child)
+                if sub_empty and (sub_emptied or _old(e, cutoff)):
                     delete_dirs.append(child)
+                    emptied = True
                 else:
                     empty = False
                 continue
-            mtime = getattr(e, "modificationTime", None)
             size = getattr(e, "size", 0) or 0
-            if isinstance(mtime, int) and not isinstance(mtime, bool) and 0 < mtime < cutoff:
+            if _old(e, cutoff):
                 delete_files.append((child, size))
+                emptied = True
             else:
                 kept["files"] += 1
                 kept["bytes"] += size
                 empty = False
-        return empty
+        return empty, emptied
 
     try:
         top = list(ls(root))
     except Exception as exc:  # noqa: BLE001
-        if _is_not_found(exc):
+        if _is_not_found(exc) and _absent_from_parent(root, ls):
             # Configured but not created yet: no cluster has delivered logs, so there is nothing to prune.
             return PrunePlan([], [], 0, 0, [], [], root_missing=True)
         list_errors.append((root, f"{type(exc).__name__}: {exc}"))
@@ -154,52 +169,92 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
         except Exception as exc:  # noqa: BLE001
             list_errors.append((path, f"{type(exc).__name__}: {exc}"))
             continue
-        cluster_empty = True
+        cluster_empty, cluster_emptied = True, False
         for k in kinds:
             kpath = _join(path, k)
             if not (_is_dir(k) and _name(k) in LOG_KINDS):
                 skipped.append((kpath, "not a known log kind"))
                 cluster_empty = False
                 continue
-            if walk_log_tree(kpath):
+            k_empty, k_emptied = walk_log_tree(kpath)
+            if k_empty and (k_emptied or _old(k, cutoff)):
                 delete_dirs.append(kpath)
+                cluster_emptied = True
             else:
                 cluster_empty = False
-        if cluster_empty:
+        if cluster_empty and (cluster_emptied or _old(e, cutoff)):
             delete_dirs.append(path)
     return PrunePlan(delete_files, delete_dirs, kept["files"], kept["bytes"], skipped, list_errors)
 
 
-def execute_plan(plan: PrunePlan, rm, dry_run: bool) -> tuple:
-    """Carry out `plan` with `rm(path, recurse=False)` (dbutils.fs.rm). Returns
-    (deleted_files, deleted_dirs, failures), where failures is a list of messages.
+def _absent_from_parent(path: str, ls) -> bool:
+    """True only when the parent lists and does not contain `path`: positive evidence it doesn't exist, so a
+    not-found message from some other cause can't pass for a missing root."""
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        return not any(_name(e) == name for e in ls(_parent(path)))
+    except Exception:  # noqa: BLE001 - can't confirm absence => not missing (the caller records the error)
+        return False
+
+
+def parse_retention_days(raw: object) -> int:
+    """cluster_log_retention_days as an int. Fails closed on anything that isn't a plain integer."""
+    text = raw.strip() if isinstance(raw, str) else raw
+    if isinstance(text, bool) or text in (None, ""):
+        raise PipelineConfigError(f"cluster_log_retention_days must be an integer, got {raw!r}")
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        raise PipelineConfigError(
+            f"cluster_log_retention_days must be an integer, got {raw!r} (0 disables the delete)"
+        ) from None
+
+
+def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None) -> tuple:
+    """Carry out `plan` with `rm(path, recurse=False)` (dbutils.fs.rm, which returns True on success).
+    Returns (deleted_files, deleted_dirs, raced_dirs, failures), failures a list of messages.
 
     - dry_run: no rm call at all; the counts are 0 and failures only carry the plan's listing errors.
     - Files first, then directories in plan order (deepest first). Every rm is non-recursive, so a
       directory that gained a file since the listing fails to delete instead of taking the new log with it.
+    - A directory whose remove fails but which `ls` now shows non-empty is a race with a fresh delivery,
+      not a failure: it is counted in raced_dirs and kept (so a live cluster doesn't page support).
+    - An rm that returns False deleted nothing, so it is a failure, not a success.
     - Every item is tried even after a failure; failures are collected for the caller to raise on.
-    - A directory above a file that failed to delete is skipped (it can't be empty), so one bad file is
-      reported once rather than once per ancestor directory.
+    - A directory above a file or directory that failed (or raced) is skipped (it can't be empty), so one
+      problem is reported once rather than once per ancestor directory.
     """
     failures = [f"list {p}: {e}" for p, e in plan.list_errors]
     if dry_run:
-        return 0, 0, failures
-    deleted_files = deleted_dirs = 0
-    failed_paths = []
+        return 0, 0, 0, failures
+    deleted_files = deleted_dirs = raced_dirs = 0
+    stuck = []  # paths that are still there, so no directory above them can be empty
+
+    def _rm(path):
+        if rm(path, recurse=False) is False:
+            raise OSError("rm returned False (nothing deleted)")
+
     for path, _ in plan.delete_files:
         try:
-            rm(path, recurse=False)
+            _rm(path)
             deleted_files += 1
         except Exception as exc:  # noqa: BLE001 - collected; keep going
             failures.append(f"delete {path}: {type(exc).__name__}: {exc}")
-            failed_paths.append(path)
+            stuck.append(path)
     for path in plan.delete_dirs:
-        if any(f.startswith(path + "/") for f in failed_paths):
+        if any(f.startswith(path + "/") for f in stuck):
             continue
         try:
-            rm(path, recurse=False)
+            _rm(path)
             deleted_dirs += 1
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"remove dir {path}: {type(exc).__name__}: {exc}")
-            failed_paths.append(path)
-    return deleted_files, deleted_dirs, failures
+            stuck.append(path)
+            try:
+                raced = ls is not None and len(list(ls(path))) > 0
+            except Exception:  # noqa: BLE001 - can't tell; report the original failure
+                raced = False
+            if raced:
+                raced_dirs += 1
+            else:
+                failures.append(f"remove dir {path}: {type(exc).__name__}: {exc}")
+    return deleted_files, deleted_dirs, raced_dirs, failures
