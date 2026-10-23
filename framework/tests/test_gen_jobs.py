@@ -933,6 +933,7 @@ def test_shipped_cluster_log_prune_job_shape():
     assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
     assert job["schedule"]["quartz_cron_expression"]
     assert job["parameters"] == [{"name": "dry_run", "default": "false"}]
+    assert job["timeout_seconds"] == 14400   # a run against a large backlog fails (and emails) after 4 hours
     (task,) = job["tasks"]
     assert task["notebook_task"]["notebook_path"] == "../notebooks/cluster_log_prune.py"
     assert task["notebook_task"]["base_parameters"] == {
