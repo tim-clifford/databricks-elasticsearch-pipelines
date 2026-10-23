@@ -966,6 +966,15 @@ def test_read_source_latest_rejects_a_bad_row_count_before_reading(rows):
     assert session.calls == []
 
 
+@pytest.mark.parametrize("lookback", [-1, 0.0, False, "60", None])
+def test_read_source_latest_rejects_a_bad_look_back_before_reading(lookback):
+    from pipeline_lib.stream_batch import read_source_latest
+    session = _HistorySession(_HISTORY)
+    with pytest.raises(ValueError, match="lookback_seconds"):
+        read_source_latest(session, "c.s.src", 4, lookback, now=_NOW)
+    assert session.calls == []
+
+
 def test_runner_reads_the_source_version_through_read_source_latest_with_both_knobs():
     # The notebook glue: its read binds the source, the row count and the look-back, in that order, so neither knob
     # can be dropped or swapped without this failing.
@@ -979,3 +988,6 @@ def test_runner_reads_the_source_version_through_read_source_latest_with_both_kn
     # source_latest as an error, fail-soft).
     assert "LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = int(require_log_monitor_source_lookback_seconds(" in source
     assert "LOG_MONITOR_SOURCE_HISTORY_ROWS = int(require_log_monitor_source_history_rows(" in source
+    # run_start records the effective knobs for a streaming run (None in batch mode, where they do nothing).
+    for knob in ("log_monitor_source_lookback_seconds", "log_monitor_source_history_rows"):
+        assert f'"{knob}": {knob.upper()} if PIPELINE_MODE == "streaming" else None,' in source

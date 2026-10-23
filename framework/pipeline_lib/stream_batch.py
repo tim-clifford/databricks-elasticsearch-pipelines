@@ -52,6 +52,11 @@ def source_latest_from_row(row):
     return version, _EPOCH + timedelta(microseconds=ts_us)
 
 
+def _require_lookback_seconds(lookback_seconds):
+    if isinstance(lookback_seconds, bool) or not isinstance(lookback_seconds, int) or lookback_seconds < 0:
+        raise ValueError(f"lookback_seconds must be a non-negative int, got {lookback_seconds!r}")
+
+
 def source_latest_from_rows(rows, lookback_seconds, now=None):
     """(version, commit datetime in UTC) recorded as a batch's `source_latest`: of `rows` (the newest commits of the
     source's history, each with `version` and `ts_us` as source_latest_from_row reads them), the newest one
@@ -62,9 +67,8 @@ def source_latest_from_rows(rows, lookback_seconds, now=None):
     recorded, so clock skew between them shifts the effective look-back by the skew (normally milliseconds). Picks
     by version, so row order does not matter. Raises on no rows, a negative or non-integer look-back, or an unusable
     row; the caller records that as the read's error."""
-    if isinstance(lookback_seconds, bool) or not isinstance(lookback_seconds, int) or lookback_seconds < 0:
-        raise ValueError(f"lookback_seconds must be a non-negative int, got {lookback_seconds!r}")
-    commits = [source_latest_from_row(row) for row in rows]
+    _require_lookback_seconds(lookback_seconds)
+    commits =[source_latest_from_row(row) for row in rows]
     if not commits:
         raise ValueError("the source history read returned no rows")
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=lookback_seconds)
@@ -77,9 +81,11 @@ def read_source_latest(session, table, history_rows, lookback_seconds, now=None)
     commits of `table`'s history (`DESCRIBE HISTORY ... LIMIT`, newest first; the commit time as epoch microseconds
     so the session time zone cannot shift it), picked by source_latest_from_rows with `lookback_seconds`. With no
     look-back the newest commit is the answer, so it fetches one row (the cost of the read before the look-back).
-    `table` is the config's validated source name. Raises on a non-positive or non-integer `history_rows`."""
+    `table` is the config's validated source name. Raises before reading on a non-positive or non-integer
+    `history_rows`, or a negative or non-integer `lookback_seconds`."""
     if isinstance(history_rows, bool) or not isinstance(history_rows, int) or history_rows < 1:
         raise ValueError(f"history_rows must be a positive int, got {history_rows!r}")
+    _require_lookback_seconds(lookback_seconds)
     limit = 1 if lookback_seconds == 0 else history_rows
     rows = (session.sql(f"DESCRIBE HISTORY {table} LIMIT {limit}")
             .selectExpr("version", "unix_micros(timestamp) AS ts_us").collect())
