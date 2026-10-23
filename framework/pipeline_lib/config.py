@@ -1835,7 +1835,7 @@ def ensure_per_user_schema(schema: str, me: str, sql) -> None:
 def selected_config_labels(sql_files: list, configs_by_view: dict) -> set:
     """Labels of every config whose view is in `sql_files` (view .sql file names); `configs_by_view` maps a view
     name to its list of (label, config)."""
-    return {label for f in sql_files for label, _ in configs_by_view[f[:-len(".sql")] if f.endswith(".sql") else f]}
+    return {label for f in sql_files for label, _ in configs_by_view[f[:-len(".sql")]]}
 
 
 def selected_view_files(requested: object, sql_files: list) -> list:

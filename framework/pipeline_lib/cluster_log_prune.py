@@ -227,7 +227,7 @@ def parse_retention_days(raw: object) -> int:
     bool or float), or a string of optional sign plus digits (no underscores, decimals or units)."""
     if isinstance(raw, int) and not isinstance(raw, bool):
         return raw
-    if isinstance(raw, str) and re.fullmatch(r"[+-]?\d+", raw.strip()):
+    if isinstance(raw, str) and re.fullmatch(r"[+-]?[0-9]+", raw.strip()):
         return int(raw.strip())
     raise PipelineConfigError(
         f"cluster_log_retention_days must be an integer, got {raw!r} (0 disables the delete)"
