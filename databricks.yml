@@ -311,6 +311,19 @@ variables:
     description: "Global default for the durable monitoring sink. Empty default (off). When true a run also appends its metrics to ${var.monitoring_log_table}. A pipeline's own monitoring_log_enabled and a per-run --params override this. Fail-closed when on: table unset/missing or a failed append fails the task."
     default: ""
 
+  # The monitoring log's per-batch source version read (streaming, log on), on the same three-layer pattern:
+  # per-run --params > a pipeline's own value in its config > this global default > the built-in default.
+  # Each streaming batch fetches the newest log_monitor_source_history_rows commits of the source's history
+  # and records the newest one committed at least log_monitor_source_lookback_seconds before the read
+  # (source_latest_version), so a commit landing between Spark planning the batch and the read does not make
+  # a caught-up batch look behind. When none of the fetched commits is that old, the oldest is used.
+  log_monitor_source_lookback_seconds:
+    description: "Global default look-back in seconds (non-negative integer) for the monitoring log's per-batch source version read, at most 86400, for pipelines that omit it. Empty default (built-in default 60; 0 records the newest commit). A pipeline's own value and a per-run --params override this. Streaming with the monitoring log on only."
+    default: ""
+  log_monitor_source_history_rows:
+    description: "Global default number of the source's newest history rows (positive integer, at most 10000) the monitoring log's per-batch source version read fetches, for pipelines that omit it. Empty default (built-in default 100). A pipeline's own value and a per-run --params override this. Streaming with the monitoring log on only."
+    default: ""
+
   # GLOBAL defaults for the connector's connection/reliability tuning, threaded exactly like bulk_stats:
   # framework/scripts/gen_jobs.py bakes ${var.request_timeout} / ${var.transport_max_retries} /
   # ${var.max_retries_per_doc} as the job-parameter default for every pipeline that OMITS the knob, so you

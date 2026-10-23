@@ -79,7 +79,7 @@ Set up the monitoring table once per environment in [Environment Setup](setup.md
 | `docs_written` | documents written by the batch (`batch_end`) or the whole run (`run_end`) |
 | `error_type`, `error_message` | the exception on status `error` rows |
 | `files_outstanding`, `bytes_outstanding` | `batch_summary` only: the streaming backlog left after the batch (Spark's `numFilesOutstanding` / `numBytesOutstanding`) |
-| `source_latest_version`, `source_latest_ts` | streaming `batch_start` and `batch_summary`: the source table's newest commit version and commit time, read at batch start |
+| `source_latest_version`, `source_latest_ts` | streaming `batch_start` and `batch_summary`: the source table's newest commit version made at least [`log_monitor_source_lookback_seconds`](parameters.md#log_monitor_source_lookback_seconds) (default 60) before the read at batch start, and its commit time |
 | `source_end_version`, `source_end_index` | `batch_summary` only: where the batch ended in the source, from Spark's end offset |
 | `payload` | `VARIANT`: everything else the row records (queryable with `payload:field` paths in SQL) |
 | `logged_ts` | when the row was committed to the table (retention is on this) |
@@ -137,7 +137,7 @@ WHERE e.record_type = 'batch_end' AND e.status = 'success'
 ORDER BY e.start_ts DESC;
 ```
 
-<a id="caught-up-or-behind"></a>**Caught up or behind.** `files_outstanding` at zero means caught up. A non-zero backlog is ambiguous because Spark measures it after the batch, against the table as it then is, so files that landed while the batch ran count too. Each streaming batch reads the source's newest commit at its start (`source_latest_version`), and `batch_summary` carries both that and where the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** when
+<a id="caught-up-or-behind"></a>**Caught up or behind.** `files_outstanding` at zero means caught up. A non-zero backlog is ambiguous because Spark measures it after the batch, against the table as it then is, so files that landed while the batch ran count too. Each streaming batch records the source's newest commit made at least [`log_monitor_source_lookback_seconds`](parameters.md#log_monitor_source_lookback_seconds) (default 60) before its start (`source_latest_version`), and `batch_summary` carries both that and where the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** when
 
 ```text
 source_latest_version >= source_end_version AND files_outstanding > 0

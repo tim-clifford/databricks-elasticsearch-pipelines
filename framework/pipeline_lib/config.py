@@ -82,6 +82,16 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   FAIL-CLOSED when on: a table that is unset/missing, or any
                                          #   failed append, fails the task. The table is created
                                          #   out-of-band by the `_log table create` job.
+    log_monitor_source_lookback_seconds: <n>  # OPTIONAL monitoring log knob (streaming, log on): each
+                                         #   batch records the newest source commit made at least <n>
+                                         #   seconds (non-negative int, default 60) before its read, so a
+                                         #   commit landing between Spark planning the batch and the read
+                                         #   is not counted as left behind. Omit => the
+                                         #   ${var.log_monitor_source_lookback_seconds} global (empty =>
+                                         #   the default); --params overrides per run.
+    log_monitor_source_history_rows: <n> # OPTIONAL companion knob: how many of the newest source history
+                                         #   rows that read fetches (positive int, default 100). When none
+                                         #   is old enough, the oldest fetched is used. Same layering.
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -262,6 +272,20 @@ _MAX_PARTITION_BYTES_RE = re.compile(r"^(\d+)([kmgtp]b?)?$", re.IGNORECASE)
 # there the read parallelism does not reach the write and this knob restores it. Applied in BOTH modes
 # (the whole export in batch, each micro-batch in streaming).
 _DEFAULT_WRITE_REPARTITION = 0
+
+# The monitoring log's per-batch source version read (streaming, log on). Each batch reads the newest
+# log_monitor_source_history_rows commits of the source's history and records the newest one committed at
+# least log_monitor_source_lookback_seconds before the read. The look-back absorbs the gap between Spark
+# planning the batch and the read (seconds), so a commit landing in that gap is not counted as data the batch
+# left behind. A larger look-back also ignores real backlog committed in that window just before the batch, the
+# accepted trade-off. 0 seconds and 1 row is the newest commit (no look-back).
+_DEFAULT_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = 60
+_DEFAULT_LOG_MONITOR_SOURCE_HISTORY_ROWS = 100
+# Upper bounds, so a mistyped value fails at config or run start instead of on every batch: a look-back past a day
+# no longer separates caught up from behind (and a huge one overflows the cutoff, which the fail-soft read would
+# only record as an error), and the history read's cost grows with its row count.
+_MAX_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = 86400
+_MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS = 10000
 
 
 class PipelineConfigError(ValueError):
@@ -777,6 +801,54 @@ def require_max_bytes_per_trigger(value: object, where: str = "max_bytes_per_tri
     raise PipelineConfigError(f"{where} must be a Spark byte-size like '128m' (or empty to leave unset), got {value!r}")
 
 
+def _require_int(value: object, where: str, minimum: int, maximum: int, default: int, rule: str) -> str:
+    """An integer from `minimum` to `maximum`, returned as a canonical string; empty/absent returns `default`. Accepts a
+    YAML int (config value) or a string (run-time override). A bool (int subclass), a float, a non-numeric string,
+    or a value out of range is rejected (fail closed). `rule` names the requirement in the error."""
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "":
+        return str(default)
+    if isinstance(value, bool):
+        raise PipelineConfigError(f"{where} must be {rule}, got {value!r}")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)  # rejects "12.5"/"1e3"/"abc" (no silent float truncation)
+        except ValueError:
+            raise PipelineConfigError(f"{where} must be {rule}, got {value!r}")
+    else:
+        raise PipelineConfigError(f"{where} must be {rule}, got {value!r}")
+    if not minimum <= parsed <= maximum:
+        raise PipelineConfigError(f"{where} must be {rule}, got {value!r}")
+    return str(parsed)
+
+
+def require_log_monitor_source_lookback_seconds(value: object,
+                                                where: str = "log_monitor_source_lookback_seconds") -> str:
+    """OPTIONAL monitoring log knob (streaming, log on): how many seconds before its read the per-batch source
+    version read looks back, an integer from 0 to _MAX_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS as a canonical string.
+    Empty/absent returns the default (_DEFAULT_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS); 0 means no look-back (the newest
+    commit). See the defaults' comment for why it exists. Fail closed on a bool, float, non-numeric or out-of-range
+    value."""
+    return _require_int(value, where, 0, _MAX_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS,
+                        _DEFAULT_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS,
+                        f"a non-negative integer of at most {_MAX_LOG_MONITOR_SOURCE_LOOKBACK_SECONDS}")
+
+
+def require_log_monitor_source_history_rows(value: object,
+                                            where: str = "log_monitor_source_history_rows") -> str:
+    """OPTIONAL monitoring log knob (streaming, log on): how many of the source's newest history rows the
+    per-batch source version read fetches, an integer from 1 to _MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS as a canonical
+    string. Empty/absent returns the default (_DEFAULT_LOG_MONITOR_SOURCE_HISTORY_ROWS). When none of them is old
+    enough for the look-back, the oldest one is used. Fail closed on a bool, float, non-numeric or out-of-range
+    value."""
+    return _require_int(value, where, 1, _MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS,
+                        _DEFAULT_LOG_MONITOR_SOURCE_HISTORY_ROWS,
+                        f"a positive integer of at most {_MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS}")
+
+
 def _require_es_index(value: object, where: str) -> str:
     """A valid Elasticsearch index name. Enforces the char/leading-char rules via the regex, plus the
     255-BYTE length bound and no-trailing-dot rule (which a single regex can't express well)."""
@@ -844,6 +916,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "write_repartition", "max_partition_bytes",
         "max_files_per_trigger", "max_bytes_per_trigger",
         "monitoring_log_enabled",
+        "log_monitor_source_lookback_seconds", "log_monitor_source_history_rows",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
         "pause_status", "job_group", "job_name_postfix",
     }
@@ -949,6 +1022,18 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # global for this pipeline; --params overrides per run. Canonical "true"/"false"/"".
     monitoring_log_enabled = require_es_flag(raw.get("monitoring_log_enabled", ""),
                                              f"{source}: monitoring_log_enabled")
+    # The monitoring log's source version read knobs: validated when present, else "" so the target-wide global
+    # (and then the runner's built-in default) applies, as for write_repartition.
+    log_monitor_source_lookback_seconds = (
+        require_log_monitor_source_lookback_seconds(raw["log_monitor_source_lookback_seconds"],
+                                                    f"{source}: log_monitor_source_lookback_seconds")
+        if "log_monitor_source_lookback_seconds" in raw else ""
+    )
+    log_monitor_source_history_rows = (
+        require_log_monitor_source_history_rows(raw["log_monitor_source_history_rows"],
+                                                f"{source}: log_monitor_source_history_rows")
+        if "log_monitor_source_history_rows" in raw else ""
+    )
     # streaming_start selects where a FIRST streaming run positions: "new" (start at the source's current
     # version, only new commits exported) or "full" (backfill the whole existing table). OPTIONAL: absent
     # -> "" (inherit the target-wide ${var.streaming_start} global, which databricks.yml sets to "new"). A
@@ -1107,6 +1192,8 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "max_files_per_trigger": max_files_per_trigger,
         "max_bytes_per_trigger": max_bytes_per_trigger,
         "monitoring_log_enabled": monitoring_log_enabled,
+        "log_monitor_source_lookback_seconds": log_monitor_source_lookback_seconds,
+        "log_monitor_source_history_rows": log_monitor_source_history_rows,
         "view": view,
         "source": source_map,
         "reference_tables": reference_tables,
@@ -1413,6 +1500,10 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # runner reads it from the job-parameter widget, not from here; carried for consistency with its
         # sibling run-time knobs.
         "monitoring_log_enabled": cfg["monitoring_log_enabled"],
+        # The monitoring log's source version read knobs: run behaviors, passed through verbatim (canonical
+        # string form), like monitoring_log_enabled.
+        "log_monitor_source_lookback_seconds": cfg["log_monitor_source_lookback_seconds"],
+        "log_monitor_source_history_rows": cfg["log_monitor_source_history_rows"],
         "view": obj(cfg["view"], "name", "view"),
         "source": obj(cfg["source"], "table", "source", passthrough=("primary_key",)),
         "reference_tables": {
@@ -1694,6 +1785,10 @@ _RUNTIME_KNOBS = (
     # the run's metrics to the shared monitoring Delta table. On the same three-layer pattern as every
     # knob (global ${var.monitoring_log_enabled} < config key < --params); require_es_flag like bulk_stats.
     _RuntimeKnob("monitoring_log_enabled", require_es_flag),
+    # The monitoring log's per-batch source version read (streaming, log on): its look-back and how many history
+    # rows it fetches. Built-in defaults apply when every layer is empty, as for write_repartition.
+    _RuntimeKnob("log_monitor_source_lookback_seconds", require_log_monitor_source_lookback_seconds),
+    _RuntimeKnob("log_monitor_source_history_rows", require_log_monitor_source_history_rows),
 )
 
 # The knob names in registry order (stable public list for callers/tests that need the set of run-time

@@ -37,7 +37,8 @@ from datetime import datetime, timedelta, timezone
 from pipeline_lib.observability import bulk_stats_overall, bulk_stats_tail
 
 # The monitoring table's columns, in order, as (name, sql_type, comment). This ONE tuple drives the CREATE TABLE
-# statement (create_table_sql), the column comments (set at create, and by ADD COLUMNS for a column added later),
+# statement (create_table_sql), the column comments (set at create, by ADD COLUMNS for a column added later, and by
+# ALTER COLUMN for a comment changed later),
 # the row shape (ROW_FIELDS) and the writer's DataFrame schema, so the schema is defined exactly once. payload is
 # VARIANT (semi-structured, queryable with `payload:field` paths in SQL); it needs DBR 15.3+ / recent serverless,
 # which every target here runs. The comments are stored on the table, so they are written for someone reading the
@@ -78,8 +79,9 @@ MONITORING_TABLE_COLUMNS = (
      "batch_summary only: source bytes not yet processed after this batch (Spark numBytesOutstanding). The "
      "streaming backlog."),
     ("source_latest_version", "BIGINT",
-     "batch_start and batch_summary: newest commit version of the source table, read at batch start. Behind when "
-     "this is at or past source_end_version and files_outstanding is above 0. NULL when the read failed."),
+     "batch_start and batch_summary: newest source table commit version made at least "
+     "log_monitor_source_lookback_seconds (default 60) before the read at batch start. Behind when this is at or "
+     "past source_end_version and files_outstanding is above 0. NULL when the read failed."),
     ("source_latest_ts", "TIMESTAMP",
      "batch_start and batch_summary: commit time (UTC) of source_latest_version, from the source table history."),
     ("source_end_version", "BIGINT",
@@ -566,6 +568,25 @@ def alter_add_columns_sql(table_name, cols):
         return None
     added = ", ".join(_column_sql(name, sql_type, comment) for name, sql_type, comment in cols)
     return f"ALTER TABLE {canonical} ADD COLUMNS ({added})"
+
+
+def changed_comments(existing_comments):
+    """The (name, comment) pairs of MONITORING_TABLE_COLUMNS whose column IS present in `existing_comments` (the
+    current table's {column name: comment or None}) with a different comment, in schema order. Missing columns are
+    missing_columns' job (ADD COLUMNS sets their comments); unknown columns are left alone. Drives the `_log table
+    create` job's comment step: when a build rewords a column's comment, a re-run updates exactly that column."""
+    return [(name, comment) for name, _type, comment in MONITORING_TABLE_COLUMNS
+            if name in existing_comments and existing_comments[name] != comment]
+
+
+def alter_column_comment_sql(table_name, name, comment):
+    """`ALTER TABLE <name> ALTER COLUMN <column> COMMENT '...'` (metadata only; no data is rewritten). Validates the
+    table name fail-closed, the column against MONITORING_TABLE_COLUMNS (an allow-list: only a schema column is
+    ever named) and the comment against the comment allow-list."""
+    canonical = validate_table_name(table_name)
+    if name not in {col[0] for col in MONITORING_TABLE_COLUMNS}:
+        raise ValueError(f"not a monitoring table column: {name!r}")
+    return f"ALTER TABLE {canonical} ALTER COLUMN {name} COMMENT {_sql_comment(comment)}"
 
 
 def prune_sql(table_name, retention_days):

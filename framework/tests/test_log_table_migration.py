@@ -5,6 +5,8 @@ The load-bearing contracts:
 - A fresh table is created with every column and comment, and nothing else runs.
 - An existing table gets exactly the columns it lacks (with comments), in one ADD COLUMNS; a current table gets
   no ALTER at all.
+- An existing column whose comment differs from the schema's gets exactly one ALTER COLUMN ... COMMENT; a re-run
+  then changes nothing.
 - Nothing is ever dropped: an unknown column is warned about and kept.
 - Fail closed: any failed statement raises; a table missing after the create raises.
 """
@@ -21,7 +23,11 @@ TABLE = "cat.sch.mon"
 class Field:
     def __init__(self, name, comment):
         self.name = name
-        self.metadata = {"comment": comment} if comment is not None else {}
+        # NO_METADATA stands for a field whose metadata is None rather than a dict.
+        self.metadata = None if comment is NO_METADATA else {"comment": comment} if comment is not None else {}
+
+
+NO_METADATA = object()
 
 
 class FakeSpark:
@@ -52,9 +58,14 @@ class FakeSpark:
                 self.columns = dict(re.findall(r"^  (\w+) \w+ COMMENT '([^']*)'", stmt, re.M))
         elif " ADD COLUMNS " in stmt:
             self.columns.update(re.findall(r"(\w+) \w+ COMMENT '([^']*)'", stmt))
+        elif " ALTER COLUMN " in stmt:
+            name, comment = re.fullmatch(rf"ALTER TABLE {TABLE} ALTER COLUMN (\w+) COMMENT '([^']*)'", stmt).groups()
+            assert name in self.columns
+            self.columns[name] = comment
 
     def kinds(self):
-        return ["CREATE" if s.startswith("CREATE") else "ADD" if " ADD COLUMNS " in s else s
+        return ["CREATE" if s.startswith("CREATE") else "ADD" if " ADD COLUMNS " in s
+                else "COMMENT " + s.split()[5] if " ALTER COLUMN " in s else s
                 for s in self.statements]
 
 
@@ -101,9 +112,69 @@ def test_unknown_extra_column_is_warned_and_kept():
 
 # --- fail closed --------------------------------------------------------------------------------
 
+# The source_latest_version comment as tables created before the look-back carry it.
+_OLD_SOURCE_LATEST_COMMENT = (
+    "batch_start and batch_summary: newest commit version of the source table, read at batch start. Behind when "
+    "this is at or past source_end_version and files_outstanding is above 0. NULL when the read failed.")
+
+
+def test_a_reworded_comment_is_updated_in_place():
+    spark = FakeSpark({**_current(), "source_latest_version": _OLD_SOURCE_LATEST_COMMENT})
+    summary = create_or_migrate(spark, TABLE, printer=_quiet())
+    assert spark.kinds() == ["CREATE", "COMMENT source_latest_version"]
+    assert spark.columns == _current()
+    assert "outcome=MIGRATED(comments=['source_latest_version'])" in summary
+    rerun = FakeSpark(spark.columns)
+    assert "outcome=ALREADY_EXISTS" in create_or_migrate(rerun, TABLE, printer=_quiet())
+    assert rerun.kinds() == ["CREATE"]
+
+
+def test_a_missing_comment_is_set_and_reported_with_added_columns():
+    current = _current()
+    existing = {n: c for n, c in current.items() if n != "docs_written"}
+    existing["source_latest_ts"] = None
+    spark = FakeSpark(existing)
+    summary = create_or_migrate(spark, TABLE, printer=_quiet())
+    assert spark.kinds() == ["CREATE", "ADD", "COMMENT source_latest_ts"]
+    assert spark.columns == current
+    assert "outcome=MIGRATED(added=['docs_written'], comments=['source_latest_ts'])" in summary
+
+
+def test_a_column_with_no_metadata_reads_as_uncommented_and_gets_its_comment():
+    spark = FakeSpark({**_current(), "source_end_index": NO_METADATA})
+    summary = create_or_migrate(spark, TABLE, printer=_quiet())
+    assert spark.kinds() == ["CREATE", "COMMENT source_end_index"]
+    assert spark.columns == _current()
+    assert "outcome=MIGRATED(comments=['source_end_index'])" in summary
+
+
+def test_an_unknown_columns_comment_is_never_touched():
+    spark = FakeSpark({**_current(), "mystery": "whatever"})
+    create_or_migrate(spark, TABLE, printer=_quiet())
+    assert spark.columns["mystery"] == "whatever"
+    assert spark.kinds() == ["CREATE"]
+
+
+def test_alter_column_comment_sql_allow_lists_the_column_comment_and_table():
+    from pipeline_lib.monitoring_sink import alter_column_comment_sql
+    assert alter_column_comment_sql(TABLE, "docs_written", "Docs.") == (
+        f"ALTER TABLE {TABLE} ALTER COLUMN docs_written COMMENT 'Docs.'")
+    for args in (("bad name", "docs_written", "Docs."), (TABLE, "mystery", "Docs."),
+                 (TABLE, "docs_written", "it's"), (TABLE, "docs_written", None)):
+        with pytest.raises(ValueError):
+            alter_column_comment_sql(*args)
+
+
 @pytest.mark.parametrize("stage", ["CREATE", f"ALTER TABLE {TABLE} ADD"])
 def test_any_failed_statement_fails_closed(stage):
     spark = FakeSpark({n: c for n, c in _current().items() if n != "docs_written"}, fail_on=stage)
+    with pytest.raises(RuntimeError, match="failed"):
+        create_or_migrate(spark, TABLE, printer=_quiet())
+
+
+def test_a_failed_comment_update_fails_closed():
+    spark = FakeSpark({**_current(), "source_latest_version": _OLD_SOURCE_LATEST_COMMENT},
+                      fail_on=f"ALTER TABLE {TABLE} ALTER COLUMN")
     with pytest.raises(RuntimeError, match="failed"):
         create_or_migrate(spark, TABLE, printer=_quiet())
 

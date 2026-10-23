@@ -13,7 +13,9 @@
 # MAGIC liquid clustering) and a later run a no-op. When a newer build adds a column to the schema, re-running
 # MAGIC ADDITIVELY applies it (`ALTER TABLE ADD COLUMNS` for the missing columns only), WITHOUT dropping or
 # MAGIC replacing the table, so existing rows are preserved; re-run it BEFORE deploying that build (writers fail
-# MAGIC closed on a missing column). It never drops a column it does not know (an extra column is warned about).
+# MAGIC closed on a missing column). When a newer build rewords a column's comment, re-running updates it
+# MAGIC (`ALTER TABLE ALTER COLUMN ... COMMENT`, metadata only, for the changed columns only). It never drops a
+# MAGIC column it does not know (an extra column is warned about).
 # MAGIC The export jobs only ever APPEND to the table, so their run identity needs only `MODIFY`; the identity
 # MAGIC that runs THIS job needs `CREATE TABLE` / `ALTER` (and `USE CATALOG`/`USE SCHEMA`) on the target schema.
 # MAGIC
@@ -64,8 +66,8 @@ print(CREATE_SQL)
 
 # COMMAND ----------
 # Cell 2 - CREATE + MIGRATE + VERIFY (pipeline_lib.log_table_migration.create_or_migrate, unit-tested with a fake
-# session). Creates the table, or adds the columns an existing one lacks. Success is the VERIFIED end state (the
-# table exists afterwards); anything else raises, so the run fails closed.
+# session). Creates the table, or adds the columns an existing one lacks and updates changed column comments.
+# Success is the VERIFIED end state (the table exists afterwards); anything else raises, so the run fails closed.
 SUMMARY = create_or_migrate(spark, CANONICAL_TABLE)
 
 # COMMAND ----------

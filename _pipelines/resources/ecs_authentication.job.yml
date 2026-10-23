@@ -56,6 +56,10 @@ resources:
         default: ${var.max_bytes_per_trigger}
       - name: monitoring_log_enabled
         default: ${var.monitoring_log_enabled}
+      - name: log_monitor_source_lookback_seconds
+        default: ${var.log_monitor_source_lookback_seconds}
+      - name: log_monitor_source_history_rows
+        default: ${var.log_monitor_source_history_rows}
       tasks:
       - task_key: index_pipeline_ecs_authentication
         notebook_task:

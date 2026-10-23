@@ -24,6 +24,8 @@ from pipeline_lib.config import (
     require_es_flag,
     require_filter_condition,
     require_max_bytes_per_trigger,
+    require_log_monitor_source_history_rows,
+    require_log_monitor_source_lookback_seconds,
     require_max_files_per_trigger,
     require_max_partition_bytes,
     require_max_retries_per_doc,
@@ -751,6 +753,8 @@ def test_job_parameters_full_shape_and_order():
         {"name": "max_files_per_trigger", "default": ""},
         {"name": "max_bytes_per_trigger", "default": ""},
         {"name": "monitoring_log_enabled", "default": ""},
+        {"name": "log_monitor_source_lookback_seconds", "default": ""},
+        {"name": "log_monitor_source_history_rows", "default": ""},
     ]
 
 
@@ -1074,7 +1078,7 @@ def test_runtime_knob_registry_shape():
         "verify_certs",
         "bulk_stats", "retry_transport_timeout", "bypass_fast_path", "streaming_start",
         "write_repartition", "max_partition_bytes", "max_files_per_trigger", "max_bytes_per_trigger",
-        "monitoring_log_enabled",
+        "monitoring_log_enabled", "log_monitor_source_lookback_seconds", "log_monitor_source_history_rows",
     )
     # Every knob carries a callable validator (the same require_* helper used at parse + run time).
     for knob in _RUNTIME_KNOBS:
@@ -2164,6 +2168,67 @@ def test_job_parameters_rate_limits_default_from_config():
     params = job_parameters(validate_config(cfg))
     assert {"name": "max_files_per_trigger", "default": "200"} in params
     assert {"name": "max_bytes_per_trigger", "default": "256m"} in params
+
+
+# ------------------------------------- log_monitor_source_lookback_seconds / log_monitor_source_history_rows
+
+
+@pytest.mark.parametrize("value,expected", [(0, "0"), ("0", "0"), (90, "90"), (" 15 ", "15"), (86400, "86400"),
+                                            ("", "60"), (None, "60")])
+def test_require_log_monitor_source_lookback_seconds_canonical(value, expected):
+    # A non-negative int; 0 (no look-back) is a real value, empty => the built-in default 60.
+    assert require_log_monitor_source_lookback_seconds(value) == expected
+
+
+@pytest.mark.parametrize("bad", [-1, "-5", 1.5, True, False, "abc", "12.5", [60], 86401, "10" * 12])
+def test_require_log_monitor_source_lookback_seconds_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="log_monitor_source_lookback_seconds must be a non-negative"):
+        require_log_monitor_source_lookback_seconds(bad)
+
+
+@pytest.mark.parametrize("value,expected", [(1, "1"), ("1", "1"), (250, "250"), (10000, "10000"), ("", "100"),
+                                            (None, "100")])
+def test_require_log_monitor_source_history_rows_canonical(value, expected):
+    # A positive int; empty => the built-in default 100.
+    assert require_log_monitor_source_history_rows(value) == expected
+
+
+@pytest.mark.parametrize("bad", [0, "0", -1, 1.5, True, "abc", "12.5", [100], 10001])
+def test_require_log_monitor_source_history_rows_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="log_monitor_source_history_rows must be a positive"):
+        require_log_monitor_source_history_rows(bad)
+
+
+def test_log_monitor_source_knobs_absent_store_empty_in_config():
+    # Omitted => "" so job_parameters' `cfg[name] or ref` reaches the target-wide global.
+    out = validate_config(_base())
+    assert out["log_monitor_source_lookback_seconds"] == "" and out["log_monitor_source_history_rows"] == ""
+
+
+def test_log_monitor_source_knobs_from_config_reach_job_parameters_and_resolve():
+    cfg = _with_env()
+    cfg["log_monitor_source_lookback_seconds"] = 0
+    cfg["log_monitor_source_history_rows"] = "25"
+    out = validate_config(cfg)
+    assert out["log_monitor_source_lookback_seconds"] == "0" and out["log_monitor_source_history_rows"] == "25"
+    resolved = resolve_config(out, environment="prod")
+    assert resolved["log_monitor_source_lookback_seconds"] == "0"
+    assert resolved["log_monitor_source_history_rows"] == "25"
+    params = job_parameters(out, runtime_knob_global_refs())
+    # A config-set 0 is baked as "0", not swapped for the global (it is truthy as a string).
+    assert {"name": "log_monitor_source_lookback_seconds", "default": "0"} in params
+    assert {"name": "log_monitor_source_history_rows", "default": "25"} in params
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("log_monitor_source_lookback_seconds", -1), ("log_monitor_source_lookback_seconds", "abc"),
+    ("log_monitor_source_history_rows", 0), ("log_monitor_source_history_rows", True),
+])
+def test_log_monitor_source_knobs_bad_config_value_fails_closed(field, bad):
+    cfg = _base()
+    cfg[field] = bad
+    with pytest.raises(PipelineConfigError, match=field):
+        validate_config(cfg)
 
 
 # --------------------------------------------------------------------------- job_group / job_name_postfix

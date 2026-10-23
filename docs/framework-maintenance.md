@@ -57,7 +57,11 @@ The `log_table_create` job uses re-runnable migration logic (in `framework/pipel
 2. Deploy the build, then re-run `log_table_create` before the feeds run again ([above](#upgrading-an-existing-log-table)).
 3. The job adds the column via `ALTER TABLE ADD COLUMNS` (a Delta metadata commit), preserving all existing rows.
 
-Note: `ALTER TABLE ADD COLUMNS` can transiently conflict with a log append in flight; such a task fails once (fail-closed) and the task's retry policy restarts it. The job never drops a column it does not know; an unknown column is warned about and left alone.
+### Changed column comments
+
+When a build rewords a column's comment in `MONITORING_TABLE_COLUMNS`, re-running `log_table_create` updates it on an existing table (`ALTER TABLE ALTER COLUMN ... COMMENT`, metadata only, for the changed columns only; its summary lists them as `comments=[...]`). Unlike a new column, a stale comment doesn't stop feeds from writing, so this can wait until after the deploy.
+
+Note: `ALTER TABLE ADD COLUMNS` and `ALTER COLUMN ... COMMENT` can transiently conflict with a log append in flight; such a task fails once (fail-closed) and the task's retry policy restarts it. The job never drops a column it does not know; an unknown column is warned about and left alone.
 
 ## Running the tests
 

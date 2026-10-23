@@ -556,6 +556,24 @@ and ES time, straggler partitions. Default off. Turn it on when tuning or invest
 When on, the log is required: a missing table or any failed append fails the task, so no data is sent
 without a record. See [Logging and Monitoring](monitoring.md#monitoring-log).
 
+### `log_monitor_source_lookback_seconds`
+
+Streaming with the monitoring log on: how far back, in seconds, each batch's source version read looks. A
+integer from 0 to 86400 (a day); built-in default `60`. Each batch records the newest source commit made at least
+this long before the read (`source_latest_version`), so a commit that lands between Spark planning the
+batch and the read doesn't make a caught-up batch look [behind](monitoring.md#caught-up-or-behind).
+The trade-off: data committed within this window just before a batch doesn't count as left behind, so
+keep it short next to how far behind matters to you. `0` records the newest commit and reads only one
+history row, whatever [`log_monitor_source_history_rows`](#log_monitor_source_history_rows) is set to.
+
+### `log_monitor_source_history_rows`
+
+Streaming with the monitoring log on: how many of the source's newest history rows that read fetches. A
+integer from 1 to 10000; built-in default `100`. If none of them is older than the look-back (the source
+committed more often than this within the window), the oldest one fetched is used, so a caught-up
+batch can again read as behind. Larger values make the read slower
+([cost](technical-details.md#source-version-read-cost)).
+
 ### `max_partition_bytes`
 
 Sets `spark.sql.files.maxPartitionBytes` for the source read: smaller values split the read into more,
@@ -669,6 +687,8 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`verify_certs`](#verify_certs) | Knob | global, config, `--params` | verifies the ES server's TLS certificate |
 | [`bulk_stats`](#bulk_stats) | Knob | global, config, `--params` | logs per-partition bulk-send diagnostics |
 | [`monitoring_log_enabled`](#monitoring_log_enabled) | Knob | global, config, `--params` | records every run and batch in the monitoring table |
+| [`log_monitor_source_lookback_seconds`](#log_monitor_source_lookback_seconds) | Knob | global, config, `--params` | how far back each streaming batch's source version read looks |
+| [`log_monitor_source_history_rows`](#log_monitor_source_history_rows) | Knob | global, config, `--params` | how many source history rows that read fetches |
 | [`max_partition_bytes`](#max_partition_bytes) | Knob | global, config, `--params` | the source read's partition size, which sets how many partitions the write gets |
 | [`write_repartition`](#write_repartition) | Knob | global, config, `--params` | repartitions the write input into this many partitions |
 | [`max_files_per_trigger`](#max_files_per_trigger) | Knob | global, config, `--params` | the most Delta files one streaming micro-batch reads |

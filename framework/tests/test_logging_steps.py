@@ -818,3 +818,198 @@ def test_progress_recorder_periodic_interval_restarts_after_a_gap_prune():
     for bid in list(range(10)) + list(range(20, 20 + N + 1)):  # a gap from 9 to 20
         rec(FakeQuery([[report(bid)]]))
     assert pruned == [0, 20, 20 + N]
+
+
+# --- source_latest_from_rows: the look-back pick ----------------------------------------------------------------
+
+_NOW = datetime(2026, 10, 22, 12, 0, 1, tzinfo=timezone.utc)
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _commit(version, seconds_before_now):
+    ts = _NOW - timedelta(seconds=seconds_before_now)
+    return {"version": version, "ts_us": (ts - _EPOCH) // timedelta(microseconds=1)}
+
+
+def _at(seconds_before_now):
+    return _NOW - timedelta(seconds=seconds_before_now)
+
+
+# Newest first, as DESCRIBE HISTORY returns them: v13 landed 0.2 s before the read (after Spark planned the batch).
+_HISTORY = [_commit(13, 0.2), _commit(12, 30), _commit(11, 61), _commit(10, 120)]
+
+
+def test_source_latest_from_rows_skips_commits_inside_the_look_back():
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    assert source_latest_from_rows(_HISTORY, 60, now=_NOW) == (11, _at(61))
+
+
+def test_source_latest_from_rows_a_commit_landing_after_planning_is_not_counted():
+    # The race: the batch was planned at 12:00:00.0 with v42 the newest (end offset v43); v43 landed at 12:00:00.8,
+    # before the 12:00:01 read. With no look-back it reads as v43 (>= the end offset, so "behind"); a look-back of
+    # a few seconds records v42.
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    rows = [_commit(43, 0.2), _commit(42, 11)]
+    assert source_latest_from_rows(rows, 0, now=_NOW)[0] == 43
+    assert source_latest_from_rows(rows, 5, now=_NOW)[0] == 42
+
+
+def test_source_latest_from_rows_a_commit_exactly_at_the_cutoff_counts():
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    # v3 is older still, so a strict < would pick it instead of v4 (not the fallback, which would also give v3).
+    assert source_latest_from_rows([_commit(5, 59), _commit(4, 60), _commit(3, 120)], 60, now=_NOW) == (4, _at(60))
+
+
+def test_source_latest_from_rows_no_look_back_is_the_newest_commit():
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    assert source_latest_from_rows(_HISTORY, 0, now=_NOW) == (13, _at(0.2))
+
+
+def test_source_latest_from_rows_falls_back_to_the_oldest_fetched_when_none_is_old_enough():
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    assert source_latest_from_rows(_HISTORY[:3], 300, now=_NOW) == (11, _at(61))
+
+
+def test_source_latest_from_rows_one_row_no_look_back_is_that_row_even_if_its_clock_runs_ahead():
+    # log_monitor_source_lookback_seconds=0 with log_monitor_source_history_rows=1 is the LIMIT 1 read: the newest
+    # commit, even when its commit time is slightly ahead of the reader's clock (it falls back to the only row).
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    ahead = _commit(7, -0.5)
+    assert source_latest_from_rows([ahead], 0, now=_NOW)[0] == 7
+
+
+def test_source_latest_from_rows_does_not_depend_on_row_order():
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    shuffled = [_HISTORY[2], _HISTORY[0], _HISTORY[3], _HISTORY[1]]
+    assert source_latest_from_rows(shuffled, 60, now=_NOW) == (11, _at(61))
+    assert source_latest_from_rows(shuffled, 300, now=_NOW) == (10, _at(120))
+
+
+def test_source_latest_from_rows_defaults_now_to_the_current_time():
+    # v2 (two minutes old) is picked only when the cutoff really is now minus 60 s: a default in the past leaves no
+    # row old enough (the fallback gives v1), one in the future admits v3.
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    real_now = datetime.now(timezone.utc)
+
+    def at(age):
+        return (real_now - age - _EPOCH) // timedelta(microseconds=1)
+
+    rows = [{"version": 3, "ts_us": at(timedelta(0))}, {"version": 2, "ts_us": at(timedelta(minutes=2))},
+            {"version": 1, "ts_us": at(timedelta(hours=1))}]
+    assert source_latest_from_rows(rows, 60)[0] == 2
+
+
+@pytest.mark.parametrize("lookback", [-1, 1.5, True, "60", None])
+def test_source_latest_from_rows_rejects_a_bad_look_back(lookback):
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    with pytest.raises(ValueError, match="lookback_seconds"):
+        source_latest_from_rows(_HISTORY, lookback, now=_NOW)
+
+
+def test_source_latest_from_rows_rejects_no_rows_and_unusable_rows():
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    with pytest.raises(ValueError, match="no rows"):
+        source_latest_from_rows([], 60, now=_NOW)
+    with pytest.raises((KeyError, TypeError, ValueError)):
+        source_latest_from_rows([_HISTORY[0], {"version": 3}], 60, now=_NOW)
+
+
+def test_foreach_batch_records_the_look_back_pick_on_batch_start():
+    # End to end through make_foreach_batch: the picked commit (not the newest) is what batch_start carries and
+    # what is relayed to batch_summary, in today's payload shape.
+    from pipeline_lib.stream_batch import source_latest_from_rows
+    ev = Events()
+    _fb_src(ev, read=lambda session: source_latest_from_rows(_HISTORY, 60, now=_NOW))(FakeBatchDF(), 4)
+    start, = rows_of(ev, "batch_start")
+    expected = {"version": 11, "timestamp": "2026-10-22T11:59:00.000000"}
+    assert json.loads(start["payload"]) == {"mode": "streaming", "source_latest": expected}
+    assert start["source_latest_version"] == 11
+    assert ev.items[-1] == ("source_relay", 4, expected)
+
+
+class _HistorySession:
+    """Records the history read's SQL and projection and returns `rows`."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def sql(self, stmt):
+        self.calls.append(("sql", stmt))
+        return self
+
+    def selectExpr(self, *exprs):
+        self.calls.append(("selectExpr", exprs))
+        return self
+
+    def collect(self):
+        return self.rows
+
+
+def test_read_source_latest_fetches_the_configured_rows_and_applies_the_look_back():
+    from pipeline_lib.stream_batch import read_source_latest
+    session = _HistorySession(_HISTORY)
+    assert read_source_latest(session, "c.s.src", 4, 60, now=_NOW) == (11, _at(61))
+    assert session.calls == [("sql", "DESCRIBE HISTORY c.s.src LIMIT 4"),
+                             ("selectExpr", ("version", "unix_micros(timestamp) AS ts_us"))]
+    no_look_back = _HistorySession(_HISTORY[:1])
+    assert read_source_latest(no_look_back, "c.s.src", 4, 0, now=_NOW)[0] == 13
+    assert no_look_back.calls[0] == ("sql", "DESCRIBE HISTORY c.s.src LIMIT 1")  # no look-back: one row is enough
+
+
+@pytest.mark.parametrize("rows", [0, -1, 1.5, True, "100", None])
+def test_read_source_latest_rejects_a_bad_row_count_before_reading(rows):
+    from pipeline_lib.stream_batch import read_source_latest
+    session = _HistorySession(_HISTORY)
+    with pytest.raises(ValueError, match="history_rows"):
+        read_source_latest(session, "c.s.src", rows, 60, now=_NOW)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("lookback", [-1, 0.0, False, "60", None])
+def test_read_source_latest_rejects_a_bad_look_back_before_reading(lookback):
+    from pipeline_lib.stream_batch import read_source_latest
+    session = _HistorySession(_HISTORY)
+    with pytest.raises(ValueError, match="lookback_seconds"):
+        read_source_latest(session, "c.s.src", 4, lookback, now=_NOW)
+    assert session.calls == []
+
+
+def test_runner_reads_the_source_version_through_read_source_latest_with_both_knobs():
+    # The notebook glue: its read binds the source, the row count and the look-back, in that order, so neither knob
+    # can be dropped or swapped without this failing.
+    import os
+    nb = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks", "run_index_pipeline.py")
+    source = open(nb).read()
+    assert ("return read_source_latest(session, SOURCE_FQN, LOG_MONITOR_SOURCE_HISTORY_ROWS,\n"
+            "                                      LOG_MONITOR_SOURCE_LOOKBACK_SECONDS)") in source
+    assert "DESCRIBE HISTORY" not in source.split("def _read_source_latest", 1)[1].split("def _prune_relays", 1)[0]
+    # The validators return canonical strings; read_source_latest takes ints (a string would make every batch record
+    # source_latest as an error, fail-soft).
+    assert "LOG_MONITOR_SOURCE_LOOKBACK_SECONDS = int(require_log_monitor_source_lookback_seconds(" in source
+    assert "LOG_MONITOR_SOURCE_HISTORY_ROWS = int(require_log_monitor_source_history_rows(" in source
+    # run_start records the effective knobs for a streaming run (None in batch mode, where they do nothing).
+    for knob in ("log_monitor_source_lookback_seconds", "log_monitor_source_history_rows"):
+        assert f'"{knob}": {knob.upper()} if PIPELINE_MODE == "streaming" else None,' in source
+
+
+def test_read_source_latest_takes_the_cutoff_clock_before_the_read(monkeypatch):
+    # A commit landing while the history read runs is newer than the read's start; with the clock taken after a
+    # slow read (here 5 s) and a 3 s look-back it would count. Taken before, it does not. The fake read advances the
+    # fake clock, so the test tells the two orders apart.
+    import pipeline_lib.stream_batch as sb
+    clock = [_NOW]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    class SlowRead(_HistorySession):
+        def collect(self):
+            clock[0] = _NOW + timedelta(seconds=5)
+            return self.rows
+
+    monkeypatch.setattr(sb, "datetime", Clock)
+    rows = [_commit(9, -1), _commit(8, 10)]  # v9 landed 1 s into the read
+    assert sb.read_source_latest(SlowRead(rows), "c.s.src", 2, 3)[0] == 8
