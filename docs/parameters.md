@@ -93,6 +93,21 @@ example `acme_${environment}` becomes `acme_prod`).
 - **Fails closed:** a feed whose names use the token fails at run if the value is empty or produces an
   illegal identifier (one containing a hyphen, for example). It may stay empty if no name uses the token.
 
+### `view_schema_per_user`
+
+`true` puts every view in a per-developer schema, `<view schema>_<deploying user's short name>` (for
+example `es_poc` becomes `es_poc_jane_doe`), so developers sharing a workspace don't overwrite each
+other's views (see [Environment Setup](setup.md#per-developer-views)). `deploy_views` creates the schema
+if it's missing and every feed job reads its view from there. Source and reference tables are unchanged.
+
+- **Set:** top level, per target, or `--var`. Default `false`; the `dev` target sets `true`.
+- **Takes effect:** at deploy. `--var view_schema_per_user=false` turns it off for one deploy, to test
+  against the real view schema.
+- **Values:** `true` or `false`. Anything else fails the run.
+- **Fails closed:** with it on, an empty or illegal user name fails `deploy_views` and feed runs instead
+  of falling back to the shared schema.
+- **Needs:** `CREATE SCHEMA` on each view catalog for the `deploy_views` identity.
+
 ### `wheel_path`
 
 The UC Volume path to the `databricks-es-connector` wheel every index job installs. The connector
@@ -144,6 +159,19 @@ with a `cluster_log_conf` block (see [Logging and Monitoring](monitoring.md#clus
 
 - **Set:** per target, or `--var`. Default empty (unused).
 - **Fails closed:** a config that opts in fails the deploy in any target where this is empty.
+- **Cleanup:** the `cluster_log_prune` job deletes logs older than
+  [`cluster_log_retention_days`](#cluster_log_retention_days) from this path.
+
+### `cluster_log_retention_days`
+
+Days of delivered cluster logs the `cluster_log_prune` job keeps under
+[`cluster_log_volume_path`](#cluster_log_volume_path). It deletes older files, then the directories that
+leaves empty ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)).
+
+- **Set:** per target, or `--var`. Default `30`.
+- **Takes effect:** at deploy.
+- **Values:** an integer; `0` (or negative) disables the delete. A non-integer, or a number of days that
+  reaches back before 1970 (so nothing could ever be deleted), fails the run.
 
 ### `job_name_prefix`
 
@@ -630,7 +658,24 @@ above at deploy.
 | `repo_workspace_path` | none (required) | the `/Workspace/...` path of the connector repo to build (the folder holding its `pyproject.toml`) |
 | `wheel_version` | none (required) | the version to build; must match the repo's `pyproject.toml` |
 
-`deploy_views`, `log_table_create` and `log_table_prune` take no run-time parameters.
+**`deploy_views`** ([Deploying some of the views](maintenance-jobs.md#deploying-some-of-the-views))
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `views` | blank (every view) | deploy only these views: a comma-separated list of view names (the `.sql` file names without the extension). An unknown name or an empty entry fails before anything deploys. At most 9,988 characters, or the run fails |
+
+The length limit comes from the Jobs API, which caps the JSON form of all the job parameters passed to
+one run at 10,000 characters and refuses to start a longer run ("The provided job parameters (in json
+representation) are too long"). `{"views":""}` uses 12 of those. So "every view" is the blank default,
+never a typed-out list; a list long enough to hit the limit has to be split across runs.
+
+**`cluster_log_prune`** ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs))
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `dry_run` | `false` | `true` lists what the run would delete (files, bytes, directories) and deletes nothing |
+
+`log_table_create` and `log_table_prune` take no run-time parameters.
 
 ## Summary table
 
@@ -642,11 +687,13 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | Parameter | Kind | Set in | Description |
 |---|---|---|---|
 | [`environment`](#environment) | Bundle | per target | the value substituted for `${environment}` in feed catalog and schema names |
+| [`view_schema_per_user`](#view_schema_per_user) | Bundle | top level, per target, `--var` | puts each developer's views in `<view schema>_<short name>` (on in `dev`) |
 | [`wheel_path`](#wheel_path) | Bundle | per target | the UC Volume path of the connector wheel every index job installs |
 | [`checkpoint_base_path`](#checkpoint_base_path) | Bundle | per target | the UC Volume base path for streaming checkpoints, one folder per feed |
 | [`cluster_policy_id`](#cluster_policy_id) | Bundle | per target | the cluster policy applied to every feed's job cluster |
 | [`ca_certs`](#ca_certs) | Bundle | per target | a CA bundle for verifying the ES server's TLS certificate |
 | [`cluster_log_volume_path`](#cluster_log_volume_path) | Bundle | per target | where job-cluster logs are delivered, for cluster configs that opt in |
+| [`cluster_log_retention_days`](#cluster_log_retention_days) | Bundle | per target | how many days of delivered cluster logs `cluster_log_prune` keeps |
 | [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | the prefix in every job's display name |
 | [`global_job_tags`](#global_job_tags) | Bundle | top level (keys), values may vary | tags applied to every job and its job clusters |
 | [`schedule_pause_status`](#schedule_pause_status) | Bundle | top level and per target | the target-wide pause state of scheduled and continuous triggers |
@@ -696,3 +743,5 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`config_name`](#maintenance-job-parameters) | Job | `checkpoint_clear` | the feed whose checkpoint to delete |
 | [`es_host_config`, `index_name`, `verify_certs`, `sample_interval_secs`, `request_timeout_secs`](#maintenance-job-parameters) | Job | `es_diagnostics` | which host (and optionally index) to check, and how to sample it |
 | [`repo_workspace_path`, `wheel_version`](#maintenance-job-parameters) | Job | `build_wheel` | the connector repo to build and the version to build |
+| [`views`](#maintenance-job-parameters) | Job | `deploy_views` | deploy only these views (blank deploys every view) |
+| [`dry_run`](#maintenance-job-parameters) | Job | `cluster_log_prune` | list what would be deleted without deleting |

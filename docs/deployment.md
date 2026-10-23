@@ -37,8 +37,10 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
 5. **Validate** the bundle for the target. It resolves the target's variables and checks the job
    definitions without deploying anything.
 6. **Deploy.** The target's variables come from `databricks.yml` ([precedence](parameters.md#bundle-variables)).
-   A deploy creates or updates the feed jobs and the six maintenance jobs.
-7. **Deploy the views.** `deploy_views` creates or replaces every feed's view from its `.sql` file.
+   A deploy creates or updates the feed jobs and the seven maintenance jobs.
+7. **Deploy the views.** `deploy_views` creates or replaces every feed's view from its `.sql` file. When
+   only a few views changed, `--params views=<name>,<name>` deploys just those
+   ([Deploying some of the views](maintenance-jobs.md#deploying-some-of-the-views)).
 8. **Create the monitoring log table** the first time you use the log in a target
    ([Logging and Monitoring](monitoring.md#monitoring-log)). Re-running it is safe.
 9. **Run a feed** and check its output ([Run output](monitoring.md#run-output)).
@@ -47,9 +49,9 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
 
 | You changed | Run |
 |---|---|
-| a feed config | generate, check, deploy; also `deploy_views` if the change touches the view, source or reference tables |
+| a feed config | generate, check, deploy; also `deploy_views` if the change touches the view, source or reference tables (`--params views=<view name>` deploys only that view) |
 | a feed config's file name | the same, but a streaming feed starts over from a new checkpoint: see [Renaming a feed](maintenance-jobs.md#renaming-a-feed) first |
-| a view's `.sql` file | deploy, then `deploy_views` |
+| a view's `.sql` file | deploy, then `deploy_views` (`--params views=<view name>,...` for just the changed views) |
 | `databricks.yml` | deploy (generate first if the change is to a value the generator reads: see [Read at generation](parameters.md#bundle-variables)) |
 | a job-cluster spec | generate, check, deploy |
 | framework code, or a new release | the whole sequence ([Taking a new release](framework-maintenance.md#taking-a-new-release)) |

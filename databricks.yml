@@ -88,6 +88,9 @@ variables:
   # the only tag lever there. A tag whose key/value conflicts with a FIXED cluster-policy rule fails closed
   # at DEPLOY (like any policy conflict). Complex, so NOT settable via --var; override a target through
   # .databricks/bundle/<target>/variable-overrides.json.
+  view_schema_per_user:
+    description: "true => deploy_views creates every view in <view schema>_<deploying user's short name> (creating the schema if missing; needs CREATE SCHEMA on the catalog) and every job reads from there, so developers sharing a workspace don't overwrite each other's views. Only the view moves; source and reference tables are unchanged. Default false; the dev target sets true. Simple string, so --var view_schema_per_user=false turns it off for one deploy (to test against the real schema). Takes effect at deploy."
+    default: "false"
   global_job_tags:
     type: complex
     description: "Global tags (map of key -> value string) applied to every job. Empty {} = no tags (omitted). To add tags replace {} with an indented block, e.g. environment: \"${var.environment}\". Fixed jobs resolve it per target at deploy; generated jobs bake the top-level default (+ an es_index_list tag) at generation. Job tags forward to job clusters. type: complex, so NOT --var-settable; override via variable-overrides.json."
@@ -252,11 +255,16 @@ variables:
   # unconditionally because the Jobs API rejects an empty cluster_log_conf (400 "Invalid cluster log
   # storage info", seen live), and a bundle cannot omit a nested block at deploy. So a config that opts
   # in needs this set to a real path in EVERY target it deploys to (empty there fails the deploy, loudly).
-  # Serverless has no cluster log delivery. Logs ACCUMULATE: nothing here deletes them. See "Cluster log
-  # delivery" in docs/monitoring.md (grants, contents). Simple string, so --var-settable.
+  # Serverless has no cluster log delivery. The `_cluster logs prune` job (framework/resources/
+  # _cluster_log_prune.job.yml) deletes files older than cluster_log_retention_days, only inside the
+  # <path>/<cluster-id>/<log kind>/ layout. See "Cluster log delivery" in docs/monitoring.md (grants,
+  # contents). Simple string, so --var-settable.
   cluster_log_volume_path:
-    description: "UC Volume path job-cluster logs are delivered to, for job cluster configs that opt in with a cluster_log_conf block referencing ${var.cluster_log_volume_path}. Empty default (unused). Must be set in every target such a config deploys to. Logs accumulate; no automatic cleanup."
+    description: "UC Volume path job-cluster logs are delivered to, for job cluster configs that opt in with a cluster_log_conf block referencing ${var.cluster_log_volume_path}. Empty default (unused). Must be set in every target such a config deploys to. The `_cluster logs prune` job deletes logs older than cluster_log_retention_days from it."
     default: ""
+  cluster_log_retention_days:
+    description: "Days of delivered cluster logs the `_cluster logs prune` job keeps under cluster_log_volume_path (older files are deleted, then empty directories). 0 disables the delete. Default 30. Deploy-time; set per target or --var."
+    default: "30"
 
   # GLOBAL fully-qualified name (catalog.schema.table) of the shared monitoring Delta table every job
   # appends its metrics to when monitoring_log_enabled is on. Threaded exactly like checkpoint_base_path /
@@ -539,6 +547,7 @@ targets:
     default: true
     mode: development
     variables:
+      view_schema_per_user: "true"  # each developer's views go to <schema>_<short name>; --var view_schema_per_user=false to use the real schema
       # DEV deploy-time values. All ship EMPTY on main - fill in for your environment (or override any of
       # them at deploy with --var=<name>=<value>). An empty value fails closed where it is required
       # (wheel_path for index runs, checkpoint_base_path for streaming, cluster_policy_id for job clusters).

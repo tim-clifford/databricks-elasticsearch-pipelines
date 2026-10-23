@@ -172,6 +172,12 @@ The table is liquid-clustered on `(config_name, event_ts)` (the columns monitori
 
 An always-on (continuous) run never reaches an end-of-run summary because it never terminates. Health comes from the Databricks Jobs continuous-run state (RUNNING, restart count, failure notifications) plus, with the monitoring log on, the per-batch rows the runner writes as each batch runs. Bound a first-run backfill or large post-restart catch-up with `max_files_per_trigger` and `max_bytes_per_trigger` so one micro-batch does not try to read the whole table.
 
+<a id="spotting-a-stuck-feed"></a>**Spotting a stuck feed.** A feed whose stream fails on every attempt (for example after [a renamed or dropped source column](troubleshooting.md#a-renamed-or-dropped-source-column)) shows up differently by job shape:
+
+- **Standalone:** a string of runs that each end `FAILED` with "The continuous job run was cancelled because a task reached its retry limit", a new one starting about a minute after each.
+- **Job group member:** the run stays `RUNNING`, so the run state looks healthy. Look at the task instead: its attempt number (`attempt_number` in `databricks jobs get-run <run_id>`, one entry per attempt under `tasks`) keeps climbing while the other members stay on their first attempt.
+- **Either way:** a failure email per failed attempt when `support_email` is set, and, in the monitoring log, a `run_start` row per attempt (each under its own `task_run_id`) with no `batch_end` after it.
+
 ## Cluster log delivery
 
 Optionally, classic **job clusters** can deliver their driver, executor, and init-script logs to a Unity Catalog Volume, so the full Spark and driver logs survive after the cluster terminates. This is useful for a post-mortem on a continuous stream. It is **opt-in per job cluster config**, in two steps.
@@ -201,10 +207,10 @@ The generator inlines the spec verbatim, so every job using that config gets it.
 
 **Classic job clusters only.** Serverless compute does not support cluster log delivery, so serverless feeds and the serverless maintenance jobs are unaffected; their output stays in the run log. `existing_cluster` feeds use whatever the existing cluster is configured with. The `es_diagnostics` job's optional job cluster takes its spec from `diagnostics_job_clusters`: add a `cluster_log_conf` block to that spec to deliver its logs too.
 
-**Where logs land.** Databricks writes under `<destination>/<cluster-id>/` (`driver/`, `executor/`, `init_scripts/`), delivering periodically (about every 5 minutes) and at termination.
+**Where logs land.** Databricks writes under `<destination>/<cluster-id>/` (`driver/`, `executor/`, `init_scripts/` when the cluster runs init scripts, and `eventlog/`, which appears once the cluster terminates), delivering periodically (about every 5 minutes) and at termination.
 
 **Permissions.** The identity the job cluster runs as needs `READ VOLUME` and `WRITE VOLUME` on the volume (plus `USE CATALOG` and `USE SCHEMA`).
 
-**They accumulate.** There is no automatic retention: every cluster (every continuous restart, every scheduled run) adds a directory. Prune the volume yourself (or add a cleanup job) if storage matters. See why this is opt-in in [technical details](technical-details.md#cluster-log-delivery-opt-in).
+**Retention.** Every cluster (every continuous restart, every scheduled run) adds a directory. The `cluster_log_prune` job deletes files older than [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days) (default 30) and the directories that leaves empty, daily, paused or unpaused by `schedule_pause_status`. It only touches the `<destination>/<cluster-id>/<log kind>/` layout and leaves anything else on the volume alone ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)). See why delivery is opt-in in [technical details](technical-details.md#cluster-log-delivery-opt-in).
 
 **Sensitive contents.** The logs hold everything the notebook prints and the driver and executors log: config, host URLs, error messages and stack traces. Secret values read through `dbutils.secrets` are redacted in notebook output, but don't assume the same for the delivered files: treat the volume as sensitive and restrict who can read it.

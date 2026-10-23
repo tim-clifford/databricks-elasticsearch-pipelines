@@ -70,9 +70,9 @@ Two fallbacks pin `startingVersion` on the real stream instead. If the no-op pas
 
 An **added** source column fails the stream once with `DELTA_SCHEMA_CHANGED_WITH_VERSION` ("Please try restarting the query"); the task retry restarts it with the new schema and it continues (verified live). Whether the new column reaches Elasticsearch depends on the view: a view that names its columns sends it only once the view is changed to include it, while a view that uses `SELECT *` sends it from the restarted stream on, because the stream runs the view's SQL against each micro-batch.
 
-A **renamed or dropped** column fails on every attempt with `DELTA_STREAMING_INCOMPATIBLE_SCHEMA_CHANGE_USE_SCHEMA_LOG` and needs an operator (deliberately: no `schemaTrackingLocation` is set).
+A **renamed or dropped** column fails on every attempt with `DELTA_STREAMING_INCOMPATIBLE_SCHEMA_CHANGE_USE_SCHEMA_LOG` and needs an operator (verified live for both, on a standalone feed and a job group member, with a view that doesn't use the column). This is deliberate: no `schemaTrackingLocation` is set, so the stream never silently carries on across a change to its source's columns. Delta allows a rename or drop only on a table with column mapping enabled, so only those tables can hit this. Recovery is a checkpoint reset plus a backfill of the rows the reset skips: see [Troubleshooting](troubleshooting.md#a-renamed-or-dropped-source-column).
 
-Note the task retry limit is **per run and cumulative**: a long-lived run's earlier failures (added columns, transient Elasticsearch errors) count toward it. A single-task continuous job that hits the limit is cancelled and restarted by the trigger ("The continuous job run was cancelled because a task reached its retry limit"); in a job group, tasks were seen retried past that limit while siblings ran.
+Note the task retry limit is **per run and cumulative**: a long-lived run's earlier failures (added columns, transient Elasticsearch errors) count toward it. A single-task continuous job that hits the limit (attempts 0 to 3) is cancelled and restarted by the trigger ("The continuous job run was cancelled because a task reached its retry limit"), so a failure that never clears loops: four failed attempts, a new run, again. In a job group whose other tasks are healthy, the failing task is instead retried past that limit indefinitely: in a live test it reached attempt 12 within 13 minutes, the wait between attempts growing from about 55 seconds to about 110, the run stayed `RUNNING` and was never cancelled, and the sibling task stayed on its first attempt and kept sending (see [task_retry_mode](#task-retry-mode)).
 
 ## Scheduling and recovery
 
@@ -90,8 +90,8 @@ A continuous job's per-task recovery is governed by the continuous trigger's `ta
 
 Under `ON_FAILURE`:
 
-- If a task's stream fails, Databricks **retries that task in place** (with exponential backoff) as long as at least one other task in the run is still on its first attempt, so one stream can recover without disturbing the others.
-- When that no longer holds, or the retry limit is reached, the **whole run is cancelled and a fresh one started** (the job-level restart, itself exponential-backoff throttled).
+- If a task's stream fails, Databricks **retries that task in place** (with exponential backoff) as long as at least one other task in the run is still on its first attempt, so one stream can recover without disturbing the others. While that holds, the task's retries are not capped: a task that can never recover keeps being retried, the run is never cancelled, and its siblings keep running (seen live past attempt 12).
+- When it no longer holds (a single-task job, or no other task is still on its first attempt), the retry limit applies: once it is reached the **whole run is cancelled and a fresh one started** (the job-level restart, itself exponential-backoff throttled).
 
 This matters most for a **job group** of continuous streams (multiple tasks in one run): under the `NEVER` default a failed task would sit `FAILED` while the sibling streams keep running, so the run never reaches a terminal state and the continuous trigger never restarts it either. The failed task would never recover. `ON_FAILURE` gives the intended "retry the task, else restart the job" behavior. A single-task continuous job recovers under either value (its failure ends the run, which the trigger restarts), but it is pinned the same way for consistency.
 
