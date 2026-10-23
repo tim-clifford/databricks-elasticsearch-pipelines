@@ -1,0 +1,76 @@
+resources:
+  jobs:
+    cluster_log_prune:
+      name: "[${bundle.target}] ${var.job_name_prefix}: _cluster logs prune"
+      description: >-
+        A serverless maintenance job that bounds the growth of delivered job-cluster logs (the UC Volume at
+        cluster_log_volume_path, ${var.cluster_log_volume_path}, used by job cluster configs that opt in with
+        a cluster_log_conf block). It deletes log files older than cluster_log_retention_days
+        (${var.cluster_log_retention_days}; 0 disables the delete) and removes the directories that leaves
+        empty, touching only the delivery layout (<path>/<cluster id>/<driver|executor|eventlog|init_scripts>);
+        anything else under the path is reported and left alone. An empty cluster_log_volume_path makes it a
+        no-op. Runs on a daily schedule that is PAUSED by default (${var.schedule_pause_status}); run it on
+        demand with `databricks bundle run cluster_log_prune`, adding `--params dry_run=true` to see what
+        it would delete without deleting. Needs READ VOLUME and WRITE VOLUME on the volume. No cluster
+        block => serverless notebook task.
+
+      # Never run two copies at once, consistent with every other job.
+      max_concurrent_runs: 1
+
+      # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
+      # rather than queued, matching every generated job and the other maintenance jobs.
+      queue:
+        enabled: false
+
+      # Daily at 04:00 UTC (an hour after log_table_prune), PAUSED by default (${var.schedule_pause_status}):
+      # dev/stg deploy the schedule but never fire it; prd (schedule_pause_status=UNPAUSED) prunes nightly.
+      # On-demand runs work regardless of pause_status.
+      schedule:
+        quartz_cron_expression: 0 0 4 * * ?
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
+
+      # Run-time parameter: dry_run=true lists what would be deleted (counts and bytes) and deletes nothing.
+      parameters:
+        - name: dry_run
+          default: "false"
+
+      # Notify the target's support recipients on a run failure. ${var.support_email} is a complex LIST
+      # var: an empty list in dev/stg (no recipients = off) and a real address in prd. on_failure
+      # references the whole var so the empty case is [] (not [""]). notification_settings suppress
+      # SKIPPED (queue disabled => an overlapping trigger is skipped, not failed) and CANCELED runs, so
+      # recipients are paged only on a genuine failure. Matches every other job (see framework/scripts/gen_jobs.py).
+      email_notifications:
+        on_failure: ${var.support_email}
+      notification_settings:
+        no_alert_for_skipped_runs: true
+        no_alert_for_canceled_runs: true
+
+      # Global job tags from databricks.yml (empty {} => omitted). Applied to every job; serverless, so
+      # these are job-level tags (no cluster to forward onto). Matches every other job.
+      tags: ${var.global_job_tags}
+
+      tasks:
+        - task_key: cluster_log_prune
+          notebook_task:
+            notebook_path: ../notebooks/cluster_log_prune.py
+            # Both deploy-time bundle variables: the delivery path and the retention window. The notebook
+            # validates them, plans from a full listing, then deletes.
+            base_parameters:
+              cluster_log_volume_path: ${var.cluster_log_volume_path}
+              cluster_log_retention_days: ${var.cluster_log_retention_days}
+          # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
+          # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
+          # plus alert_on_last_attempt: false so every failed attempt pages. See framework/scripts/gen_jobs.py _build_task.
+          email_notifications:
+            on_failure: ${var.support_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: false
+
+      # On-demand: invoke via `databricks bundle run cluster_log_prune`. CAN_MANAGE_RUN so any teammate in
+      # `users` can trigger it, matching the other maintenance jobs.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          group_name: users

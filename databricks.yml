@@ -255,11 +255,16 @@ variables:
   # unconditionally because the Jobs API rejects an empty cluster_log_conf (400 "Invalid cluster log
   # storage info", seen live), and a bundle cannot omit a nested block at deploy. So a config that opts
   # in needs this set to a real path in EVERY target it deploys to (empty there fails the deploy, loudly).
-  # Serverless has no cluster log delivery. Logs ACCUMULATE: nothing here deletes them. See "Cluster log
-  # delivery" in docs/monitoring.md (grants, contents). Simple string, so --var-settable.
+  # Serverless has no cluster log delivery. The `_cluster logs prune` job (framework/resources/
+  # _cluster_log_prune.job.yml) deletes files older than cluster_log_retention_days, only inside the
+  # <path>/<cluster-id>/<log kind>/ layout. See "Cluster log delivery" in docs/monitoring.md (grants,
+  # contents). Simple string, so --var-settable.
   cluster_log_volume_path:
-    description: "UC Volume path job-cluster logs are delivered to, for job cluster configs that opt in with a cluster_log_conf block referencing ${var.cluster_log_volume_path}. Empty default (unused). Must be set in every target such a config deploys to. Logs accumulate; no automatic cleanup."
+    description: "UC Volume path job-cluster logs are delivered to, for job cluster configs that opt in with a cluster_log_conf block referencing ${var.cluster_log_volume_path}. Empty default (unused). Must be set in every target such a config deploys to. The `_cluster logs prune` job deletes logs older than cluster_log_retention_days from it."
     default: ""
+  cluster_log_retention_days:
+    description: "Days of delivered cluster logs the `_cluster logs prune` job keeps under cluster_log_volume_path (older files are deleted, then empty directories). 0 disables the delete. Default 30. Deploy-time; set per target or --var."
+    default: "30"
 
   # GLOBAL fully-qualified name (catalog.schema.table) of the shared monitoring Delta table every job
   # appends its metrics to when monitoring_log_enabled is on. Threaded exactly like checkpoint_base_path /

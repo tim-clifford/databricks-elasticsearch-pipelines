@@ -837,6 +837,7 @@ def test_shipped_deploy_views_job_wires_subset_and_per_user_schema():
     ("_es_diagnostics.job.yml", "es_diagnostics"),
     ("_log_table_create.job.yml", "log_table_create"),
     ("_log_table_prune.job.yml", "log_table_prune"),
+    ("_cluster_log_prune.job.yml", "cluster_log_prune"),
 ])
 def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
     # The hand-authored jobs are NOT emitted by gen_jobs, so guard their failure-email block against drift:
@@ -916,6 +917,29 @@ def test_shipped_log_table_prune_job_shape():
     }
     # No run-time job parameters: both values are deploy-time base_parameters, not overridable per run.
     assert "parameters" not in job
+
+
+def test_shipped_cluster_log_prune_job_shape():
+    # cluster_log_prune is hand-authored, so guard its shape against drift: single-flight + skip-not-queue,
+    # the serverless notebook task, both deploy-time base_parameters (path + retention), a daily schedule
+    # PAUSED by default, and dry_run as its one run-time parameter (default false, so a scheduled run
+    # deletes). The planner is unit-tested in test_cluster_log_prune.py; deletes are proven by a live run.
+    path = os.path.join(_FRAMEWORK_ROOT, "resources", "_cluster_log_prune.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["cluster_log_prune"]
+    assert job["max_concurrent_runs"] == 1
+    assert job["queue"] == {"enabled": False}
+    assert job["tags"] == "${var.global_job_tags}"
+    assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
+    assert job["schedule"]["quartz_cron_expression"]
+    assert job["parameters"] == [{"name": "dry_run", "default": "false"}]
+    (task,) = job["tasks"]
+    assert task["notebook_task"]["notebook_path"] == "../notebooks/cluster_log_prune.py"
+    assert task["notebook_task"]["base_parameters"] == {
+        "cluster_log_volume_path": "${var.cluster_log_volume_path}",
+        "cluster_log_retention_days": "${var.cluster_log_retention_days}",
+    }
+    assert "job_clusters" not in job and "existing_cluster_id" not in task and "job_cluster_key" not in task
 
 
 def test_shipped_checkpoint_clear_job_allows_concurrent_runs():
@@ -1402,9 +1426,10 @@ def test_shipped_databricks_yml_declares_global_job_tags():
     ("_build_wheel.job.yml", "build_wheel"),
     ("_es_diagnostics.job.yml", "es_diagnostics"),
     ("_log_table_create.job.yml", "log_table_create"),
+    ("_cluster_log_prune.job.yml", "cluster_log_prune"),
 ])
 def test_shipped_fixed_jobs_reference_global_job_tags(filename, job_key):
-    # The 5 hand-authored jobs are NOT emitted by gen_jobs, so guard against drift: each must reference the
+    # The hand-authored jobs are NOT emitted by gen_jobs, so guard against drift: each must reference the
     # whole global_job_tags var so it gets the same global tags every generated job carries.
     path = os.path.join(_FRAMEWORK_ROOT, "resources", filename)
     with open(path) as fh:
@@ -1793,7 +1818,7 @@ def test_shipped_job_files_found():
     names = [os.path.relpath(p, _REPO_ROOT) for p in _shipped_job_files()]
     assert "framework/resources/_es_diagnostics.job.yml" in names
     assert "_pipelines/resources/ecs_dns_activity.job.yml" in names
-    assert len(names) == 11  # 6 fixed + 5 generated on main
+    assert len(names) == 12  # 7 fixed + 5 generated on main
 
 
 @pytest.mark.parametrize("path", _shipped_job_files(), ids=lambda p: os.path.relpath(p, _REPO_ROOT))

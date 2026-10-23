@@ -39,7 +39,7 @@ _WORKSPACE_EXPR = '"/Workspace" + _nb_path'
 
 def test_notebooks_found():
     assert sorted(os.path.basename(p) for p in NOTEBOOKS) == [
-        "build_wheel.py", "checkpoint_clear.py", "deploy_views.py", "es_diagnostics.py",
+        "build_wheel.py", "checkpoint_clear.py", "cluster_log_prune.py", "deploy_views.py", "es_diagnostics.py",
         "log_table_create.py", "log_table_prune.py", "run_index_pipeline.py"]
 
 
