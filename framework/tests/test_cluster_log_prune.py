@@ -610,3 +610,11 @@ def test_run_prune_caps_long_lists():
     lines = []
     run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _never, log=lines.append)
     assert sum("SKIPPED" in l for l in lines) == 200 and any("50 more skipped" in l for l in lines)
+
+
+def test_run_prune_a_listing_failure_alone_fails_the_run():
+    # Nothing to delete, no delete failure, but one cluster directory can't be read: not green.
+    lines = []
+    with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
+        run_prune(ROOT, 30, CUTOFF, False, _fs({CID: PermissionError("denied")}), _Rm(), log=lines.append)
+    assert any(f"LIST FAILED (left untouched): {ROOT}/{CID}" in l for l in lines)

@@ -331,6 +331,11 @@ Each developer owns their own copy.
 - If the per-user schema already exists, it must be owned by you. One owned by anyone else (a shared
   schema with a matching name, or another developer's whose name happens to concatenate the same, such as
   `es` + `poc_jane` and `es_poc` + `jane`) fails that view instead of deploying into it.
+- It assumes the jobs run as the developer who deployed them (the `dev` default; no `run_as`), since the
+  schema is named after the deployer and the ownership check uses the identity the job runs as.
+- The collision check covers schemas the feed configs name, and the ownership check covers schemas owned
+  by anyone else. A schema you own that no config names (for example the monitoring log table's) isn't
+  detected, so don't give it a name of the form `<view schema>_<your short name>`.
 - A service principal's short name (a CI deploy) is usually not a legal schema name, so deploy to `dev`
   as a service principal with `--var view_schema_per_user=false`.
 
