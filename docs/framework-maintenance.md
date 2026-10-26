@@ -13,7 +13,7 @@ The framework is maintained by Databricks in an upstream source repo. Your deplo
 
 ## What's in framework/ vs _pipelines/
 
-`_pipelines/` holds your feeds (views, configs, job cluster specs, and the job resources generated from them); `framework/` holds the shared code that runs them and is not edited per feed. `databricks.yml` at the root is yours too: it carries your environment's values. The docs follow the same split: [`docs/_pipelines/`](_pipelines/README.md) holds your own documentation (your feeds, environments, and infrastructure), and the rest of `docs/` documents the framework. For the complete directory layout, see [README.md#layout](../README.md#layout).
+`_pipelines/` holds your feeds (views, configs, job cluster specs, and the job resources generated from them); `framework/` holds the shared code that runs them and is not edited per feed. `databricks.yml` at the root is yours too: it carries your environment's values. The docs follow the same split: [`docs/_pipelines/`](_pipelines/README.md) holds your own internal documentation (your feeds, environments, infrastructure, and processes), and the rest of `docs/` documents the framework. For the complete directory layout, see [README.md#layout](../README.md#layout).
 
 ## Taking a new release
 

@@ -1,6 +1,6 @@
-# Feeds and Infrastructure
+# Internal Documentation
 
-Documentation for this deployment: its feeds, environments, and infrastructure. This folder belongs to
+Internal documentation for this deployment: its feeds, environments, infrastructure, and processes. This folder belongs to
 the same owner as `_pipelines/`. Add, change, and remove documents here freely; framework updates never
 change anything in this folder. Keep this `README.md` as the folder's index (it can say anything), since
 the main README links to it.

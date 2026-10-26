@@ -555,8 +555,8 @@ Under the fast path, each chunk is sent with a request for only the response's `
 chunk is done in one send with very little to decode. A chunk with any document-level error (a 409, a
 429, a mapping error) is then sent again in full to get each document's result. So:
 
-- **It helps** a feed where document-level errors are routine, above all `op_type: create` with
-  re-sends, where most chunks carry 409s: the fast path sends each of those chunks twice, and bypassing
+- **It helps** a feed where document-level errors are routine, above all re-sends with
+  `op_type: create`, where most chunks carry 409s: the fast path sends each of those chunks twice, and bypassing
   it sends them once. It also makes the `create` counts exact, and avoids the second send duplicating a
   chunk's good documents when the feed has no `es_id_field`.
 - **It costs** on a feed whose chunks are almost always clean: every response then carries and decodes
@@ -564,7 +564,7 @@ chunk is done in one send with very little to decode. A chunk with any document-
   GIL, so it also lowers the `write_concurrency` a partition can use
   ([Python threads and the GIL](throughput.md#python-threads-and-the-gil)).
 
-Turn on [`bulk_stats`](#bulk_stats) to see which case a feed is in.
+Turn on [`bulk_stats`](#bulk_stats), if it isn't already on, to see which case a feed is in.
 
 ### `require_existing_index`
 
@@ -585,7 +585,7 @@ endpoint, for example). Connector default `true`. `false` can't be combined with
 ### `bulk_stats`
 
 `true` logs per-partition bulk-send diagnostics under the `BULK_STATS` tag: docs per request, round-trip
-and ES time, straggler partitions. Connector default off. Turn it on when tuning or investigating a slow feed; see
+and ES time, straggler partitions. Connector default off. Turn it on, if it isn't already on, when tuning or investigating a slow feed; see
 [Logging and Monitoring](monitoring.md#reading-the-bulk_stats-output) for how to read it.
 
 ### `monitoring_log_enabled`

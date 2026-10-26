@@ -9,7 +9,8 @@ there is one (`...` marks the parts that vary), the cause, and the fix.
 1. **Read the failed run's output.** Open the run in the Jobs UI. The framework fails closed with a
    specific message: almost every failure names the setting or file at fault.
 2. **Check the monitoring log**, if it's on: the run's `run_end` and `batch_end` rows carry the error type
-   and message, and a missing end row says where the run stopped. For a streaming feed, the
+   and message, and once the run is over, a missing end row says where it stopped (while a batch or run
+   is still in progress, its end row isn't written yet). For a streaming feed, the
    `batch_summary` rows show the backlog after each batch and whether it was caught up or behind
    ([Logging and Monitoring](monitoring.md#monitoring-log)).
 
@@ -243,12 +244,12 @@ documents with backoff, which absorbs brief bursts. If 429s are steady, lower th
 
 ### Slow writes with no errors
 
-Turn on [`bulk_stats`](parameters.md#bulk_stats) and use [Reading the signals](#reading-the-signals)
+Turn on [`bulk_stats`](parameters.md#bulk_stats), if it isn't already on, and use [Reading the signals](#reading-the-signals)
 below to tell whether ES or the client side is the limit.
 
 ### Reading the signals
 
-Turn on [`bulk_stats`](parameters.md#bulk_stats) to see what the write is doing (what each part of the
+Turn on [`bulk_stats`](parameters.md#bulk_stats), if it isn't already on, to see what the write is doing (what each part of the
 output means is in [Logging and Monitoring](monitoring.md#reading-the-bulk_stats-output)). These
 signals tell you which side of the balance a feed is on; the levers are explained in
 [Throughput Tuning](throughput.md#the-levers):
@@ -430,6 +431,11 @@ restarted since the deploy: its running run keeps the settings it started with
 <a id="gaps-in-the-monitoring-log"></a>
 
 ## Gaps in the monitoring log
+
+A missing end row first means the batch or run may still be in progress: `batch_end` is written when the
+batch's write finishes, and `run_end` when the run ends (never, for a continuous run that is still
+going). `batch_summary` is written after the batch is over, so it can land shortly after `batch_end`.
+Check the run's state in the Jobs UI first. Once the batch or run is over:
 
 - **`batch_start` with no `batch_end`:** the batch never finished. The task was killed or the driver died
   mid-write.

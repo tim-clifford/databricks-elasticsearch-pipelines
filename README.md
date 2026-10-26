@@ -59,8 +59,8 @@ way: `docs/_pipelines/` holds your own documentation, and the rest of `docs/` do
 databricks.yml                  Bundle definition: variables + targets (edit for your environment)
 requirements.txt                Off-cluster tooling deps (pinned pyyaml for the generator)
 docs/                           The framework documentation above, plus your own in _pipelines/
-  _pipelines/                   YOU EDIT THIS: your own documentation (feeds, environments,
-    README.md                   infrastructure), starting from this index
+  _pipelines/                   YOU EDIT THIS: your own internal documentation (feeds, environments,
+    README.md                   infrastructure, processes), starting from this index
 
 You edit these, one pair per feed:
   _pipelines/
@@ -112,7 +112,7 @@ with the `_`-prefixed fixed jobs.
 
 ## License & Attribution
 
-**Copyright © Databricks, Inc.** — Developed and maintained by Databricks Forward Deployed Engineering. Available to support customers and the broader community in building Elasticsearch export pipelines on Databricks. For production support and customization, contact your Databricks account team.
+**Copyright © Databricks, Inc.** Developed and maintained by Databricks Forward Deployed Engineering. Available to support customers and the broader community in building Elasticsearch export pipelines on Databricks. For production support and customization, contact your Databricks account team.
 
 ---
 
