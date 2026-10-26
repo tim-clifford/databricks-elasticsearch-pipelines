@@ -135,7 +135,15 @@ def test_job_notebook_params_found():
                      ("deploy_views.py", "view_schema_per_user"), ("deploy_views.py", "views"),
                      ("cluster_log_prune.py", "dry_run"), ("cluster_log_prune.py", "cluster_log_retention_days")]:
         assert expected in names
-    assert len(params) > 100   # 5 generated feed jobs (one task each, plus a 2-task group) x ~37 params + fixed jobs
+    # Every shipped job file contributes (a renamed glob or a skipped task type would drop one), and the total
+    # is pinned so a job or task that stops being collected fails here. Update the count when a job, task or
+    # parameter is added or removed.
+    repo_root = os.path.dirname(_FRAMEWORK_ROOT)
+    job_files = {os.path.relpath(f, repo_root) for f in
+                 glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml"))
+                 + glob.glob(os.path.join(repo_root, "_pipelines", "resources", "*.job.yml"))}
+    assert len(job_files) == 12 and {j for j, _, _ in params} == job_files
+    assert len(params) == 232
 
 
 
@@ -226,6 +234,23 @@ def test_deploy_views_preflight_sees_every_config():
     rebinds = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
                and any(getattr(t, "id", None) == "configs_by_view" for t in n.targets)]
     assert len(rebinds) == 1 and rebinds[0].lineno < pre.lineno
+
+
+def test_deploy_views_guards_each_per_user_schema_once_as_the_run_identity():
+    # ensure_per_user_schema checks ownership against _ME (the current_user() result), and runs once per
+    # schema: inside `if _schema not in _schemas_created`, which then records the schema.
+    nb = os.path.join(_FRAMEWORK_ROOT, "notebooks", "deploy_views.py")
+    tree = _file_ast(nb)
+    (call,) = _calls(nb, "ensure_per_user_schema")
+    assert [ast.unparse(a) for a in call.args[:2]] == ["_schema", "_ME"]
+    (me,) = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+             and any(getattr(t, "id", None) == "_ME" for t in n.targets)]
+    assert "current_user()" in ast.unparse(me.value)
+    (guard,) = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+                and ast.unparse(n.test) == "_schema not in _schemas_created"]
+    body = [ast.unparse(n) for n in guard.body]
+    assert guard.body[0].lineno <= call.lineno <= guard.body[-1].end_lineno   # the call is inside the guard
+    assert body[-1] == "_schemas_created.add(_schema)"
 
 
 def test_deploy_views_deploys_only_the_selected_files():

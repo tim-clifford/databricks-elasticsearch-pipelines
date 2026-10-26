@@ -725,6 +725,16 @@ def test_per_user_preflight_problem():
     assert per_user_preflight_problem([shared, broken], {"shared.yml", "broken.yml"}, "", "tim_clifford") is None
 
 
+
+def test_per_user_preflight_reports_a_too_long_per_user_schema_as_itself():
+    # A config that resolves but whose per-user schema is over the limit is the user name's problem, not the
+    # config's: the pre-flight raises that reason instead of calling the config unresolved.
+    long_schema = validate_config({**_base(), "view": {"catalog": "cat", "schema": "s" * 250, "name": "v"}})
+    shared = ("shared.yml", validate_config(_base()))
+    with pytest.raises(PipelineConfigError, match="255-character"):
+        per_user_preflight_problem([shared, ("long.yml", long_schema)], {"shared.yml"}, "", "tim_clifford")
+
+
 _ME = "tim.clifford@databricks.com"
 
 

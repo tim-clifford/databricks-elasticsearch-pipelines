@@ -1733,6 +1733,8 @@ def per_user_schema_collisions(entries: list, environment: str, user: str) -> tu
     `<view schema>_<user>` is a plain concatenation, so e.g. schema `es` + user `poc` is `es_poc`, which may be
     another feed's real, shared schema; deploy_views fails closed rather than replace views there.
 
+    Raises PipelineConfigError when a config resolves but its per-user schema name is over the limit.
+
     unresolved: labels of the configs that failed to resolve (any error), sorted. Their schemas are unknown, so
     the check is incomplete for them: deploy_views reports one in the subset being deployed as that view's own
     failure, and fails closed on one outside it (nothing else would report it).
@@ -1750,10 +1752,12 @@ def per_user_schema_collisions(entries: list, environment: str, user: str) -> tu
             schemas = {f"{resolved['view']['catalog']}.{resolved['view']['schema']}",
                        f"{resolved['source']['catalog']}.{resolved['source']['schema']}"}
             schemas |= {f"{spec['catalog']}.{spec['schema']}" for spec in resolved["reference_tables"].values()}
-            mine = view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"])
         except Exception:  # noqa: BLE001 - reported per view (or fails closed) by deploy_views
             unresolved.append(label)
             continue
+        # Outside the try: the config resolved, so an error here is the per-user schema's own (over Unity
+        # Catalog's name limit) and is raised as itself rather than reported as an unresolved config.
+        mine = view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"])
         configured |= schemas
         per_user.add(mine)
     collisions = sorted({s.lower() for s in per_user} & {s.lower() for s in configured})
