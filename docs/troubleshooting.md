@@ -12,8 +12,6 @@ there is one (`...` marks the parts that vary), the cause, and the fix.
    and message, and a missing end row says where the run stopped. For a streaming feed, the
    `batch_summary` rows show the backlog after each batch and whether it was caught up or behind
    ([Logging and Monitoring](monitoring.md#monitoring-log)).
-3. **For slow or failing writes, look at the ES host**, for example with
-   [`es_diagnostics`](maintenance-jobs.md#diagnosing-an-elasticsearch-host) (a work in progress).
 
 ## Symptom index
 
@@ -258,7 +256,6 @@ signals tell you which side of the balance a feed is on; the levers are explaine
 | You see | It means | Try |
 |---|---|---|
 | 429 rejections (`rejected(429=...)`), or `took_ms` rising run over run | ES is under too much pressure | lower `write_concurrency` or the partition count |
-| `es_diagnostics` (a work in progress) reports `REJECTING`, `SATURATED`, `PRESSURED` or `HEAP_GC_PRESSURE` | the ES host may be the limit | lower the pressure, or add ES capacity |
 | `rtt_ms` far above `took_ms`, no 429s, executors idle | the write is waiting on round trips | raise `write_concurrency`, or add partitions or cores |
 | `gil_wait_ms_total` a large share of `wall_ms` on the `tail:` line, with `rtt_ms` rising while `took_ms` doesn't on the `overall` line | a partition's threads are waiting for the GIL, not for ES ([why](throughput.md#python-threads-and-the-gil)) | lower `write_concurrency` and get the parallelism from more cores (with enough partitions to use them) instead |
 | a high `wall_max/median` or `stragglers>2x` in the `tail:` line | uneven partitions; the slowest sets the pace | `write_repartition` for evenly sized partitions, or a smaller `max_partition_bytes` |
@@ -358,8 +355,7 @@ What it looks like on a continuous feed:
   attempt number and its failure emails show the problem
   ([Spotting a stuck feed](monitoring.md#spotting-a-stuck-feed)).
 
-To recover, reset the feed's checkpoint and send the rows it missed. These steps were run end to end
-for a rename and a drop, on a standalone feed and on a group member:
+To recover, reset the feed's checkpoint and [backfill](backfill.md) the rows it missed:
 
 1. **Confirm the change.** `DESCRIBE HISTORY <source table>` shows a `RENAME COLUMN` or `DROP COLUMNS`
    commit. Note its version and time.
@@ -375,21 +371,19 @@ for a rename and a drop, on a standalone feed and on a group member:
    job group this stops every member; the others resume from their own checkpoints afterwards, with
    nothing lost.
 5. **Clear the checkpoint** of the failing feed only:
-   `databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>`.
+   `databricks bundle run checkpoint_clear -t <target> --params config_name=<config_name>`.
 6. **Restart.** Choose how the new stream starts, put `pause_status` back, generate and deploy:
    - **Re-send the whole table**, if that volume is acceptable: set `streaming_start: full` in the config
      ([Method 1](backfill.md#method-1-streaming-from-the-start-of-the-table-streaming-feeds-only)). Remove
      it again once the first batch has succeeded, so a later reset doesn't re-send the table again. Skip
      step 7.
-   - **Backfill only the gap** (the default `streaming_start: new`): the restarted stream begins at the
+   - **Backfill only the gap** (`streaming_start: new`): the restarted stream begins at the
      source's current version, so it never sends the rows committed between the point from step 2 and
      the restart, including rows that landed while the feed was paused. Step 7 sends them.
-7. **Backfill the gap** once the restarted stream is up, with batch runs from a
-   [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill) filtered on a column that
-   records when each row landed ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). Start the
-   window before the point from step 2 and end it after the restart. With `es_id_field` set the overlap
-   just overwrites documents with themselves; without it, rows in the overlap are duplicated, so keep the
-   window tight. Then remove the backfill config.
+7. **Backfill the gap** once the restarted stream is up, following [How to Backfill](backfill.md) with
+   [Option 2](backfill.md#option-2-a-parallel-job-for-the-backfill) and
+   [Method 2](backfill.md#method-2-batch-runs-in-sized-pieces): filter on a column that records when each
+   row landed, from before the point in step 2 to after the restart.
 
 ### A continuous run cancelled at its retry limit
 
@@ -429,7 +423,9 @@ higher precedence is setting it ([precedence](parameters.md#bundle-variables)):
 - a `--var` on the deploy command.
 
 Also check you redeployed: `--var` on `bundle run` has no effect, and values come from the last deploy.
-For a feed config change, regenerate before deploying.
+For a feed config change, regenerate before deploying. And for a continuous feed, check the job has been
+restarted since the deploy: its running run keeps the settings it started with
+([Continuous jobs need a restart](deployment.md#continuous-jobs-need-a-restart)).
 
 <a id="gaps-in-the-monitoring-log"></a>
 
