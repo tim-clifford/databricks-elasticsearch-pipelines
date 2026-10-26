@@ -1738,12 +1738,16 @@ def _per_user_schema_scan(entries: list, environment: str, user: str) -> tuple:
             schemas = {f"{resolved['view']['catalog']}.{resolved['view']['schema']}",
                        f"{resolved['source']['catalog']}.{resolved['source']['schema']}"}
             schemas |= {f"{spec['catalog']}.{spec['schema']}" for spec in resolved["reference_tables"].values()}
-            mine = view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"])
         except Exception as exc:  # noqa: BLE001 - reported per view (or fails closed) by deploy_views
             problems[label] = f"{type(exc).__name__}: {exc}"
             continue
+        # A resolved config's schemas are real even when its own per-user schema is invalid (e.g. too long), so
+        # they join the collision set before that is computed.
         configured |= schemas
-        per_user.add(mine)
+        try:
+            per_user.add(view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"]))
+        except Exception as exc:  # noqa: BLE001 - as above
+            problems[label] = f"{type(exc).__name__}: {exc}"
     collisions = sorted({s.lower() for s in per_user} & {s.lower() for s in configured})
     return collisions, problems
 

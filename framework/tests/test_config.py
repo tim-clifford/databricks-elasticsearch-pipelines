@@ -736,6 +736,17 @@ def test_per_user_preflight_names_the_real_reason_a_config_cant_be_checked():
     assert per_user_preflight_problem([shared, long_schema], {"shared.yml", "long.yml"}, "", "tim_clifford") is None
 
 
+
+def test_per_user_preflight_keeps_the_schemas_of_a_config_whose_per_user_schema_is_invalid():
+    # long.yml resolves but its per-user schema is too long; its SOURCE schema (cat.es_poc) is still a real
+    # schema, so short.yml's per-user schema landing on it is a collision even with long.yml in the subset.
+    # 252 + len("_poc") = 256, one over the limit.
+    long_schema = ("long.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "s" * 252, "name": "v"},
+                                                 "source": {**_base()["source"], "schema": "es_poc"}}))
+    short = ("short.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}}))
+    msg = per_user_preflight_problem([long_schema, short], {"long.yml", "short.yml"}, "", "poc")
+    assert msg and "cat.es_poc" in msg and "also configured" in msg
+
 def test_per_user_preflight_reports_an_unchecked_config_before_a_collision():
     # Both problems at once: the unchecked config is reported (its schemas might add more collisions).
     shared = ("shared.yml", validate_config(_base()))   # view schema es_poc

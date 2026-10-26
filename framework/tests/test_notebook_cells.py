@@ -234,6 +234,10 @@ def test_deploy_views_preflight_sees_every_config():
     rebinds = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
                and any(getattr(t, "id", None) == "configs_by_view" for t in n.targets)]
     assert len(rebinds) == 1 and rebinds[0].lineno < pre.lineno
+    # The subset must already be applied (sql_files = _selected) when the pre-flight reads sql_files.
+    (subset,) = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and getattr(n.value, "id", None) == "_selected"
+                 and any(getattr(t, "id", None) == "sql_files" for t in n.targets)]
+    assert subset.lineno < pre.lineno
 
 
 def test_deploy_views_guards_each_per_user_schema_once_as_the_run_identity():
