@@ -2,7 +2,7 @@
 
 How to take a new framework release, change code under `framework/`, run the tests, and move to a new connector version. For whoever owns the deployed copy of this repo.
 
-In normal operation nobody changes the code under `framework/`: feeds are added and changed entirely in `_pipelines/` and `databricks.yml`. If you need a change to the framework itself, the recommended route is to ask Databricks, who maintain it. If you do make framework changes yourself, this guide is the process to follow, and it is the same process Databricks follows for its own changes.
+In normal operation nobody changes the code under `framework/`: feeds are added and changed entirely in `_pipelines/` and `databricks.yml`. If you need a change to the framework itself, the recommended route is to ask Databricks for support. If you do make framework changes yourself, this guide is the process to follow, and it is the same process Databricks follows for its own changes.
 
 ## The upstream repo and your copy
 
@@ -13,14 +13,14 @@ The framework is maintained by Databricks in an upstream source repo. Your deplo
 
 ## What's in framework/ vs _pipelines/
 
-`_pipelines/` holds your feeds (views, configs, job cluster specs, and the job resources generated from them); `framework/` holds the shared code that runs them and is not edited per feed. `databricks.yml` at the root is yours too: it carries your environment's values. The docs follow the same split: [`docs/_pipelines/`](_pipelines/README.md) holds your own documentation (your feeds, environments, and infrastructure), and the rest of `docs/` documents the framework. For the complete directory layout, see [README.md#layout](../README.md#layout).
+`_pipelines/` holds your feeds (views, configs, job cluster specs, and the job resources generated from them); `framework/` holds the shared code that runs them and is not edited per feed. `databricks.yml` at the root is yours too: it carries your environment's values. The docs follow the same split: [`docs/_pipelines/`](_pipelines/README.md) holds your own internal documentation (your feeds, environments, infrastructure, and processes), and the rest of `docs/` documents the framework. For the complete directory layout, see [README.md#layout](../README.md#layout).
 
 ## Taking a new release
 
 When a new framework release is published, upgrade your deployed copy in these steps:
 
-1. **Check for local changes.** If your copy has framework changes that aren't upstream ([above](#the-upstream-repo-and-your-copy)), compare them against the release and decide how each carries over, together with any doc edits that describe them. Step 2 also replaces `README.md` and everything in `docs/` outside `docs/_pipelines/`, so first move anything there that is about your own deployment into `docs/_pipelines/`: edits you made to `README.md` or a framework doc, and any file you added under `docs/`. A moved file sits one level deeper, so fix its relative links and any links to it. If your copy doesn't have `docs/_pipelines/` yet, copy it from the release first; it holds only a starting index.
-2. **Replace `framework/` and the framework docs.** Replace the entire `framework/` directory with the one from the release. Replace the framework docs the same way: `README.md`, and everything in `docs/` except `docs/_pipelines/` (delete those files before copying in the release's, so that any doc the release removed doesn't linger). Always leave the release's `docs/_pipelines/` out of the copy, so that your own folder is kept as it is. Keep your `_pipelines/`, `docs/_pipelines/`, `databricks.yml`, and any `.databricks/bundle/<target>/variable-overrides.json` edits intact.
+1. **Check for local changes.** If your copy has framework changes that aren't upstream ([above](#the-upstream-repo-and-your-copy)), compare them against the release and decide how each carries over, together with any doc edits that describe them.
+2. **Replace `framework/` and the framework docs.** Replace the entire `framework/` directory with the one from the release. Replace the framework docs the same way: `README.md`, and everything in `docs/` except `docs/_pipelines/`. Always leave the release's `docs/_pipelines/` out of the copy, so that your own folder is kept as it is. Keep your `_pipelines/`, `docs/_pipelines/`, `databricks.yml`, and any `.databricks/bundle/<target>/variable-overrides.json` edits intact.
 3. **Check the new `databricks.yml`.** The release comes with its own `databricks.yml`, with its variable declarations and targets. Compare it against your current one: look for new variables (especially run-time knobs) and add them to your targets, or to the top-level `default` if you want all targets to inherit the same value.
 4. **Reinstall dependencies.** Run `pip install -r requirements.txt` to pin the new pyyaml version (see [The pyyaml pin](#the-pyyaml-pin) for why the pin matters).
 5. **Regenerate job resources.** Run `python framework/scripts/gen_jobs.py` to regenerate `_pipelines/resources/*.job.yml` with any new framework changes.
@@ -28,7 +28,7 @@ When a new framework release is published, upgrade your deployed copy in these s
 7. **Run the test suite.** Execute `python -m pytest framework/tests` and verify all tests pass (see [Running the tests](#running-the-tests) for details).
 8. **Validate the bundle.** Run `databricks bundle validate -t <target>` for each target you deploy to.
 9. **Deploy to dev first.** Deploy to your dev target (`databricks bundle deploy -t dev`). If the release adds monitoring log columns and the log is on, [upgrade the log table](#upgrading-an-existing-log-table) right after this deploy. Run a few feeds and confirm they export data as expected.
-10. **Deploy to production.** Once dev validates, deploy to your other targets, upgrading the log table in each the same way. Job resource keys don't change between releases unless the release says so, so each job is updated in place and keeps its run history.
+10. **Deploy to production.** Once dev validates, deploy to your other targets, upgrading the log table in each the same way. Job resource keys don't change between releases unless the release says so, so each job is updated in place and keeps its run history. Restart any continuous feed after its target's deploy, so it runs the new release ([Continuous jobs need a restart](deployment.md#continuous-jobs-need-a-restart)).
 
 ## Monitoring log table changes
 
@@ -42,12 +42,12 @@ The `log_table_create` job takes the schema from the deployed framework code, so
 2. **Run `log_table_create` straight away**, before the feeds run again:
 
    ```bash
-   databricks bundle run log_table_create -t <target> -p <profile>
+   databricks bundle run log_table_create -t <target>
    ```
 
    The job is re-runnable: it adds any column the new schema has and the table lacks, without dropping or replacing the table, so existing rows are preserved and receive `NULL` for new columns.
 
-A feed run that starts between the two steps writes a column the table lacks and fails at its first log write (`run_start`, before any data is sent); the next scheduled run, or a continuous job's retry, then succeeds. To avoid even those failures, deploy the build with its triggers paused (`databricks bundle deploy -t <target> -p <profile> --var=schedule_pause_status=PAUSED`), run `log_table_create`, then deploy again without the `--var` to restore the target's pause state. A feed that sets its own `pause_status: UNPAUSED` stays unpaused through the first deploy, so check for those first. Between the two deploys every inherited trigger is paused, so continuous feeds stop and `log_table_prune` doesn't run, and a run started by hand in that window still fails at its first log write.
+A feed run that starts between the two steps writes a column the table lacks and fails at its first log write (`run_start`, before any data is sent); the next scheduled run, or a continuous job's retry, then succeeds. To avoid even those failures, deploy the build with its triggers paused (`databricks bundle deploy -t <target> --var=schedule_pause_status=PAUSED`), run `log_table_create`, then deploy again without the `--var` to restore the target's pause state. A feed that sets its own `pause_status: UNPAUSED` stays unpaused through the first deploy, so check for those first. Between the two deploys every inherited trigger is paused, so continuous feeds stop and `log_table_prune` doesn't run, and a run started by hand in that window still fails at its first log write.
 
 ### Adding a column later
 
@@ -162,4 +162,4 @@ targets:
 
 ### Redeploying with the new wheel
 
-Run `databricks bundle deploy -t <target>` to deploy the bundle with the new `wheel_path`. The next run of any job will use the new wheel.
+Run `databricks bundle deploy -t <target>` to deploy the bundle with the new `wheel_path`. The next run of any job will use the new wheel. A continuous feed's run that is already going keeps the old wheel until you restart it ([Continuous jobs need a restart](deployment.md#continuous-jobs-need-a-restart)).

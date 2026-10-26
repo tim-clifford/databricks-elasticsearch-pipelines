@@ -40,7 +40,7 @@ include:
   - _pipelines/resources/*.yml
 
 variables:
-  # Folded into any config name that contains ${environment} (e.g. ocsf_${environment} -> ocsf_prod).
+  # Folded into any config name that contains ${environment} (e.g. ocsf_${environment} -> ocsf_prd).
   # Empty default: not every deployment has an environment component, and a config that uses the token
   # but gets an empty value fails closed at run (the runner resolves the token when the job runs;
   # bundle deploy/validate don't). Set the real value PER TARGET below
@@ -608,7 +608,7 @@ targets:
     mode: production
     variables:
       # STG deploy-time values. All ship EMPTY on main - fill in (or override at deploy with --var).
-      environment: ""              # e.g. staging - folded into ${environment} in config object names
+      environment: ""              # e.g. stg - folded into ${environment} in config object names
       wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
       checkpoint_base_path: ""     # e.g. /Volumes/<catalog>/<schema>/<volume>/checkpoints (UC Volume; required only for streaming)
       cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute
@@ -633,7 +633,7 @@ targets:
     variables:
       schedule_pause_status: UNPAUSED
       # PRD deploy-time values. All ship EMPTY on main - fill in (or override at deploy with --var).
-      environment: ""              # e.g. prod - folded into ${environment} in config object names
+      environment: ""              # e.g. prd - folded into ${environment} in config object names
       wheel_path: ""               # e.g. /Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl
       checkpoint_base_path: ""     # e.g. /Volumes/<catalog>/<schema>/<volume>/checkpoints (UC Volume; required only for streaming)
       cluster_policy_id: ""        # workspace-specific; required only if a pipeline uses job_cluster compute

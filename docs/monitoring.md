@@ -51,12 +51,12 @@ the monitoring log below keeps each batch's write diagnostics.
 
 ## Monitoring log
 
-To keep a durable record of every run and every batch for support, dashboards, alerting, and capacity trends, turn on the monitoring log. The run then appends rows to a shared Delta table. It is off by default. When on, it is part of the export's contract, not best-effort: see [Fail-closed](#fail-closed-when-on) below.
+To keep a durable record of every run and every batch for support, dashboards, alerting, and capacity trends, turn on the monitoring log. The run then appends rows to a shared Delta table. It is off unless you turn it on. When on, it is part of the export's contract, not best-effort: see [Fail-closed](#fail-closed-when-on) below.
 
 **One-time setup: create the table.** Table creation is a separate, deliberate step, not something an export job does (so export jobs never need `CREATE` permission). Point `monitoring_log_table` at a `catalog.schema.table` (per target, or `--var`), then run `log_table_create` once:
 
 ```bash
-databricks bundle run log_table_create -t <target> -p <profile>
+databricks bundle run log_table_create -t <target>
 ```
 
 It runs `CREATE TABLE IF NOT EXISTS` with the log's schema (from `framework/pipeline_lib/monitoring_sink.py`), then `ALTER TABLE ADD COLUMNS` for any column an existing table lacks, and is idempotent. The identity that runs this job needs `CREATE TABLE` (and `USE CATALOG` / `USE SCHEMA`) on the target schema. That identity owns the table it creates, so it can always re-run the job; a different identity re-running it on an existing table also needs `SELECT` and `MODIFY` on the table, which adding columns requires. Export jobs only append, so their identity needs only `MODIFY` on the table. If a table name is blank or not a three-part identifier it fails closed.
@@ -79,7 +79,7 @@ Set up the monitoring table once per environment in [Environment Setup](setup.md
 | `docs_written` | documents written by the batch (`batch_end`) or the whole run (`run_end`) |
 | `error_type`, `error_message` | the exception on status `error` rows |
 | `files_outstanding`, `bytes_outstanding` | `batch_summary` only: the streaming backlog left after the batch (Spark's `numFilesOutstanding` / `numBytesOutstanding`) |
-| `source_latest_version`, `source_latest_ts` | streaming `batch_start` and `batch_summary`: the source table's newest commit version made at least [`log_monitor_source_lookback_seconds`](parameters.md#log_monitor_source_lookback_seconds) (default 60) before the read at batch start, and its commit time |
+| `source_latest_version`, `source_latest_ts` | streaming `batch_start` and `batch_summary`: the source table's newest commit version made at least [`log_monitor_source_lookback_seconds`](parameters.md#log_monitor_source_lookback_seconds) (built-in default 60) before the read at batch start, and its commit time |
 | `source_end_version`, `source_end_index` | `batch_summary` only: where the batch ended in the source, from Spark's end offset |
 | `payload` | `VARIANT`: everything else the row records (queryable with `payload:field` paths in SQL) |
 | `logged_ts` | when the row was committed to the table (retention is on this) |
@@ -94,9 +94,9 @@ The table has two levels, each with a start and an end:
 | `batch_summary` | streaming only: when the notebook sees Spark's progress report for the batch | `success` | `progress`: Spark's whole `StreamingQueryProgress` (backlog, step durations, rates, source offsets); `source_latest` relayed from the batch's `batch_start` (absent if the relay was lost) |
 | `run_end` | when the run ends in-process | `success` / `error` / `stopped` | totals (batches, rows) or the error |
 
-A batch-mode run is exactly one batch (`batch_id` 0); a streaming run has one set of batch rows per micro-batch. `batch_start` and `batch_end` are written inline from the batch and carry everything about the batch (outcome, counts, ES diagnostics) in both modes. `batch_summary` is Spark's side, streaming only. A `batch_end` with no `batch_summary` is a streaming batch whose progress report was lost (typically a cancel shortly after it committed); its outcome and ES diagnostics are still in `batch_end`. `stopped` is a continuous stream whose query ended without error while the notebook kept running. A job cancel interrupts the notebook itself, so a cancelled run leaves `run_start` with no `run_end`, just like a killed run.
+A batch-mode run is exactly one batch (`batch_id` 0); a streaming run has one set of batch rows per micro-batch. `batch_start` and `batch_end` are written inline from the batch and carry everything about the batch (outcome, counts, ES diagnostics) in both modes. `batch_summary` is Spark's side, streaming only, and it is written after the batch is over, once the notebook sees Spark's progress report, so it can land shortly after the batch's `batch_end`. A recent `batch_end` with no `batch_summary` yet is usually just that. One that stays without a `batch_summary` is a streaming batch whose progress report was lost (typically a cancel shortly after it committed); its outcome and ES diagnostics are still in `batch_end`. `stopped` is a continuous stream whose query ended without error while the notebook kept running. A job cancel interrupts the notebook itself, so a cancelled run leaves `run_start` with no `run_end`, just like a killed run.
 
-**Reading the gaps.** A `batch_start` with no `batch_end` is a batch that never finished (the task was killed or the driver died mid-write). A `run_start` with no `run_end` is a run that was killed or cancelled. A batch retried by the task's retry policy shows a second `batch_start` for the same `batch_id` under the retry's own `task_run_id`. Per-partition bulk-send detail is not stored (too granular for this log); it still prints in the run log when `bulk_stats` is on.
+**Reading the gaps.** A missing end row first means the batch or run may still be in progress: a `batch_start` has no `batch_end` until the batch's write finishes, and a `run_start` has no `run_end` until the run ends (never, for a continuous run that is still going). Check the run's state in the Jobs UI before reading a gap as a failure. Once the batch or run is over, a `batch_start` with no `batch_end` is a batch that never finished (the task was killed or the driver died mid-write), and a `run_start` with no `run_end` is a run that was killed or cancelled. A batch retried by the task's retry policy shows a second `batch_start` for the same `batch_id` under the retry's own `task_run_id`. Per-partition bulk-send detail is not stored (too granular for this log); it still prints in the run log when `bulk_stats` is on.
 
 <a id="fail-closed-when-on"></a>**Fail-closed when on.** With `monitoring_log_enabled` on, the log is required: `monitoring_log_table` unset or malformed, the table missing or unwritable, or any failed append fails the task. So support receives the failure notification and no further data is sent without a log record. Because `batch_start` is written before a batch's data is sent, a log outage stops the export before the next batch reaches Elasticsearch. A failure while recording a failure never hides the original error (the log fault is attached as a note). A failed `batch_summary` append fails the task too. The trade-off: a log write that fails after a batch's data reached Elasticsearch (in `batch_end`) fails the micro-batch before the checkpoint advances, so the task's retry re-sends that batch. With `es_id_field` set that re-send is idempotent; without it, Elasticsearch assigns new ids and the batch's rows are duplicated. See [technical details](technical-details.md#fail-closed-log-trade-off) for the full trade-off.
 
@@ -111,7 +111,7 @@ WHERE record_type = 'batch_end' AND event_ts > current_timestamp() - INTERVAL 1 
 ORDER BY start_ts DESC;
 ```
 
-**Example: batches that started but never finished (killed mid-write):**
+**Example: batches that started but never finished (killed mid-write, or still in progress):**
 
 ```sql
 SELECT s.config_name, s.job_run_id, s.task_run_id, s.batch_id, s.start_ts
@@ -137,7 +137,7 @@ WHERE e.record_type = 'batch_end' AND e.status = 'success'
 ORDER BY e.start_ts DESC;
 ```
 
-<a id="caught-up-or-behind"></a>**Caught up or behind.** `files_outstanding` at zero means caught up. A non-zero backlog is ambiguous because Spark measures it after the batch, against the table as it then is, so files that landed while the batch ran count too. Each streaming batch records the source's newest commit made at least [`log_monitor_source_lookback_seconds`](parameters.md#log_monitor_source_lookback_seconds) (default 60) before its start (`source_latest_version`), and `batch_summary` carries both that and where the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** when
+<a id="caught-up-or-behind"></a>**Caught up or behind.** `files_outstanding` at zero means caught up. A non-zero backlog is ambiguous because Spark measures it after the batch, against the table as it then is, so files that landed while the batch ran count too. Each streaming batch records the source's newest commit made at least [`log_monitor_source_lookback_seconds`](parameters.md#log_monitor_source_lookback_seconds) (built-in default 60) before its start (`source_latest_version`), and `batch_summary` carries both that and where the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** when
 
 ```text
 source_latest_version >= source_end_version AND files_outstanding > 0
@@ -160,11 +160,9 @@ WHERE record_type = 'batch_summary' AND event_ts > current_timestamp() - INTERVA
 ORDER BY config_name, batch_id DESC;
 ```
 
-**Retention and the prune job.** The table grows without limit otherwise. The `log_table_prune` job enforces retention: it deletes rows older than `monitoring_log_retention_days` (default 90; `0` disables the delete), then optimizes (reclusters and compacts) and vacuums. It runs daily at 03:00 UTC, paused or unpaused by the target's [`schedule_pause_status`](parameters.md#schedule_pause_status) like every other trigger. It fails when `monitoring_log_table` is empty, so in any target where triggers are unpaused but the log isn't used, pause `log_table_prune` (or it fails, and emails `support_email`, every day). Run it on demand with:
-
-```bash
-databricks bundle run log_table_prune -t <target> -p <profile>
-```
+**Retention.** The `log_table_prune` job keeps the table to
+[`monitoring_log_retention_days`](parameters.md#monitoring_log_retention_days): see
+[Maintenance Jobs: The monitoring log table](maintenance-jobs.md#the-monitoring-log-table).
 
 The table is liquid-clustered on `(config_name, event_ts)` (the columns monitoring queries filter by), so data skipping holds up as the table grows. The `log_table_create` job also sets `delta.autoOptimize.optimizeWrite` and `autoCompact` to keep the table compact.
 
@@ -200,7 +198,7 @@ Then regenerate and redeploy:
 
 ```bash
 python framework/scripts/gen_jobs.py
-databricks bundle deploy -t <target> -p <profile>
+databricks bundle deploy -t <target>
 ```
 
 The generator inlines the spec verbatim, so every job using that config gets it.
@@ -211,6 +209,6 @@ The generator inlines the spec verbatim, so every job using that config gets it.
 
 **Permissions.** The identity the job cluster runs as needs `READ VOLUME` and `WRITE VOLUME` on the volume (plus `USE CATALOG` and `USE SCHEMA`).
 
-**Retention.** Every cluster (every continuous restart, every scheduled run) adds a directory. The `cluster_log_prune` job deletes files older than [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days) (default 30) and the directories that leaves empty, daily, paused or unpaused by `schedule_pause_status`. It only touches the `<destination>/<cluster-id>/<log kind>/` layout and leaves anything else on the volume alone ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)). See why delivery is opt-in in [technical details](technical-details.md#cluster-log-delivery-opt-in).
+**Retention.** Every cluster (every continuous restart, every scheduled run) adds a directory. The `cluster_log_prune` job deletes files older than [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days) and the directories that leaves empty, daily, paused or unpaused by `schedule_pause_status`. It only touches the `<destination>/<cluster-id>/<log kind>/` layout and leaves anything else on the volume alone ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)). See why delivery is opt-in in [technical details](technical-details.md#cluster-log-delivery-opt-in).
 
 **Sensitive contents.** The logs hold everything the notebook prints and the driver and executors log: config, host URLs, error messages and stack traces. Secret values read through `dbutils.secrets` are redacted in notebook output, but don't assume the same for the delivered files: treat the volume as sensitive and restrict who can read it.

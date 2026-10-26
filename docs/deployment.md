@@ -5,6 +5,7 @@ workspace or target comes first: see [Environment Setup](setup.md).
 
 - [The deploy sequence](#the-deploy-sequence)
 - [What to re-run after a change](#what-to-re-run-after-a-change)
+- [Continuous jobs need a restart](#continuous-jobs-need-a-restart)
 - [Running a feed](#running-a-feed)
 - [Overriding a bundle variable at deploy](#overriding-a-bundle-variable-at-deploy)
 - [Who can run the jobs](#who-can-run-the-jobs)
@@ -12,17 +13,19 @@ workspace or target comes first: see [Environment Setup](setup.md).
 ## The deploy sequence
 
 The full sequence, from the repo root. Each step is explained below; later docs refer back to this one.
+The `databricks` commands here and in the other docs don't name a workspace; add `-p <profile>` if you
+use a named CLI profile ([Local tools](setup.md#local-tools)).
 
 ```bash
-pip install -r requirements.txt pytest                      # once: the generator's pinned dependency, and pytest
-python -m pytest framework/tests -q                         # after changing framework code or taking a release
-python framework/scripts/gen_jobs.py                        # generate a job per feed config
-python framework/scripts/gen_jobs.py --check                # confirm the generated jobs are current
-databricks bundle validate -t <target> -p <profile>
-databricks bundle deploy -t <target> -p <profile>
-databricks bundle run deploy_views -t <target> -p <profile>
-databricks bundle run log_table_create -t <target> -p <profile>   # optional: only if you use the monitoring log
-databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
+pip install -r requirements.txt pytest               # once: the generator's pinned dependency, and pytest
+python -m pytest framework/tests -q                  # after changing framework code or taking a release
+python framework/scripts/gen_jobs.py                 # generate a job per feed config
+python framework/scripts/gen_jobs.py --check         # confirm the generated jobs are current
+databricks bundle validate -t <target>
+databricks bundle deploy -t <target>
+databricks bundle run deploy_views -t <target>
+databricks bundle run log_table_create -t <target>   # optional: only if you use the monitoring log
+databricks bundle run index_pipeline_<config_name> -t <target>
 ```
 
 1. **Install the tooling** once per machine. `requirements.txt` pins the generator's one dependency,
@@ -37,7 +40,9 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
 5. **Validate** the bundle for the target. It resolves the target's variables and checks the job
    definitions without deploying anything.
 6. **Deploy.** The target's variables come from `databricks.yml` ([precedence](parameters.md#bundle-variables)).
-   A deploy creates or updates the feed jobs and the seven maintenance jobs.
+   A deploy creates or updates the feed jobs and the seven maintenance jobs. A continuous feed's run
+   that is already going keeps its old settings until it is restarted
+   ([Continuous jobs need a restart](#continuous-jobs-need-a-restart)).
 7. **Deploy the views.** `deploy_views` creates or replaces every feed's view from its `.sql` file. When
    only a few views changed, `--params views=<name>,<name>` deploys just those
    ([Deploying some of the views](maintenance-jobs.md#deploying-some-of-the-views)).
@@ -56,18 +61,43 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
 | a job-cluster spec | generate, check, deploy |
 | framework code, or a new release | the whole sequence ([Taking a new release](framework-maintenance.md#taking-a-new-release)) |
 
+After any of these, restart each running continuous feed the change affects, or it carries on with its
+old settings ([below](#continuous-jobs-need-a-restart)).
+
+## Continuous jobs need a restart
+
+A continuous (always-on) feed has one run that never ends, and a run keeps the job settings, parameters
+and deployed files it started with. So a deploy updates the job, but the run already going doesn't pick
+the change up until it restarts. This applies to every change in the table above, for example:
+
+- a feed config value, such as a run-time knob, `trigger_interval` or `compute`;
+- a `databricks.yml` value the job uses, such as `wheel_path` (a new connector version), a host config,
+  or a run-time knob's global;
+- the view's `.sql` file, since a stream reads the view's `SELECT` from the deployed files when it
+  starts;
+- framework code, from a change or a new release.
+
+To apply the change, open the job in the Jobs UI and click **Restart run**, or start it with the Jobs
+API's `run-now` request, as in the Databricks
+[continuous jobs docs](https://docs.databricks.com/aws/en/jobs/continuous). For a
+[job group](feed-configuration.md#job-groups) that restarts every member, since they share one run.
+Each restarted stream resumes from its checkpoint.
+
+A feed whose continuous trigger was paused needs no separate restart: unpausing it starts a fresh run,
+which picks up the current settings.
+
 ## Running a feed
 
 Run a feed with the defaults from its config and the last deploy:
 
 ```bash
-databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
+databricks bundle run index_pipeline_<config_name> -t <target>
 ```
 
 Override run-time settings for a single run:
 
 ```bash
-databricks bundle run index_pipeline_<config_name> -t <target> -p <profile> \
+databricks bundle run index_pipeline_<config_name> -t <target> \
   --params filter_condition="action = 'allowed'",chunk_size=1000,max_partition_bytes=8m
 ```
 
@@ -77,7 +107,7 @@ It doesn't work per member on a [job group](feed-configuration.md#run-time-param
 Stream a whole table on a feed's first streaming run (instead of only new commits):
 
 ```bash
-databricks bundle run index_pipeline_<config_name> -t <target> -p <profile> \
+databricks bundle run index_pipeline_<config_name> -t <target> \
   --params pipeline_mode=streaming,streaming_start=full
 ```
 
@@ -88,7 +118,7 @@ databricks bundle run index_pipeline_<config_name> -t <target> -p <profile> \
 A `--var` overrides a bundle variable for one deploy, for a one-off wheel path for example:
 
 ```bash
-databricks bundle deploy -t <target> -p <profile> \
+databricks bundle deploy -t <target> \
   --var="wheel_path=/Volumes/<catalog>/<schema>/<volume>/databricks_es_connector-<version>-py3-none-any.whl"
 ```
 

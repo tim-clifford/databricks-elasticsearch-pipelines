@@ -1,6 +1,6 @@
 # Feed Configuration Guide
 
-The full guide to configuring a feed: its view, mode, compute, triggers and grouping. Use it to set up a feed from the start or to change how an existing one runs. [New Feed Quick Start](quick-start.md) is the short path to a first working feed, but you don't need to go through it first. Each config key is defined in the [Parameters Reference](parameters.md); this guide explains how to use them together. Several choices here (compute, partitions, micro-batch size) also set how much a feed can send to Elasticsearch: [Throughput Tuning](throughput.md) covers how to size them.
+The full guide to configuring a feed: its view, mode, compute, triggers and grouping. Use it to set up a feed from the start or to change how an existing one runs. [New Feed Quick Start](quick-start.md) is the short path to a first working feed, but doesn't contain all the available options that are documented here. Each config key is defined in the [Parameters Reference](parameters.md); this guide explains how to use them together. Several choices here (compute, partitions, micro-batch size) also impact how much data a feed sends to Elasticsearch at a time: [Throughput Tuning](throughput.md) covers how to size them.
 
 - [Feeds, tables and indices](#feeds-tables-and-indices)
 - [Views](#views)
@@ -23,7 +23,7 @@ The full guide to configuring a feed: its view, mode, compute, triggers and grou
 Each feed config maps one source table, through its view, to one Elasticsearch index. Beyond that one-to-one link, feeds can overlap on either side:
 
 - **Several feeds can read the same source table**, through one shared view or each through its own view, for example to send different columns or different subsets of rows to different indices or hosts.
-- **Several feeds can write the same index**, for example one feed per source table, or one per `filter_condition` subset of a table.
+- **Several feeds can write the same index**, for example one feed per source table going to the same index, or one per `filter_condition` subset of a table.
 
 Both are allowed, and neither is checked for overlap. When feeds share a source or an index, configure them so that each document comes from exactly one feed: give feeds that write one index disjoint rows (separate tables, or non-overlapping `filter_condition`s), and set [`es_id_field`](parameters.md#es_id_field) so a row that is sent twice overwrites itself instead of becoming a second document. Overlapping feeds either duplicate documents (with Elasticsearch-assigned ids) or overwrite each other's documents (with a shared `es_id_field`), and the result depends on which feed ran last. Grouped feeds writing one index add one more consideration: see [Members writing one index](#members-writing-one-index).
 
@@ -122,11 +122,9 @@ compute:
 
 The `cluster_config` names a `databricks.yml` cluster config: a `type: complex` bundle variable with a single `cluster_id` field, set per target. The generator emits `existing_cluster_id: ${var.<name>.cluster_id}` and the bundle resolves the right cluster id per target at deploy. This mirrors `es_host_config`: a workspace-specific value is never a literal, always a per-target variable. A `cluster_config` that names no declared cluster config fails at generation (`framework/scripts/gen_jobs.py`), before deploy.
 
-### Cluster policy and tags
+### Cluster policy
 
 The generator injects the target's [`cluster_policy_id`](parameters.md#cluster_policy_id) into every job cluster, so all job-cluster feeds run under that workspace's cluster policy; set it in every target a job-cluster feed deploys to. Serverless and `existing_cluster` feeds have no job cluster and are unaffected.
-
-Hardcoded `custom_tags` in a job-cluster spec pass straight through onto the cluster (e.g., `project: elastic`).
 
 ## Job tags
 
@@ -151,7 +149,7 @@ In addition to the global tags, `gen_jobs.py` adds one generated tag to each gen
 
 ### Tags on clusters and serverless
 
-Databricks forwards job tags to the job cluster as cluster tags, so on a `job_cluster` feed the global tags also land on the cluster alongside the spec's `custom_tags`. Serverless jobs have no cluster, so job-level tags are the only tag lever. A tag whose key or value conflicts with a value fixed by the workspace cluster policy fails at deploy, the same as any policy conflict. Tag value length is bounded by the cloud provider (AWS 255, Azure 256, GCP 63) once a tag reaches a cluster. To keep a large job group deployable, `gen_jobs.py` truncates a long `es_index_list` to a conservative cap (255), keeping whole index names in sorted order and appending a ` ...+N` marker for the count dropped (see [technical details](technical-details.md#es-index-list-tag) for why truncation matters). The global tags are independent and are never truncated.
+Hardcoded `custom_tags` in a job-cluster spec pass straight through onto the cluster (e.g., `project: elastic`). Databricks also forwards job tags to the job cluster as cluster tags, so on a `job_cluster` feed the global tags land on the cluster alongside the spec's `custom_tags`. Serverless jobs have no cluster, so job-level tags are the only tag lever. A tag whose key or value conflicts with a value fixed by the workspace cluster policy fails at deploy, the same as any policy conflict. Tag value length is bounded by the cloud provider (AWS 255, Azure 256, GCP 63) once a tag reaches a cluster. To keep a large job group deployable, `gen_jobs.py` truncates a long `es_index_list` to a conservative cap (255), keeping whole index names in sorted order and appending a ` ...+N` marker for the count dropped (see [technical details](technical-details.md#es-index-list-tag) for why truncation matters). The global tags are independent and are never truncated.
 
 ## When a feed runs
 
@@ -195,7 +193,7 @@ continuous:
   trigger_interval: 30 seconds  # Spark ProcessingTime cadence
 ```
 
-This emits a Databricks Jobs continuous trigger: the orchestrator keeps exactly one run perpetually active and restarts it on completion or failure, and the runner drives the stream with `Trigger.ProcessingTime(interval)` instead of `Trigger.availableNow`, so it never terminates. `trigger_interval` is the target gap between the start of one micro-batch and the next; batches never overlap. A shorter interval trades throughput (more, smaller bulk writes and index refreshes) for lower latency; to size each micro-batch, see [Throughput Tuning: Streaming micro-batch size](throughput.md#streaming-micro-batch-size). One always-on run holds its job cluster for as long as it is unpaused, so treat it as a running-cost commitment.
+This emits a Databricks Jobs continuous trigger: the orchestrator keeps exactly one run perpetually active and restarts it on completion or failure, and the runner drives the stream with `Trigger.ProcessingTime(interval)` instead of `Trigger.availableNow`, so it never terminates. `trigger_interval` is the target gap between the start of one micro-batch and the next; batches never overlap. A shorter interval trades throughput (more, smaller bulk writes and index refreshes) for lower latency; to size each micro-batch, see [Throughput Tuning: Streaming micro-batch size](throughput.md#streaming-micro-batch-size). One always-on run holds its job cluster for as long as it is unpaused, so treat it as a running-cost commitment. The run keeps the settings it started with, so after deploying a change, restart it ([Continuous jobs need a restart](deployment.md#continuous-jobs-need-a-restart)).
 
 #### Classic compute only
 
@@ -226,7 +224,7 @@ For a one-off test, unpause a single job in the Jobs UI or API, or deploy with `
 
 ### Overlapping runs skipped
 
-Every job except `checkpoint_clear` (which allows 20 concurrent runs, one per feed) sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that comes while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. Without `queue: {enabled: false}` the tick would wait in a queue instead (see [technical details](technical-details.md#queue-disabled)).
+Every job except `checkpoint_clear` (which allows up to 20 concurrent runs, so several feeds' checkpoints can be cleared at once) sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that comes while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. Without `queue: {enabled: false}` the tick would wait in a queue instead (see [technical details](technical-details.md#queue-disabled)).
 
 ## Job groups
 

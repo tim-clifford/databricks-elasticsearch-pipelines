@@ -10,7 +10,7 @@
 # MAGIC
 # MAGIC Parameter (set by the DAB job as a widget):
 # MAGIC - `environment`: folded into any config name that contains `${environment}` (e.g.
-# MAGIC   `ocsf_${environment}` -> `ocsf_prod`). May be empty when no config name uses the token.
+# MAGIC   `ocsf_${environment}` -> `ocsf_prd`). May be empty when no config name uses the token.
 # MAGIC - `view_schema_per_user`, `view_schema_user_name` (deploy-time): when the first is true, every view is
 # MAGIC   created in `<view schema>_<user name>` (the schema is created if missing) instead of the configured
 # MAGIC   schema, so developers sharing a workspace each get their own copy. Off => the configured schema.

@@ -1,7 +1,7 @@
 # Parameters Reference
 
-Every value you can set, in one place: what it does, where you set it, when it takes effect, its
-default, and what to weigh when you change it. Other docs link here instead of repeating these
+Every value you can set, in one place: what it does, where you set it, when it takes effect, what
+applies when it's unset, and what to weigh when you change it. Other docs link here instead of repeating these
 definitions.
 
 - [How values are set](#how-values-are-set)
@@ -24,8 +24,11 @@ Values reach a job in three ways, and they take effect at different times.
 | Feed config key | `_pipelines/pipeline_configs/<config_name>.yml` | when you regenerate (`python framework/scripts/gen_jobs.py`) and deploy |
 | Job parameter | `--params <name>=<value>` on `bundle run` (or the Jobs UI/API) | for that one run |
 
-The workspace itself is not a variable: it comes from your Databricks CLI profile (`-p <profile>`) or
-`DATABRICKS_HOST`.
+A continuous feed's running run keeps the values it started with, so a deployed change reaches it only
+once it restarts ([Continuous jobs need a restart](deployment.md#continuous-jobs-need-a-restart)).
+
+The workspace itself is not a variable: it comes from the Databricks CLI's authentication
+([Local tools](setup.md#local-tools)).
 
 ### Bundle variables
 
@@ -85,9 +88,9 @@ Two exceptions:
 ### `environment`
 
 A value folded into any `catalog` or `schema` in a feed config that contains `${environment}` (for
-example `acme_${environment}` becomes `acme_prod`).
+example `acme_${environment}` becomes `acme_prd`).
 
-- **Set:** per target, or `--var`. Default empty.
+- **Set:** per target, or `--var`.
 - **Takes effect:** when the job runs: the runner folds it in. `bundle deploy` and `validate` don't
   resolve it.
 - **Fails closed:** a feed whose names use the token fails at run if the value is empty or produces an
@@ -100,10 +103,11 @@ example `es_poc` becomes `es_poc_jane_doe`), so developers sharing a workspace d
 other's views (see [Environment Setup](setup.md#per-developer-views)). `deploy_views` creates the schema
 if it's missing and every feed job reads its view from there. Source and reference tables are unchanged.
 
-- **Set:** top level, per target, or `--var`. Default `false`; the `dev` target sets `true`.
+- **Set:** top level, per target, or `--var`.
 - **Takes effect:** at deploy. `--var view_schema_per_user=false` turns it off for one deploy, to test
   against the real view schema.
 - **Values:** `true` or `false`. Anything else fails the run.
+- **Recommendation:** `true` in `dev` and `false` elsewhere, as shipped out of the box.
 - **Fails closed:** with it on, an empty or illegal user name fails `deploy_views` and feed runs instead
   of falling back to the shared schema.
 - **Needs:** `CREATE SCHEMA` on each view catalog for the `deploy_views` identity.
@@ -113,7 +117,7 @@ if it's missing and every feed job reads its view from there. Source and referen
 The UC Volume path to the `databricks-es-connector` wheel every index job installs. The connector
 version lives in the filename.
 
-- **Set:** per target, or `--var` (for example a one-off wheel). Default empty.
+- **Set:** per target, or `--var` (for example a one-off wheel).
 - **Takes effect:** at deploy.
 - **Required by:** every index job (an empty value fails the run). `deploy_views` doesn't need it.
 - **Note:** the wheel is a prerequisite this bundle does not create. The `build_wheel` job can build and
@@ -125,7 +129,7 @@ version lives in the filename.
 The UC Volume base path for streaming checkpoints. The runner appends `/<config_name>`, so each feed
 gets its own checkpoint folder.
 
-- **Set:** per target, or `--var`. Default empty.
+- **Set:** per target, or `--var`.
 - **Takes effect:** at deploy.
 - **Required by:** streaming runs only (an empty value fails a streaming run). Batch runs and
   `deploy_views` don't use it.
@@ -138,7 +142,7 @@ gets its own checkpoint folder.
 The workspace's cluster policy id, injected into every feed's job cluster (with
 `apply_policy_default_values: true`).
 
-- **Set:** per target, or `--var`. Default empty.
+- **Set:** per target, or `--var`.
 - **Required by:** any feed with `job_cluster` compute. An empty value fails the deploy, since the Jobs
   API rejects `policy_id: ""`. Serverless and `existing_cluster` feeds don't use it.
 - **Note:** a policy id is workspace-specific, so set it in each target for that target's workspace.
@@ -148,7 +152,7 @@ The workspace's cluster policy id, injected into every feed's job cluster (with
 The UC Volume path to a CA bundle (PEM) the connector uses to verify the ES server's TLS certificate.
 One bundle is shared by every host config.
 
-- **Set:** per target, or `--var`. Default empty, meaning use the system CA store.
+- **Set:** per target, or `--var`. Empty means use the system CA store.
 - **Fails closed:** combined with `verify_certs: false` the connector rejects the run. Pick one.
 - **Limitation:** a different CA bundle per host config is not supported.
 
@@ -157,7 +161,7 @@ One bundle is shared by every host config.
 The UC Volume destination for job-cluster log delivery, used only by a job cluster config that opts in
 with a `cluster_log_conf` block (see [Logging and Monitoring](monitoring.md#cluster-log-delivery)).
 
-- **Set:** per target, or `--var`. Default empty (unused).
+- **Set:** per target, or `--var`. Empty means unused.
 - **Fails closed:** a config that opts in fails the deploy in any target where this is empty.
 - **Cleanup:** the `cluster_log_prune` job deletes logs older than
   [`cluster_log_retention_days`](#cluster_log_retention_days) from this path.
@@ -168,10 +172,12 @@ Days of delivered cluster logs the `cluster_log_prune` job keeps under
 [`cluster_log_volume_path`](#cluster_log_volume_path). It deletes older files, then the directories that
 leaves empty ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)).
 
-- **Set:** per target, or `--var`. Default `30`.
+- **Set:** per target, or `--var`.
 - **Takes effect:** at deploy.
 - **Values:** an integer; `0` (or negative) disables the delete. A non-integer, or a number of days that
   reaches back before 1970 (so nothing could ever be deleted), fails the run.
+- **Recommendation:** long enough to cover a post-mortem on any job cluster's logs; the value shipped
+  out of the box is `30`.
 
 ### `job_name_prefix`
 
@@ -188,8 +194,8 @@ The prefix in every job's display name, `[<target>] <prefix>: <postfix>` (see
 Tags (a map of key to string value) applied to every job the bundle deploys. Job tags are forwarded to
 job clusters as cluster tags. See [Job tags](feed-configuration.md#job-tags).
 
-- **Set:** `type: complex`, so in `databricks.yml` or `variable-overrides.json`, not `--var`. Default
-  `{}` (no tags).
+- **Set:** `type: complex`, so in `databricks.yml` or `variable-overrides.json`, not `--var`. `{}` means
+  no tags.
 - **Read at generation:** the fixed maintenance jobs resolve it per target at deploy. Generated jobs bake
   the top-level default **at generation**, so the tag key set for generated jobs comes from the top
   level only; per-target values still work through `${var...}` references.
@@ -224,7 +230,7 @@ notify.
 The fully-qualified `catalog.schema.table` of the shared monitoring Delta table (see
 [Logging and Monitoring](monitoring.md#monitoring-log)).
 
-- **Set:** per target, or `--var`. Default empty.
+- **Set:** per target, or `--var`.
 - **Takes effect:** at deploy (a notebook base parameter, not a per-run parameter).
 - **Required by:** any run with [`monitoring_log_enabled`](#monitoring_log_enabled) on. Unset,
   malformed, missing or unwritable fails the run.
@@ -236,8 +242,10 @@ The fully-qualified `catalog.schema.table` of the shared monitoring Delta table 
 Days of history the `log_table_prune` job keeps in the monitoring table. It deletes older rows, then
 runs `OPTIMIZE` and `VACUUM`.
 
-- **Set:** per target, or `--var`. Default `90`.
+- **Set:** per target, or `--var`.
 - **Values:** a non-negative integer; `0` disables the delete (keep everything).
+- **Recommendation:** as long as you query the log's history for support and trends; the value shipped
+  out of the box is `90`.
 
 ## Elasticsearch host configs
 
@@ -279,7 +287,7 @@ by name. Each entry's fields are `${var.<name>.<field>}` references, which resol
 
 The host config a feed uses when it omits `es_host_config`, and the default host for `es_diagnostics`.
 
-- **Set:** the top-level `default:` only. Default `es_host_default`.
+- **Set:** the top-level `default:` only. Out of the box it names `es_host_default`.
 - **Read at generation:** must name a declared host config, and a target override fails generation.
   The default host's values still vary per target, on the host config itself.
 
@@ -299,19 +307,19 @@ property, so redeploy after changing them. Set at most one path; setting both fa
 
 ### `diagnostics_existing_cluster_id`
 
-Run `es_diagnostics` on an already-running cluster, by id. A plain string, so `--var` works. Default
-empty (serverless).
+Run `es_diagnostics` on an already-running cluster, by id. A plain string, so `--var` works. Empty means
+serverless.
 
 ### `diagnostics_job_cluster_key`
 
-The `job_cluster_key` (from `diagnostics_job_clusters`) to run `es_diagnostics` on. Default empty.
+The `job_cluster_key` (from `diagnostics_job_clusters`) to run `es_diagnostics` on.
 
 ### `diagnostics_job_clusters`
 
 The whole `job_clusters` list for `es_diagnostics`: a `job_cluster_key` plus a `new_cluster` spec, for
 example copied from a `_pipelines/job_cluster_configs/<key>.yml` file (add
 `apply_policy_default_values: true` if a policy is enforced). `type: complex`, so set it per target or
-in `variable-overrides.json`. Default `[]`.
+in `variable-overrides.json`. `[]` means none.
 
 ## Feed definition keys
 
@@ -427,7 +435,8 @@ or the same value on several; different values fail generation. See
 
 Each knob below can be set three ways, by the [precedence rule](#run-time-knobs-one-precedence-rule):
 the `${var.<name>}` global in `databricks.yml`, the feed config key of the same name, and
-`--params <name>=<value>`. "Default" is what applies when all three are unset. For how the write knobs
+`--params <name>=<value>`. The connector, Spark or built-in default noted for each is what applies when
+all three are unset. For how the write knobs
 interact, see [Throughput Tuning](throughput.md).
 
 ### `pipeline_mode`
@@ -441,7 +450,7 @@ config. See
 ### `filter_condition`
 
 A Spark SQL predicate applied to the view's rows before writing, for example `"action = 'allowed'"`.
-Default empty (no filter). A malformed predicate fails the run when Spark applies it.
+Empty means no filter. A malformed predicate fails the run when Spark applies it.
 
 Leave the global empty unless every feed that omits the key really should carry that filter.
 
@@ -501,14 +510,16 @@ queue is full), with exponential backoff. A non-negative integer; `0` disables. 
 
 Reach for this, not `transport_max_retries`, when a feed sees 429s under load. Raising it far
 multiplies backoff time within the partition; the real ceiling is ES's write capacity. The connector
-warns if this is `0` while `transport_max_retries` is above 3, since a 429'd document would then get no
-retry at either layer.
+warns if this is `0` while `transport_max_retries` is raised above its connector default of 3. That
+combination looks like an attempt to ride out backpressure, but it can't: ES returns per-document 429s
+inside a successful bulk response, which `transport_max_retries` never sees, so with this at `0` a 429'd
+document gets no retry at all, whatever `transport_max_retries` is set to.
 
 ### `retry_transport_timeout`
 
 `true` makes the connector own whole-request timeout retries: a bulk send that exceeds `request_timeout`
 is re-sent with backoff (up to `transport_max_retries` times) instead of the ES client re-sending it
-silently and then failing the batch. Default off.
+silently and then failing the batch. Connector default off.
 
 It only changes timeout handling; connection resets and 429 or 503 responses are retried as before.
 With `bulk_stats` on, the cost shows as `timeout_sends` and `timeout_wait_ms`.
@@ -537,15 +548,15 @@ deduplicated instead of written. The data is correct; only the count is off.
 
 ### `bypass_fast_path`
 
-`true` skips the connector's fast path and checks every document's result on the first send. Default
-off.
+`true` skips the connector's fast path and checks every document's result on the first send. Connector
+default off.
 
 Under the fast path, each chunk is sent with a request for only the response's `errors` flag. A clean
 chunk is done in one send with very little to decode. A chunk with any document-level error (a 409, a
 429, a mapping error) is then sent again in full to get each document's result. So:
 
-- **It helps** a feed where document-level errors are routine, above all `op_type: create` with
-  re-sends, where most chunks carry 409s: the fast path sends each of those chunks twice, and bypassing
+- **It helps** a feed where document-level errors are routine, above all re-sends with
+  `op_type: create`, where most chunks carry 409s: the fast path sends each of those chunks twice, and bypassing
   it sends them once. It also makes the `create` counts exact, and avoids the second send duplicating a
   chunk's good documents when the feed has no `es_id_field`.
 - **It costs** on a feed whose chunks are almost always clean: every response then carries and decodes
@@ -553,7 +564,7 @@ chunk is done in one send with very little to decode. A chunk with any document-
   GIL, so it also lowers the `write_concurrency` a partition can use
   ([Python threads and the GIL](throughput.md#python-threads-and-the-gil)).
 
-Turn on [`bulk_stats`](#bulk_stats) to see which case a feed is in.
+Turn on [`bulk_stats`](#bulk_stats), if it isn't already on, to see which case a feed is in.
 
 ### `require_existing_index`
 
@@ -574,12 +585,12 @@ endpoint, for example). Connector default `true`. `false` can't be combined with
 ### `bulk_stats`
 
 `true` logs per-partition bulk-send diagnostics under the `BULK_STATS` tag: docs per request, round-trip
-and ES time, straggler partitions. Default off. Turn it on when tuning or investigating a slow feed; see
+and ES time, straggler partitions. Connector default off. Turn it on, if it isn't already on, when tuning or investigating a slow feed; see
 [Logging and Monitoring](monitoring.md#reading-the-bulk_stats-output) for how to read it.
 
 ### `monitoring_log_enabled`
 
-`true` also records every run and batch in the [monitoring table](#monitoring_log_table). Default off.
+`true` also records every run and batch in the [monitoring table](#monitoring_log_table). Off unless set.
 
 When on, the log is required: a missing table or any failed append fails the task, so no data is sent
 without a record. See [Logging and Monitoring](monitoring.md#monitoring-log).
@@ -608,7 +619,20 @@ Sets `spark.sql.files.maxPartitionBytes` for the source read: smaller values spl
 smaller partitions, which carry through the view to the write. A Spark byte size (`2m`, `32m`) or a
 byte count; `0` leaves the engine default. Built-in default `2m`.
 
-A good starting target is about 1x to 3x the total worker cores in partitions. See
+A good starting target is about 1x to 3x the total worker cores in partitions. It is a cap on how much
+of the source each read partition holds, not a partition count, so some sources don't split as
+expected:
+
+- **One very large file.** Parquet splits only at row-group boundaries, so a large file with few row
+  groups yields only that many partitions with data, however small this is.
+- **Lots of very small files.** Spark packs whole files into a partition up to this size, counting each
+  file as at least `spark.sql.files.openCostInBytes`. At a small value every small file gets its own
+  partition, so thousands of tiny files give thousands of tiny partitions and their per-task overhead.
+- **Uneven files** give uneven partitions, and the largest becomes a straggler.
+- **A shuffling view** (a large join, `GROUP BY`, `DISTINCT`, a window) resets the count, so this no
+  longer decides the write's partitions.
+
+In those cases [`write_repartition`](#write_repartition) sets the write's partition count directly. See
 [Throughput Tuning](throughput.md#partitions).
 
 ### `write_repartition`
@@ -616,8 +640,9 @@ A good starting target is about 1x to 3x the total worker cores in partitions. S
 Repartitions the write input into this many partitions before the ES write. A non-negative integer;
 `0` (built-in default) turns it off.
 
-Set it per feed: the right value depends on the feed's data and its cluster. It adds a shuffle, and in
-return gives the write a set number of evenly sized partitions. See
+Set it per feed: the right value depends on the feed's data and its cluster. A good starting target is
+either `0` (off), or about 1x to 3x the total worker cores. It adds a shuffle, and in return gives the
+write a set number of evenly sized partitions. See
 [Throughput Tuning](throughput.md#partitions) for how to choose it.
 
 ### `max_files_per_trigger`
@@ -628,7 +653,9 @@ Use it to bound a backfill or a large catch-up so one micro-batch doesn't read t
 ### `max_bytes_per_trigger`
 
 Streaming only: a soft cap on bytes per micro-batch (Delta always admits at least one file). A Spark
-byte size such as `128m`. Default: no cap.
+byte size such as `128m`. Spark default: no byte cap, so when it's unset only
+[`max_files_per_trigger`](#max_files_per_trigger) bounds a micro-batch. When both are set, a micro-batch
+ends at whichever limit it reaches first.
 
 ## Maintenance job parameters
 
@@ -679,8 +706,8 @@ never a typed-out list; a list long enough to hit the limit has to be split acro
 
 ## Summary table
 
-Every parameter on this page, with where it is set and what it does. Follow a parameter's link for its
-default, what happens when it is left empty, and what to weigh when you change it. "Bundle"
+Every parameter on this page, with where it is set and what it does. Follow a parameter's link for
+what happens when it is left empty, and what to weigh when you change it. "Bundle"
 means a `databricks.yml` variable, "Config" a feed config key, "Knob" a run-time knob (bundle global,
 feed config, or `--params`), and "Job" a maintenance job's `--params`.
 
