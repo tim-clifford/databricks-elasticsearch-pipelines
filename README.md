@@ -28,18 +28,18 @@ The bundle deploys:
 - **Maintenance jobs**: creating or replacing the views (`deploy_views`), clearing a streaming
   checkpoint, checking an Elasticsearch host (a work in progress), building the connector wheel,
   creating and pruning the optional monitoring log, a Delta table that records every run and batch, and
-  pruning delivered cluster logs.
+  pruning optional delivered cluster logs.
 
 ## Documentation
 
 | If you want to | Read |
 |---|---|
-| Read about this deployment's own feeds, environments, and infrastructure | [Feeds and Infrastructure](docs/_pipelines/README.md) |
 | Set up the framework in a workspace, or add an environment | [Environment Setup](docs/setup.md) |
-| Add a new feed, the short way | [New Feed Quick Start](docs/quick-start.md) |
+| Add a new feed - initial POC | [New Feed Quick Start](docs/quick-start.md) |
 | Configure a feed fully: streaming, compute, schedule, job groups, shared views, etc. | [Feed Configuration Guide](docs/feed-configuration.md) |
 | Look up any setting: what it does, where it's set, what to set it to | [Parameters Reference](docs/parameters.md) |
 | Deploy the bundle and run feeds | [Deployment](docs/deployment.md) |
+| Our internal documentation about our own feeds, environments, infrastructure, and processes. (We maintain these docs.) | [Internal Documentation](docs/_pipelines/README.md) |
 | Run a maintenance job: views, checkpoints, the connector wheel, the ES host check, the log table | [Maintenance Jobs](docs/maintenance-jobs.md) |
 | Read a feed's run output, the monitoring log, or cluster logs | [Logging and Monitoring](docs/monitoring.md) |
 | Keep feeds caught up without overloading Elasticsearch, at the lowest cluster cost | [Throughput Tuning](docs/throughput.md) |
@@ -47,22 +47,6 @@ The bundle deploys:
 | Fix a feed that fails, falls behind, or sends the wrong data | [Troubleshooting](docs/troubleshooting.md) |
 | Take a framework update, run the tests, or change framework code | [Framework Maintenance and Upgrades](docs/framework-maintenance.md) |
 | Understand why something works the way it does | [Technical Details](docs/technical-details.md) |
-
-## Quick reference
-
-The [deploy sequence](docs/deployment.md#the-deploy-sequence), from the repo root:
-
-```bash
-pip install -r requirements.txt pytest                      # once: the generator's pinned dependency, and pytest
-python -m pytest framework/tests -q                         # after changing framework code or taking a release
-python framework/scripts/gen_jobs.py                        # generate a job per feed config
-python framework/scripts/gen_jobs.py --check                # confirm the generated jobs are current
-databricks bundle validate -t <target> -p <profile>
-databricks bundle deploy -t <target> -p <profile>
-databricks bundle run deploy_views -t <target> -p <profile>
-databricks bundle run log_table_create -t <target> -p <profile>   # optional: only if you use the monitoring log
-databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
-```
 
 ## Layout
 
