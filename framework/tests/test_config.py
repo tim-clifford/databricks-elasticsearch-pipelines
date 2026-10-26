@@ -802,6 +802,11 @@ def test_selected_view_files():
     assert selected_view_files("c_view,a_view", files) == ["a_view.sql", "c_view.sql"]
     with pytest.raises(PipelineConfigError, match="unknown view"):
         selected_view_files("a_view.sql", files)
+    # A non-.sql entry is never a view: it can't be selected, by default or by name.
+    mixed = ["a_view.sql", "notes.txt"]
+    assert selected_view_files("", mixed) == ["a_view.sql"]
+    with pytest.raises(PipelineConfigError, match="unknown view"):
+        selected_view_files("notes", mixed)
 
 
 def test_per_user_schema_collisions_reports_unresolved_labels():

@@ -1842,7 +1842,7 @@ def selected_view_files(requested: object, sql_files: list) -> list:
     """The view .sql files deploy_views deploys: `sql_files` narrowed by the `views` parameter (see
     select_views), as file names, in `sql_files` order."""
     by_name = {f[:-len(".sql")]: f for f in sql_files if f.endswith(".sql")}
-    return [by_name[n] for n in select_views(requested, [f[:-len(".sql")] for f in sql_files])]
+    return [by_name[n] for n in select_views(requested, list(by_name))]
 
 
 def view_schema_fqn(view_fqn: str) -> str:
