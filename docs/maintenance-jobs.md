@@ -8,21 +8,22 @@ The fixed jobs that set up and look after the feeds: views, checkpoints, the con
 - [Resetting a checkpoint](#resetting-a-checkpoint)
 - [Renaming a feed](#renaming-a-feed)
 - [Diagnosing an Elasticsearch host](#diagnosing-an-elasticsearch-host)
+- [The monitoring log table](#the-monitoring-log-table)
 - [Pruning cluster logs](#pruning-cluster-logs)
 
 ## Maintenance jobs at a glance
 
-Seven fixed jobs handle setup and upkeep. Run any with `databricks bundle run <resource_key> -t <target> -p <profile>`, with optional `--params` as noted.
+Seven fixed jobs handle setup and upkeep. Run any with `databricks bundle run <resource_key> -t <target>`, with optional `--params` as noted.
 
 | Resource key | Display name | What it does | When to run it |
 |---|---|---|---|
 | `deploy_views` | Deploy views | Creates or updates every feed's view in the workspace, or only the ones named with `--params views=<name>,<name>` ([how](#deploying-some-of-the-views)). Fails closed if the schema or join logic is invalid. | Once per deploy, before the first index run. Re-run if you modify a view's SQL. |
 | `build_wheel` | Build wheel | Builds the `databricks-es-connector` wheel from a checked-out copy of the connector repo (with `--params repo_workspace_path=<path>,wheel_version=<x.x.x>`). Publishes it to the UC Volume next to your existing wheels. Does not switch your feeds to it. | On demand when you want to update the connector version. |
-| `checkpoint_clear` | Checkpoint clear | Deletes a feed's checkpoint directory (with `--params config_name=<config_name>`). The next streaming run starts fresh. Safe to run while the stream is paused. | When you wipe an index and want to backfill it, or when you change `streaming_start`. |
+| `checkpoint_clear` | Checkpoint clear | Deletes a feed's checkpoint directory (with `--params config_name=<config_name>`). The next streaming run starts fresh. Safe to run while the stream is paused. | When you wipe an index and want to backfill it, or when you want to reset the checkpoint to the current point in time (`streaming_start=new`), or remove a checkpoint from a config that no longer exists. |
 | `es_diagnostics` | Diagnostics | A work in progress ([see below](#diagnosing-an-elasticsearch-host)). Samples an Elasticsearch cluster twice (5 seconds apart by default) and reports a verdict on its health (with optional `--params index_name=<index>,es_host_config=<name>`). Reports write thread-pool saturation, rejections, indexing pressure, circuit breakers, node heap/GC, and cluster state. | When writes are slow or timing out, as one input on whether the host is saturated. |
-| `log_table_create` | Log table create | Creates the monitoring Delta table if it does not exist, or adds any new columns to an existing table and updates any changed column comments. Idempotent. (See [Monitoring log](monitoring.md#monitoring-log) below.) | Once, before turning the monitoring log on. Re-run after deploying a build that adds a monitoring column, before its feeds run again ([how](framework-maintenance.md#upgrading-an-existing-log-table)). |
-| `log_table_prune` | Log table prune | Deletes rows older than `monitoring_log_retention_days` (default 90), then optimizes and vacuums. Runs daily, paused or unpaused by the target's `schedule_pause_status`. | Leave it scheduled where the log is in use; pause it in any target where triggers are unpaused but the log isn't used (it fails without a table). |
-| `cluster_log_prune` | Cluster logs prune | Deletes delivered cluster log files older than `cluster_log_retention_days` (default 30), then the directories that leaves empty, touching only the cluster log layout (optional `--params dry_run=true` to list without deleting; [details](#pruning-cluster-logs)). Runs daily, paused or unpaused by `schedule_pause_status`. Does nothing when `cluster_log_volume_path` is empty. | Leave it scheduled where any job cluster delivers logs. |
+| `log_table_create` | Log table create | Creates the monitoring Delta table if it does not exist, or adds any new columns to an existing table and updates any changed column comments. Idempotent. ([details](#the-monitoring-log-table)) | Once, before turning the monitoring log on. Re-run after deploying a build that adds a monitoring column, before its feeds run again ([how](framework-maintenance.md#upgrading-an-existing-log-table)). |
+| `log_table_prune` | Log table prune | Deletes rows older than `monitoring_log_retention_days`, then optimizes and vacuums. Runs daily, paused or unpaused by the target's `schedule_pause_status`. | Leave it scheduled where the log is in use; pause it in any target where triggers are unpaused but the log isn't used (it fails without a table). ([details](#the-monitoring-log-table)) |
+| `cluster_log_prune` | Cluster logs prune | Deletes delivered cluster log files older than `cluster_log_retention_days`, then the directories that leaves empty, touching only the cluster log layout (optional `--params dry_run=true` to list without deleting; [details](#pruning-cluster-logs)). Runs daily, paused or unpaused by `schedule_pause_status`. Does nothing when `cluster_log_volume_path` is empty. | Leave it scheduled where any job cluster delivers logs. |
 
 Every maintenance job parameter is in [Parameters Reference](parameters.md#maintenance-job-parameters).
 
@@ -32,7 +33,7 @@ By default `deploy_views` creates or replaces every view. To deploy only the vie
 them, comma-separated, by their `.sql` file names without the extension:
 
 ```bash
-databricks bundle run deploy_views -t <target> -p <profile> --params views=ecs_dns_activity,ecs_authentication
+databricks bundle run deploy_views -t <target> --params views=ecs_dns_activity,ecs_authentication
 ```
 
 - An unknown name (a typo, or a name with `.sql` on it) or an empty entry (`a,,b`, a trailing comma)
@@ -58,7 +59,7 @@ In `dev` environments, use `mode: development` in `databricks.yml` and append `$
 When a stream's checkpoint is stale (the index was wiped, or you want to start from a fresh `streaming_start`), clear it with the `checkpoint_clear` job:
 
 ```bash
-databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>
+databricks bundle run checkpoint_clear -t <target> --params config_name=<config_name>
 ```
 
 This deletes the whole checkpoint directory `<checkpoint_base_path>/<config_name>` and does nothing else. It never reads the Elasticsearch secret or writes a document. The next `streaming` run of that feed then behaves like a first run: `streaming_start=new` reseeds at the source's current version, `streaming_start=full` backfills the whole table. Clearing an already-absent checkpoint is a harmless no-op. `config_name` is required and validated (a blank or path-bearing value fails), so the job can only delete the one checkpoint that feed would use, never a shared base or another feed's checkpoint.
@@ -84,7 +85,7 @@ A batch feed loses nothing: every run re-exports the whole view.
 a first run and [`streaming_start`](parameters.md#streaming_start) decides where it begins. The old
 checkpoint is left where it was, unused.
 
-- **`new`** (the default) starts at the source's version as of the start of that first run. Everything
+- **`new`** starts at the source's version as of the start of that first run. Everything
   after the point the old feed had reached, up to then, is never sent, leaving a **gap** in the index
   that only a backfill fills. The gap starts where the old stream ended, not when it last ran: if the old
   feed was behind, the rows it hadn't reached yet are in the gap too.
@@ -154,9 +155,9 @@ To rename a streaming feed:
 When a host looks backed up (writes slowing, requests timing out), run the read-only `es_diagnostics` job to collect an outside view of what the cluster is doing:
 
 ```bash
-databricks bundle run es_diagnostics -t <target> -p <profile>                              # default host, cluster/node level
-databricks bundle run es_diagnostics -t <target> -p <profile> --params index_name=<index>  # + deep-dive on one index
-databricks bundle run es_diagnostics -t <target> -p <profile> --params es_host_config=es_host_secondary  # hit a different host
+databricks bundle run es_diagnostics -t <target>                               # default host, cluster/node level
+databricks bundle run es_diagnostics -t <target> --params index_name=<index>   # + deep-dive on one index
+databricks bundle run es_diagnostics -t <target> --params es_host_config=es_host_secondary  # hit a different host
 ```
 
 The job only issues `GET` requests (it never writes a document or misuses the ES secret). It connects to the host config named by `es_host_config` (default: the bundle's `default_es_host_config`), using the same endpoints and secrets the feeds use. The host is picked only by name, from the `es_host_configs_json` variable in `databricks.yml`, so someone who can run the job can't point it at another endpoint ([why](technical-details.md#diagnostics-host-by-name-security)).
@@ -176,17 +177,45 @@ Run parameters: `index_name` (blank checks only cluster and nodes), `es_host_con
 
 By default the job runs serverless. To run it on a cluster instead (for example to match the runtime or the network path a feed's writes take), set one of the `es_diagnostics` compute variables in `databricks.yml` and redeploy. Compute is a deploy-time property. Set `diagnostics_existing_cluster_id` to run on an already-running cluster by id, or `diagnostics_job_clusters` + `diagnostics_job_cluster_key` to run on a new job cluster (copy a `_pipelines/job_cluster_configs/<key>.yml` `new_cluster` spec into the list). Set at most one path. See [Parameters Reference](parameters.md#diagnostics-compute) for details.
 
+## The monitoring log table
+
+Two jobs look after the [monitoring log](monitoring.md#monitoring-log) table.
+
+**Creating it: `log_table_create`.** Run it once per target before turning the log on, and again after
+deploying a build that adds a monitoring column, before its feeds run again
+([Upgrading an existing log table](framework-maintenance.md#upgrading-an-existing-log-table)). It is
+idempotent: it creates the table if it doesn't exist, adds any new columns to an existing one and
+updates changed column comments, without dropping anything. The setup steps and the grants it needs are
+in [Logging and Monitoring](monitoring.md#monitoring-log).
+
+```bash
+databricks bundle run log_table_create -t <target>
+```
+
+**Retention: `log_table_prune`.** The table grows without limit otherwise. The `log_table_prune` job
+enforces retention: it deletes rows older than
+[`monitoring_log_retention_days`](parameters.md#monitoring_log_retention_days) (`0` disables the
+delete), then optimizes (reclusters and compacts) and vacuums. It runs daily at 03:00 UTC, paused or
+unpaused by the target's [`schedule_pause_status`](parameters.md#schedule_pause_status) like every other
+trigger. It fails when `monitoring_log_table` is empty, so in any target where triggers are unpaused but
+the log isn't used, pause `log_table_prune` (or it fails, and emails `support_email`, every day). Run it
+on demand with:
+
+```bash
+databricks bundle run log_table_prune -t <target>
+```
+
 ## Pruning cluster logs
 
 Job clusters that [deliver their logs](monitoring.md#cluster-log-delivery) add a directory under
 `cluster_log_volume_path` for every cluster, and nothing else removes them. The `cluster_log_prune` job
 deletes log files older than [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days)
-(default 30; `0` disables the delete), then removes the directories that leaves empty. It runs daily at
+(`0` disables the delete), then removes the directories that leaves empty. It runs daily at
 04:00 UTC, paused or unpaused by the target's `schedule_pause_status`, and on demand:
 
 ```bash
-databricks bundle run cluster_log_prune -t <target> -p <profile>                      # delete
-databricks bundle run cluster_log_prune -t <target> -p <profile> --params dry_run=true  # list only
+databricks bundle run cluster_log_prune -t <target>                         # delete
+databricks bundle run cluster_log_prune -t <target> --params dry_run=true   # list only
 ```
 
 - **What it touches.** Only files under `<cluster_log_volume_path>/<cluster id>/<log kind>/`, where the
