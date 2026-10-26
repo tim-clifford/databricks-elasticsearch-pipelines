@@ -1,27 +1,49 @@
 # Maintenance Jobs
 
-The fixed jobs that set up and look after the feeds: views, checkpoints, the connector wheel, the Elasticsearch host check, and the monitoring log table. For anyone operating feeds.
+The fixed jobs that set up and look after the feeds: views, checkpoints, the connector wheel, the Elasticsearch host check, the monitoring log table, and delivered cluster logs. For anyone operating feeds.
 
 - [Maintenance jobs at a glance](#maintenance-jobs-at-a-glance)
+- [Deploying some of the views](#deploying-some-of-the-views)
 - [Checkpoints](#checkpoints)
 - [Resetting a checkpoint](#resetting-a-checkpoint)
 - [Renaming a feed](#renaming-a-feed)
 - [Diagnosing an Elasticsearch host](#diagnosing-an-elasticsearch-host)
+- [Pruning cluster logs](#pruning-cluster-logs)
 
 ## Maintenance jobs at a glance
 
-Six fixed jobs handle setup and upkeep. Run any with `databricks bundle run <resource_key> -t <target> -p <profile>`, with optional `--params` as noted.
+Seven fixed jobs handle setup and upkeep. Run any with `databricks bundle run <resource_key> -t <target> -p <profile>`, with optional `--params` as noted.
 
 | Resource key | Display name | What it does | When to run it |
 |---|---|---|---|
-| `deploy_views` | Deploy views | Creates or updates every feed's view in the workspace. Fails closed if the schema or join logic is invalid. | Once per deploy, before the first index run. Re-run if you modify a view's SQL. |
+| `deploy_views` | Deploy views | Creates or updates every feed's view in the workspace, or only the ones named with `--params views=<name>,<name>` ([how](#deploying-some-of-the-views)). Fails closed if the schema or join logic is invalid. | Once per deploy, before the first index run. Re-run if you modify a view's SQL. |
 | `build_wheel` | Build wheel | Builds the `databricks-es-connector` wheel from a checked-out copy of the connector repo (with `--params repo_workspace_path=<path>,wheel_version=<x.x.x>`). Publishes it to the UC Volume next to your existing wheels. Does not switch your feeds to it. | On demand when you want to update the connector version. |
 | `checkpoint_clear` | Checkpoint clear | Deletes a feed's checkpoint directory (with `--params config_name=<config_name>`). The next streaming run starts fresh. Safe to run while the stream is paused. | When you wipe an index and want to backfill it, or when you change `streaming_start`. |
 | `es_diagnostics` | Diagnostics | A work in progress ([see below](#diagnosing-an-elasticsearch-host)). Samples an Elasticsearch cluster twice (5 seconds apart by default) and reports a verdict on its health (with optional `--params index_name=<index>,es_host_config=<name>`). Reports write thread-pool saturation, rejections, indexing pressure, circuit breakers, node heap/GC, and cluster state. | When writes are slow or timing out, as one input on whether the host is saturated. |
 | `log_table_create` | Log table create | Creates the monitoring Delta table if it does not exist, or adds any new columns to an existing table and updates any changed column comments. Idempotent. (See [Monitoring log](monitoring.md#monitoring-log) below.) | Once, before turning the monitoring log on. Re-run after deploying a build that adds a monitoring column, before its feeds run again ([how](framework-maintenance.md#upgrading-an-existing-log-table)). |
 | `log_table_prune` | Log table prune | Deletes rows older than `monitoring_log_retention_days` (default 90), then optimizes and vacuums. Runs daily, paused or unpaused by the target's `schedule_pause_status`. | Leave it scheduled where the log is in use; pause it in any target where triggers are unpaused but the log isn't used (it fails without a table). |
+| `cluster_log_prune` | Cluster logs prune | Deletes delivered cluster log files older than `cluster_log_retention_days` (default 30), then the directories that leaves empty, touching only the cluster log layout (optional `--params dry_run=true` to list without deleting; [details](#pruning-cluster-logs)). Runs daily, paused or unpaused by `schedule_pause_status`. Does nothing when `cluster_log_volume_path` is empty. | Leave it scheduled where any job cluster delivers logs. |
 
 Every maintenance job parameter is in [Parameters Reference](parameters.md#maintenance-job-parameters).
+
+## Deploying some of the views
+
+By default `deploy_views` creates or replaces every view. To deploy only the views a change touches, name
+them, comma-separated, by their `.sql` file names without the extension:
+
+```bash
+databricks bundle run deploy_views -t <target> -p <profile> --params views=ecs_dns_activity,ecs_authentication
+```
+
+- An unknown name (a typo, or a name with `.sql` on it) or an empty entry (`a,,b`, a trailing comma)
+  fails the run before any view is deployed, so a subset run never quietly deploys fewer views than you
+  asked for.
+- The run still checks that every view file has a feed config and every config a view file, so a wiring
+  mistake anywhere still fails.
+- **Length limit.** The value can be at most 9,988 characters; longer fails the run. The Jobs API caps
+  the JSON of all the job parameters passed to one run at 10,000 characters and refuses to start a
+  longer one. Leave `views` blank to deploy everything; don't list every view. If a subset is too long,
+  split it across runs.
 
 ## Checkpoints
 
@@ -153,3 +175,44 @@ The run **fails only** when it could collect nothing at all (bad host, api_key, 
 Run parameters: `index_name` (blank checks only cluster and nodes), `es_host_config` (the named host config to check; unknown names fail), `verify_certs` (`false` for self-signed endpoints; ignored when `ca_certs` is set), `sample_interval_secs` (`0` for one snapshot: gauges only, so it can never report `HEALTHY`; use the default two-sample window to clear a host), and `request_timeout_secs` (timeout per request).
 
 By default the job runs serverless. To run it on a cluster instead (for example to match the runtime or the network path a feed's writes take), set one of the `es_diagnostics` compute variables in `databricks.yml` and redeploy. Compute is a deploy-time property. Set `diagnostics_existing_cluster_id` to run on an already-running cluster by id, or `diagnostics_job_clusters` + `diagnostics_job_cluster_key` to run on a new job cluster (copy a `_pipelines/job_cluster_configs/<key>.yml` `new_cluster` spec into the list). Set at most one path. See [Parameters Reference](parameters.md#diagnostics-compute) for details.
+
+## Pruning cluster logs
+
+Job clusters that [deliver their logs](monitoring.md#cluster-log-delivery) add a directory under
+`cluster_log_volume_path` for every cluster, and nothing else removes them. The `cluster_log_prune` job
+deletes log files older than [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days)
+(default 30; `0` disables the delete), then removes the directories that leaves empty. It runs daily at
+04:00 UTC, paused or unpaused by the target's `schedule_pause_status`, and on demand:
+
+```bash
+databricks bundle run cluster_log_prune -t <target> -p <profile>                      # delete
+databricks bundle run cluster_log_prune -t <target> -p <profile> --params dry_run=true  # list only
+```
+
+- **What it touches.** Only files under `<cluster_log_volume_path>/<cluster id>/<log kind>/`, where the
+  cluster id has Databricks' cluster id format and the log kind is `driver`, `executor`, `eventlog` or
+  `init_scripts`. Anything else under the path (a checkpoint folder, a wheel, a stray file) is listed as
+  `SKIPPED` in the run output and left alone, so a path set to a shared volume root can't delete other
+  data. A file whose age can't be read is kept.
+- **Dry run.** `dry_run=true` prints the plan (file count, bytes, the first 200 files, empty directories)
+  and deletes nothing. Use it the first time you turn the job on against a volume that already holds
+  logs, or after changing `cluster_log_volume_path`.
+- **Failures.** A file or directory that can't be deleted, or a directory that can't be listed, is
+  reported and fails the run after everything else has been tried.
+- **Directories.** A finished cluster (every file under it past the cutoff, nothing else there) is
+  removed whole, including empty directories it never used. "Finished" is judged by file age alone: a
+  cluster that has delivered nothing for the whole retention window is assumed to have terminated. An
+  empty tree left by an earlier run that stopped partway is removed once it holds `eventlog/` (which
+  Databricks delivers only when a cluster terminates); without it, the empty tree stays until removed by
+  hand. Such a leftover only follows a run that already failed and emailed. (An all-purpose
+  cluster restarted under the same id keeps its old `eventlog/`, so its still-empty new directories can
+  be removed; removal is never recursive, so no log is lost. Job clusters get a new id every run.) For a cluster still delivering, only
+  directories emptied by the deletes go, so its new, still-empty directories are left alone. Removal
+  never deletes contents: a directory that gained a log since the listing stays, counted as
+  `raced_dirs` in the summary rather than as a failure.
+- **Unset path.** With `cluster_log_volume_path` empty the run succeeds without doing anything
+  (`cluster_log_retention_days` is still validated, so a malformed value fails even then), so the
+  job can stay scheduled in targets that don't deliver cluster logs. A path that is set but doesn't exist
+  yet (no cluster has delivered logs there) also succeeds, with a warning in the run output. A missing
+  volume fails the run, since log delivery can't create one.
+- **Grants.** The job's identity needs `READ VOLUME` and `WRITE VOLUME` on the volume.

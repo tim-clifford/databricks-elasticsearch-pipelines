@@ -22,6 +22,8 @@
 # MAGIC Deploy-time parameters (base_parameters; from bundle variables, fixed at deploy):
 # MAGIC - `config_name`: the pipeline definition to load (`_pipelines/pipeline_configs/<config_name>.yml`).
 # MAGIC - `environment`: folded into any `${environment}` in the config's object names (may be empty).
+# MAGIC - `view_schema_per_user`, `view_schema_user_name`: when the first is true, the view is read from
+# MAGIC   `<view schema>_<user name>` (the developer's own copy deploy_views created); off => the configured schema.
 # MAGIC - `wheel_path`: UC Volume path to the connector `.whl` to install (required).
 # MAGIC - `es_host_url`, `secret_scope_name`, `secret_key_name`: the ES endpoint, and the Databricks
 # MAGIC   secret scope/key holding the ES api_key (all required for an index-job run).
@@ -119,6 +121,8 @@ print(f"connector installed: databricks_es_connector {_connector_version}")
 # time. Empty defaults fail closed at validation rather than silently assuming a value.
 dbutils.widgets.text("config_name", "", "Pipeline definition name (_pipelines/pipeline_configs/<config_name>.yml)")
 dbutils.widgets.text("environment", "", "Environment folded into ${environment} in config names")
+dbutils.widgets.text("view_schema_per_user", "", "true => read the view from <view schema>_<view_schema_user_name> (deploy-time; empty/false => off)")
+dbutils.widgets.text("view_schema_user_name", "", "Deploying user's short name appended to the view schema when view_schema_per_user is true")
 dbutils.widgets.text("es_host_url", "", "Elasticsearch endpoint, e.g. https://<host>:9200")
 dbutils.widgets.text("secret_scope_name", "", "Databricks secret scope holding the ES api_key")
 dbutils.widgets.text("secret_key_name", "", "Key in the scope whose value is the ES api_key")
@@ -164,6 +168,8 @@ dbutils.widgets.text("task_run_id", "", "Databricks task run id ({{task.run_id}}
 dbutils.widgets.text("monitoring_log_table", "", "Fully-qualified catalog.schema.table for the monitoring sink (deploy-time; empty => sink skipped). Created by the `_log table create` job.")
 CONFIG_NAME = dbutils.widgets.get("config_name").strip()
 ENVIRONMENT = dbutils.widgets.get("environment").strip()
+VIEW_SCHEMA_PER_USER = dbutils.widgets.get("view_schema_per_user").strip()
+VIEW_SCHEMA_USER_NAME = dbutils.widgets.get("view_schema_user_name").strip()
 ES_HOST_URL = dbutils.widgets.get("es_host_url").strip()
 SECRET_SCOPE_NAME = dbutils.widgets.get("secret_scope_name").strip()
 SECRET_KEY_NAME = dbutils.widgets.get("secret_key_name").strip()
@@ -214,6 +220,7 @@ if FRAMEWORK_ROOT not in sys.path:
     sys.path.insert(0, FRAMEWORK_ROOT)
 
 from pipeline_lib.config import (  # noqa: E402
+    apply_view_schema_user,
     load_config,
     render_view_sql,
     require_connector_version,
@@ -230,6 +237,7 @@ from pipeline_lib.config import (  # noqa: E402
     require_write_repartition,
     resolve_config,
     view_select_body,
+    view_schema_user,
     view_substitutions,
     write_config_overrides,
 )
@@ -396,8 +404,11 @@ if config_path is None:
     raise ValueError(f"no pipeline definition found for {CONFIG_NAME!r} (.yml/.yaml) in {CONFIG_DIR}")
 
 # load_config validates the schema; resolve_config folds ${environment} in and validates the result
-# (both fail closed). After this, every catalog/schema/name is a concrete identifier.
-cfg = resolve_config(load_config(config_path), ENVIRONMENT)
+# (both fail closed). After this, every catalog/schema/name is a concrete identifier. With per-user view
+# schemas on, the view (only) then moves to <schema>_<user>, applied once here, so VIEW_FQN and the run
+# record name the developer's copy; view_schema_user fails closed on a missing or illegal user name.
+VIEW_SCHEMA_USER = view_schema_user(VIEW_SCHEMA_PER_USER, VIEW_SCHEMA_USER_NAME)
+cfg = apply_view_schema_user(resolve_config(load_config(config_path), ENVIRONMENT), VIEW_SCHEMA_USER)
 
 # COMMAND ----------
 # Echo the resolved configuration + effective run-time settings before the export, so a run's log

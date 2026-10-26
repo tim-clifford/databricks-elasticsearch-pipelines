@@ -124,6 +124,10 @@ def test_render_wires_global_deploy_vars():
     assert bp["ca_certs"] == "${var.ca_certs}"
     # monitoring_log_table is threaded the same way (deploy-time global, not a per-run job parameter).
     assert bp["monitoring_log_table"] == "${var.monitoring_log_table}"
+    # The per-user view schema toggle and the deploying user's short name, the same pair deploy_views gets,
+    # so every job reads the view copy deploy_views created.
+    assert bp["view_schema_per_user"] == "${var.view_schema_per_user}"
+    assert bp["view_schema_user_name"] == "${workspace.current_user.short_name}"
 
 
 def test_render_all_jobs_max_concurrent_runs_1():
@@ -809,6 +813,23 @@ def test_shipped_deploy_views_job_disables_queue():
     assert job["queue"] == {"enabled": False}
 
 
+def test_shipped_deploy_views_job_wires_subset_and_per_user_schema():
+    # `views` is a run-time job parameter defaulting to "" (all views); the per-user view schema pair is
+    # deploy-time and must match what gen_jobs gives every index job, or deploy_views and the jobs would
+    # disagree on where the views live.
+    path = os.path.join(_FRAMEWORK_ROOT, "resources", "_deploy_views.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["deploy_views"]
+    assert job["parameters"] == [{"name": "views", "default": ""}]
+    bp = job["tasks"][0]["notebook_task"]["base_parameters"]
+    generated = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", _cfg(), None)
+    gbp = yaml.safe_load(generated)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]["tasks"][0][
+        "notebook_task"]["base_parameters"]
+    for key in ("view_schema_per_user", "view_schema_user_name"):
+        assert bp[key] == gbp[key]
+    assert bp["view_schema_per_user"] == "${var.view_schema_per_user}"
+
+
 @pytest.mark.parametrize("filename,job_key", [
     ("_deploy_views.job.yml", "deploy_views"),
     ("_checkpoint_clear.job.yml", "checkpoint_clear"),
@@ -816,6 +837,7 @@ def test_shipped_deploy_views_job_disables_queue():
     ("_es_diagnostics.job.yml", "es_diagnostics"),
     ("_log_table_create.job.yml", "log_table_create"),
     ("_log_table_prune.job.yml", "log_table_prune"),
+    ("_cluster_log_prune.job.yml", "cluster_log_prune"),
 ])
 def test_shipped_hand_authored_jobs_notify_support_email(filename, job_key):
     # The hand-authored jobs are NOT emitted by gen_jobs, so guard their failure-email block against drift:
@@ -895,6 +917,30 @@ def test_shipped_log_table_prune_job_shape():
     }
     # No run-time job parameters: both values are deploy-time base_parameters, not overridable per run.
     assert "parameters" not in job
+
+
+def test_shipped_cluster_log_prune_job_shape():
+    # cluster_log_prune is hand-authored, so guard its shape against drift: single-flight + skip-not-queue,
+    # the serverless notebook task, both deploy-time base_parameters (path + retention), a daily schedule
+    # PAUSED by default, and dry_run as its one run-time parameter (default false, so a scheduled run
+    # deletes). The planner is unit-tested in test_cluster_log_prune.py; deletes are proven by a live run.
+    path = os.path.join(_FRAMEWORK_ROOT, "resources", "_cluster_log_prune.job.yml")
+    with open(path) as fh:
+        job = yaml.safe_load(fh)["resources"]["jobs"]["cluster_log_prune"]
+    assert job["max_concurrent_runs"] == 1
+    assert job["queue"] == {"enabled": False}
+    assert job["tags"] == "${var.global_job_tags}"
+    assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
+    assert job["schedule"]["quartz_cron_expression"]
+    assert job["parameters"] == [{"name": "dry_run", "default": "false"}]
+    assert job["timeout_seconds"] == 14400   # a run against a large backlog fails (and emails) after 4 hours
+    (task,) = job["tasks"]
+    assert task["notebook_task"]["notebook_path"] == "../notebooks/cluster_log_prune.py"
+    assert task["notebook_task"]["base_parameters"] == {
+        "cluster_log_volume_path": "${var.cluster_log_volume_path}",
+        "cluster_log_retention_days": "${var.cluster_log_retention_days}",
+    }
+    assert "job_clusters" not in job and "existing_cluster_id" not in task and "job_cluster_key" not in task
 
 
 def test_shipped_checkpoint_clear_job_allows_concurrent_runs():
@@ -1375,15 +1421,28 @@ def test_shipped_databricks_yml_declares_global_job_tags():
     assert gen_jobs.load_global_job_tags() == {}  # ships empty on main
 
 
+def test_shipped_databricks_yml_per_user_views_and_cluster_log_retention():
+    # Per-user view schemas are off by default and ON in dev (dropping the dev override would put every
+    # developer back in one shared view schema); cluster log retention defaults to 30 days.
+    with open(os.path.join(_REPO_ROOT, "databricks.yml")) as fh:
+        bundle = yaml.safe_load(fh)
+    assert bundle["variables"]["view_schema_per_user"]["default"] == "false"
+    assert bundle["targets"]["dev"]["variables"]["view_schema_per_user"] == "true"
+    for target in ("stg", "prd"):
+        assert "view_schema_per_user" not in bundle["targets"][target].get("variables", {})
+    assert bundle["variables"]["cluster_log_retention_days"]["default"] == "30"
+
+
 @pytest.mark.parametrize("filename,job_key", [
     ("_deploy_views.job.yml", "deploy_views"),
     ("_checkpoint_clear.job.yml", "checkpoint_clear"),
     ("_build_wheel.job.yml", "build_wheel"),
     ("_es_diagnostics.job.yml", "es_diagnostics"),
     ("_log_table_create.job.yml", "log_table_create"),
+    ("_cluster_log_prune.job.yml", "cluster_log_prune"),
 ])
 def test_shipped_fixed_jobs_reference_global_job_tags(filename, job_key):
-    # The 5 hand-authored jobs are NOT emitted by gen_jobs, so guard against drift: each must reference the
+    # The hand-authored jobs are NOT emitted by gen_jobs, so guard against drift: each must reference the
     # whole global_job_tags var so it gets the same global tags every generated job carries.
     path = os.path.join(_FRAMEWORK_ROOT, "resources", filename)
     with open(path) as fh:
@@ -1772,7 +1831,7 @@ def test_shipped_job_files_found():
     names = [os.path.relpath(p, _REPO_ROOT) for p in _shipped_job_files()]
     assert "framework/resources/_es_diagnostics.job.yml" in names
     assert "_pipelines/resources/ecs_dns_activity.job.yml" in names
-    assert len(names) == 11  # 6 fixed + 5 generated on main
+    assert len(names) == 12  # 7 fixed + 5 generated on main
 
 
 @pytest.mark.parametrize("path", _shipped_job_files(), ids=lambda p: os.path.relpath(p, _REPO_ROOT))

@@ -33,12 +33,25 @@ resources:
       # these are job-level tags (no cluster to forward onto). Matches every other job.
       tags: ${var.global_job_tags}
 
+      # Run-time parameter: deploy only the named views (comma-separated view names, no .sql extension), e.g.
+      # `databricks bundle run deploy_views --params views=ecs_dns_activity`. Empty (the default) deploys
+      # every view. The notebook fails closed on an unknown name. The Jobs API caps a run's job parameters at
+      # 10,000 characters as JSON, so "all" is the empty default, never a typed-out list.
+      parameters:
+        - name: views
+          default: ""
+
       tasks:
         - task_key: deploy_views
           notebook_task:
             notebook_path: ../notebooks/deploy_views.py
+            # Deploy-time: environment, and the per-user view schema toggle + the deploying user's short name
+            # (when view_schema_per_user is true, views go to <schema>_<short name>; the generated jobs get
+            # the same pair, so they read the same copy).
             base_parameters:
               environment: ${var.environment}
+              view_schema_per_user: ${var.view_schema_per_user}
+              view_schema_user_name: ${workspace.current_user.short_name}
           # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
           # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
           # plus alert_on_last_attempt: false so every failed attempt pages. See framework/scripts/gen_jobs.py _build_task.

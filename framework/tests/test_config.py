@@ -12,7 +12,9 @@ import pytest
 from pipeline_lib.config import (
     _RUNTIME_KNOBS,
     RUNTIME_KNOB_NAMES,
+    VIEWS_PARAM_MAX_CHARS,
     PipelineConfigError,
+    apply_view_schema_user,
     column_present,
     job_base_parameters,
     job_parameters,
@@ -38,9 +40,19 @@ from pipeline_lib.config import (
     require_write_concurrency,
     require_write_repartition,
     resolve_config,
+    describe_schema_rows,
+    ensure_per_user_schema,
+    per_user_preflight_problem,
+    per_user_schema_collisions,
+    schema_owner_problem,
+    selected_config_labels,
+    selected_view_files,
     resolve_name,
+    select_views,
     shared_view_conflict,
     validate_config,
+    view_schema_fqn,
+    view_schema_user,
     view_select_body,
     view_substitutions,
     write_config_overrides,
@@ -548,7 +560,394 @@ def test_view_substitutions_source_override_none_is_real_source():
     assert subs["source"] == "cat.ocsf.dns_activity"
 
 
+def test_view_substitutions_view_schema_user_moves_only_the_view():
+    # Per-user view schemas: ${view} lands in <schema>_<user>; ${source} and ${ref_*} are shared inputs and
+    # keep their real names, with or without the streaming source_override.
+    subs = view_substitutions(validate_config(_with_env()), environment="catalog", view_schema_user="tim_clifford")
+    assert subs["view"] == "acme_catalog.es_poc_tim_clifford.ecs_dns_activity"
+    assert subs["source"] == "acme_catalog.ocsf.dns_activity"
+    assert subs["ref_validation"] == "acme_catalog.ocsf_validation_catalog.dns_activity validation"
+    streamed = view_substitutions(validate_config(_with_env()), environment="catalog",
+                                  source_override="__batch_src", view_schema_user="tim_clifford")
+    assert streamed["view"] == "acme_catalog.es_poc_tim_clifford.ecs_dns_activity"
+    assert streamed["source"] == "__batch_src"
+
+
+def test_runner_composition_keeps_a_single_suffix():
+    # The runner applies the suffix once (apply_view_schema_user on the resolved config), then renders the
+    # streaming SELECT with view_substitutions on that config and no user: the view keeps exactly one suffix.
+    cfg = apply_view_schema_user(resolve_config(validate_config(_with_env()), "catalog"), "tim_clifford")
+    subs = view_substitutions(cfg, "catalog", source_override="__batch_src")
+    assert subs["view"] == "acme_catalog.es_poc_tim_clifford.ecs_dns_activity"
+    assert subs["source"] == "__batch_src"
+
+
+def test_view_substitutions_view_schema_user_empty_is_unchanged():
+    cfg = validate_config(_with_env())
+    assert view_substitutions(cfg, "catalog", view_schema_user="") == view_substitutions(cfg, "catalog")
+
+
+# --------------------------------------------------------------------------- view_schema_user
+
+
+@pytest.mark.parametrize("flag", ["", "false", "FALSE", " false ", None, False])
+def test_view_schema_user_off_ignores_the_name(flag):
+    # Off (or unset) never uses the name, even an empty or illegal one: the configured schemas apply.
+    assert view_schema_user(flag, "tim_clifford") == ""
+    assert view_schema_user(flag, "") == ""
+    assert view_schema_user(flag, "not legal!") == ""
+
+
+@pytest.mark.parametrize("flag", ["true", "TRUE", " true ", True])
+def test_view_schema_user_on_returns_the_name(flag):
+    assert view_schema_user(flag, "tim_clifford") == "tim_clifford"
+    assert view_schema_user(flag, "  tim_clifford  ") == "tim_clifford"
+
+
+@pytest.mark.parametrize("name", ["", "   ", None])
+def test_view_schema_user_on_without_a_name_fails(name):
+    # Fail closed: per-user mode with no name must not fall back to the shared schema.
+    with pytest.raises(PipelineConfigError, match="no user name"):
+        view_schema_user("true", name)
+
+
+@pytest.mark.parametrize("name", ["tim.clifford", "tim-clifford", "1tim", "tim clifford", "tim;drop"])
+def test_view_schema_user_on_with_illegal_name_fails(name):
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        view_schema_user("true", name)
+
+
+@pytest.mark.parametrize("flag", ["yes", "1", "on", "t"])
+def test_view_schema_user_bad_flag_fails(flag):
+    # Allow-list: only true/false/"" are accepted, so a truthy-looking typo can't silently mean either.
+    with pytest.raises(PipelineConfigError, match="view_schema_per_user must be 'true' or 'false'"):
+        view_schema_user(flag, "tim_clifford")
+
+
+def test_apply_view_schema_user_moves_only_the_view_schema():
+    resolved = resolve_config(validate_config(_with_env()), "catalog")
+    out = apply_view_schema_user(resolved, "tim_clifford")
+    assert out["view"] == {**resolved["view"], "schema": "es_poc_tim_clifford"}
+    assert out["source"] == resolved["source"]
+    assert out["reference_tables"] == resolved["reference_tables"]
+    # The input is not mutated (the runner keeps one resolved config).
+    assert resolved["view"]["schema"] == "es_poc"
+
+
+def test_apply_view_schema_user_empty_returns_input():
+    resolved = resolve_config(validate_config(_base()), "")
+    assert apply_view_schema_user(resolved, "") is resolved
+
+
+def test_view_schema_user_lowercases():
+    # UC names are case-insensitive: Tim_Clifford and tim_clifford must land in the same (one) schema name.
+    assert view_schema_user("true", "Tim_Clifford") == "tim_clifford"
+
+
+def test_view_schema_user_illegal_name_hints_at_service_principals():
+    with pytest.raises(PipelineConfigError, match="--var view_schema_per_user=false"):
+        view_schema_user("true", "1a2b3c4d-0000")
+
+
+def test_apply_view_schema_user_rejects_over_long_schema():
+    resolved = resolve_config(validate_config(_base()), "")   # view schema es_poc (6 chars)
+    ok = "u" * (255 - len("es_poc_"))
+    assert apply_view_schema_user(resolved, ok)["view"]["schema"] == f"es_poc_{ok}"
+    with pytest.raises(PipelineConfigError, match="over Unity Catalog's 255-character limit"):
+        apply_view_schema_user(resolved, ok + "u")
+
+
+@pytest.mark.parametrize("fqn,expected", [
+    ("acme_catalog.es_poc_tim_clifford.ecs_dns_activity", "acme_catalog.es_poc_tim_clifford"),
+    ("c.s.v", "c.s"),
+])
+def test_view_schema_fqn(fqn, expected):
+    assert view_schema_fqn(fqn) == expected
+
+
+@pytest.mark.parametrize("fqn", ["c.s", "c.s.v.x", "c..v", "", "s.v"])
+def test_view_schema_fqn_rejects_non_three_part(fqn):
+    with pytest.raises(PipelineConfigError, match="catalog.schema.name"):
+        view_schema_fqn(fqn)
+
+
+def _collisions(cfgs, environment, user):
+    """per_user_schema_collisions' collision list, labelling the configs c0.yml, c1.yml, ..."""
+    return per_user_schema_collisions([(f"c{i}.yml", c) for i, c in enumerate(cfgs)], environment, user)[0]
+
+
+def test_per_user_schema_collisions():
+    # es + poc = es_poc: a per-user schema that is another config's real view schema is reported.
+    shared = validate_config(_base())   # view schema es_poc
+    short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
+    assert _collisions([shared, short], "", "poc") == ["cat.es_poc"]
+    assert _collisions([shared, short], "", "tim_clifford") == []
+    assert _collisions([shared, short], "", "") == []
+
+
+def test_per_user_schema_collisions_include_source_and_reference_schemas():
+    # View schema "src" + user "dev" is "src_dev", the source table's schema: views would land among the
+    # source tables.
+    cfg = validate_config({**_base(), "view": {"catalog": "cat", "schema": "src", "name": "v"},
+                           "source": {"catalog": "cat", "schema": "src_dev", "table": "t"}})
+    assert _collisions([cfg], "", "dev") == ["cat.src_dev"]
+    # _with_env joins acme_catalog.ocsf_validation_catalog (a reference table): view schema "ocsf" + user
+    # "validation_catalog" lands on it.
+    ref = validate_config({**_with_env(), "view": {"catalog": "acme_${environment}", "schema": "ocsf", "name": "v"}})
+    assert _collisions([ref], "catalog", "validation_catalog") == ["acme_catalog.ocsf_validation_catalog"]
+
+
+def test_per_user_schema_collisions_ignore_case():
+    # UC names are case-insensitive: view schema ES + user poc is the shared es_poc.
+    shared = validate_config(_base())   # view schema es_poc
+    upper = validate_config({**_base(), "view": {"catalog": "cat", "schema": "ES", "name": "other"}})
+    assert _collisions([shared, upper], "", "poc") == ["cat.es_poc"]
+
+
+def test_per_user_schema_collisions_skips_any_resolve_error():
+    # Not only PipelineConfigError: a malformed config dict (KeyError) is also left to the per-view loop.
+    shared = validate_config(_base())
+    short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
+    assert _collisions([{}, shared, short], "", "poc") == ["cat.es_poc"]
+
+
+def test_per_user_preflight_problem():
+    shared = ("shared.yml", validate_config(_base()))   # view schema es_poc
+    short = ("short.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}}))
+    broken = ("broken.yml", {})
+    assert per_user_preflight_problem([shared, short], {"short.yml"}, "", "") is None          # off
+    assert per_user_preflight_problem([shared], {"shared.yml"}, "", "tim_clifford") is None
+    assert "cat.es_poc" in per_user_preflight_problem([shared, short], {"short.yml"}, "", "poc")
+    # A broken config outside the subset blocks the run (its schemas can't be checked) ...
+    msg = per_user_preflight_problem([shared, broken], {"shared.yml"}, "", "tim_clifford")
+    assert msg and "broken.yml" in msg and "can't check" in msg
+    # ... but one inside the subset is left to fail its own view.
+    assert per_user_preflight_problem([shared, broken], {"shared.yml", "broken.yml"}, "", "tim_clifford") is None
+
+
+
+def test_per_user_preflight_names_the_real_reason_a_config_cant_be_checked():
+    # A too-long per-user schema is reported with its own error, not as "fails to resolve", and like any other
+    # unchecked config it blocks the run only from outside the subset; inside it, it fails just its own view.
+    long_schema = ("long.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "s" * 250, "name": "v"}}))
+    shared = ("shared.yml", validate_config(_base()))
+    msg = per_user_preflight_problem([shared, long_schema], {"shared.yml"}, "", "tim_clifford")
+    assert msg and "long.yml" in msg and "255-character" in msg
+    assert per_user_preflight_problem([shared, long_schema], {"shared.yml", "long.yml"}, "", "tim_clifford") is None
+
+
+
+def test_per_user_preflight_keeps_the_schemas_of_a_config_whose_per_user_schema_is_invalid():
+    # long.yml resolves but its per-user schema is too long; its SOURCE schema (cat.es_poc) is still a real
+    # schema, so short.yml's per-user schema landing on it is a collision even with long.yml in the subset.
+    # 252 + len("_poc") = 256, one over the limit.
+    long_schema = ("long.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "s" * 252, "name": "v"},
+                                                 "source": {**_base()["source"], "schema": "es_poc"}}))
+    short = ("short.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}}))
+    msg = per_user_preflight_problem([long_schema, short], {"long.yml", "short.yml"}, "", "poc")
+    assert msg and "cat.es_poc" in msg and "also configured" in msg
+
+def test_per_user_preflight_reports_an_unchecked_config_before_a_collision():
+    # Both problems at once: the unchecked config is reported (its schemas might add more collisions).
+    shared = ("shared.yml", validate_config(_base()))   # view schema es_poc
+    short = ("short.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}}))
+    msg = per_user_preflight_problem([shared, short, ("broken.yml", {})], {"short.yml"}, "", "poc")
+    assert "broken.yml" in msg and "can't check" in msg and "cat.es_poc" not in msg
+
+
+_ME = "tim.clifford@databricks.com"
+
+
+def test_schema_owner_problem():
+    s = "cat.es_poc_tim_clifford"
+    assert schema_owner_problem(None, _ME, s) is None                                  # doesn't exist yet
+    assert schema_owner_problem([("Namespace Name", "x"), ("Owner", _ME)], _ME, s) is None
+    assert schema_owner_problem([("Owner", "Tim.Clifford@Databricks.com")], _ME, s) is None   # case-insensitive
+    msg = schema_owner_problem([("Owner", "jane@x.com")], _ME, s)
+    assert msg and "owned by 'jane@x.com'" in msg and "--var view_schema_per_user=false" in msg
+    for rows in ([("Namespace Name", "x")], [("Owner", "")], [("Owner", _ME), ("Owner", _ME)]):
+        assert "owner can't be read" in schema_owner_problem(rows, _ME, s)
+
+
+def test_describe_schema_rows():
+    rows = describe_schema_rows(lambda sql: [("Owner", _ME), ("Namespace Name", "x")], "cat.s")
+    assert rows == [("Owner", _ME), ("Namespace Name", "x")]
+
+    def missing(sql):
+        raise RuntimeError("[SCHEMA_NOT_FOUND] The schema `cat`.`s` cannot be found.")
+    assert describe_schema_rows(missing, "cat.s") is None
+
+    def denied(sql):
+        raise RuntimeError("[PERMISSION_DENIED] User does not have USE SCHEMA on Schema 'cat.s'")
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        describe_schema_rows(denied, "cat.s")
+
+
+class _Sql:
+    """Fake spark.sql(...).collect(): DESCRIBE returns the owner rows in `owners` order (None = not found)."""
+    def __init__(self, *owners):
+        self.owners, self.statements = list(owners), []
+
+    def __call__(self, stmt):
+        self.statements.append(stmt.split(" ")[0])
+        if stmt.startswith("DESCRIBE"):
+            owner = self.owners.pop(0)
+            if owner is None:
+                raise RuntimeError("[SCHEMA_NOT_FOUND] The schema cannot be found.")
+            return [("Owner", owner)]
+        return []
+
+
+def test_ensure_per_user_schema_creates_and_rechecks():
+    sql = _Sql(None, _ME)                      # absent, then ours after the create
+    ensure_per_user_schema("cat.s_me", _ME, sql)
+    assert sql.statements == ["DESCRIBE", "CREATE", "DESCRIBE"]
+    sql = _Sql(_ME, _ME)                       # already ours
+    ensure_per_user_schema("cat.s_me", _ME, sql)
+    assert sql.statements == ["DESCRIBE", "CREATE", "DESCRIBE"]
+
+
+def test_ensure_per_user_schema_refuses_someone_elses():
+    sql = _Sql("jane@x.com")                   # exists, not ours: refused before any CREATE
+    with pytest.raises(ValueError, match="owned by 'jane@x.com'"):
+        ensure_per_user_schema("cat.s_me", _ME, sql)
+    assert sql.statements == ["DESCRIBE"]
+    sql = _Sql(None, "jane@x.com")             # someone else created it between our check and our create
+    with pytest.raises(ValueError, match="owned by 'jane@x.com'"):
+        ensure_per_user_schema("cat.s_me", _ME, sql)
+    sql = _Sql(None, None)                     # can't be described even after the create: fail closed
+    with pytest.raises(ValueError, match="owner can't be read"):
+        ensure_per_user_schema("cat.s_me", _ME, sql)
+
+
+def test_selected_config_labels():
+    cbv = {"a_view": [("a.yml", {}), ("a2.yml", {})], "b_view": [("b.yml", {})]}
+    assert selected_config_labels(["a_view.sql"], cbv) == {"a.yml", "a2.yml"}
+    assert selected_config_labels(["a_view.sql", "b_view.sql"], cbv) == {"a.yml", "a2.yml", "b.yml"}
+
+
+def test_selected_view_files():
+    files = ["a_view.sql", "b_view.sql", "c_view.sql"]
+    assert selected_view_files("", files) == files
+    assert selected_view_files("c_view,a_view", files) == ["a_view.sql", "c_view.sql"]
+    with pytest.raises(PipelineConfigError, match="unknown view"):
+        selected_view_files("a_view.sql", files)
+    # A non-.sql entry is never a view: it can't be selected, by default or by name.
+    mixed = ["a_view.sql", "notes.txt"]
+    assert selected_view_files("", mixed) == ["a_view.sql"]
+    with pytest.raises(PipelineConfigError, match="unknown view"):
+        selected_view_files("notes", mixed)
+
+
+def test_per_user_schema_collisions_reports_unresolved_labels():
+    needs_env = validate_config(_with_env())
+    entries = [("needs_env.yml", needs_env), ("bad.yml", {}), ("ok.yml", validate_config(_base()))]
+    assert per_user_schema_collisions(entries, "", "poc") == ([], ["bad.yml", "needs_env.yml"])
+    assert per_user_schema_collisions(entries, "", "") == ([], [])
+
+
+def test_per_user_schema_collisions_skips_unresolvable_configs():
+    # A config needing ${environment} with none given can't resolve: skipped here (deploy_views fails that
+    # view on its own), so it can't abort the whole run before any view deploys.
+    needs_env = validate_config(_with_env())
+    shared = validate_config(_base())
+    short = validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}})
+    assert _collisions([needs_env, shared, short], "", "poc") == ["cat.es_poc"]
+
+
+def test_view_schema_fqn_of_per_user_substitution():
+    # What deploy_views creates in per-user mode: the suffixed schema, never the catalog or the shared schema.
+    subs = view_substitutions(validate_config(_with_env()), "catalog", view_schema_user="tim_clifford")
+    assert view_schema_fqn(subs["view"]) == "acme_catalog.es_poc_tim_clifford"
+
+
+def test_apply_view_schema_user_rejects_a_trailing_newline():
+    resolved = resolve_config(validate_config(_base()), "")
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        apply_view_schema_user(resolved, "tim\n")
+
+
+def test_apply_view_schema_user_rejects_illegal_result():
+    # Defense in depth: even if a caller skips view_schema_user, an illegal result fails closed.
+    resolved = resolve_config(validate_config(_base()), "")
+    with pytest.raises(PipelineConfigError, match="not a legal SQL identifier"):
+        apply_view_schema_user(resolved, "x.y")
+
+
+# --------------------------------------------------------------------------- select_views
+
+_VIEWS = ["a_view", "b_view", "c_view"]
+
+
+@pytest.mark.parametrize("requested", ["", "   ", None])
+def test_select_views_empty_means_all(requested):
+    assert select_views(requested, _VIEWS) == _VIEWS
+
+
+def test_select_views_subset_keeps_available_order_and_dedupes():
+    assert select_views("c_view, a_view", _VIEWS) == ["a_view", "c_view"]
+    assert select_views("b_view,b_view", _VIEWS) == ["b_view"]
+
+
+@pytest.mark.parametrize("requested,missing", [
+    ("a_view,typo_view", "typo_view"),
+    ("a_view.sql", "a_view.sql"),   # names, not file names: the .sql suffix is not silently stripped
+    ("A_VIEW", "A_VIEW"),           # exact match only
+])
+def test_select_views_unknown_name_fails_closed(requested, missing):
+    with pytest.raises(PipelineConfigError, match=f"unknown view\\(s\\): {re.escape(missing)}"):
+        select_views(requested, _VIEWS)
+
+
+@pytest.mark.parametrize("requested", ["a_view,,b_view", "a_view,", ",a_view", "a_view, ,b_view"])
+def test_select_views_empty_entry_fails(requested):
+    with pytest.raises(PipelineConfigError, match="empty entry"):
+        select_views(requested, _VIEWS)
+
+
+def test_select_views_length_limit_is_the_jobs_api_budget():
+    # The Jobs API refuses a run whose job parameters exceed 10,000 characters as JSON; {"views":""} uses 12.
+    assert VIEWS_PARAM_MAX_CHARS == 9_988
+    at_limit = "v" * VIEWS_PARAM_MAX_CHARS
+    assert select_views(at_limit, [at_limit]) == [at_limit]
+    over = "v" * (VIEWS_PARAM_MAX_CHARS + 1)
+    with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
+        select_views(over, [over])
+    # The length check comes first, so even a blank-padded over-long value fails rather than meaning "all".
+    with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
+        select_views(" " * (VIEWS_PARAM_MAX_CHARS + 1), _VIEWS)
+
+
+def test_select_views_length_counts_json_escapes():
+    # The API limit is on the JSON form: a quote or backslash costs 2 characters, a non-ASCII char up to 6.
+    with pytest.raises(PipelineConfigError, match=r"5000 characters \(10012 as JSON\), over the 9988"):
+        select_views('"' * 5_000, _VIEWS)
+    with pytest.raises(PipelineConfigError, match="over the 9988-character limit"):
+        select_views("\u00e9" * 2_000, _VIEWS)
+
+
+def test_select_views_non_string_fails():
+    with pytest.raises(PipelineConfigError, match="must be a string"):
+        select_views(["a_view"], _VIEWS)
+
+
 # --------------------------------------------------------------------------- shared_view_conflict
+
+
+def test_shared_view_conflict_view_schema_user_is_shared_by_all_sharers():
+    # The same user suffix applies to every sharer, so it never creates a conflict on its own.
+    a = validate_config(_base())
+    b = validate_config({**_base(), "es_index_name": "other-index"})
+    assert shared_view_conflict([("a.yml", a), ("b.yml", b)], "", "tim_clifford") is None
+
+
+def test_shared_view_conflict_reports_the_per_user_view():
+    # Sharers that disagree (different sources) in per-user mode: the message names the suffixed view, i.e.
+    # the user is passed through to view_substitutions rather than dropped.
+    a = validate_config(_base())
+    b = validate_config({**_base(), "source": {"catalog": "cat", "schema": "ocsf", "table": "other"}})
+    msg = shared_view_conflict([("a.yml", a), ("b.yml", b)], "", "tim_clifford")
+    assert msg is not None and "cat.es_poc_tim_clifford.ecs_dns_activity" in msg
 
 
 def test_shared_view_conflict_single_config_is_none():
@@ -683,6 +1082,9 @@ def test_job_base_parameters():
         "ca_certs": "${var.ca_certs}",
         "monitoring_log_table": "${var.monitoring_log_table}",
         "streaming_trigger_interval": "",
+        # Per-user view schema toggle + user name: "" when the caller passes no refs (off).
+        "view_schema_per_user": "",
+        "view_schema_user_name": "",
         # Jobs dynamic value references, resolved per run by the Jobs service (monitoring log run id).
         "job_run_id": "{{job.run_id}}",
         "task_run_id": "{{task.run_id}}",

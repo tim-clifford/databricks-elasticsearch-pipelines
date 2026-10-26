@@ -340,14 +340,56 @@ Expected once per added column: the task retry restarts the stream and it contin
 its columns sends the new column only once you add it to the view and run `deploy_views`; a view that
 uses `SELECT *` sends it from the restarted stream on.
 
+<a id="a-renamed-or-dropped-source-column"></a>
+
 ### A renamed or dropped source column
 
 `DELTA_STREAMING_INCOMPATIBLE_SCHEMA_CHANGE_USE_SCHEMA_LOG`
 
-This fails on every attempt and needs an operator: the stream can't continue across that change
-([why](technical-details.md#schema-changes-in-a-stream)). Update the view for the new schema, then decide
-how the stream should resume, for example by [resetting its checkpoint](maintenance-jobs.md#resetting-a-checkpoint)
-and choosing `streaming_start`.
+Every attempt fails with this, even when the view doesn't use the column, so the feed sends nothing
+until someone acts. Retries never clear it ([why](technical-details.md#schema-changes-in-a-stream)).
+What it looks like on a continuous feed:
+
+- **A standalone feed** fails four attempts about a minute apart, the run ends ("The continuous job run
+  was cancelled because a task reached its retry limit"), and the trigger starts a new run about a minute
+  later on a new cluster. That repeats indefinitely.
+- **A job group member** is retried in place with a growing wait (about one minute, then two), and the
+  run stays `RUNNING` and is never cancelled. The other members keep sending, so only that task's
+  attempt number and its failure emails show the problem
+  ([Spotting a stuck feed](monitoring.md#spotting-a-stuck-feed)).
+
+To recover, reset the feed's checkpoint and send the rows it missed. These steps were run end to end
+for a rename and a drop, on a standalone feed and on a group member:
+
+1. **Confirm the change.** `DESCRIBE HISTORY <source table>` shows a `RENAME COLUMN` or `DROP COLUMNS`
+   commit. Note its version and time.
+2. **Note where the feed stopped**, the same way as step 2 of
+   [renaming a feed](maintenance-jobs.md#renaming-a-feed): the `start_ts` of its last successful
+   `batch_end` row in the monitoring log, and that batch's `batch_summary` `source_end_version`. Without
+   the log, go by the commit time from step 1 and widen the backfill window in step 7.
+3. **Update the view** if it uses the renamed or dropped column. Deploy (the stream reads the view's
+   `.sql` from the deployed files) and run `deploy_views` (batch runs, including the backfill, read the
+   view itself).
+4. **Stop the feed.** Set `pause_status: PAUSED` in its config, generate and deploy, cancel the running
+   run, and check that it has stopped ([Pausing triggers](feed-configuration.md#pausing-triggers)). In a
+   job group this stops every member; the others resume from their own checkpoints afterwards, with
+   nothing lost.
+5. **Clear the checkpoint** of the failing feed only:
+   `databricks bundle run checkpoint_clear -t <target> -p <profile> --params config_name=<config_name>`.
+6. **Restart.** Choose how the new stream starts, put `pause_status` back, generate and deploy:
+   - **Re-send the whole table**, if that volume is acceptable: set `streaming_start: full` in the config
+     ([Method 1](backfill.md#method-1-streaming-from-the-start-of-the-table-streaming-feeds-only)). Remove
+     it again once the first batch has succeeded, so a later reset doesn't re-send the table again. Skip
+     step 7.
+   - **Backfill only the gap** (the default `streaming_start: new`): the restarted stream begins at the
+     source's current version, so it never sends the rows committed between the point from step 2 and
+     the restart, including rows that landed while the feed was paused. Step 7 sends them.
+7. **Backfill the gap** once the restarted stream is up, with batch runs from a
+   [backfill config](backfill.md#option-2-a-parallel-job-for-the-backfill) filtered on a column that
+   records when each row landed ([Method 2](backfill.md#method-2-batch-runs-in-sized-pieces)). Start the
+   window before the point from step 2 and end it after the restart. With `es_id_field` set the overlap
+   just overwrites documents with themselves; without it, rows in the overlap are duplicated, so keep the
+   window tight. Then remove the backfill config.
 
 ### A continuous run cancelled at its retry limit
 
@@ -355,7 +397,9 @@ and choosing `streaming_start`.
 
 The task retry limit counts every failure in a long-lived run (added columns, transient ES errors). The
 continuous trigger starts a fresh run. Look at the earlier failures in the run to find what keeps failing
-([Continuous streaming](feed-configuration.md#continuous-streaming)).
+([Continuous streaming](feed-configuration.md#continuous-streaming)). If the same error ends run after run,
+the failure is permanent, for example [a renamed or dropped source column](#a-renamed-or-dropped-source-column).
+A job group member that keeps failing usually doesn't end the run at all: see the same section.
 
 ## A scheduled job didn't run
 
