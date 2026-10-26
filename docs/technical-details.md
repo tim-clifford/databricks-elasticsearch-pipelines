@@ -32,6 +32,7 @@ This document explains the rationale behind the framework's design decisions, ed
   - [op_type create miscount](#op_type-create-miscount)
   - [Why the generated tag key set is fixed at generation](#global-job-tags-key-set)
   - [The es_index_list tag](#es-index-list-tag)
+  - [Per-user view schema checks](#per-user-view-schema-checks)
 - [Permissions and tooling](#permissions-and-tooling)
   - [All users can run every job](#can-manage-run)
   - [Why pyyaml is pinned](#pyyaml-pin)
@@ -128,7 +129,7 @@ A failure while recording a failure never hides the original error (the log faul
 
 `files_outstanding` / `bytes_outstanding` at zero means caught up, but a non-zero backlog is ambiguous: Spark measures it **after** the batch, against the table as it is then, so files that landed while the batch ran count too. Spark's own `latestOffset` would settle it, but the Delta source always reports it as null (seen live on DBR 17.3).
 
-Each streaming batch records the source's newest commit made at least `log_monitor_source_lookback_seconds` (default 60) before its start (`source_latest_version`, from the newest `log_monitor_source_history_rows` history rows, default 100), and `batch_summary` carries both that and where the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** (it left files that were already there for the next batch) when
+Each streaming batch records the source's newest commit made at least `log_monitor_source_lookback_seconds` (built-in default 60) before its start (`source_latest_version`, from the newest `log_monitor_source_history_rows` history rows, built-in default 100), and `batch_summary` carries both that and where the batch ended (`source_end_version`, `source_end_index`). A batch was **behind** (it left files that were already there for the next batch) when
 
 ```
 source_latest_version >= source_end_version AND files_outstanding > 0
@@ -232,6 +233,26 @@ In addition to the global tags, the generator adds one generated tag to each gen
 The separator is a **space**, not a comma: the Jobs API restricts a tag value to `^[\d \w+\-=.:/@]*$`, which excludes commas; Elasticsearch index names never contain spaces, so a space is unambiguous.
 
 **Truncation:** Tag value length is bounded by the cloud provider (AWS 255, Azure 256, GCP labels 63) once a tag reaches a cluster. To keep a large job group deployable, the generator **truncates** a long `es_index_list` to a conservative cap (255 characters), keeping whole index names in sorted order and appending a ` ...+N` marker for the count dropped (with a generation warning). The global tags are independent tag values and are never truncated. GCP's 63-character label limit is tighter than the cap, so a GCP deployment with many indices per group may still need fewer. Databricks allows at most 25 tags per job; because the generator adds `es_index_list` to every generated job, at most **24** global tags are allowed (`gen_jobs.py` fails closed on more).
+
+<a id="per-user-view-schema-checks"></a>
+### Per-user view schema checks
+
+With [per-developer views](setup.md#per-developer-views) on, a view's schema is the configured view schema
+with the developer's short name appended, so the name can coincide with a schema that already means
+something else. `deploy_views` checks for two cases:
+
+- **A configured schema.** If a per-user schema would be one of the configured schemas (a view, source or
+  reference table schema, for example view schema `es` and user `poc` against a feed whose view schema is
+  `es_poc`), `deploy_views` fails before deploying. It also fails when a config outside a `views` subset
+  run can't be resolved, since its schemas can't be checked; a broken config inside the subset fails only
+  its own view.
+- **A schema someone else owns.** An existing per-user schema owned by anyone else (a shared schema with a
+  matching name, or another developer's whose name happens to concatenate the same, such as `es` +
+  `poc_jane` and `es_poc` + `jane`) fails that view instead of deploying into it.
+
+The first check covers schemas the feed configs name, and the second covers schemas owned by anyone else.
+A schema you own that no config names (for example the monitoring log table's) isn't detected, so don't
+give it a name of the form `<view schema>_<your short name>`.
 
 ## Permissions and tooling
 

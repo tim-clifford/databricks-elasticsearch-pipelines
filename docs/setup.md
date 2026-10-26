@@ -23,8 +23,12 @@ in order. Each setting mentioned here is defined in the [Parameters Reference](p
   create the views in (each feed config names them).
 - A UC Volume for the connector wheel, and one for streaming checkpoints if any feed streams (one volume
   can hold both).
-- Optionally, a UC Volume path for a CA bundle (if ES uses a private CA) and a schema for the monitoring
-  log table.
+- Optionally, a UC Volume path for a CA bundle, if ES uses a certificate the system CA store doesn't
+  trust ([`ca_certs`](parameters.md#ca_certs)).
+- Optionally, a UC Volume for cluster logs, if job clusters should keep their logs
+  ([`cluster_log_volume_path`](parameters.md#cluster_log_volume_path)).
+- Optionally, a schema for the monitoring log table
+  ([`monitoring_log_table`](parameters.md#monitoring_log_table)).
 
 <a id="connector-wheel"></a>
 
@@ -41,7 +45,7 @@ a clear message, before reading or sending anything, on an older wheel. Two ways
   workspace, set `wheel_path` for the target (the job writes to that path's folder), deploy, then run:
 
   ```bash
-  databricks bundle run build_wheel -t <target> -p <profile> \
+  databricks bundle run build_wheel -t <target> \
     --params repo_workspace_path=/Workspace/<path-to-connector-repo>,wheel_version=<version>
   ```
 
@@ -56,8 +60,8 @@ Each lives in a Databricks secret scope; the bundle stores only the scope and ke
 share one scope, or each host can have its own. With the Databricks CLI, for each host:
 
 ```bash
-databricks secrets create-scope <scope> -p <profile>            # once per scope
-databricks secrets put-secret <scope> <key> -p <profile>        # prompts for that host's api_key value
+databricks secrets create-scope <scope>       # once per scope
+databricks secrets put-secret <scope> <key>   # prompts for that host's api_key value
 ```
 
 The identity the jobs run as needs `READ` on every scope that holds one of the keys.
@@ -90,17 +94,15 @@ targets:
 With `run_as`, the identity that deploys needs the Service Principal User role on that service
 principal. Whichever identity the jobs run as needs every grant in [Permissions](#permissions) below.
 
-### Optional prerequisites
+### Optional: a cluster policy
 
-Only if you use the feature:
+If any feed uses `job_cluster` compute, the workspace's cluster policy for it. Its id goes in
+[`cluster_policy_id`](parameters.md#cluster_policy_id).
 
-- **A cluster policy** for job-cluster feeds: its id goes in [`cluster_policy_id`](parameters.md#cluster_policy_id).
-- **A support email address** or list for failure emails: [`support_email`](parameters.md#support_email).
-- **A UC Volume for cluster logs**, if job clusters should keep their logs:
-  [`cluster_log_volume_path`](parameters.md#cluster_log_volume_path).
-- **A UC Volume for a CA bundle**, if ES uses a certificate the system CA store doesn't trust:
-  [`ca_certs`](parameters.md#ca_certs).
-- **A schema for the monitoring log table**: [`monitoring_log_table`](parameters.md#monitoring_log_table).
+### Optional: failure email recipients
+
+An address or list to email when a job fails, if you want failure emails:
+[`support_email`](parameters.md#support_email).
 
 ### Permissions
 
@@ -126,7 +128,11 @@ identity ([why that shapes the job parameters](technical-details.md#can-manage-r
 
 ### Local tools
 
-- The [Databricks CLI](https://docs.databricks.com/dev-tools/cli/), with a profile for each workspace.
+- The [Databricks CLI](https://docs.databricks.com/dev-tools/cli/), authenticated to each workspace you
+  deploy to. The commands in these docs don't name a workspace: the CLI takes it from its environment
+  (for example `DATABRICKS_HOST`, or `DATABRICKS_CONFIG_PROFILE` naming a profile) or from your
+  `DEFAULT` profile. If you switch between workspaces with named profiles instead, add `-p <profile>` to
+  each `databricks` command.
 - Python with the generator's pinned dependency, from the repo root:
 
   ```bash
@@ -139,11 +145,11 @@ identity ([why that shapes the job parameters](technical-details.md#can-manage-r
 
 `databricks.yml` defines three targets, chosen with `-t`:
 
-- **`dev`** (the default) uses development mode: each deploying user gets their own copy, with resource
+- **`dev`** (the default target out of the box) uses development mode: each deploying user gets their own copy, with resource
   names prefixed by the user name.
 - **`stg`** and **`prd`** use production mode, with a shared deploy path per target.
 
-All three take the workspace from your CLI profile (`-p <profile>`) or `DATABRICKS_HOST`. Whether
+All three take the workspace from the CLI's authentication ([Local tools](#local-tools)). Whether
 scheduled and continuous jobs run in a target is set per target in `databricks.yml` by
 [`schedule_pause_status`](parameters.md#schedule_pause_status). The usual setup is paused in `dev` and
 `stg`, so their triggers are deployed but don't start runs, and unpaused in `prd`, where the triggers
@@ -311,7 +317,7 @@ for each feed.
 Views live in Unity Catalog, so without this two developers deploying to one `dev` workspace would
 overwrite each other's views, and one could fail to replace a view the other owns. With
 [`view_schema_per_user`](parameters.md#view_schema_per_user) set to `true` (the `dev` target's
-setting), `deploy_views` creates every view in `<view schema>_<your short name>`, lowercased (for example
+setting out of the box), `deploy_views` creates every view in `<view schema>_<your short name>`, lowercased (for example
 `es_poc_jane_doe`), creating the schema if it's missing, and every feed job reads its view from there.
 Each developer owns their own copy.
 
@@ -319,23 +325,15 @@ Each developer owns their own copy.
   reads the same inputs.
 - It needs `CREATE SCHEMA` on the view catalog (see [Permissions](#permissions)).
 - To test against the real view schema for one deploy, turn it off:
-  `databricks bundle deploy -t dev -p <profile> --var view_schema_per_user=false`, then run
+  `databricks bundle deploy -t dev --var view_schema_per_user=false`, then run
   `deploy_views`. The next deploy without the flag turns it back on.
 - With it on, a missing or illegal user name fails `deploy_views` and the feed runs, rather than
   falling back to the shared schema.
-- If a per-user schema would be one of the configured schemas (a view, source or reference table schema,
-  for example view schema `es` and user `poc` against a feed whose view schema is `es_poc`),
-  `deploy_views` fails before deploying. It also fails when a config outside a `views` subset run can't
-  be resolved, since its schemas can't be checked; a broken config inside the subset fails only its own
-  view.
-- If the per-user schema already exists, it must be owned by you. One owned by anyone else (a shared
-  schema with a matching name, or another developer's whose name happens to concatenate the same, such as
-  `es` + `poc_jane` and `es_poc` + `jane`) fails that view instead of deploying into it.
-- It assumes the jobs run as the developer who deployed them (the `dev` default; no `run_as`), since the
-  schema is named after the deployer and the ownership check uses the identity the job runs as.
-- The collision check covers schemas the feed configs name, and the ownership check covers schemas owned
-  by anyone else. A schema you own that no config names (for example the monitoring log table's) isn't
-  detected, so don't give it a name of the form `<view schema>_<your short name>`.
+- If the per-user schema already exists, it must be owned by you; `deploy_views` won't deploy into a
+  schema someone else owns, or one that is also a configured schema
+  ([the edge cases](technical-details.md#per-user-view-schema-checks)).
+- It assumes the jobs run as the developer who deployed them (no `run_as` in `dev`), since the schema is
+  named after the deployer and the ownership check uses the identity the job runs as.
 - A service principal's short name (a CI deploy) is usually not a legal schema name, so deploy to `dev`
   as a service principal with `--var view_schema_per_user=false`.
 
@@ -344,11 +342,8 @@ What's still shared between developers in one `dev` workspace:
 - **Elasticsearch indices.** Feeds write the index their config names, so two developers running one
   feed against the same host write the same index, and docs with the same `_id` overwrite each other.
   Agree who runs which feed, or point dev feeds at separate indices.
-- **Checkpoints**, unless you add the short name to `checkpoint_base_path` (see
-  [Per-developer checkpoints](#per-developer-checkpoints)). A shared checkpoint also means one
-  developer's `_checkpoint clear` resets the other's stream.
 - **The [monitoring log table](#monitoring-log-table).** Sharing it is safe: every row carries its job
-  and task run ids. Any developer's `_log table prune` run applies retention to everyone's rows.
+  and task run ids. Any developer's `_log table prune` run applies retention to everyone's rows, though.
 - **The cluster log volume.** Any developer's `_cluster logs prune` run deletes everyone's logs past
   retention.
 
@@ -363,7 +358,7 @@ The monitoring log records every run and batch in a Delta table. To use it:
 2. Create the table once (re-running is safe):
 
    ```bash
-   databricks bundle run log_table_create -t <target> -p <profile>
+   databricks bundle run log_table_create -t <target>
    ```
 
 3. Turn it on with [`monitoring_log_enabled`](parameters.md#monitoring_log_enabled), for the whole target,
@@ -386,7 +381,7 @@ How to read the table is in [Logging and Monitoring](monitoring.md#monitoring-lo
   [`cluster_policy_id`](parameters.md#cluster_policy_id) in each target it deploys to.
 - **Cluster log delivery.** To keep job-cluster logs after the cluster ends, see
   [Cluster log delivery](monitoring.md#cluster-log-delivery). The `cluster_log_prune` job deletes them
-  after [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days) (default 30).
+  after [`cluster_log_retention_days`](parameters.md#cluster_log_retention_days).
 
 ## First deploy
 
@@ -394,15 +389,15 @@ Run the [deploy sequence](deployment.md#the-deploy-sequence) from the repo root,
 later deploy uses:
 
 ```bash
-pip install -r requirements.txt pytest                      # once: the generator's pinned dependency, and pytest
-python -m pytest framework/tests -q                         # after changing framework code or taking a release
-python framework/scripts/gen_jobs.py                        # generate a job per feed config
-python framework/scripts/gen_jobs.py --check                # confirm the generated jobs are current
-databricks bundle validate -t <target> -p <profile>
-databricks bundle deploy -t <target> -p <profile>
-databricks bundle run deploy_views -t <target> -p <profile>
-databricks bundle run log_table_create -t <target> -p <profile>   # optional: only if you use the monitoring log
-databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
+pip install -r requirements.txt pytest               # once: the generator's pinned dependency, and pytest
+python -m pytest framework/tests -q                  # after changing framework code or taking a release
+python framework/scripts/gen_jobs.py                 # generate a job per feed config
+python framework/scripts/gen_jobs.py --check         # confirm the generated jobs are current
+databricks bundle validate -t <target>
+databricks bundle deploy -t <target>
+databricks bundle run deploy_views -t <target>
+databricks bundle run log_table_create -t <target>   # optional: only if you use the monitoring log
+databricks bundle run index_pipeline_<config_name> -t <target>
 ```
 
 The deploy creates the feed jobs and the seven maintenance jobs (`build_wheel`, `deploy_views`,
