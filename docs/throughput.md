@@ -11,6 +11,7 @@ defined in the [Parameters Reference](parameters.md); this doc is about how they
 - [The levers](#the-levers)
 - [Reading the signals](#reading-the-signals)
 - [A tuning procedure](#a-tuning-procedure)
+- [Target throughput](#target-throughput)
 
 ## Before you tune: know the source
 
@@ -101,7 +102,7 @@ Most of the write doesn't need the GIL:
 What does need it is the Python work around each request: handing the lines to the senders, the ES
 client's work to send each request, and reading each response. Under the [fast path](#fast-path) a clean
 chunk's response is just its `errors` flag, which is cheap. A chunk that takes the full path (any
-document-level error, such as a 409 or 429, or every chunk with `bypass_fast_path` on) has its response
+document-level error retry, such as a 409 or 429, or every chunk with `bypass_fast_path` on) has its response
 decoded and checked document by document, which is the heaviest GIL work in the write.
 
 What follows from that:
@@ -153,6 +154,16 @@ memory).
 
 Adding cores only helps if there are enough partitions to use them; see [Partitions](#partitions).
 
+### Driver sizing
+
+The driver doesn't send documents, so it usually doesn't set the feed's throughput directly. It plans
+each batch, runs the notebook, tracks the stream and its checkpoint, gathers each partition's results and
+writes the monitoring log. That only matters when the driver is too small to keep up: then batches start
+late, the gaps between them grow, and a driver short of memory can fail the run. Choose a driver node
+with enough memory and CPU for that overhead. A [job group](feed-configuration.md#job-groups) with
+several tasks on one cluster runs each task's notebook and stream on the same driver, so it may need a
+larger driver than a single feed.
+
 ### `write_concurrency`
 
 The number of bulk requests each partition keeps in flight. While one request waits for ES, others are
@@ -184,9 +195,7 @@ Two settings control the count:
   can't even out partitions when the source files are uneven, and a shuffling view resets it.
 - [`write_repartition`](parameters.md#write_repartition) sets the write's partition count directly and
   spreads the rows evenly across them, whatever the source files or the view do. It adds a shuffle, so
-  it costs time of its own, but evenly sized partitions remove stragglers. Choose it per feed: start
-  from the worker core count and adjust from the `tail:` line in the
-  [`BULK_STATS` output](monitoring.md#reading-the-bulk_stats-output).
+  it costs time of its own, but evenly sized partitions remove stragglers.
 
 ### `chunk_size`
 
@@ -198,8 +207,12 @@ The number of documents in each bulk request.
   overhead grows.
 
 Large documents make each request heavier at the same `chunk_size`, so a feed with big documents usually
-wants a smaller value. A request also can't hold more rows than Spark hands the writer in one Arrow batch
-(`spark.sql.execution.arrow.maxRecordsPerBatch`), so beyond that size raising `chunk_size` changes nothing.
+wants a smaller value. A request also can't hold more rows than Spark hands the writer in one Arrow batch, so beyond that size
+raising `chunk_size` changes nothing. An Arrow batch ends at a row limit,
+`spark.sql.execution.arrow.maxRecordsPerBatch`, and on Spark 4.0 and later (Databricks Runtime 17 and
+later) also at a byte limit, `spark.sql.execution.arrow.maxBytesPerBatch`, whichever it reaches first. A
+feed with large documents can hit the byte limit first, so its requests hold fewer than `chunk_size`
+documents.
 
 ### Timeouts and retries
 
@@ -228,11 +241,11 @@ error is then sent a second time to get those results.
 [`bypass_fast_path`](parameters.md#bypass_fast_path) decodes every response in full on the first send.
 Turn it on when:
 
-- **409s are expected regularly**, as with `op_type: create` and re-sends: almost every such chunk fails
+- **409s are expected regularly**, as with re-sends with `op_type: create`: almost every such chunk fails
   the probe and goes out twice, so bypassing the fast path halves those sends.
 - **You need exact counts** for `op_type: create`.
 
-Leave it off for feeds whose chunks are almost always clean: decoding every response in full is
+Leave `bypass_fast_path` off (so the fast path stays on) for feeds whose chunks are almost always clean: decoding every response in full is
 Python work under the GIL, so it lowers the `write_concurrency` a partition can use
 ([Python threads and the GIL](#python-threads-and-the-gil)).
 
@@ -245,7 +258,9 @@ A streaming feed processes new data in micro-batches.
 - **Larger batches:** fewer fixed per-batch costs (planning, checkpoint commits and, with the
   [monitoring log](monitoring.md#monitoring-log) on, its writes), so better throughput, but each batch takes
   longer and a retried batch re-sends more.
-- **Smaller batches:** steadier, shorter batches, at more total overhead.
+- **Smaller batches:** steadier, shorter batches, at more total overhead. Don't set the caps so low that
+  a micro-batch holds less than typically arrives in the time one micro-batch takes to process: each
+  batch then leaves more behind than it sent, and the feed falls further behind however fast it runs.
 
 The caps matter most during a backfill or a catch-up after downtime, where an uncapped first batch can
 try to read the whole backlog at once. As a rough target, set one or both so a micro-batch holds no more
@@ -256,7 +271,7 @@ Inside each micro-batch, the write is tuned with the same levers as a batch run.
 
 ## Reading the signals
 
-Turn on [`bulk_stats`](parameters.md#bulk_stats) to see what the write is doing. Which signals point to
+Turn on [`bulk_stats`](parameters.md#bulk_stats), if it isn't already on, to see what the write is doing. Which signals point to
 which lever is in [Troubleshooting: Reading the signals](troubleshooting.md#reading-the-signals), and
 what each part of the output means is in
 [Logging and Monitoring: Reading the BULK_STATS output](monitoring.md#reading-the-bulk_stats-output). For
@@ -265,8 +280,8 @@ write diagnostics, including 429s per batch.
 
 ## A tuning procedure
 
-1. **Measure first.** Turn on `bulk_stats` for the feed (in its config, or `--params bulk_stats=true` for
-   one run) and run a representative batch: one the size of the target from the
+1. **Measure first.** Make sure `bulk_stats` is on for the feed (if it isn't already on for the target,
+   turn it on in its config, or with `--params bulk_stats=true` for one run) and run a representative batch: one the size of the target from the
    [source analysis](#before-you-tune-know-the-source).
 2. **Find the symptom** in [the signals table](troubleshooting.md#reading-the-signals).
 3. **Change one lever** that matches it, by a modest step, and run again. Changing two at once hides
@@ -281,3 +296,15 @@ write diagnostics, including 429s per batch.
 
 When nothing on the client side moves the numbers, the limit is downstream: ES capacity (nodes, write
 threads, shards and refresh settings) or the network between the cluster and ES.
+
+## Target throughput
+
+What to aim for, in short:
+
+- **Stay caught up with the normal volume.** Under normal conditions the feed sends at least what the
+  source receives over each interval ([know the source](#before-you-tune-know-the-source)), so it doesn't
+  fall behind.
+- **Leave room for spikes and recoveries.** Keep enough headroom to absorb the source's peaks and to
+  catch up in a reasonable time after an outage or a pause, without overloading Elasticsearch.
+- **Use the fewest cores that do that.** Once a feed meets both, extra cores only add cost. Pick the
+  smallest cluster that still meets the target with that headroom.
