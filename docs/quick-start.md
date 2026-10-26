@@ -41,9 +41,9 @@ Create `_pipelines/pipeline_configs/<config_name>.yml` (the filename becomes the
 # _pipelines/pipeline_configs/my_data.yml
 es_index_name: my-data-index
 es_id_field: id                    # column from the view to use as the ES _id
-es_host_config: es_host_default    # optional; omit to use the bundle default
+es_host_config: es_host_default    # optional; omit to use default_es_host_config
 
-pipeline_mode: batch               # optional; batch (default) or streaming
+pipeline_mode: batch               # optional; batch or streaming (omit to use the target's global)
 
 view:
   catalog: my_workspace
@@ -61,7 +61,7 @@ A `catalog` or `schema` may include `${environment}` for per-environment names (
 For a first test against an index or host that can't take the whole table yet, add a [`filter_condition`](parameters.md#filter_condition) that limits the feed to a volume the target environment can handle, for example a recent date range, and remove it once the test is done:
 
 ```yaml
-filter_condition: "timestamp >= current_date() - INTERVAL 1 DAY"   # optional; for initial testing only
+filter_condition: "timestamp >= current_timestamp() - INTERVAL 1 DAY"   # optional; for initial testing only
 ```
 
 ### Regenerate job resources
@@ -75,16 +75,16 @@ This creates `_pipelines/resources/<config_name>.job.yml`. Run it whenever you a
 ### Deploy the bundle
 
 ```bash
-databricks bundle validate -t <target> -p <profile>
-databricks bundle deploy -t <target> -p <profile>
+databricks bundle validate -t <target>
+databricks bundle deploy -t <target>
 ```
 
-Replace `<target>` with your environment (e.g. `dev`, `prd`) and `<profile>` with your Databricks CLI profile. The bundle resolves variables from that target's block in `databricks.yml`. Check the status in the Databricks workspace.
+Replace `<target>` with your environment (e.g. `dev`, `prd`), and add `-p <profile>` if you use a named Databricks CLI profile ([Local tools](setup.md#local-tools)). The bundle resolves variables from that target's block in `databricks.yml`. Check the status in the Databricks workspace.
 
-### Deploy the views
+### Run the deploy views job
 
 ```bash
-databricks bundle run deploy_views -t <target> -p <profile>
+databricks bundle run deploy_views -t <target>
 ```
 
 This creates the Databricks views from the `.sql` files. Watch for `created my_view` in the output (or a `FAILED` message if something went wrong).
@@ -92,13 +92,13 @@ This creates the Databricks views from the `.sql` files. Watch for `created my_v
 ### Run the feed
 
 ```bash
-databricks bundle run index_pipeline_<config_name> -t <target> -p <profile>
+databricks bundle run index_pipeline_<config_name> -t <target>
 ```
 
 For example, if your config is `my_data.yml`:
 
 ```bash
-databricks bundle run index_pipeline_my_data -t dev -p my-profile
+databricks bundle run index_pipeline_my_data -t dev
 ```
 
 Batch mode runs once and stops. Streaming mode drains all available data, then stops (or runs continuously with a `continuous` block; see [Feed Configuration: Continuous streaming](feed-configuration.md#continuous-streaming)).
