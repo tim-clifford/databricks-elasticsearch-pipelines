@@ -202,6 +202,32 @@ def test_cluster_log_prune_passes_its_parameters_through():
     assert [ast.unparse(a) for a in call.args[4:6]] == ["dbutils.fs.ls", "dbutils.fs.rm"]
 
 
+def test_cluster_log_prune_derives_dry_run_from_its_widget():
+    # How DRY_RUN is computed, not just that it reaches run_prune: an inverted or constant value would
+    # delete files on `--params dry_run=true`.
+    nb = os.path.join(_FRAMEWORK_ROOT, "notebooks", "cluster_log_prune.py")
+    assigns = {t.id: ast.unparse(n.value) for n in ast.walk(_file_ast(nb)) if isinstance(n, ast.Assign)
+               for t in n.targets if isinstance(t, ast.Name) and t.id in ("DRY_RUN", "DRY_RUN_RAW")}
+    assert assigns == {"DRY_RUN_RAW": "dbutils.widgets.get('dry_run')",
+                       "DRY_RUN": "require_es_flag(DRY_RUN_RAW, 'dry_run') == 'true'"}
+    assert len([n for n in ast.walk(_file_ast(nb)) if isinstance(n, ast.Assign)
+                and any(getattr(t, "id", None) == "DRY_RUN" for t in n.targets)]) == 1
+
+
+def test_deploy_views_preflight_sees_every_config():
+    # The collision check must see every loaded config (a per-user schema can land on a schema a config
+    # outside the subset names); only the unresolved-config check is narrowed to the subset.
+    nb = os.path.join(_FRAMEWORK_ROOT, "notebooks", "deploy_views.py")
+    (pre,) = _calls(nb, "per_user_preflight_problem")
+    assert [ast.unparse(a) for a in pre.args[:2]] == [
+        "[entry for entries in configs_by_view.values() for entry in entries]",
+        "selected_config_labels(sql_files, configs_by_view)"]
+    tree = _file_ast(nb)
+    rebinds = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", None) == "configs_by_view" for t in n.targets)]
+    assert len(rebinds) == 1 and rebinds[0].lineno < pre.lineno
+
+
 def test_deploy_views_deploys_only_the_selected_files():
     # The subset is applied by reassigning sql_files before the deploy loop iterates it.
     nb = os.path.join(_FRAMEWORK_ROOT, "notebooks", "deploy_views.py")
