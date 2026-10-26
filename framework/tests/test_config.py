@@ -726,13 +726,22 @@ def test_per_user_preflight_problem():
 
 
 
-def test_per_user_preflight_reports_a_too_long_per_user_schema_as_itself():
-    # A config that resolves but whose per-user schema is over the limit is the user name's problem, not the
-    # config's: the pre-flight raises that reason instead of calling the config unresolved.
-    long_schema = validate_config({**_base(), "view": {"catalog": "cat", "schema": "s" * 250, "name": "v"}})
+def test_per_user_preflight_names_the_real_reason_a_config_cant_be_checked():
+    # A too-long per-user schema is reported with its own error, not as "fails to resolve", and like any other
+    # unchecked config it blocks the run only from outside the subset; inside it, it fails just its own view.
+    long_schema = ("long.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "s" * 250, "name": "v"}}))
     shared = ("shared.yml", validate_config(_base()))
-    with pytest.raises(PipelineConfigError, match="255-character"):
-        per_user_preflight_problem([shared, ("long.yml", long_schema)], {"shared.yml"}, "", "tim_clifford")
+    msg = per_user_preflight_problem([shared, long_schema], {"shared.yml"}, "", "tim_clifford")
+    assert msg and "long.yml" in msg and "255-character" in msg
+    assert per_user_preflight_problem([shared, long_schema], {"shared.yml", "long.yml"}, "", "tim_clifford") is None
+
+
+def test_per_user_preflight_reports_an_unchecked_config_before_a_collision():
+    # Both problems at once: the unchecked config is reported (its schemas might add more collisions).
+    shared = ("shared.yml", validate_config(_base()))   # view schema es_poc
+    short = ("short.yml", validate_config({**_base(), "view": {"catalog": "cat", "schema": "es", "name": "other"}}))
+    msg = per_user_preflight_problem([shared, short, ("broken.yml", {})], {"short.yml"}, "", "poc")
+    assert "broken.yml" in msg and "can't check" in msg and "cat.es_poc" not in msg
 
 
 _ME = "tim.clifford@databricks.com"

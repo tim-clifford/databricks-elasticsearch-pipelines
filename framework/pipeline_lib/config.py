@@ -1725,6 +1725,29 @@ def select_views(requested: object, available: list) -> list:
     return [n for n in available if n in wanted]
 
 
+def _per_user_schema_scan(entries: list, environment: str, user: str) -> tuple:
+    """(collisions, problems): the collision list (see per_user_schema_collisions) and {label: reason} for every
+    config whose schemas can't be checked, the reason being the error that stopped it (a resolve error, or the
+    per-user schema's own, such as a name over Unity Catalog's limit)."""
+    if not user:
+        return [], {}
+    configured, per_user, problems = set(), set(), {}
+    for label, c in entries:
+        try:
+            resolved = resolve_config(c, environment)
+            schemas = {f"{resolved['view']['catalog']}.{resolved['view']['schema']}",
+                       f"{resolved['source']['catalog']}.{resolved['source']['schema']}"}
+            schemas |= {f"{spec['catalog']}.{spec['schema']}" for spec in resolved["reference_tables"].values()}
+            mine = view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"])
+        except Exception as exc:  # noqa: BLE001 - reported per view (or fails closed) by deploy_views
+            problems[label] = f"{type(exc).__name__}: {exc}"
+            continue
+        configured |= schemas
+        per_user.add(mine)
+    collisions = sorted({s.lower() for s in per_user} & {s.lower() for s in configured})
+    return collisions, problems
+
+
 def per_user_schema_collisions(entries: list, environment: str, user: str) -> tuple:
     """(collisions, unresolved) for per-user mode; ([], []) when off.
 
@@ -1733,50 +1756,32 @@ def per_user_schema_collisions(entries: list, environment: str, user: str) -> tu
     `<view schema>_<user>` is a plain concatenation, so e.g. schema `es` + user `poc` is `es_poc`, which may be
     another feed's real, shared schema; deploy_views fails closed rather than replace views there.
 
-    Raises PipelineConfigError when a config resolves but its per-user schema name is over the limit.
-
-    unresolved: labels of the configs that failed to resolve (any error), sorted. Their schemas are unknown, so
-    the check is incomplete for them: deploy_views reports one in the subset being deployed as that view's own
-    failure, and fails closed on one outside it (nothing else would report it).
+    unresolved: labels of the configs whose schemas can't be checked (any error: the config fails to resolve,
+    or its per-user schema name is invalid, e.g. too long), sorted. deploy_views reports one in the subset
+    being deployed as that view's own failure, and fails closed on one outside it (nothing else would report it).
 
     `entries` is every loaded (label, config), not just a subset run's, since any of them may own the shared
     schema. Two DEVELOPERS whose suffixed names coincide (schema `es` + user `poc_jane` and schema `es_poc` +
     user `jane` are both `es_poc_jane`) aren't visible here; deploy_views catches that, and any other shared
     schema, with the owner check (schema_owner_problem)."""
-    if not user:
-        return [], []
-    configured, per_user, unresolved = set(), set(), []
-    for label, c in entries:
-        try:
-            resolved = resolve_config(c, environment)
-            schemas = {f"{resolved['view']['catalog']}.{resolved['view']['schema']}",
-                       f"{resolved['source']['catalog']}.{resolved['source']['schema']}"}
-            schemas |= {f"{spec['catalog']}.{spec['schema']}" for spec in resolved["reference_tables"].values()}
-        except Exception:  # noqa: BLE001 - reported per view (or fails closed) by deploy_views
-            unresolved.append(label)
-            continue
-        # Outside the try: the config resolved, so an error here is the per-user schema's own (over Unity
-        # Catalog's name limit) and is raised as itself rather than reported as an unresolved config.
-        mine = view_schema_fqn(view_substitutions(c, environment, view_schema_user=user)["view"])
-        configured |= schemas
-        per_user.add(mine)
-    collisions = sorted({s.lower() for s in per_user} & {s.lower() for s in configured})
-    return collisions, sorted(unresolved)
+    collisions, problems = _per_user_schema_scan(entries, environment, user)
+    return collisions, sorted(problems)
 
 
 def per_user_preflight_problem(entries: list, selected_labels: set, environment: str, user: str) -> str | None:
     """The reason per-user mode must not deploy, or None. Off (no user) => None.
 
-    - Some per-user schema is also a configured schema (see per_user_schema_collisions).
-    - Some config outside this run's subset (`selected_labels`) fails to resolve: its schemas can't be
-      checked and nothing else would report it. One inside the subset fails only its own view, later."""
-    collisions, unresolved = per_user_schema_collisions(entries, environment, user)
-    unchecked = [label for label in unresolved if label not in selected_labels]
+    - Some config outside this run's subset (`selected_labels`) can't be checked (it fails to resolve, or its
+      per-user schema name is invalid): nothing else would report it. The message carries each one's error.
+      One inside the subset fails only its own view, later.
+    - Otherwise, some per-user schema is also a configured schema (see per_user_schema_collisions)."""
+    collisions, problems = _per_user_schema_scan(entries, environment, user)
+    unchecked = sorted(label for label in problems if label not in selected_labels)
     if unchecked:
         return (
-            f"per-user mode can't check for schema collisions: config(s) {', '.join(unchecked)} (not in this "
-            f"run's views) fail to resolve; fix them, include their views in the run, or deploy with "
-            f"--var view_schema_per_user=false"
+            f"per-user mode can't check for schema collisions: config(s) not in this run's views can't be "
+            f"checked: {'; '.join(f'{label} ({problems[label]})' for label in unchecked)}. Fix them, include "
+            f"their views in the run, or deploy with --var view_schema_per_user=false"
         )
     if collisions:
         return (
