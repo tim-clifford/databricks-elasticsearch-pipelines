@@ -339,10 +339,18 @@ Each developer owns their own copy.
 - A service principal's short name (a CI deploy) is usually not a legal schema name, so deploy to `dev`
   as a service principal with `--var view_schema_per_user=false`.
 
-Developers still share the Elasticsearch indices their feeds write and the
-[monitoring log table](#monitoring-log-table). The log is safe to share (every row carries its job and
-task run ids); two developers writing one index are not, so agree who runs which feed, or point dev
-feeds at separate indices.
+What's still shared between developers in one `dev` workspace:
+
+- **Elasticsearch indices.** Feeds write the index their config names, so two developers running one
+  feed against the same host write the same index, and docs with the same `_id` overwrite each other.
+  Agree who runs which feed, or point dev feeds at separate indices.
+- **Checkpoints**, unless you add the short name to `checkpoint_base_path` (see
+  [Per-developer checkpoints](#per-developer-checkpoints)). A shared checkpoint also means one
+  developer's `_checkpoint clear` resets the other's stream.
+- **The [monitoring log table](#monitoring-log-table).** Sharing it is safe: every row carries its job
+  and task run ids. Any developer's `_log table prune` run applies retention to everyone's rows.
+- **The cluster log volume.** Any developer's `_cluster logs prune` run deletes everyone's logs past
+  retention.
 
 <a id="monitoring-log-table"></a>
 
