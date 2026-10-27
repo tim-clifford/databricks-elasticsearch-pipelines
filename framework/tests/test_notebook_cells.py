@@ -73,6 +73,34 @@ def test_every_runtime_knob_is_a_runner_widget_that_is_read():
         assert f'dbutils.widgets.get("{name}")' in source, f"{name} is never read"
 
 
+def test_runner_passes_each_write_knob_from_its_own_widget():
+    # write_config_overrides receives every one of its parameters, and each one from the widget OF THE SAME
+    # NAME: a swapped (retry_backoff_initial=RETRY_BACKOFF_MAX) or dropped argument would otherwise pass every
+    # other test while silently ignoring a per-run override.
+    import inspect
+    from pipeline_lib.config import write_config_overrides
+    path = os.path.join(_FRAMEWORK_ROOT, "notebooks", "run_index_pipeline.py")
+    tree = _file_ast(path)
+    widget_of = {}   # NAME -> widget it was read from, for `NAME = dbutils.widgets.get("w")...`
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            for call in ast.walk(node.value):
+                if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "get"
+                        and ast.unparse(call.func.value) == "dbutils.widgets" and call.args
+                        and isinstance(call.args[0], ast.Constant)):
+                    widget_of[node.targets[0].id] = call.args[0].value
+    calls = _calls(path, "write_config_overrides")
+    assert len(calls) == 1
+    call = calls[0]
+    params = list(inspect.signature(write_config_overrides).parameters)
+    passed = dict(zip(params, call.args))
+    passed.update({kw.arg: kw.value for kw in call.keywords})
+    assert set(passed) == set(params), f"not passed: {sorted(set(params) - set(passed))}"
+    for name, value in passed.items():
+        assert isinstance(value, ast.Name), f"{name} is not passed a plain variable"
+        assert widget_of.get(value.id) == name, f"{name} is passed {value.id}, read from {widget_of.get(value.id)!r}"
+
+
 def _shipped_job_notebook_params():
     """(job file, notebook file, parameter name) for every base_parameter and job-level parameter of every task
     in every shipped job: the hand-authored framework/resources jobs and the generated _pipelines/resources jobs."""

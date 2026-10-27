@@ -1272,7 +1272,7 @@ def test_require_retry_backoff_canonical(validator, value, expected):
     assert validator(value) == expected
 
 
-@pytest.mark.parametrize("bad", [-1, "-0.5", "abc", True, False, "nan", "inf", float("inf"), [], {}])
+@pytest.mark.parametrize("bad", [-1, "-0.5", "abc", True, False, "nan", "inf", float("inf"), [], {}, 10**400])
 @pytest.mark.parametrize("validator,name", [(require_retry_backoff_initial, "retry_backoff_initial"),
                                             (require_retry_backoff_max, "retry_backoff_max")])
 def test_require_retry_backoff_fails_closed(validator, name, bad):
@@ -1867,7 +1867,11 @@ def test_tuning_knobs_carried_through_resolve():
     cfg["request_timeout"] = 90
     cfg["max_retries_per_request"] = 5
     cfg["max_retries_per_doc"] = 7
+    cfg["retry_backoff_initial"] = 1.5
+    cfg["retry_backoff_max"] = 45
     out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["retry_backoff_initial"] == "1.5"
+    assert out["retry_backoff_max"] == "45.0"
     assert out["chunk_size"] == "800"
     assert out["verify_certs"] == "false"
     assert out["require_existing_index"] == ""  # omitted -> unset
@@ -1882,6 +1886,8 @@ def test_reliability_knobs_omitted_carry_through_resolve_as_unset():
     assert out["request_timeout"] == ""
     assert out["max_retries_per_request"] == ""
     assert out["max_retries_per_doc"] == ""
+    assert out["retry_backoff_initial"] == ""
+    assert out["retry_backoff_max"] == ""
 
 
 def test_job_parameters_tuning_defaults_from_config():

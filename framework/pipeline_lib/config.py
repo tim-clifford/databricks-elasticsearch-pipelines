@@ -525,7 +525,7 @@ def require_retry_backoff_seconds(value: object, where: str) -> str:
         raise PipelineConfigError(f"{where} must be a non-negative number of seconds, got {value!r}")
     try:
         parsed = float(value)
-    except ValueError:
+    except (ValueError, OverflowError):  # OverflowError: an int too large for a float (e.g. 10**400)
         raise PipelineConfigError(f"{where} must be a non-negative number of seconds, got {value!r}")
     if not math.isfinite(parsed) or parsed < 0:
         raise PipelineConfigError(f"{where} must be a non-negative number of seconds, got {value!r}")
