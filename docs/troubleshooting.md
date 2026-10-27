@@ -160,9 +160,9 @@ the job's identity can read the volume ([Environment Setup](setup.md#connector-w
 
 ### Connector wheel too old
 
-`wheel_path: databricks-es-connector 0.9.7 is older than the framework's minimum 0.10.0; ...`
+`wheel_path: databricks-es-connector 0.10.0 is older than the framework's minimum 1.0.0; ...`
 
-`wheel_path` points at a connector release the framework doesn't support. Point it at a 0.10.0 or later
+`wheel_path` points at a connector release the framework doesn't support. Point it at a 1.0.0 or later
 wheel and redeploy ([Environment Setup](setup.md#connector-wheel)).
 
 ### Host config empty for the target
@@ -230,17 +230,30 @@ returned per-document results, so its documents are counted as rejected (one sam
 Find out why before changing anything: an overloaded ES host needs less pressure (lower
 `write_concurrency` or the partition count), and requests that are too heavy need a smaller
 [`chunk_size`](parameters.md#chunk_size). Raise `request_timeout` only when the host is healthy and
-requests legitimately take longer. With
-[`retry_transport_timeout`](parameters.md#retry_transport_timeout) on (recommended), `bulk_stats` shows
-how many sends timed out. See [Throughput Tuning](throughput.md#timeouts-and-retries).
+requests legitimately take longer. The connector retries a timed-out request (see
+[`max_retries_per_request`](parameters.md#max_retries_per_request)), so this error means every retry
+timed out too; `bulk_stats` shows how many sends timed out (`timeouts`). See
+[Throughput Tuning](throughput.md#timeouts-and-retries).
 
 ### 429 rejections
 
-`es_rejected_execution_exception`, or `rejected(429=...)` in the `BULK_STATS` output
+ES rejects writes with a 429 (`es_rejected_execution_exception`) in two ways, and the message tells you
+which:
 
-ES's write queue is full. [`max_retries_per_doc`](parameters.md#max_retries_per_doc) retries those
-documents with backoff, which absorbs brief bursts. If 429s are steady, lower the pressure:
-`write_concurrency`, the partition count, or cores ([Reading the signals](#reading-the-signals)).
+- **Whole request (indexing pressure).** `EsWriteError: ... <chunk_size> document(s) rejected ...
+  ApiError(429, 'es_rejected_execution_exception' ...)`, with an error sample whose `op_type` is `bulk`
+  and whose `status` is None, and `retry_status(sends=...)` in the `BULK_STATS` output. ES had too much
+  bulk data in flight and rejected the entire request, so every document in the chunk counts as
+  rejected. The connector already retried it [`max_retries_per_request`](parameters.md#max_retries_per_request)
+  times with backoff; the error means the pressure outlasted those retries.
+- **Per document (write queue full).** Individual documents in a successful request are rejected,
+  shown as `rejected(429=...)`. [`max_retries_per_doc`](parameters.md#max_retries_per_doc) retries those
+  documents with backoff, which absorbs brief bursts.
+
+Either way, if 429s are steady, lower the pressure: `write_concurrency`, `chunk_size` (smaller requests
+put less data in flight at once), the partition count, or cores
+([Reading the signals](#reading-the-signals)). To ride out longer bursts instead, give the retries more
+time with [`retry_backoff_initial`](parameters.md#retry_backoff_initial) or `max_retries_per_request`.
 
 ### Slow writes with no errors
 
@@ -256,13 +269,14 @@ signals tell you which side of the balance a feed is on; the levers are explaine
 
 | You see | It means | Try |
 |---|---|---|
-| 429 rejections (`rejected(429=...)`), or `took_ms` rising run over run | ES is under too much pressure | lower `write_concurrency` or the partition count |
+| 429 rejections (`rejected(429=...)` or `retry_status(sends=...)`), or `took_ms` rising run over run | ES is under too much pressure | lower `write_concurrency`, `chunk_size` or the partition count |
 | `rtt_ms` far above `took_ms`, no 429s, executors idle | the write is waiting on round trips | raise `write_concurrency`, or add partitions or cores |
 | `gil_wait_ms_total` a large share of `wall_ms` on the `tail:` line, with `rtt_ms` rising while `took_ms` doesn't on the `overall` line | a partition's threads are waiting for the GIL, not for ES ([why](throughput.md#python-threads-and-the-gil)) | lower `write_concurrency` and get the parallelism from more cores (with enough partitions to use them) instead |
 | a high `wall_max/median` or `stragglers>2x` in the `tail:` line | uneven partitions; the slowest sets the pace | `write_repartition` for evenly sized partitions, or a smaller `max_partition_bytes` |
 | a high `docs_max/median` in the `tail:` line | rows are unevenly spread across partitions | `write_repartition` |
 | `docs/send` well below `chunk_size` | requests are smaller than you asked for | `chunk_size` is above the Arrow batch size or some other limit, so raising it does nothing; look at the other levers instead |
-| `timeout_sends` climbing (with `retry_transport_timeout` on) | requests are timing out and being retried | find out whether ES is overloaded (lower the pressure) or requests are too big (smaller `chunk_size`); raise `request_timeout` only for a healthy host |
+| `timeouts(sends=...)` climbing | requests are timing out and being retried | find out whether ES is overloaded (lower the pressure) or requests are too big (smaller `chunk_size`); raise `request_timeout` only for a healthy host |
+| `backoff_ms` a large share of the batch time | the connector is waiting out pushback between retries | lower the pressure; the retries are landing the data but costing time |
 
 ## Falling behind
 

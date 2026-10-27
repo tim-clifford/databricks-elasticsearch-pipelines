@@ -221,17 +221,18 @@ When requests are slow rather than rejected, these decide what happens:
 - [`request_timeout`](parameters.md#request_timeout) is how long one request may take. Too short fails
   requests a slow-but-working ES would have finished; too long holds a thread on a request that won't
   come back. It and `chunk_size` are separate levers: change each for its own reason.
-- [`transport_max_retries`](parameters.md#transport_max_retries) is how many times a whole request is
-  re-sent after it fails (a timeout, a connection error, or a 429 or 503 on the request). Each timed-out
-  attempt waits a full `request_timeout`, so a higher value lets a batch ride out a brief slowdown but can
-  stretch a batch a long way before it fails and Spark retries the task.
-- [`retry_transport_timeout`](parameters.md#retry_transport_timeout) decides who re-sends a timed-out
-  request: the connector, with backoff and a record in `bulk_stats` (`timeout_sends`, `timeout_wait_ms`),
-  instead of the ES client, invisibly. Turn it on for every feed: it changes nothing until a timeout
-  happens, and then shows how often requests time out and how much time retries cost.
+- [`max_retries_per_request`](parameters.md#max_retries_per_request) is how many times the connector
+  re-sends a whole request after it fails (a timeout, a connection error, or a 429, 502, 503 or 504 on
+  the request). Each timed-out attempt waits a full `request_timeout`, and every retry also waits the
+  backoff, so a higher value lets a batch ride out a brief slowdown but can stretch a batch a long way
+  before it fails and Spark retries the task.
+- [`retry_backoff_initial`](parameters.md#retry_backoff_initial) and
+  [`retry_backoff_max`](parameters.md#retry_backoff_max) set the wait between retries (2s doubling to
+  30s by default). The wait is what gives an ES cluster under indexing pressure time to recover, and
+  `bulk_stats` shows its total as `backoff_ms`.
 - [`max_retries_per_doc`](parameters.md#max_retries_per_doc) is the separate retry for documents ES
-  rejects with a 429. It buys time for a briefly full queue, with backoff. It is not a capacity fix: if
-  429s are steady, lower the pressure instead.
+  rejects with a 429. It buys time for a briefly full queue, with the same backoff. It is not a capacity
+  fix: if 429s are steady, lower the pressure instead.
 
 ### Fast path
 

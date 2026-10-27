@@ -517,7 +517,7 @@ def test_bulk_stats_cpu_and_gil_render_na_when_absent():
 
 def test_bulk_stats_partial_cpu_gil_presence_renders_na_not_partial_total():
     # A field present on SOME partitions but not all (a connector-version mix) must NOT be summed into
-    # a total that looks cluster-wide -- that would understate contention. It reads n/a until uniform.
+    # a total that looks cluster-wide - that would understate contention. It reads n/a until uniform.
     # part0 carries cpu+gil, part1 does not.
     mixed = [
         {"n_sends": 5, "docs_sent": 100, "send_busy_ms": 50.0, "partition_wall_ms": 50.0,

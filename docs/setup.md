@@ -37,7 +37,7 @@ in order. Each setting mentioned here is defined in the [Parameters Reference](p
 Every feed job installs the [databricks-es-connector](/../../../databricks-es-connector)
 wheel from the UC Volume path in [`wheel_path`](parameters.md#wheel_path). Keep the wheel's standard
 filename (`databricks_es_connector-<version>-py3-none-any.whl`), which carries the version. The framework
-requires connector **0.10.0 or later**: every feed run checks the installed version first and fails with
+requires connector **1.0.0 or later**: every feed run checks the installed version first and fails with
 a clear message, before reading or sending anything, on an older wheel. Two ways to get it there:
 
 - **Upload a wheel** you built or downloaded, with the Catalog Explorer or the Databricks CLI.
@@ -196,8 +196,8 @@ at the top level for every target, or in one target's `variables` block:
 variables:
   pipeline_mode:
     default: batch                 # the mode most feeds use; the run fails if nothing sets it
-  retry_transport_timeout:
-    default: "true"                # recommended for every feed
+  max_retries_per_request:
+    default: "5"                   # more whole-request retries (with backoff) for every feed
 targets:
   prd:
     variables:

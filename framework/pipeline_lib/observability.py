@@ -42,7 +42,7 @@ def _ts_token(now=None):
     """Wall-clock `ts=<ISO-8601 UTC, ms>Z` token appended to each emitted line so the trail can be
     placed in real time and correlated with ES/cluster metrics. It matters most for the streaming
     BULK_STATS relay: `foreachBatch` BUILDS the line server-side, but the notebook PRINTS it client-side
-    later, so the driver log's own line timestamp is the relay time, not the batch time -- this token
+    later, so the driver log's own line timestamp is the relay time, not the batch time - this token
     captures the batch time at the moment the line is built. `now=None` reads the current UTC time; tests
     pass a fixed datetime. Fail-soft: returns '' if the clock read fails, so a formatter never raises."""
     try:

@@ -263,7 +263,7 @@ from pipeline_lib.checkpoint import EMPTY, HAS_OFFSET, checkpoint_offsets_state 
 # The streaming wait loop (pure, duck-typed query; unit-tested off-cluster with a fake query).
 from pipeline_lib.stream_wait import await_stream as _await_stream  # noqa: E402
 
-# The framework supports connector 0.10.0 and later (MIN_CONNECTOR_VERSION). Checked once here, before any
+# The framework supports connector 1.0.0 and later (MIN_CONNECTOR_VERSION). Checked once here, before any
 # config load or export work, so an older wheel fails the run with one clear message.
 require_connector_version(_connector_version, "wheel_path")
 

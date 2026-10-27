@@ -493,11 +493,18 @@ before raising it: an overloaded ES host needs less pressure, not a longer wait,
 holds a thread on a request that may never return. Raise it when ES is healthy but large requests
 legitimately take longer. See [Throughput Tuning](throughput.md#timeouts-and-retries).
 
-### `transport_max_retries`
+### `max_retries_per_request`
 
-How many times the ES client re-sends a whole request after a transport failure (a connection reset or
-timeout, or a 429 or 503 on the bulk call itself). A non-negative integer; `0` disables. Connector
-default `3`.
+How many times the connector re-sends a whole bulk request that failed: it timed out, the connection
+was refused or dropped, or ES answered the whole request with a 429, 502, 503 or 504. A 429 on the
+whole request is ES indexing pressure: the cluster has too much bulk data in flight and rejects the
+entire request. A non-negative integer; `0` disables. Connector default `3`.
+
+The connector runs every retry itself and waits between attempts (see
+[`retry_backoff_initial`](#retry_backoff_initial)), so a cluster that is pushing back gets time to
+recover. The Elasticsearch client's own retries are always off: they re-send immediately, which uses
+up the whole budget in milliseconds. A request that still fails after the last retry counts its whole
+chunk as errors, which fails the batch. ([Why the connector manages retries](technical-details.md#connector-managed-retries).)
 
 It retries only whole requests that fail. When a request succeeds but ES rejects some of the documents
 in it (per-document 429s in the response), those documents are retried by
@@ -506,27 +513,34 @@ in it (per-document 429s in the response), those documents are retried by
 ### `max_retries_per_doc`
 
 How many times the connector re-sends an individual document that ES rejects with a 429 (the write
-queue is full), with exponential backoff. A non-negative integer; `0` disables. Connector default `3`.
+queue is full). A non-negative integer; `0` disables. Connector default `3`. It waits between attempts
+with the same backoff as [`max_retries_per_request`](#max_retries_per_request).
 
-Reach for this, not `transport_max_retries`, when a feed sees 429s under load. Raising it far
-multiplies backoff time within the partition; the real ceiling is ES's write capacity. The connector
-warns if this is `0` while `transport_max_retries` is raised above its connector default of 3. That
+Reach for this, not `max_retries_per_request`, when a feed sees per-document 429s under load. Raising it
+far multiplies backoff time within the partition; the real ceiling is ES's write capacity. The connector
+warns if this is `0` while `max_retries_per_request` is raised above its connector default of 3. That
 combination looks like an attempt to ride out backpressure, but it can't: ES returns per-document 429s
-inside a successful bulk response, which `transport_max_retries` never sees, so with this at `0` a 429'd
-document gets no retry at all, whatever `transport_max_retries` is set to.
+inside a successful bulk response, which `max_retries_per_request` never sees, so with this at `0` a
+429'd document gets no retry at all, whatever `max_retries_per_request` is set to.
 
-### `retry_transport_timeout`
+### `retry_backoff_initial`
 
-`true` makes the connector own whole-request timeout retries: a bulk send that exceeds `request_timeout`
-is re-sent with backoff (up to `transport_max_retries` times) instead of the ES client re-sending it
-silently and then failing the batch. Connector default off.
+Seconds the connector waits before the first retry. Each later retry doubles the wait, up to
+[`retry_backoff_max`](#retry_backoff_max): retry n waits
+`min(retry_backoff_initial * 2^(n-1), retry_backoff_max)` seconds. Applies to both retry layers. A
+non-negative number (decimals allowed); `0` retries without waiting. Connector default `2`, so the
+defaults wait 2s, 4s, 8s, 16s, then 30s.
 
-It only changes timeout handling; connection resets and 429 or 503 responses are retried as before.
-With `bulk_stats` on, the cost shows as `timeout_sends` and `timeout_wait_ms`.
+The wait blocks the thread that is sending, which is what relieves an overloaded cluster, and it also
+sets how long a failing request takes to give up: with the defaults, 3 retries wait 14 seconds in total.
+Raise it (or [`max_retries_per_request`](#max_retries_per_request)) when indexing-pressure 429s outlast
+the default retries. With `bulk_stats` on, the time spent waiting shows as `backoff_ms`.
 
-**Recommendation:** turn it on for every feed (set the global `${var.retry_transport_timeout}` to
-`true`). It changes nothing until a request times out, and then makes the timeouts and the time spent
-retrying them visible. ([Why it exists](technical-details.md#retry-transport-timeout).)
+### `retry_backoff_max`
+
+Cap, in seconds, on any single retry wait. A non-negative number, at least the effective
+[`retry_backoff_initial`](#retry_backoff_initial) (the run fails before writing otherwise). Connector
+default `30`.
 
 ### `op_type`
 
@@ -752,9 +766,10 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`chunk_size`](#chunk_size) | Knob | global, config, `--params` | documents per bulk request |
 | [`write_concurrency`](#write_concurrency) | Knob | global, config, `--params` | bulk requests in flight at once per write partition |
 | [`request_timeout`](#request_timeout) | Knob | global, config, `--params` | the per-request ES client timeout, in seconds |
-| [`transport_max_retries`](#transport_max_retries) | Knob | global, config, `--params` | retries of a whole bulk request after a transport failure |
+| [`max_retries_per_request`](#max_retries_per_request) | Knob | global, config, `--params` | retries of a whole bulk request that timed out, lost its connection, or got a 429/502/503/504 |
 | [`max_retries_per_doc`](#max_retries_per_doc) | Knob | global, config, `--params` | retries of a single document ES rejects with a 429 |
-| [`retry_transport_timeout`](#retry_transport_timeout) | Knob | global, config, `--params` | has the connector retry timed-out bulk requests itself, with backoff |
+| [`retry_backoff_initial`](#retry_backoff_initial) | Knob | global, config, `--params` | seconds before the first retry, doubling each retry |
+| [`retry_backoff_max`](#retry_backoff_max) | Knob | global, config, `--params` | cap in seconds on any single retry wait |
 | [`op_type`](#op_type) | Knob | global, config, `--params` | `index` (overwrite by `_id`) or `create` (append only) |
 | [`bypass_fast_path`](#bypass_fast_path) | Knob | global, config, `--params` | checks every document's result on the first send |
 | [`require_existing_index`](#require_existing_index) | Knob | global, config, `--params` | fails the run if the ES index doesn't exist, instead of letting ES create it |

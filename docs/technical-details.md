@@ -26,7 +26,7 @@ This document explains the rationale behind the framework's design decisions, ed
   - [Monitoring table layout](#liquid-clustering)
   - [Why cluster log delivery is opt-in](#cluster-log-delivery-opt-in)
 - [Writing to Elasticsearch](#writing-to-elasticsearch)
-  - [Why retry_transport_timeout exists](#retry-transport-timeout)
+  - [Why the connector manages retries](#connector-managed-retries)
 - [Generation and deployment](#generation-and-deployment)
   - [Generation reads only top-level defaults](#generation-reads-only-top-level-defaults)
   - [op_type create miscount](#op_type-create-miscount)
@@ -195,14 +195,14 @@ Cluster log delivery (`cluster_log_conf`) is deliberately not injected into ever
 
 ## Writing to Elasticsearch
 
-<a id="retry-transport-timeout"></a>
-### Why retry_transport_timeout exists
+<a id="connector-managed-retries"></a>
+### Why the connector manages retries
 
-When a bulk request takes longer than `request_timeout`, the outcome is unknown: ES may or may not have applied it. By default the Elasticsearch Python client handles that inside its transport layer. It re-sends the same request right away, up to `transport_max_retries` times, each attempt waiting a full `request_timeout`, and the connector sees nothing until the last attempt fails. A run of timeouts therefore shows up only as a slow batch, with no record of how many sends timed out or how long the retries took.
+The Elasticsearch Python client can retry a failed request in its transport layer, but it re-sends right away. With a single ES host there is no other node to try, so nothing waits: a cluster rejecting requests under indexing pressure (a 429 on the whole bulk request) gets the same request again within milliseconds, the client's whole retry budget is spent before the pressure eases, and the chunk fails. Those retries are also invisible: the connector sees only the last failure.
 
-With `retry_transport_timeout` on, the connector builds its client with the transport's timeout retry turned off and does the retry itself: on a timeout only, it waits with exponential backoff (2 seconds, doubling, at most 30) and re-sends the chunk, within the same `transport_max_retries` budget. Every attempt, failed ones included, is recorded in `bulk_stats` (`timeout_sends`, `timeout_wait_ms`), so the cost of timeouts is visible, and the backoff gives a busy ES host time to recover instead of receiving the same request again at once. Connection resets and 429 or 503 responses are still retried by the transport, as before. A re-sent chunk is applied again, which is an overwrite with `es_id_field` set and a duplicate without it, the same as any other retry.
+So the connector builds every client with the transport's retries turned off and runs every retry itself, for every call it makes to ES. It retries a timeout, a connection error, or a whole-request 429, 502, 503 or 504, up to [`max_retries_per_request`](parameters.md#max_retries_per_request) times, and waits with exponential backoff between attempts ([`retry_backoff_initial`](parameters.md#retry_backoff_initial), doubling, at most [`retry_backoff_max`](parameters.md#retry_backoff_max)). The wait blocks the sending thread, so a cluster under pressure gets time to recover. Any other failure (a 400, an auth error) fails on its first attempt. Every attempt and every wait is recorded in `bulk_stats` (`timeouts`, `conn_errors`, `retry_status`, `backoff_ms`), so the cost of retries is visible. A re-sent chunk is applied again, which is an overwrite with `es_id_field` set and a duplicate without it, the same as any other retry.
 
-The logic is in the connector (`retry_transport_timeout` in `EsWriteConfig`, and the bulk sender in `bulk.py`).
+The logic is in the connector (`retry.py`, used by the bulk sender in `bulk.py` and the reader in `read.py`).
 
 ## Generation and deployment
 
