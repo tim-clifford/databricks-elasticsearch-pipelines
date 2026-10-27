@@ -399,7 +399,7 @@ def _require_global_var_declared(name: str, validator, path: str | None = None,
     """Fail closed at GENERATION if databricks.yml declares no `<name>` variable, or its static default
     fails `validator` (the SAME require_* helper the runner applies to the effective value).
 
-    A config that OMITS a globally-defaulted knob (bulk_stats, request_timeout, transport_max_retries)
+    A config that OMITS a globally-defaulted knob (bulk_stats, request_timeout, max_retries_per_request)
     has its job-parameter default baked as ${var.<name>}. If the variable is not declared that reference
     would fail only at deploy with a confusing error, so require its declaration here (mirrors
     require_job_name_prefix_declared). Validating the declared default with the runner's own validator

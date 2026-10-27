@@ -224,12 +224,19 @@ def bulk_stats_overall(bulk_stats):
         "http_ms_max": _max("http_ms_max"),
         "took_ms_mean": _weighted_mean("took_ms_mean"),
         "took_ms_max": _max("took_ms_max"),
-        # Failed-send accounting (connector 0.9.7+): count and wall time of sends that RAISED, split by
-        # timeout vs other transport error. None on older wheels.
+        # Failed-send accounting: count and wall time of sends that RAISED, by failure kind (timeout,
+        # connection error, a whole-request status in the connector's retry list such as an
+        # indexing-pressure 429, or any other error), plus the time the connector spent waiting between
+        # retries. None when a partition lacks the field.
         "timeout_sends": _sum_opt("timeout_sends"),
         "timeout_wait_ms": _rounded(_sum_opt("timeout_wait_ms"), 1),
+        "connection_error_sends": _sum_opt("connection_error_sends"),
+        "connection_error_wait_ms": _rounded(_sum_opt("connection_error_wait_ms"), 1),
+        "retry_status_sends": _sum_opt("retry_status_sends"),
+        "retry_status_wait_ms": _rounded(_sum_opt("retry_status_wait_ms"), 1),
         "error_sends": _sum_opt("error_sends"),
         "error_wait_ms": _rounded(_sum_opt("error_wait_ms"), 1),
+        "backoff_sleep_ms": _rounded(_sum_opt("backoff_sleep_ms"), 1),
         # Retry/reject accounting (connector 0.9.7+): docs re-sent for a retryable 429, and non-2xx item
         # responses bucketed by status (transient 429/503 vs permanent 400/409). None on older wheels.
         "docs_retried": _sum_opt("docs_retried"),
@@ -305,7 +312,10 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
             f"http_ms(mean={_num(o['http_ms_mean'])} max={_num(o['http_ms_max'])}) "
             f"took_ms(mean={_num(o['took_ms_mean'])} max={_num(o['took_ms_max'])}) "
             f"timeouts(sends={_num(o['timeout_sends'])} wait_ms={_num(o['timeout_wait_ms'])}) "
+            f"conn_errors(sends={_num(o['connection_error_sends'])} wait_ms={_num(o['connection_error_wait_ms'])}) "
+            f"retry_status(sends={_num(o['retry_status_sends'])} wait_ms={_num(o['retry_status_wait_ms'])}) "
             f"errors(sends={_num(o['error_sends'])} wait_ms={_num(o['error_wait_ms'])}) "
+            f"backoff_ms={_num(o['backoff_sleep_ms'])} "
             f"retried={_num(o['docs_retried'])} "
             f"rejected(429={_num(o['rejected_429'])} 409={_num(o['rejected_409'])} "
             f"4xx={_num(o['rejected_4xx_other'])} 5xx={_num(o['rejected_5xx'])}) "
@@ -330,7 +340,12 @@ def format_bulk_stats(bulk_stats, oneline=False, now=None):
                 f"docs={_num(p.get('docs_sent'))} bytes/doc={_num(_rounded(bytes_per_doc, 1))} "
                 f"conc={_num(_rounded(conc, 2))} cpu_ms={_num(p.get('send_cpu_ms'))} "
                 f"timeouts(sends={_num(p.get('timeout_sends'))} wait_ms={_num(p.get('timeout_wait_ms'))}) "
+                f"conn_errors(sends={_num(p.get('connection_error_sends'))} "
+                f"wait_ms={_num(p.get('connection_error_wait_ms'))}) "
+                f"retry_status(sends={_num(p.get('retry_status_sends'))} "
+                f"wait_ms={_num(p.get('retry_status_wait_ms'))}) "
                 f"errors(sends={_num(p.get('error_sends'))} wait_ms={_num(p.get('error_wait_ms'))}) "
+                f"backoff_ms={_num(p.get('backoff_sleep_ms'))} "
                 f"retried={_num(p.get('docs_retried'))} "
                 f"rejected(429={_num(p.get('rejected_429'))} 409={_num(p.get('rejected_409'))} "
                 f"4xx={_num(p.get('rejected_4xx_other'))} 5xx={_num(p.get('rejected_5xx'))}) "
@@ -445,6 +460,8 @@ def bulk_stats_tail(result):
             "slowest_http_ms_max": _val(sp, "http_ms_max"),
             "slowest_took_ms_max": _val(sp, "took_ms_max"),
             "slowest_timeout_wait_ms": _val(sp, "timeout_wait_ms"),
+            "slowest_retry_status_sends": _val(sp, "retry_status_sends"),
+            "slowest_backoff_sleep_ms": _val(sp, "backoff_sleep_ms"),
             "slowest_rejected_429": _val(sp, "rejected_429"),
             "slowest_docs_retried": _val(sp, "docs_retried"),
             "slowest_docs_deduped": _val(sp, "docs_deduped"),
@@ -498,7 +515,8 @@ def format_tail_summary(result, now=None):
         # concurrency, and docs. gil_wait_ms_total on the slowest partition is a first-class "why it lagged"
         # signal: a large value beside a large rtt_ms_max says the tail is GIL starvation (the worker could
         # not read the ES response), not the network / ES queue. timeout_wait_ms says the tail is time spent
-        # on connector-owned timeout re-sends (retry_transport_timeout). http_ms_max sits between rtt and
+        # on timed-out sends; retry_status_sends + backoff_sleep_ms say it is whole-request pushback (e.g. an
+        # indexing-pressure 429) and the connector's waits between retries. http_ms_max sits between rtt and
         # took (network vs ES). rejected_429 + docs_retried say the tail is item-level 429 backpressure (ES
         # write queue full); docs_deduped says it is create-mode dedup of a resend (op_type=create,
         # 0.10.0+). All n/a on connectors without them (pre-0.9.7 / pre-0.10.0).
@@ -509,6 +527,8 @@ def format_tail_summary(result, now=None):
                     f"http_ms_max={_num(t['slowest_http_ms_max'])} "
                     f"took_ms_max={_num(t['slowest_took_ms_max'])} "
                     f"timeout_wait_ms={_num(t['slowest_timeout_wait_ms'])} "
+                    f"retry_status_sends={_num(t['slowest_retry_status_sends'])} "
+                    f"backoff_ms={_num(t['slowest_backoff_sleep_ms'])} "
                     f"rejected_429={_num(t['slowest_rejected_429'])} "
                     f"docs_retried={_num(t['slowest_docs_retried'])} "
                     f"docs_deduped={_num(t['slowest_docs_deduped'])} "

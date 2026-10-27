@@ -143,7 +143,7 @@ def test_job_notebook_params_found():
                  glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml"))
                  + glob.glob(os.path.join(repo_root, "_pipelines", "resources", "*.job.yml"))}
     assert len(job_files) == 12 and {j for j, _, _ in params} == job_files
-    assert len(params) == 232
+    assert len(params) == 238
 
 
 

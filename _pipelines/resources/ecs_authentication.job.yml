@@ -30,18 +30,20 @@ resources:
         default: ${var.op_type}
       - name: request_timeout
         default: ${var.request_timeout}
-      - name: transport_max_retries
-        default: ${var.transport_max_retries}
+      - name: max_retries_per_request
+        default: ${var.max_retries_per_request}
       - name: max_retries_per_doc
         default: ${var.max_retries_per_doc}
+      - name: retry_backoff_initial
+        default: ${var.retry_backoff_initial}
+      - name: retry_backoff_max
+        default: ${var.retry_backoff_max}
       - name: require_existing_index
         default: ${var.require_existing_index}
       - name: verify_certs
         default: ${var.verify_certs}
       - name: bulk_stats
         default: ${var.bulk_stats}
-      - name: retry_transport_timeout
-        default: ${var.retry_transport_timeout}
       - name: bypass_fast_path
         default: ${var.bypass_fast_path}
       - name: streaming_start

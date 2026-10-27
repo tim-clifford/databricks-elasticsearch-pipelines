@@ -724,9 +724,10 @@ def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
 
 
 @pytest.mark.parametrize("name,bad", [
-    ("bulk_stats", "on"), ("retry_transport_timeout", "yes"), ("bypass_fast_path", "1"),
+    ("bulk_stats", "on"), ("retry_backoff_initial", "-1"), ("retry_backoff_max", "soon"),
+    ("bypass_fast_path", "1"),
     ("verify_certs", "maybe"), ("require_existing_index", "nope"),
-    ("request_timeout", "abc"), ("transport_max_retries", "-1"), ("max_retries_per_doc", "-1"),
+    ("request_timeout", "abc"), ("max_retries_per_request", "-1"), ("max_retries_per_doc", "-1"),
     ("pipeline_mode", "turbo"), ("op_type", "has space"), ("streaming_start", "sideways"),
     ("write_repartition", "-5"), ("max_partition_bytes", "32x"), ("chunk_size", "0"),
     ("monitoring_log_enabled", "maybe"), ("log_monitor_source_lookback_seconds", "-1"),
@@ -755,19 +756,22 @@ def test_require_runtime_knobs_declared_accepts_scalar_shorthand(tmp_path):
 # --- render guards: an omitted knob bakes its ${var.<name>} global ref, a set knob bakes its literal ---
 
 
-def test_render_singleton_omitted_retry_transport_timeout_bakes_global_ref():
+@pytest.mark.parametrize("name", ["retry_backoff_initial", "retry_backoff_max"])
+def test_render_singleton_omitted_retry_backoff_bakes_global_ref(name):
     cfg = _cfg()
     text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
     job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
-    assert {"name": "retry_transport_timeout", "default": "${var.retry_transport_timeout}"} in job["parameters"]
+    assert {"name": name, "default": f"${{var.{name}}}"} in job["parameters"]
+    assert all(p["name"] != "retry_transport_timeout" for p in job["parameters"])
 
 
-def test_render_singleton_set_retry_transport_timeout_bakes_literal():
+@pytest.mark.parametrize("name", ["retry_backoff_initial", "retry_backoff_max"])
+def test_render_singleton_set_retry_backoff_bakes_literal(name):
     cfg = _cfg()
-    cfg["retry_transport_timeout"] = "true"
+    cfg[name] = "5.0"
     text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
     job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
-    assert {"name": "retry_transport_timeout", "default": "true"} in job["parameters"]
+    assert {"name": name, "default": "5.0"} in job["parameters"]
 
 
 def test_render_singleton_omitted_bypass_fast_path_bakes_global_ref():
