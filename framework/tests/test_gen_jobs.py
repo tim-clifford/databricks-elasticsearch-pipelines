@@ -2021,3 +2021,37 @@ def test_old_root_resources_file_or_dangling_link_also_blocks(tmp_path, monkeypa
     old.symlink_to(tmp_path / "nowhere")
     assert gen_jobs.old_root_resources_dir() == str(old)
     assert gen_jobs.main(["--check"]) == 1
+
+
+# --- the retry backoff pair is checked at generation ---------------------------------------------
+
+def _bundle_with(initial="", maximum=""):
+    return {"variables": {"retry_backoff_initial": {"default": initial}, "retry_backoff_max": maximum}}
+
+
+@pytest.mark.parametrize("cfg_vals, globals_, ok", [
+    ({}, ("", ""), True),                                    # all unset: connector defaults (2 / 30)
+    ({"retry_backoff_initial": "5.0", "retry_backoff_max": "60.0"}, ("", ""), True),
+    ({"retry_backoff_initial": "10.0", "retry_backoff_max": "5.0"}, ("", ""), False),   # config pair inverted
+    ({}, ("60", "30"), False),                               # global pair inverted
+    ({"retry_backoff_initial": "60.0"}, ("", "30"), False),  # config initial over the global max
+    ({"retry_backoff_max": "1.0"}, ("5", ""), False),        # config max under the global initial
+    ({"retry_backoff_max": "90.0"}, ("60", "30"), True),     # config overrides the inverted global max
+    ({"retry_backoff_initial": "60.0"}, ("", ""), True),     # one side unset at both layers: run-time check
+    ({"retry_backoff_initial": "0.0", "retry_backoff_max": "0.0"}, ("", ""), True),
+])
+def test_require_retry_backoff_pair(cfg_vals, globals_, ok):
+    cfg = {**_cfg(), **cfg_vals}
+    doc = _bundle_with(*globals_)
+    if ok:
+        gen_jobs.require_retry_backoff_pair(cfg, doc, "x.yml")
+    else:
+        with pytest.raises(ValueError, match="retry_backoff_max .* is below retry_backoff_initial"):
+            gen_jobs.require_retry_backoff_pair(cfg, doc, "x.yml")
+
+
+def test_shipped_bundle_and_configs_pass_the_backoff_pair_check():
+    # The real databricks.yml globals with every shipped pipeline config.
+    doc = gen_jobs._read_bundle_doc()
+    for path in gen_jobs.discover_configs():
+        gen_jobs.require_retry_backoff_pair(gen_jobs.load_config(path), doc, path)

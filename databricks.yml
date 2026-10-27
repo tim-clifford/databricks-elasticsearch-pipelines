@@ -349,10 +349,12 @@ variables:
   # defaults apply everywhere; set them per target below (or --var) to change them target-wide. A legal
   # request_timeout is "" or a positive integer of seconds; a legal max_retries_per_request /
   # max_retries_per_doc is "" or a non-negative integer (0 disables that layer's retries); a legal
-  # retry_backoff_initial / retry_backoff_max is "" or a non-negative number of seconds. Each value is
-  # validated on its own at generation and at run; the cross-field rule (retry_backoff_max >= the effective
-  # retry_backoff_initial) is checked when the run builds the connector config, before anything is
-  # written. Like the other simple string vars they accept --var=request_timeout=120 at deploy.
+  # retry_backoff_initial / retry_backoff_max is "" or a non-negative number of seconds, and the effective
+  # retry_backoff_max must be >= the effective retry_backoff_initial. Each value is validated at generation
+  # and at run. The pair is checked at generation when both sides are known there (a pipeline value or
+  # these globals); a side left to the connector default, or set per target / --var, is checked when the
+  # run builds the connector config, before anything is written. Like the other simple string vars they
+  # accept --var=request_timeout=120 at deploy.
   request_timeout:
     description: "Global default for EsWriteConfig request_timeout (per-request ES client timeout, seconds). Empty default (connector default applies). A pipeline's own request_timeout and a per-run --params override this. Set per target/--var to raise it target-wide."
     default: ""

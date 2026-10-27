@@ -539,8 +539,9 @@ the default retries. With `bulk_stats` on, the time spent waiting shows as `back
 ### `retry_backoff_max`
 
 Cap, in seconds, on any single retry wait. A non-negative number, at least the effective
-[`retry_backoff_initial`](#retry_backoff_initial) (the run fails before writing otherwise). Connector
-default `30`.
+[`retry_backoff_initial`](#retry_backoff_initial). Generation rejects a pair it can see is inverted (a
+feed's config values or the `databricks.yml` globals); any other inverted pair fails the run before it
+writes. Connector default `30`.
 
 ### `op_type`
 
