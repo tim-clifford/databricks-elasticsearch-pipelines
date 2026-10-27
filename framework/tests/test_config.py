@@ -2758,3 +2758,40 @@ def test_runner_checks_connector_version_once_before_config_load():
     assert names_import and config_load
     assert calls[0] < names_import.start() and calls[0] < config_load.start()
     assert "_VERSION_GATED_KNOBS" not in src
+
+
+# The connector backoff defaults the generator relies on are pinned in the framework; the runner checks the
+# installed connector still has them.
+def test_connector_retry_backoff_defaults_are_canonical():
+    from pipeline_lib.config import CONNECTOR_RETRY_BACKOFF_DEFAULTS
+    assert CONNECTOR_RETRY_BACKOFF_DEFAULTS == {"retry_backoff_initial": "2.0", "retry_backoff_max": "30.0"}
+
+
+def test_require_connector_retry_defaults_accepts_the_pinned_values():
+    from pipeline_lib.config import require_connector_retry_defaults
+    require_connector_retry_defaults({"retry_backoff_initial": 2.0, "retry_backoff_max": 30.0, "other": 1})
+    require_connector_retry_defaults({"retry_backoff_initial": 2, "retry_backoff_max": 30})
+
+
+@pytest.mark.parametrize("installed, match", [
+    ({"retry_backoff_initial": 3.0, "retry_backoff_max": 30.0}, "retry_backoff_initial default is 3.0"),
+    ({"retry_backoff_initial": 2.0, "retry_backoff_max": 60.0}, "retry_backoff_max default is 60.0"),
+    ({"retry_backoff_max": 30.0}, "no retry_backoff_initial default"),
+    ({}, "no retry_backoff_initial default"),
+])
+def test_require_connector_retry_defaults_fails_closed_on_drift(installed, match):
+    from pipeline_lib.config import require_connector_retry_defaults
+    with pytest.raises(PipelineConfigError, match=match):
+        require_connector_retry_defaults(installed, "wheel_path")
+
+
+def test_runner_checks_connector_retry_defaults_after_the_version_check():
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks",
+                        "run_index_pipeline.py")
+    src = open(path).read()
+    check = [m.start() for m in re.finditer(r"^require_connector_retry_defaults\(", src, re.M)]
+    version = re.search(r"^require_connector_version\(_connector_version\b", src, re.M)
+    config_load = re.search(r"^cfg = .*\bload_config\(", src, re.M)
+    assert len(check) == 1 and version and config_load
+    assert version.start() < check[0] < config_load.start()
+    assert "_dataclasses.fields(_EsConnection)" in src[check[0]:check[0] + 200]

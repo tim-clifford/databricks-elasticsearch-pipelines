@@ -227,6 +227,7 @@ from pipeline_lib.config import (  # noqa: E402
     apply_view_schema_user,
     load_config,
     render_view_sql,
+    require_connector_retry_defaults,
     require_connector_version,
     require_es_flag,
     require_filter_condition,
@@ -266,6 +267,11 @@ from pipeline_lib.stream_wait import await_stream as _await_stream  # noqa: E402
 # The framework supports connector 1.0.0 and later (MIN_CONNECTOR_VERSION). Checked once here, before any
 # config load or export work, so an older wheel fails the run with one clear message.
 require_connector_version(_connector_version, "wheel_path")
+# The generator checks each feed's retry backoff pair against the connector defaults pinned in the framework;
+# confirm the installed connector still has those defaults.
+import dataclasses as _dataclasses  # noqa: E402
+from databricks_es_connector import EsConnection as _EsConnection  # noqa: E402
+require_connector_retry_defaults({f.name: f.default for f in _dataclasses.fields(_EsConnection)}, "wheel_path")
 
 # The write surface used by the export cells below. Imported after the version check, so an older wheel
 # missing one of these names fails with the check's message rather than an ImportError, and here so the

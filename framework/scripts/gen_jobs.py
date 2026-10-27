@@ -33,6 +33,7 @@ _REPO_ROOT = os.path.dirname(_FRAMEWORK_ROOT)
 sys.path.insert(0, _FRAMEWORK_ROOT)
 from pipeline_lib.config import (  # noqa: E402
     _RUNTIME_KNOBS,
+    CONNECTOR_RETRY_BACKOFF_DEFAULTS,
     PipelineConfigError,
     _require_identifier,
     job_base_parameters,
@@ -460,16 +461,23 @@ def _global_default(name: str, doc: dict) -> str:
 def require_retry_backoff_pair(cfg: dict, doc: dict, where: str) -> None:
     """Fail closed at GENERATION when a pipeline's effective retry_backoff_max is below its effective
     retry_backoff_initial, wherever each side comes from (the pipeline's own config value, else the
-    databricks.yml global default). The connector would reject the pair when the run builds its config,
-    so every run of that pipeline would fail; catching it here keeps it from deploying. A pair with one
-    side unset at both layers takes the connector's own default for that side, which the framework does
-    not know, so the connector's check at run time covers that case. Per-target/--var overrides are
-    deploy-time and likewise checked at run."""
-    initial = cfg.get("retry_backoff_initial") or require_retry_backoff_initial(
-        _global_default("retry_backoff_initial", doc), "retry_backoff_initial (databricks.yml) default")
-    maximum = cfg.get("retry_backoff_max") or require_retry_backoff_max(
-        _global_default("retry_backoff_max", doc), "retry_backoff_max (databricks.yml) default")
-    if initial and maximum and float(maximum) < float(initial):
+    databricks.yml global default, else the connector's own default from CONNECTOR_RETRY_BACKOFF_DEFAULTS,
+    which the runner verifies against the installed connector). The connector would reject the pair when
+    the run builds its config, so every run of that pipeline would fail; catching it here keeps it from
+    deploying.
+
+    The top-level globals are checked as the default every target inherits, even when each target
+    overrides one side: the same rule require_runtime_knobs_declared applies to each global on its own.
+    Per-target and --var values are deploy-time and checked at run."""
+    initial = (cfg.get("retry_backoff_initial")
+               or require_retry_backoff_initial(_global_default("retry_backoff_initial", doc),
+                                                "retry_backoff_initial (databricks.yml) default")
+               or CONNECTOR_RETRY_BACKOFF_DEFAULTS["retry_backoff_initial"])
+    maximum = (cfg.get("retry_backoff_max")
+               or require_retry_backoff_max(_global_default("retry_backoff_max", doc),
+                                            "retry_backoff_max (databricks.yml) default")
+               or CONNECTOR_RETRY_BACKOFF_DEFAULTS["retry_backoff_max"])
+    if float(maximum) < float(initial):
         raise ValueError(
             f"{where}: effective retry_backoff_max ({maximum}) is below retry_backoff_initial ({initial}); "
             "the connector rejects that pair, so every run would fail. Set retry_backoff_max >= "

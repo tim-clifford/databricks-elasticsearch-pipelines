@@ -638,6 +638,31 @@ def require_connector_version(version: object, where: str = "installed connector
     return version
 
 
+# The connector's own retry_backoff_initial / retry_backoff_max defaults (EsConnection, 1.0.0), as the
+# canonical strings require_retry_backoff_* produce. Generation needs them to check a pipeline's effective
+# backoff pair when a side is left to the connector (gen_jobs.require_retry_backoff_pair), and it runs
+# without the connector installed, so they are pinned here. The runner, which has the connector, verifies
+# the installed defaults still match before any export (require_connector_retry_defaults), so this copy
+# cannot drift silently.
+CONNECTOR_RETRY_BACKOFF_DEFAULTS = {"retry_backoff_initial": "2.0", "retry_backoff_max": "30.0"}
+
+
+def require_connector_retry_defaults(installed: dict, where: str = "installed connector") -> None:
+    """Fail closed unless the installed connector's retry backoff defaults equal
+    CONNECTOR_RETRY_BACKOFF_DEFAULTS. `installed` maps each field name to the connector's default value
+    (the runner reads them from EsConnection's dataclass fields). A mismatch means a connector release
+    changed a default the generator's pair check relies on: update CONNECTOR_RETRY_BACKOFF_DEFAULTS."""
+    for name, pinned in CONNECTOR_RETRY_BACKOFF_DEFAULTS.items():
+        if name not in installed:
+            raise PipelineConfigError(f"{where}: databricks-es-connector has no {name} default; "
+                                      "the framework requires connector 1.0.0 or later")
+        actual = require_retry_backoff_seconds(installed[name], f"{where}: {name} default")
+        if actual != pinned:
+            raise PipelineConfigError(
+                f"{where}: databricks-es-connector's {name} default is {actual}, but the framework's "
+                f"CONNECTOR_RETRY_BACKOFF_DEFAULTS pins {pinned}; update it in pipeline_lib/config.py")
+
+
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
                            write_concurrency: object = "", bulk_stats: object = "",
                            request_timeout: object = "", max_retries_per_request: object = "",

@@ -2037,7 +2037,9 @@ def _bundle_with(initial="", maximum=""):
     ({"retry_backoff_initial": "60.0"}, ("", "30"), False),  # config initial over the global max
     ({"retry_backoff_max": "1.0"}, ("5", ""), False),        # config max under the global initial
     ({"retry_backoff_max": "90.0"}, ("60", "30"), True),     # config overrides the inverted global max
-    ({"retry_backoff_initial": "60.0"}, ("", ""), True),     # one side unset at both layers: run-time check
+    ({"retry_backoff_initial": "60.0"}, ("", ""), False),    # over the connector's default max (30)
+    ({"retry_backoff_max": "1.0"}, ("", ""), False),         # under the connector's default initial (2)
+    ({"retry_backoff_initial": "30.0"}, ("", ""), True),     # equal to the connector's default max
     ({"retry_backoff_initial": "0.0", "retry_backoff_max": "0.0"}, ("", ""), True),
 ])
 def test_require_retry_backoff_pair(cfg_vals, globals_, ok):
