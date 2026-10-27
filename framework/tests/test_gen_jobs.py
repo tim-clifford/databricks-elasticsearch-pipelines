@@ -2055,3 +2055,28 @@ def test_shipped_bundle_and_configs_pass_the_backoff_pair_check():
     doc = gen_jobs._read_bundle_doc()
     for path in gen_jobs.discover_configs():
         gen_jobs.require_retry_backoff_pair(gen_jobs.load_config(path), doc, path)
+
+
+def test_main_rejects_an_inverted_backoff_pair_before_writing(tmp_path, monkeypatch):
+    # Wiring: generation runs the pair check on every config, and fails before writing any job file.
+    monkeypatch.chdir(tmp_path)
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    (config_dir / "feed.yml").write_text(
+        "es_index_name: test-index\n"
+        "pipeline_mode: batch\n"
+        "retry_backoff_initial: 10\n"
+        "retry_backoff_max: 5\n"
+        "view: {catalog: c, schema: s, name: v}\n"
+        "source: {catalog: c, schema: s, table: t}\n"
+    )
+    resources_dir = tmp_path / "_pipelines" / "resources"
+    resources_dir.mkdir()
+    dab_yml = _write_bundle_variables(tmp_path)
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    with pytest.raises(ValueError, match="feed.yml: effective retry_backoff_max"):
+        gen_jobs.main(argv=[])
+    assert list(resources_dir.iterdir()) == []
