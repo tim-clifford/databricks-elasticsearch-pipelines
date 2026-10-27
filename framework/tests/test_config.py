@@ -2769,8 +2769,8 @@ def test_connector_retry_backoff_defaults_are_canonical():
 
 def test_require_connector_retry_defaults_accepts_the_pinned_values():
     from pipeline_lib.config import require_connector_retry_defaults
-    require_connector_retry_defaults({"retry_backoff_initial": 2.0, "retry_backoff_max": 30.0, "other": 1})
-    require_connector_retry_defaults({"retry_backoff_initial": 2, "retry_backoff_max": 30})
+    require_connector_retry_defaults({"retry_backoff_initial": 2.0, "retry_backoff_max": 30.0, "other": 1}, 86400)
+    require_connector_retry_defaults({"retry_backoff_initial": 2, "retry_backoff_max": 30}, 86400.0)
 
 
 @pytest.mark.parametrize("installed, match", [
@@ -2778,11 +2778,28 @@ def test_require_connector_retry_defaults_accepts_the_pinned_values():
     ({"retry_backoff_initial": 2.0, "retry_backoff_max": 60.0}, "retry_backoff_max default is 60.0"),
     ({"retry_backoff_max": 30.0}, "no retry_backoff_initial default"),
     ({}, "no retry_backoff_initial default"),
+    # A field whose default was removed: dataclasses reports the MISSING sentinel, not a number.
+    ({"retry_backoff_initial": __import__("dataclasses").MISSING, "retry_backoff_max": 30.0}, "retry_backoff_initial"),
+    ({"retry_backoff_initial": "fast", "retry_backoff_max": 30.0}, "retry_backoff_initial"),
 ])
 def test_require_connector_retry_defaults_fails_closed_on_drift(installed, match):
     from pipeline_lib.config import require_connector_retry_defaults
     with pytest.raises(PipelineConfigError, match=match):
-        require_connector_retry_defaults(installed, "wheel_path")
+        require_connector_retry_defaults(installed, 86400, "wheel_path")
+
+
+@pytest.mark.parametrize("max_backoff", [3600, 86401, None, "86400", True])
+def test_require_connector_retry_defaults_checks_the_backoff_ceiling(max_backoff):
+    from pipeline_lib.config import require_connector_retry_defaults
+    with pytest.raises(PipelineConfigError, match="MAX_RETRY_BACKOFF_SECONDS"):
+        require_connector_retry_defaults({"retry_backoff_initial": 2.0, "retry_backoff_max": 30.0}, max_backoff)
+
+
+@pytest.mark.parametrize("validator", [require_retry_backoff_initial, require_retry_backoff_max])
+def test_require_retry_backoff_enforces_the_connector_ceiling(validator):
+    assert validator(86400) == "86400.0"
+    with pytest.raises(PipelineConfigError, match="from 0 to 86400"):
+        validator(86401)
 
 
 def test_runner_checks_connector_retry_defaults_after_the_version_check():
@@ -2795,3 +2812,4 @@ def test_runner_checks_connector_retry_defaults_after_the_version_check():
     assert len(check) == 1 and version and config_load
     assert version.start() < check[0] < config_load.start()
     assert "_dataclasses.fields(_EsConnection)" in src[check[0]:check[0] + 200]
+    assert "_MAX_RETRY_BACKOFF_SECONDS" in src[check[0]:check[0] + 250]

@@ -2082,3 +2082,17 @@ def test_main_rejects_an_inverted_backoff_pair_before_writing(tmp_path, monkeypa
     with pytest.raises(ValueError, match="feed.yml: effective retry_backoff_max"):
         gen_jobs.main(argv=[])
     assert list(resources_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("doc", [
+    {"variables": {}},                                                    # variables absent
+    {"variables": {"retry_backoff_initial": None, "retry_backoff_max": None}},   # shorthand null
+    {"variables": {"retry_backoff_initial": {"default": None}, "retry_backoff_max": {}}},  # null / no default
+])
+def test_global_default_absent_or_null_falls_back_to_connector_defaults(doc):
+    assert gen_jobs._global_default("retry_backoff_initial", doc) == ""
+    # With nothing set anywhere the connector defaults (2 / 30) apply: 60 is over the default max...
+    with pytest.raises(ValueError, match="is below retry_backoff_initial"):
+        gen_jobs.require_retry_backoff_pair({**_cfg(), "retry_backoff_initial": "60.0"}, doc, "x.yml")
+    # ...and an unset pair is the legal default pair.
+    gen_jobs.require_retry_backoff_pair(_cfg(), doc, "x.yml")

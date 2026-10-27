@@ -509,10 +509,15 @@ def require_max_retries_per_doc(value: object, where: str = "max_retries_per_doc
     return require_max_retries_per_request(value, where)
 
 
+# The connector's upper bound on any retry backoff value (MAX_RETRY_BACKOFF_SECONDS, 1.0.0): one day. Pinned
+# with CONNECTOR_RETRY_BACKOFF_DEFAULTS below and verified against the installed connector by the runner.
+CONNECTOR_MAX_RETRY_BACKOFF_SECONDS = 86400
+
+
 def require_retry_backoff_seconds(value: object, where: str) -> str:
     """OPTIONAL EsWriteConfig retry backoff, in SECONDS (retry_backoff_initial / retry_backoff_max): a
-    NON-NEGATIVE finite number (int or decimal, e.g. 2 or 0.5), or "" for unset (leave the connector
-    default). 0 is MEANINGFUL (retry without waiting) and distinct from "". Accepts a YAML number (config
+    finite number from 0 to CONNECTOR_MAX_RETRY_BACKOFF_SECONDS (int or decimal, e.g. 2 or 0.5), or "" for
+    unset (leave the connector default). 0 is MEANINGFUL (retry without waiting) and distinct from "". Accepts a YAML number (config
     default) or a string (run-time override) and returns the canonical string form (repr of the float, so
     "2" -> "2.0"). A bool (int subclass), a non-numeric string, NaN/inf, or a negative value is rejected
     (fail closed). The connector enforces the cross-field rule retry_backoff_max >= retry_backoff_initial
@@ -527,8 +532,9 @@ def require_retry_backoff_seconds(value: object, where: str) -> str:
         parsed = float(value)
     except (ValueError, OverflowError):  # OverflowError: an int too large for a float (e.g. 10**400)
         raise PipelineConfigError(f"{where} must be a non-negative number of seconds, got {value!r}")
-    if not math.isfinite(parsed) or parsed < 0:
-        raise PipelineConfigError(f"{where} must be a non-negative number of seconds, got {value!r}")
+    if not math.isfinite(parsed) or not 0 <= parsed <= CONNECTOR_MAX_RETRY_BACKOFF_SECONDS:
+        raise PipelineConfigError(
+            f"{where} must be a number of seconds from 0 to {CONNECTOR_MAX_RETRY_BACKOFF_SECONDS}, got {value!r}")
     return repr(parsed)
 
 
@@ -647,11 +653,19 @@ def require_connector_version(version: object, where: str = "installed connector
 CONNECTOR_RETRY_BACKOFF_DEFAULTS = {"retry_backoff_initial": "2.0", "retry_backoff_max": "30.0"}
 
 
-def require_connector_retry_defaults(installed: dict, where: str = "installed connector") -> None:
-    """Fail closed unless the installed connector's retry backoff defaults equal
-    CONNECTOR_RETRY_BACKOFF_DEFAULTS. `installed` maps each field name to the connector's default value
-    (the runner reads them from EsConnection's dataclass fields). A mismatch means a connector release
-    changed a default the generator's pair check relies on: update CONNECTOR_RETRY_BACKOFF_DEFAULTS."""
+def require_connector_retry_defaults(installed: dict, installed_max_backoff: object,
+                                     where: str = "installed connector") -> None:
+    """Fail closed unless the installed connector matches the retry backoff facts pinned here:
+    CONNECTOR_RETRY_BACKOFF_DEFAULTS (`installed` maps each field name to the connector's default value,
+    read from EsConnection's dataclass fields) and CONNECTOR_MAX_RETRY_BACKOFF_SECONDS
+    (`installed_max_backoff`, the connector's MAX_RETRY_BACKOFF_SECONDS). A mismatch means a connector
+    release changed something the generator's checks rely on: update the constant named in the message."""
+    if (isinstance(installed_max_backoff, bool) or not isinstance(installed_max_backoff, (int, float))
+            or installed_max_backoff != CONNECTOR_MAX_RETRY_BACKOFF_SECONDS):
+        raise PipelineConfigError(
+            f"{where}: databricks-es-connector's MAX_RETRY_BACKOFF_SECONDS is {installed_max_backoff!r}, but the "
+            f"framework's CONNECTOR_MAX_RETRY_BACKOFF_SECONDS pins {CONNECTOR_MAX_RETRY_BACKOFF_SECONDS}; update "
+            "it in pipeline_lib/config.py")
     for name, pinned in CONNECTOR_RETRY_BACKOFF_DEFAULTS.items():
         if name not in installed:
             raise PipelineConfigError(f"{where}: databricks-es-connector has no {name} default; "

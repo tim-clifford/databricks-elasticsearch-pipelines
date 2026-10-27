@@ -271,7 +271,9 @@ require_connector_version(_connector_version, "wheel_path")
 # confirm the installed connector still has those defaults.
 import dataclasses as _dataclasses  # noqa: E402
 from databricks_es_connector import EsConnection as _EsConnection  # noqa: E402
-require_connector_retry_defaults({f.name: f.default for f in _dataclasses.fields(_EsConnection)}, "wheel_path")
+from databricks_es_connector.config import MAX_RETRY_BACKOFF_SECONDS as _MAX_RETRY_BACKOFF_SECONDS  # noqa: E402
+require_connector_retry_defaults({f.name: f.default for f in _dataclasses.fields(_EsConnection)},
+                                 _MAX_RETRY_BACKOFF_SECONDS, "wheel_path")
 
 # The write surface used by the export cells below. Imported after the version check, so an older wheel
 # missing one of these names fails with the check's message rather than an ImportError, and here so the
