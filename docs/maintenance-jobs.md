@@ -25,7 +25,7 @@ Seven fixed jobs handle setup and upkeep. Run any with `databricks bundle run <r
 | `log_table_prune` | Log table prune | Deletes rows older than `monitoring_log_retention_days`, then optimizes and vacuums. Runs daily, paused or unpaused by the target's `schedule_pause_status`. | Leave it scheduled where the log is in use; pause it in any target where triggers are unpaused but the log isn't used (it fails without a table). ([details](#the-monitoring-log-table)) |
 | `cluster_log_prune` | Cluster logs prune | Deletes delivered cluster log files older than `cluster_log_retention_days`, then the directories that leaves empty, touching only the cluster log layout (optional `--params dry_run=true` to list without deleting; [details](#pruning-cluster-logs)). Runs daily, paused or unpaused by `schedule_pause_status`. Does nothing when `cluster_log_volume_path` is empty. | Leave it scheduled where any job cluster delivers logs. |
 
-None of these jobs retries a failed task (`max_retries: 0` on every task, unlike the feed jobs' [task retries](feed-configuration.md#retrying-a-failed-task)): a failure fails the run at once and emails [`support_email`](parameters.md#support_email).
+None of these jobs retries a failed task: every task sets `max_retries: 0` and turns off serverless auto-optimization (`disable_auto_optimization: true`), which would otherwise retry a failed serverless task by itself. A failure fails the run at once and emails [`support_email`](parameters.md#support_email). This differs from the feed jobs' [task retries](feed-configuration.md#retrying-a-failed-task).
 
 Every maintenance job parameter is in [Parameters Reference](parameters.md#maintenance-job-parameters).
 

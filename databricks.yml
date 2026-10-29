@@ -379,11 +379,14 @@ variables:
   # failed attempt STARTED, up to max_retries times; the run fails only once the last attempt fails, and every
   # failed attempt emails ${var.support_email}. A batch retry re-exports the whole view; a streaming retry
   # resumes from the checkpoint. NOT used by continuous feeds (the Jobs API rejects a task retry policy there;
-  # they recover through task_retry_mode) or by the fixed maintenance jobs (max_retries: 0). These are job
-  # definition fields, so --params can't change them per run. Both must be non-empty integers (validated at
-  # generation): max_retries 0 to 10 (0 = no retry), interval 0 to 3600000 ms. Accept --var at deploy.
+  # they recover through task_retry_mode) or by the fixed maintenance jobs (max_retries: 0 with serverless
+  # auto-optimization off, so they never retry). These are job definition fields, so --params can't change them
+  # per run. Both must be non-empty integers (validated at generation): max_retries 0 to 10, interval 0 to
+  # 3600000 ms. 0 stops retries on classic compute only: feed jobs keep serverless auto-optimization on, which
+  # retries a failed serverless task once on its own when max_retries is 0 (a value of 1 or more is respected
+  # exactly). Accept --var at deploy.
   triggered_task_max_retries:
-    description: "Global default Jobs task max_retries for triggered (scheduled or on-demand) feed jobs: times a failed task is re-run in the same run, 0 to 10 (0 = no retry). A feed's own triggered_task_max_retries overrides it. Not used by continuous feeds or the maintenance jobs."
+    description: "Global default Jobs task max_retries for triggered (scheduled or on-demand) feed jobs: times a failed task is re-run in the same run, 0 to 10. 0 means no retry on classic compute; on serverless, auto-optimization still retries once. A feed's own triggered_task_max_retries overrides it. Not used by continuous feeds or the maintenance jobs."
     default: "2"
   triggered_task_min_retry_interval_millis:
     description: "Global default Jobs task min_retry_interval_millis for triggered feed jobs: minimum milliseconds from the start of a failed attempt to the start of its retry, 0 to 3600000. A feed's own triggered_task_min_retry_interval_millis overrides it. Not used by continuous feeds or the maintenance jobs."

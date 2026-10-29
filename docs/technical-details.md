@@ -99,7 +99,9 @@ They are emitted only on triggered jobs because the Jobs API refuses a task retr
 
 The interval is in milliseconds, the Jobs field's own unit, because a bundle variable is substituted as is: a global in seconds couldn't be converted at deploy, so per-target values wouldn't work.
 
-The maintenance jobs set `max_retries: 0` explicitly (the Jobs default is also 0), and a test fails if any of their tasks carries another value or a retry field.
+Serverless auto-optimization, on by default, retries a failed task on its own when the task has no retry count. A serverless task with no retry fields (and so with `max_retries: 0`, which the API drops as a zero value) ran a second attempt 5 seconds after the first failed. A serverless feed deployed with `triggered_task_max_retries` 0 likewise ran two attempts, the second 67 seconds after the first started, so the interval applied to it. With `max_retries: 2` serverless ran exactly three attempts, with auto-optimization on and with it off (`disable_auto_optimization: true`); with 0 on a job cluster, one attempt. Feed jobs keep auto-optimization on, as Databricks recommends, so `0` stops retries only on classic compute ([Classic and serverless](feed-configuration.md#classic-and-serverless)).
+
+The maintenance jobs set `max_retries: 0` **and** `disable_auto_optimization: true` on every task, so a failure fails the run at once on serverless too: forced to fail, `checkpoint_clear` ran one attempt. On a classic cluster (`es_diagnostics` can run on one) the API accepts the field and ignores it. A test fails if any maintenance task carries anything else, or if a feed task turns auto-optimization off.
 
 <a id="task-retry-mode"></a>
 ### Continuous jobs pin task_retry_mode

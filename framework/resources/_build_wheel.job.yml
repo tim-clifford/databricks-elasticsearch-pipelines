@@ -61,10 +61,12 @@ resources:
             # and wheel_version arrive as job parameters (above), not here.
             base_parameters:
               wheel_path: ${var.wheel_path}
-          # Never retried: a failed maintenance task fails the run at once and emails support. Pinned rather
-          # than left to the Jobs default (also 0) so it is explicit and test-guarded; feed jobs retry through
-          # the triggered_task_* settings, these never do.
+          # Never retried: a failed maintenance task fails the run at once and emails support. max_retries: 0
+          # alone isn't enough on serverless: auto-optimization, on by default, retries a failed task on its
+          # own, so it is turned off here too (it has no effect on a classic cluster). Feed jobs retry through
+          # the triggered_task_* settings and keep auto-optimization on; these never retry.
           max_retries: 0
+          disable_auto_optimization: true
           # Per-task failure notifications: the job-level block fires only on a terminal FAILED run, so it
           # misses a task that fails then succeeds on retry. Mirror it on the task (same ${var.support_email})
           # plus alert_on_last_attempt: false so every failed attempt pages. See framework/scripts/gen_jobs.py _build_task.

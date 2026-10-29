@@ -25,7 +25,7 @@ there is one (`...` marks the parts that vary), the cause, and the fix.
 | [Falling behind](#falling-behind) | growing backlog, skipped runs, stale index |
 | [Data issues](#data-issues) | fewer documents, duplicates, a stream that writes nothing, source updates missing |
 | [Streaming](#streaming-failures) | schema changes, continuous retry limit |
-| [Schedules](#a-scheduled-job-didnt-run) | paused, skipped, failure emails from a successful run |
+| [Schedules](#a-scheduled-job-didnt-run) | paused, skipped, a serverless retry with retries at 0, failure emails from a successful run |
 | [Settings](#a-committed-value-seems-ignored) | a committed value seems ignored |
 | [The monitoring log](#gaps-in-the-monitoring-log) | start rows with no end row |
 
@@ -439,6 +439,12 @@ the next run catches up. If it happens often, the feed takes longer than its sch
 the interval or make the feed faster ([Overlapping runs skipped](feed-configuration.md#overlapping-runs-skipped)).
 Task retries count toward the run's length: a run that is still retrying a failed task holds the slot
 ([Retrying a failed task](feed-configuration.md#retrying-a-failed-task)).
+
+### A serverless feed retried with retries set to 0
+
+A serverless feed with `triggered_task_max_retries: 0` still ran a second attempt. That retry comes from
+Databricks' serverless auto-optimization, which the framework leaves on for feeds; `0` stops retries only
+on classic compute ([Classic and serverless](feed-configuration.md#classic-and-serverless)).
 
 ### Failure emails from a successful run
 

@@ -2106,7 +2106,7 @@ _RETRY_REFS = {
     "max_retries": "${var.triggered_task_max_retries}",
     "min_retry_interval_millis": "${var.triggered_task_min_retry_interval_millis}",
 }
-_JOBS_RETRY_KEYS = ("max_retries", "min_retry_interval_millis", "retry_on_timeout")
+_JOBS_RETRY_KEYS = ("max_retries", "min_retry_interval_millis", "retry_on_timeout", "disable_auto_optimization")
 
 
 def _retry_fields(task):
@@ -2244,7 +2244,8 @@ def test_main_fails_closed_without_triggered_retry_global(tmp_path, monkeypatch,
 
 def test_shipped_generated_jobs_retry_fields_match_trigger():
     # Every shipped generated job: a triggered job's tasks all carry both retry fields, a continuous job's
-    # tasks carry none. Fails if a regenerated file drifts either way.
+    # tasks carry none, and no feed task turns serverless auto-optimization off (feeds keep the platform
+    # default). Fails if a regenerated file drifts either way.
     paths = gen_jobs.existing_generated_files()
     assert paths, "no generated job files found"
     seen = {"triggered": 0, "continuous": 0}
@@ -2262,8 +2263,9 @@ def test_shipped_generated_jobs_retry_fields_match_trigger():
 
 def test_shipped_hand_authored_jobs_never_retry():
     # The maintenance jobs are fixed at no retries: a task failure fails the run and emails at once.
-    # Allow-list: every task must carry exactly max_retries: 0 and no other retry field, and no job may
-    # reference the feed retry globals.
+    # Allow-list: every task must carry exactly max_retries: 0 plus disable_auto_optimization: true (on
+    # serverless, auto-optimization retries a failed task even with max_retries: 0; proven live) and no
+    # other retry field, and no job may reference the feed retry globals.
     paths = sorted(glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml")))
     assert len(paths) == 7, [os.path.basename(p) for p in paths]
     for path in paths:
@@ -2273,4 +2275,5 @@ def test_shipped_hand_authored_jobs_never_retry():
         for job in yaml.safe_load(text)["resources"]["jobs"].values():
             assert job["tasks"], os.path.basename(path)
             for task in job["tasks"]:
-                assert _retry_fields(task) == {"max_retries": 0}, f"{os.path.basename(path)}: {task['task_key']}"
+                assert _retry_fields(task) == {"max_retries": 0, "disable_auto_optimization": True}, \
+                    f"{os.path.basename(path)}: {task['task_key']}"

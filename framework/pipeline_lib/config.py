@@ -96,7 +96,9 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   is old enough, the oldest fetched is used. Same layering.
     triggered_task_max_retries: <n>      # OPTIONAL Jobs task retry for a TRIGGERED job (scheduled, Run
                                          #   now, on-demand): times a failed task is re-run in the same job
-                                         #   run (0 to 10, 0 = no retry). Omit => the target-wide
+                                         #   run (0 to 10). 0 = no configured retry, but on serverless
+                                         #   auto-optimization (left on for feeds) still retries a failed
+                                         #   task once on its own. Omit => the target-wide
                                          #   ${var.triggered_task_max_retries} global (shipped 2). A
                                          #   deploy-time task field, not a --params knob. Rejected on a
                                          #   continuous job, which recovers through task_retry_mode.
@@ -975,7 +977,8 @@ def _require_triggered_task_int(value: object, where: str, maximum: int, rule: s
 def require_triggered_task_max_retries(value: object, where: str = "triggered_task_max_retries",
                                        allow_empty: bool = True) -> str:
     """OPTIONAL Jobs task max_retries for a triggered job: how many times a failed task is re-run within the
-    same job run, an integer from 0 (no retry) to _MAX_TRIGGERED_TASK_MAX_RETRIES. Empty/absent => "" (inherit
+    same job run, an integer from 0 (no configured retry; serverless auto-optimization may still retry) to
+    _MAX_TRIGGERED_TASK_MAX_RETRIES. Empty/absent => "" (inherit
     ${var.triggered_task_max_retries}) unless allow_empty is False. Fail closed on a bool, float, non-numeric
     or out-of-range value."""
     return _require_triggered_task_int(value, where, _MAX_TRIGGERED_TASK_MAX_RETRIES,

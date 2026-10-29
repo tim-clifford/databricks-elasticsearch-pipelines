@@ -231,7 +231,7 @@ Every job except `checkpoint_clear` (which allows up to 20 concurrent runs, so s
 A feed job without a continuous trigger (scheduled, on demand, or started by hand) re-runs a failed task within the same run, up to [`triggered_task_max_retries`](parameters.md#triggered_task_max_retries) times (shipped `2`), each retry starting at least [`triggered_task_min_retry_interval_millis`](parameters.md#triggered_task_min_retry_interval_millis) after the failed attempt **started** (shipped `60000`, one minute). Set either in `databricks.yml` for every feed in a target, or in a feed's config for that feed:
 
 ```yaml
-triggered_task_max_retries: 3                   # 0 turns retries off for this feed
+triggered_task_max_retries: 3                   # 0 stops retries on classic compute only
 triggered_task_min_retry_interval_millis: 120000
 ```
 
@@ -246,6 +246,18 @@ Every failed attempt emails [`support_email`](parameters.md#support_email), incl
 Size the two settings against the schedule. A run that is still retrying when the next tick comes makes that tick skip ([Overlapping runs skipped](#overlapping-runs-skipped)), so keep `(retries + 1) x (attempt time, or the interval if longer)` under the schedule's interval.
 
 A continuous feed doesn't use these settings: it recovers through the pinned `task_retry_mode` ([Failure recovery](#failure-recovery)), and setting either key on a continuous feed, or on a member of a continuous job group, fails generation (the Jobs API rejects a task retry policy on a continuous job). The [maintenance jobs](maintenance-jobs.md) never retry.
+
+#### Classic and serverless
+
+Serverless jobs have Databricks' **auto-optimization**, on by default, which can retry a failed task by itself. The framework leaves it on for feed jobs (Databricks recommends it) and turns it off only on the maintenance jobs. So the settings behave differently by compute:
+
+| Setting | Classic (`job_cluster`, `existing_cluster`) | Serverless |
+|---|---|---|
+| `triggered_task_max_retries: 1` or more | exactly that many retries | exactly that many retries (tested with 2); auto-optimization adds none on top |
+| `triggered_task_max_retries: 0` | no retry: the first failure fails the run | **one retry anyway**, by auto-optimization; the run fails when it fails too |
+| `triggered_task_min_retry_interval_millis` | the minimum gap between attempt starts | the same, including before the auto-optimization retry |
+
+To stop all retries of a serverless feed you would need auto-optimization off for that task too, which the framework doesn't set on feed jobs. With auto-optimization off, a retry count of 1 or more still applies exactly, so turning it off changes only the `0` case.
 
 The connector also retries inside a task, before the task fails. The layers, from innermost:
 

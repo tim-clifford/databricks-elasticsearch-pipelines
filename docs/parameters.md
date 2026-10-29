@@ -434,8 +434,10 @@ or the same value on several; different values fail generation. See
 ### `triggered_task_max_retries`
 
 Optional. How many times Databricks re-runs a failed task within the same run, for a feed whose job
-has no continuous trigger (scheduled, on demand, or started by hand). An integer from `0` (no retry)
-to `10`. Omit it to use the `triggered_task_max_retries` variable in `databricks.yml` (shipped `2`),
+has no continuous trigger (scheduled, on demand, or started by hand). An integer from `0` to `10`.
+`0` means no retry on classic compute only: on serverless, Databricks' auto-optimization (left on for
+feeds) still retries a failed task once on its own, while `1` or more is respected exactly
+([classic and serverless](feed-configuration.md#classic-and-serverless)). Omit it to use the `triggered_task_max_retries` variable in `databricks.yml` (shipped `2`),
 which you can also set per target. The run fails only when the last attempt fails. Rejected on a
 continuous feed, and on a job group member whose group is continuous: a continuous job recovers
 through its pinned `task_retry_mode` instead. These are part of the job definition, so `--params`
