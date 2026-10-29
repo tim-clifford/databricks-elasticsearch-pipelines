@@ -256,6 +256,7 @@ def test_render_existing_cluster():
     # it (deterministic key order, keeps --check byte-stable)
     assert list(task) == [
         "task_key", "existing_cluster_id", "notebook_task",
+        "max_retries", "min_retry_interval_millis",
         "email_notifications", "notification_settings",
     ]
 
@@ -2268,7 +2269,7 @@ def test_shipped_hand_authored_jobs_never_retry():
     for path in paths:
         with open(path) as fh:
             text = fh.read()
-        assert "triggered_task_" not in text, os.path.basename(path)
+        assert "${var.triggered_task_" not in text, os.path.basename(path)
         for job in yaml.safe_load(text)["resources"]["jobs"].values():
             assert job["tasks"], os.path.basename(path)
             for task in job["tasks"]:

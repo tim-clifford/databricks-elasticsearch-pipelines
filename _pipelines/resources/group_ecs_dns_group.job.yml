@@ -71,6 +71,8 @@ resources:
             monitoring_log_enabled: ${var.monitoring_log_enabled}
             log_monitor_source_lookback_seconds: ${var.log_monitor_source_lookback_seconds}
             log_monitor_source_history_rows: ${var.log_monitor_source_history_rows}
+        max_retries: ${var.triggered_task_max_retries}
+        min_retry_interval_millis: ${var.triggered_task_min_retry_interval_millis}
         email_notifications:
           on_failure: ${var.support_email}
         notification_settings:
@@ -118,6 +120,8 @@ resources:
             monitoring_log_enabled: ${var.monitoring_log_enabled}
             log_monitor_source_lookback_seconds: ${var.log_monitor_source_lookback_seconds}
             log_monitor_source_history_rows: ${var.log_monitor_source_history_rows}
+        max_retries: ${var.triggered_task_max_retries}
+        min_retry_interval_millis: ${var.triggered_task_min_retry_interval_millis}
         email_notifications:
           on_failure: ${var.support_email}
         notification_settings:

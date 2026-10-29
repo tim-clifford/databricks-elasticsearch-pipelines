@@ -94,6 +94,16 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
     log_monitor_source_history_rows: <n> # OPTIONAL companion knob: how many of the newest source history
                                          #   rows that read fetches (positive int, default 100). When none
                                          #   is old enough, the oldest fetched is used. Same layering.
+    triggered_task_max_retries: <n>      # OPTIONAL Jobs task retry for a TRIGGERED job (scheduled, Run
+                                         #   now, on-demand): times a failed task is re-run in the same job
+                                         #   run (0 to 10, 0 = no retry). Omit => the target-wide
+                                         #   ${var.triggered_task_max_retries} global (shipped 2). A
+                                         #   deploy-time task field, not a --params knob. Rejected on a
+                                         #   continuous job, which recovers through task_retry_mode.
+    triggered_task_min_retry_interval_millis: <n>  # OPTIONAL companion: minimum milliseconds from the
+                                         #   START of a failed attempt to the start of its retry (0 to
+                                         #   3600000). Omit => ${var.triggered_task_min_retry_interval_millis}
+                                         #   (shipped 60000). Same scope and continuous rejection.
     view:   { catalog: <c>, schema: <s>, name:  <n> }   # where the view is created, and its name
     source:                              # the one source table the view reads from
       catalog: <c>
@@ -936,6 +946,54 @@ def require_log_monitor_source_history_rows(value: object,
                         f"a positive integer of at most {_MAX_LOG_MONITOR_SOURCE_HISTORY_ROWS}")
 
 
+# Triggered-task retry bounds (allow-list ranges). Ten retries and one hour between attempt starts are
+# well past any sensible setting for a scheduled feed; anything larger is more likely a typo than intent.
+_MAX_TRIGGERED_TASK_MAX_RETRIES = 10
+_MAX_TRIGGERED_TASK_MIN_RETRY_INTERVAL_MILLIS = 3_600_000
+
+# The single source of truth for the triggered-task retry keys: each config key (and its same-named bundle
+# variable) mapped to the Jobs task field it fills. The generator emits these on every task of a triggered
+# job (scheduled, Run now, on-demand) and never on a continuous job, where the Jobs API rejects a task
+# retry policy ("retryPolicy is not allowed in continuous job") and task_retry_mode governs recovery.
+TRIGGERED_TASK_RETRY_FIELDS = {
+    "triggered_task_max_retries": "max_retries",
+    "triggered_task_min_retry_interval_millis": "min_retry_interval_millis",
+}
+
+
+def _require_triggered_task_int(value: object, where: str, maximum: int, rule: str, allow_empty: bool) -> str:
+    """An integer from 0 to `maximum` as a canonical string, or "" for empty/absent when allow_empty (a
+    config that omits the key inherits the global). allow_empty=False is for the global default itself,
+    which fills an integer job field and so can't be empty."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        if allow_empty:
+            return ""
+        raise PipelineConfigError(f"{where} must be {rule}, got {value!r}")
+    return _require_int(value, where, 0, maximum, 0, rule)
+
+
+def require_triggered_task_max_retries(value: object, where: str = "triggered_task_max_retries",
+                                       allow_empty: bool = True) -> str:
+    """OPTIONAL Jobs task max_retries for a triggered job: how many times a failed task is re-run within the
+    same job run, an integer from 0 (no retry) to _MAX_TRIGGERED_TASK_MAX_RETRIES. Empty/absent => "" (inherit
+    ${var.triggered_task_max_retries}) unless allow_empty is False. Fail closed on a bool, float, non-numeric
+    or out-of-range value."""
+    return _require_triggered_task_int(value, where, _MAX_TRIGGERED_TASK_MAX_RETRIES,
+                                       f"an integer from 0 to {_MAX_TRIGGERED_TASK_MAX_RETRIES}", allow_empty)
+
+
+def require_triggered_task_min_retry_interval_millis(
+        value: object, where: str = "triggered_task_min_retry_interval_millis", allow_empty: bool = True) -> str:
+    """OPTIONAL Jobs task min_retry_interval_millis for a triggered job: the minimum milliseconds from the START
+    of a failed attempt to the start of its retry (proven live: the gap is measured start to start, not from
+    the failure), an integer from 0 to _MAX_TRIGGERED_TASK_MIN_RETRY_INTERVAL_MILLIS. Empty/absent => ""
+    (inherit ${var.triggered_task_min_retry_interval_millis}) unless allow_empty is False. Fail closed on a
+    bool, float, non-numeric or out-of-range value."""
+    return _require_triggered_task_int(value, where, _MAX_TRIGGERED_TASK_MIN_RETRY_INTERVAL_MILLIS,
+                                       f"an integer of milliseconds from 0 to "
+                                       f"{_MAX_TRIGGERED_TASK_MIN_RETRY_INTERVAL_MILLIS}", allow_empty)
+
+
 def _require_es_index(value: object, where: str) -> str:
     """A valid Elasticsearch index name. Enforces the char/leading-char rules via the regex, plus the
     255-BYTE length bound and no-trailing-dot rule (which a single regex can't express well)."""
@@ -1006,6 +1064,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "log_monitor_source_lookback_seconds", "log_monitor_source_history_rows",
         "view", "source", "reference_tables", "compute", "schedule", "continuous",
         "pause_status", "job_group", "job_name_postfix",
+        "triggered_task_max_retries", "triggered_task_min_retry_interval_millis",
     }
     unknown = sorted(set(raw) - allowed_top)
     if unknown:
@@ -1197,6 +1256,13 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         require_job_name_postfix(raw["job_name_postfix"], f"{source}: job_name_postfix")
         if "job_name_postfix" in raw else None
     )
+    # The triggered-task retry keys are OPTIONAL: absent -> "" (inherit the ${var.<key>} global). They are
+    # deploy-time Jobs task fields (see TRIGGERED_TASK_RETRY_FIELDS), not run-time knobs, so they are
+    # validated here and passed through resolve unchanged.
+    triggered_task_max_retries = require_triggered_task_max_retries(
+        raw.get("triggered_task_max_retries"), f"{source}: triggered_task_max_retries")
+    triggered_task_min_retry_interval_millis = require_triggered_task_min_retry_interval_millis(
+        raw.get("triggered_task_min_retry_interval_millis"), f"{source}: triggered_task_min_retry_interval_millis")
     # Cross-field rules for continuous (always-on) mode, all fail-closed - the three constraints that
     # make an always-on stream valid, checked here so an illegal combo fails at config load (and thus at
     # generation / deploy), never producing a job that would only break when the stream tries to start:
@@ -1228,6 +1294,15 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
                 f"{source}: continuous and schedule are mutually exclusive (a job has either an "
                 f"always-on continuous trigger or a schedule, not both); remove one"
             )
+        #  - the triggered-task retry keys don't apply: the Jobs API rejects a task retry policy on a
+        #    continuous job, whose recovery is the generator-pinned task_retry_mode: ON_FAILURE.
+        for key, value in (("triggered_task_max_retries", triggered_task_max_retries),
+                           ("triggered_task_min_retry_interval_millis", triggered_task_min_retry_interval_millis)):
+            if value:
+                raise PipelineConfigError(
+                    f"{source}: {key} applies only to triggered (scheduled or on-demand) jobs, not a "
+                    f"continuous one, which recovers through task_retry_mode; remove {key}"
+                )
 
     # pause_status is meaningful only on a job that HAS a trigger (it sets pause_status inside the
     # generated schedule/continuous block). Reject it fail-closed on a STANDALONE on-demand job (no
@@ -1291,6 +1366,8 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "pause_status": pause_status,
         "job_group": job_group,
         "job_name_postfix": job_name_postfix,
+        "triggered_task_max_retries": triggered_task_max_retries,
+        "triggered_task_min_retry_interval_millis": triggered_task_min_retry_interval_millis,
     }
 
 
@@ -1611,6 +1688,9 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # are deploy-time job properties, not object names: passed through verbatim, no ${environment}.
         "job_group": cfg["job_group"],
         "job_name_postfix": cfg["job_name_postfix"],
+        # The triggered-task retry keys are deploy-time Jobs task fields: passed through verbatim.
+        "triggered_task_max_retries": cfg["triggered_task_max_retries"],
+        "triggered_task_min_retry_interval_millis": cfg["triggered_task_min_retry_interval_millis"],
     }
 
 
