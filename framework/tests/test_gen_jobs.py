@@ -2138,10 +2138,11 @@ def test_render_continuous_task_never_carries_retry_fields():
     assert _retry_fields(task) == {}
 
 
-def test_render_continuous_with_triggered_retry_set_fails_closed():
+@pytest.mark.parametrize("value", ["1", "0"])
+def test_render_continuous_with_triggered_retry_set_fails_closed(value):
     # Defense in depth: validate_config rejects this at load; the renderer re-checks so it can never emit.
     cfg = _continuous_cfg()
-    cfg["triggered_task_max_retries"] = "1"
+    cfg["triggered_task_max_retries"] = value
     with pytest.raises(ValueError, match="triggered_task_max_retries.*continuous"):
         _render_job(cfg, _JC_SPEC)
 

@@ -2863,13 +2863,15 @@ def test_triggered_task_retry_invalid_rejected(key, bad):
         validate_config(cfg)
 
 
+@pytest.mark.parametrize("value", [1, 0])
 @pytest.mark.parametrize("key", _TRIGGERED_KEYS)
-def test_triggered_task_retry_rejected_on_continuous(key):
+def test_triggered_task_retry_rejected_on_continuous(key, value):
     # A continuous job recovers through task_retry_mode; the Jobs API rejects a task retry policy on it
-    # ("retryPolicy is not allowed in continuous job"), so fail at config load with a clear message.
+    # ("retryPolicy is not allowed in continuous job"), so fail at config load with a clear message. 0 is
+    # rejected too: any explicit value means the author expects it to apply, and it never would.
     cfg = _continuous_ready()
     cfg["continuous"] = {"trigger_interval": "30 seconds"}
-    cfg[key] = 1
+    cfg[key] = value
     with pytest.raises(PipelineConfigError, match=f"{key}.*continuous"):
         validate_config(cfg)
 
