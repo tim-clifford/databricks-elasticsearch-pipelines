@@ -724,9 +724,10 @@ def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
 
 
 @pytest.mark.parametrize("name,bad", [
-    ("bulk_stats", "on"), ("retry_transport_timeout", "yes"), ("bypass_fast_path", "1"),
+    ("bulk_stats", "on"), ("retry_backoff_initial", "-1"), ("retry_backoff_max", "soon"),
+    ("bypass_fast_path", "1"),
     ("verify_certs", "maybe"), ("require_existing_index", "nope"),
-    ("request_timeout", "abc"), ("transport_max_retries", "-1"), ("max_retries_per_doc", "-1"),
+    ("request_timeout", "abc"), ("max_retries_per_request", "-1"), ("max_retries_per_doc", "-1"),
     ("pipeline_mode", "turbo"), ("op_type", "has space"), ("streaming_start", "sideways"),
     ("write_repartition", "-5"), ("max_partition_bytes", "32x"), ("chunk_size", "0"),
     ("monitoring_log_enabled", "maybe"), ("log_monitor_source_lookback_seconds", "-1"),
@@ -755,19 +756,22 @@ def test_require_runtime_knobs_declared_accepts_scalar_shorthand(tmp_path):
 # --- render guards: an omitted knob bakes its ${var.<name>} global ref, a set knob bakes its literal ---
 
 
-def test_render_singleton_omitted_retry_transport_timeout_bakes_global_ref():
+@pytest.mark.parametrize("name", ["retry_backoff_initial", "retry_backoff_max"])
+def test_render_singleton_omitted_retry_backoff_bakes_global_ref(name):
     cfg = _cfg()
     text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
     job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
-    assert {"name": "retry_transport_timeout", "default": "${var.retry_transport_timeout}"} in job["parameters"]
+    assert {"name": name, "default": f"${{var.{name}}}"} in job["parameters"]
+    assert all(p["name"] != "retry_transport_timeout" for p in job["parameters"])
 
 
-def test_render_singleton_set_retry_transport_timeout_bakes_literal():
+@pytest.mark.parametrize("name", ["retry_backoff_initial", "retry_backoff_max"])
+def test_render_singleton_set_retry_backoff_bakes_literal(name):
     cfg = _cfg()
-    cfg["retry_transport_timeout"] = "true"
+    cfg[name] = "5.0"
     text = gen_jobs.render_job_yaml("ecs_dns_activity.yml", "ecs_dns_activity", cfg, None)
     job = yaml.safe_load(text)["resources"]["jobs"]["index_pipeline_ecs_dns_activity"]
-    assert {"name": "retry_transport_timeout", "default": "true"} in job["parameters"]
+    assert {"name": name, "default": "5.0"} in job["parameters"]
 
 
 def test_render_singleton_omitted_bypass_fast_path_bakes_global_ref():
@@ -2017,3 +2021,78 @@ def test_old_root_resources_file_or_dangling_link_also_blocks(tmp_path, monkeypa
     old.symlink_to(tmp_path / "nowhere")
     assert gen_jobs.old_root_resources_dir() == str(old)
     assert gen_jobs.main(["--check"]) == 1
+
+
+# --- the retry backoff pair is checked at generation ---------------------------------------------
+
+def _bundle_with(initial="", maximum=""):
+    return {"variables": {"retry_backoff_initial": {"default": initial}, "retry_backoff_max": maximum}}
+
+
+@pytest.mark.parametrize("cfg_vals, globals_, ok", [
+    ({}, ("", ""), True),                                    # all unset: connector defaults (2 / 30)
+    ({"retry_backoff_initial": "5.0", "retry_backoff_max": "60.0"}, ("", ""), True),
+    ({"retry_backoff_initial": "10.0", "retry_backoff_max": "5.0"}, ("", ""), False),   # config pair inverted
+    ({}, ("60", "30"), False),                               # global pair inverted
+    ({"retry_backoff_initial": "60.0"}, ("", "30"), False),  # config initial over the global max
+    ({"retry_backoff_max": "1.0"}, ("5", ""), False),        # config max under the global initial
+    ({"retry_backoff_max": "90.0"}, ("60", "30"), True),     # config overrides the inverted global max
+    ({"retry_backoff_initial": "60.0"}, ("", ""), False),    # over the connector's default max (30)
+    ({"retry_backoff_max": "1.0"}, ("", ""), False),         # under the connector's default initial (2)
+    ({"retry_backoff_initial": "30.0"}, ("", ""), True),     # equal to the connector's default max
+    ({"retry_backoff_initial": "0.0", "retry_backoff_max": "0.0"}, ("", ""), True),
+])
+def test_require_retry_backoff_pair(cfg_vals, globals_, ok):
+    cfg = {**_cfg(), **cfg_vals}
+    doc = _bundle_with(*globals_)
+    if ok:
+        gen_jobs.require_retry_backoff_pair(cfg, doc, "x.yml")
+    else:
+        with pytest.raises(ValueError, match="retry_backoff_max .* is below retry_backoff_initial"):
+            gen_jobs.require_retry_backoff_pair(cfg, doc, "x.yml")
+
+
+def test_shipped_bundle_and_configs_pass_the_backoff_pair_check():
+    # The real databricks.yml globals with every shipped pipeline config.
+    doc = gen_jobs._read_bundle_doc()
+    for path in gen_jobs.discover_configs():
+        gen_jobs.require_retry_backoff_pair(gen_jobs.load_config(path), doc, path)
+
+
+def test_main_rejects_an_inverted_backoff_pair_before_writing(tmp_path, monkeypatch):
+    # Wiring: generation runs the pair check on every config, and fails before writing any job file.
+    monkeypatch.chdir(tmp_path)
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    (config_dir / "feed.yml").write_text(
+        "es_index_name: test-index\n"
+        "pipeline_mode: batch\n"
+        "retry_backoff_initial: 10\n"
+        "retry_backoff_max: 5\n"
+        "view: {catalog: c, schema: s, name: v}\n"
+        "source: {catalog: c, schema: s, table: t}\n"
+    )
+    resources_dir = tmp_path / "_pipelines" / "resources"
+    resources_dir.mkdir()
+    dab_yml = _write_bundle_variables(tmp_path)
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    with pytest.raises(ValueError, match="feed.yml: effective retry_backoff_max"):
+        gen_jobs.main(argv=[])
+    assert list(resources_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("doc", [
+    {"variables": {}},                                                    # variables absent
+    {"variables": {"retry_backoff_initial": None, "retry_backoff_max": None}},   # shorthand null
+    {"variables": {"retry_backoff_initial": {"default": None}, "retry_backoff_max": {}}},  # null / no default
+])
+def test_global_default_absent_or_null_falls_back_to_connector_defaults(doc):
+    assert gen_jobs._global_default("retry_backoff_initial", doc) == ""
+    # With nothing set anywhere the connector defaults (2 / 30) apply: 60 is over the default max...
+    with pytest.raises(ValueError, match="is below retry_backoff_initial"):
+        gen_jobs.require_retry_backoff_pair({**_cfg(), "retry_backoff_initial": "60.0"}, doc, "x.yml")
+    # ...and an unset pair is the legal default pair.
+    gen_jobs.require_retry_backoff_pair(_cfg(), doc, "x.yml")

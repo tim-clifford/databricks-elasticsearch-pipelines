@@ -25,14 +25,21 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
     request_timeout: <positive int>      # OPTIONAL EsWriteConfig tuning: per-request ES client timeout,
                                          #   in seconds (connector default 60). Raise it (with a smaller
                                          #   chunk_size) when a bulk send times out mid-write.
-    transport_max_retries: <non-neg int> # OPTIONAL EsWriteConfig tuning: whole-request retries on a
-                                         #   transport failure (connection reset/timeout, 429/503 on the
-                                         #   bulk call), connector default 3. 0 disables them.
+    max_retries_per_request: <non-neg int> # OPTIONAL EsWriteConfig tuning: whole-request retries (a
+                                         #   timeout, a connection error, or a 429/502/503/504 on the
+                                         #   request, e.g. ES indexing pressure), connector default 3.
+                                         #   The connector runs every retry, with backoff. 0 disables them.
     max_retries_per_doc: <non-neg int>   # OPTIONAL EsWriteConfig tuning: PER-DOCUMENT retries for rows ES
                                          #   rejects with a 429 (es_rejected_execution_exception, write
                                          #   queue full), connector default 3. Distinct from
-                                         #   transport_max_retries (whole request): a 429'd document is
+                                         #   max_retries_per_request (whole request): a 429'd document is
                                          #   only ever retried by this knob. 0 disables per-doc retries.
+    retry_backoff_initial: <non-neg num> # OPTIONAL EsWriteConfig tuning: seconds before the first retry,
+                                         #   doubling each later retry (both retry layers), connector
+                                         #   default 2. 0 retries immediately.
+    retry_backoff_max: <non-neg num>     # OPTIONAL EsWriteConfig tuning: cap in seconds on any single
+                                         #   retry wait, connector default 30. Must be >= the effective
+                                         #   retry_backoff_initial (the connector rejects it otherwise).
     require_existing_index: true | false # OPTIONAL EsWriteConfig tuning: require the index to exist.
     verify_certs: true | false           # OPTIONAL EsWriteConfig tuning: verify the ES TLS certificate.
                                          #   All six: config DEFAULT, also a job parameter overridable
@@ -46,11 +53,6 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   config value here OVERRIDES the global default for this
                                          #   pipeline; the job parameter (--params bulk_stats=...) then
                                          #   overrides per run.
-    retry_transport_timeout: true | false  # OPTIONAL EsWriteConfig reliability toggle: let the connector
-                                         #   OWN whole-request timeout retries (re-send with backoff
-                                         #   instead of failing the batch). Same layering as bulk_stats
-                                         #   (config value > ${var.retry_transport_timeout} global >
-                                         #   connector default OFF).
     op_type: index | create             # OPTIONAL EsWriteConfig bulk-action selector. "index" (default)
                                          #   upserts over the _id; "create" is append-only (a resend of an
                                          #   already-indexed doc returns 409 and is a no-op, deduped not
@@ -135,6 +137,7 @@ bad environment value (a hyphen, say) fails closed at resolve time rather than p
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import NamedTuple
 
@@ -457,20 +460,21 @@ def require_request_timeout(value: object, where: str = "request_timeout") -> st
     return require_chunk_size(value, where)
 
 
-def require_transport_max_retries(value: object, where: str = "transport_max_retries") -> str:
-    """OPTIONAL EsWriteConfig transport_max_retries (whole-request retries by the ES client on a
-    transport failure - connection reset/timeout, a 429/503 on the bulk call itself): a NON-NEGATIVE
-    integer, or "" for unset (leave the connector default of 3). 0 is a MEANINGFUL value (disable
-    transport retries), so - unlike require_chunk_size - zero is accepted, and it is distinct from ""
-    (unset). Accepts a YAML int (config default) or a string (run-time override) and returns the
-    canonical string form. A bool (int subclass), a float, a non-numeric string, or a negative value is
-    rejected (fail closed). Not shared with require_write_repartition because that turns "" into a
-    non-empty default; here "" must stay "" so an unset knob defers to the connector's own default.
+def require_max_retries_per_request(value: object, where: str = "max_retries_per_request") -> str:
+    """OPTIONAL EsWriteConfig max_retries_per_request (whole-request retries: a timeout, a connection
+    error, or a 429/502/503/504 on the request itself, e.g. Elasticsearch indexing pressure rejecting
+    the whole bulk): a NON-NEGATIVE integer, or "" for unset (leave the connector default of 3). 0 is a
+    MEANINGFUL value (disable whole-request retries), so - unlike require_chunk_size - zero is accepted,
+    and it is distinct from "" (unset). Accepts a YAML int (config default) or a string (run-time
+    override) and returns the canonical string form. A bool (int subclass), a float, a non-numeric
+    string, or a negative value is rejected (fail closed). Not shared with require_write_repartition
+    because that turns "" into a non-empty default; here "" must stay "" so an unset knob defers to the
+    connector's own default.
 
-    This is the transport layer, NOT per-document retries: the _bulk API returns HTTP 200 even when
-    individual documents are rejected, so a raised transport_max_retries re-sends the whole request on a
-    connection-level failure (the timeout case) but never sees a 429'd document (that is the separate
-    max_retries_per_doc knob; see require_max_retries_per_doc)."""
+    This is the whole-request layer, NOT per-document retries: the _bulk API returns HTTP 200 even when
+    individual documents are rejected, so a whole-request retry never sees a 429'd document (that is the
+    separate max_retries_per_doc knob; see require_max_retries_per_doc). The connector runs every retry
+    itself, waiting with backoff (retry_backoff_initial / retry_backoff_max)."""
     if isinstance(value, str):
         value = value.strip()
     if value is None or value == "":
@@ -497,12 +501,53 @@ def require_max_retries_per_doc(value: object, where: str = "max_retries_per_doc
     or "" for unset (leave the connector default of 3). 0 is a MEANINGFUL value (disable per-document
     retries), distinct from "" (unset).
 
-    This is the PER-DOCUMENT layer, NOT transport_max_retries (whole request): the _bulk API returns
-    HTTP 200 even when individual documents are rejected, so a transport retry never sees a 429'd
-    document - only this knob re-sends it (elasticsearch-py exponential backoff, retry_on_doc_status
-    defaults to (429,)). Same non-negative-int-with-meaningful-zero rule as require_transport_max_retries,
-    so it delegates there and the rule never forks."""
-    return require_transport_max_retries(value, where)
+    This is the PER-DOCUMENT layer, NOT max_retries_per_request (whole request): the _bulk API returns
+    HTTP 200 even when individual documents are rejected, so a whole-request retry never sees a 429'd
+    document - only this knob re-sends it (waiting with the same backoff, retry_on_doc_status defaults
+    to (429,)). Same non-negative-int-with-meaningful-zero rule as require_max_retries_per_request, so it
+    delegates there and the rule never forks."""
+    return require_max_retries_per_request(value, where)
+
+
+# The connector's upper bound on any retry backoff value (MAX_RETRY_BACKOFF_SECONDS, 1.0.0): one day. Pinned
+# with CONNECTOR_RETRY_BACKOFF_DEFAULTS below and verified against the installed connector by the runner.
+CONNECTOR_MAX_RETRY_BACKOFF_SECONDS = 86400
+
+
+def require_retry_backoff_seconds(value: object, where: str) -> str:
+    """OPTIONAL EsWriteConfig retry backoff, in SECONDS (retry_backoff_initial / retry_backoff_max): a
+    finite number from 0 to CONNECTOR_MAX_RETRY_BACKOFF_SECONDS (int or decimal, e.g. 2 or 0.5), or "" for
+    unset (leave the connector default). 0 is MEANINGFUL (retry without waiting) and distinct from "". Accepts a YAML number (config
+    default) or a string (run-time override) and returns the canonical string form (repr of the float, so
+    "2" -> "2.0"). A bool (int subclass), a non-numeric string, NaN/inf, or a negative value is rejected
+    (fail closed). The connector enforces the cross-field rule retry_backoff_max >= retry_backoff_initial
+    when it builds the config, before any write."""
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise PipelineConfigError(f"{where} must be a non-negative number of seconds, got {value!r}")
+    try:
+        parsed = float(value)
+    except (ValueError, OverflowError):  # OverflowError: an int too large for a float (e.g. 10**400)
+        raise PipelineConfigError(f"{where} must be a non-negative number of seconds, got {value!r}")
+    if not math.isfinite(parsed) or not 0 <= parsed <= CONNECTOR_MAX_RETRY_BACKOFF_SECONDS:
+        raise PipelineConfigError(
+            f"{where} must be a number of seconds from 0 to {CONNECTOR_MAX_RETRY_BACKOFF_SECONDS}, got {value!r}")
+    return repr(parsed)
+
+
+def require_retry_backoff_initial(value: object, where: str = "retry_backoff_initial") -> str:
+    """OPTIONAL EsWriteConfig retry_backoff_initial: seconds before the first retry (connector default 2),
+    doubling each later retry. See require_retry_backoff_seconds."""
+    return require_retry_backoff_seconds(value, where)
+
+
+def require_retry_backoff_max(value: object, where: str = "retry_backoff_max") -> str:
+    """OPTIONAL EsWriteConfig retry_backoff_max: cap in seconds on any single retry wait (connector default
+    30). See require_retry_backoff_seconds."""
+    return require_retry_backoff_seconds(value, where)
 
 
 def require_es_flag(value: object, where: str) -> str:
@@ -554,8 +599,9 @@ def require_op_type(value: object, where: str = "op_type") -> str:
 
 
 # The oldest connector release the framework supports: the first with every EsWriteConfig field the runner
-# can pass (bulk_stats, retry_transport_timeout, op_type, bypass_fast_path).
-MIN_CONNECTOR_VERSION = (0, 10, 0)
+# can pass (max_retries_per_request, retry_backoff_initial, retry_backoff_max, and connector-managed
+# retries for every ES call).
+MIN_CONNECTOR_VERSION = (1, 0, 0)
 # PEP 440 public version (no epoch), group by group: release (X.Y.Z, optionally more segments), pre, post,
 # dev, local.
 _CONNECTOR_VERSION_RE = re.compile(
@@ -571,8 +617,8 @@ def require_connector_version(version: object, where: str = "installed connector
     optionally with pre, post, dev and local parts in PEP 440 order, in the normalized spelling the
     connector's __version__ uses (lowercase, "rc1" not "RC1" or "-rc1"); anything else, including a
     missing version ("unknown"), an epoch or a malformed local part, fails closed. A pre-release or dev build of the minimum itself
-    (0.10.0rc1, 0.10.0.dev1) sorts before it and is rejected; a post-release of it (0.10.0.post1, even
-    0.10.0.post1.dev0) and any build of a later release (0.11.0.dev0) are accepted. Returns the version
+    (1.0.0rc1, 1.0.0.dev1) sorts before it and is rejected; a post-release of it (1.0.0.post1, even
+    1.0.0.post1.dev0) and any build of a later release (1.1.0.dev0) are accepted. Returns the version
     string unchanged."""
     minimum = ".".join(str(p) for p in MIN_CONNECTOR_VERSION)
     m = _CONNECTOR_VERSION_RE.fullmatch(version.strip()) if isinstance(version, str) else None
@@ -582,7 +628,7 @@ def require_connector_version(version: object, where: str = "installed connector
             f"the framework requires {minimum} or later (check wheel_path)"
         )
     release, pre, post, dev = m.group(1, 2, 3, 4)
-    # Compare releases with trailing zeros dropped, so 0.10.0.0 equals 0.10.0 and 0.10.0.1 is later.
+    # Compare releases with trailing zeros dropped, so 1.0.0.0 equals 1.0.0 and 1.0.0.1 is later.
     parts = [int(p) for p in release.split(".")]
     minimum_parts = list(MIN_CONNECTOR_VERSION)
     while parts and parts[-1] == 0:
@@ -598,11 +644,44 @@ def require_connector_version(version: object, where: str = "installed connector
     return version
 
 
+# The connector's own retry_backoff_initial / retry_backoff_max defaults (EsConnection, 1.0.0), as the
+# canonical strings require_retry_backoff_* produce. Generation needs them to check a pipeline's effective
+# backoff pair when a side is left to the connector (gen_jobs.require_retry_backoff_pair), and it runs
+# without the connector installed, so they are pinned here. The runner, which has the connector, verifies
+# the installed defaults still match before any export (require_connector_retry_defaults), so this copy
+# cannot drift silently.
+CONNECTOR_RETRY_BACKOFF_DEFAULTS = {"retry_backoff_initial": "2.0", "retry_backoff_max": "30.0"}
+
+
+def require_connector_retry_defaults(installed: dict, installed_max_backoff: object,
+                                     where: str = "installed connector") -> None:
+    """Fail closed unless the installed connector matches the retry backoff facts pinned here:
+    CONNECTOR_RETRY_BACKOFF_DEFAULTS (`installed` maps each field name to the connector's default value,
+    read from EsConnection's dataclass fields) and CONNECTOR_MAX_RETRY_BACKOFF_SECONDS
+    (`installed_max_backoff`, the connector's MAX_RETRY_BACKOFF_SECONDS). A mismatch means a connector
+    release changed something the generator's checks rely on: update the constant named in the message."""
+    if (isinstance(installed_max_backoff, bool) or not isinstance(installed_max_backoff, (int, float))
+            or installed_max_backoff != CONNECTOR_MAX_RETRY_BACKOFF_SECONDS):
+        raise PipelineConfigError(
+            f"{where}: databricks-es-connector's MAX_RETRY_BACKOFF_SECONDS is {installed_max_backoff!r}, but the "
+            f"framework's CONNECTOR_MAX_RETRY_BACKOFF_SECONDS pins {CONNECTOR_MAX_RETRY_BACKOFF_SECONDS}; update "
+            "it in pipeline_lib/config.py")
+    for name, pinned in CONNECTOR_RETRY_BACKOFF_DEFAULTS.items():
+        if name not in installed:
+            raise PipelineConfigError(f"{where}: databricks-es-connector has no {name} default; "
+                                      "the framework requires connector 1.0.0 or later")
+        actual = require_retry_backoff_seconds(installed[name], f"{where}: {name} default")
+        if actual != pinned:
+            raise PipelineConfigError(
+                f"{where}: databricks-es-connector's {name} default is {actual}, but the framework's "
+                f"CONNECTOR_RETRY_BACKOFF_DEFAULTS pins {pinned}; update it in pipeline_lib/config.py")
+
+
 def write_config_overrides(chunk_size: object, require_existing_index: object, verify_certs: object,
                            write_concurrency: object = "", bulk_stats: object = "",
-                           request_timeout: object = "", transport_max_retries: object = "",
-                           max_retries_per_doc: object = "",
-                           retry_transport_timeout: object = "", op_type: object = "",
+                           request_timeout: object = "", max_retries_per_request: object = "",
+                           max_retries_per_doc: object = "", retry_backoff_initial: object = "",
+                           retry_backoff_max: object = "", op_type: object = "",
                            bypass_fast_path: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
@@ -619,28 +698,28 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     all runs), so it is included as bulk_stats=True unless explicitly overridden to false; an empty
     value (widget cleared) falls back to the connector's own default.
 
-    retry_transport_timeout is the same shape of bool knob (canonical "true"/"false"/"" via
-    require_es_flag): when true the connector owns whole-request timeout retries.
-
     op_type is a STRING knob (index | create) parsed by require_op_type: a set value is passed through
     unchanged (the connector validates the allowed set, not this layer), an unset "" is omitted so the
     connector's default op_type ("index") stands. Like the other run-time knobs it also takes the
     target-wide ${var.op_type} global; that ships empty, so a feed still opts into create explicitly unless
     a target sets it.
 
-    bypass_fast_path is the same shape of bool knob as bulk_stats/retry_transport_timeout (canonical
+    bypass_fast_path is the same shape of bool knob as bulk_stats (canonical
     "true"/"false"/"" via require_es_flag): when true the connector skips the filter_path="errors" probe
     and classifies every chunk on the full per-item path, which makes the docs_deduped/written counts
     exact for op_type=create (and avoids auto-id re-ship duplication) at the cost of the fast path's
     throughput.
 
-    request_timeout (positive int seconds) and transport_max_retries (non-negative int; 0 disables
-    transport retries) are connection/reliability knobs inherited from EsConnection. Both are unset by
-    default (omitted => the connector's own defaults, 60s / 3 retries, stand).
+    request_timeout (positive int seconds) and max_retries_per_request (non-negative int; 0 disables
+    whole-request retries) are connection/reliability knobs inherited from EsConnection. Both are unset
+    by default (omitted => the connector's own defaults, 60s / 3 retries, stand).
 
     max_retries_per_doc (non-negative int; 0 disables per-document retries) is the PER-DOCUMENT 429
-    retry count (a 429'd document is retried only by this knob, never by transport_max_retries). Unset
+    retry count (a 429'd document is retried only by this knob, never by max_retries_per_request). Unset
     by default (omitted => the connector's own default of 3 stands).
+
+    retry_backoff_initial / retry_backoff_max (non-negative seconds, floats) set the wait between retries
+    for both layers. Unset by default (omitted => the connector's own 2s / 30s stand).
 
     Every field set here exists on the connector releases the framework supports; the runner checks the
     installed release with require_connector_version before any of these are passed."""
@@ -658,23 +737,30 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     if canonical_request_timeout:
         overrides["request_timeout"] = int(canonical_request_timeout)
 
-    # transport_max_retries=0 (disable transport retries) is a MEANINGFUL override, so include it: its
-    # canonical form is the non-empty string "0" (truthy), while an unset knob is "" (falsy, omitted so
-    # the connector default of 3 stands).
-    canonical_transport_max_retries = require_transport_max_retries(transport_max_retries)
-    if canonical_transport_max_retries:
-        overrides["transport_max_retries"] = int(canonical_transport_max_retries)
+    # max_retries_per_request=0 (disable whole-request retries) is a MEANINGFUL override, so include it:
+    # its canonical form is the non-empty string "0" (truthy), while an unset knob is "" (falsy, omitted
+    # so the connector default of 3 stands).
+    canonical_max_retries_per_request = require_max_retries_per_request(max_retries_per_request)
+    if canonical_max_retries_per_request:
+        overrides["max_retries_per_request"] = int(canonical_max_retries_per_request)
 
     # max_retries_per_doc=0 (disable per-document 429 retries) is a MEANINGFUL override, so include it:
-    # same rule as transport_max_retries above (canonical "0" is truthy and included; unset "" is falsy
+    # same rule as max_retries_per_request above (canonical "0" is truthy and included; unset "" is falsy
     # and omitted so the connector default of 3 stands).
     canonical_max_retries_per_doc = require_max_retries_per_doc(max_retries_per_doc)
     if canonical_max_retries_per_doc:
         overrides["max_retries_per_doc"] = int(canonical_max_retries_per_doc)
 
+    # The backoff seconds: a canonical "0.0" (retry without waiting) is truthy and included; unset "" is
+    # omitted so the connector defaults (2s / 30s) stand.
+    for name, value, validator in (("retry_backoff_initial", retry_backoff_initial, require_retry_backoff_initial),
+                                   ("retry_backoff_max", retry_backoff_max, require_retry_backoff_max)):
+        canonical = validator(value)
+        if canonical:
+            overrides[name] = float(canonical)
+
     for name, value in (("require_existing_index", require_existing_index),
                         ("verify_certs", verify_certs), ("bulk_stats", bulk_stats),
-                        ("retry_transport_timeout", retry_transport_timeout),
                         ("bypass_fast_path", bypass_fast_path)):
         flag = require_es_flag(value, name)
         if flag:
@@ -909,9 +995,9 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
 
     allowed_top = {
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
-        "chunk_size", "write_concurrency", "request_timeout", "transport_max_retries",
-        "max_retries_per_doc",
-        "require_existing_index", "verify_certs", "bulk_stats", "retry_transport_timeout",
+        "chunk_size", "write_concurrency", "request_timeout", "max_retries_per_request",
+        "max_retries_per_doc", "retry_backoff_initial", "retry_backoff_max",
+        "require_existing_index", "verify_certs", "bulk_stats",
         "op_type", "bypass_fast_path",
         "streaming_start",
         "write_repartition", "max_partition_bytes",
@@ -971,16 +1057,24 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # return a string), because it becomes a string-valued job-parameter default in job_parameters.
     chunk_size = require_chunk_size(raw.get("chunk_size", ""), f"{source}: chunk_size")
     write_concurrency = require_write_concurrency(raw.get("write_concurrency", ""), f"{source}: write_concurrency")
-    # request_timeout (positive int seconds) and transport_max_retries (non-negative int; 0 = disable
-    # transport retries) are connection/reliability tuning knobs inherited from EsConnection. Both are
+    # request_timeout (positive int seconds) and max_retries_per_request (non-negative int; 0 = disable
+    # whole-request retries) are connection/reliability tuning knobs inherited from EsConnection. Both are
     # OPTIONAL: absent -> "" (leave the connector default, 60s / 3 retries). Stored canonical string form
     # (a string job-parameter default), like the other tuning knobs.
     request_timeout = require_request_timeout(raw.get("request_timeout", ""), f"{source}: request_timeout")
-    transport_max_retries = require_transport_max_retries(raw.get("transport_max_retries", ""), f"{source}: transport_max_retries")
+    max_retries_per_request = require_max_retries_per_request(raw.get("max_retries_per_request", ""),
+                                                              f"{source}: max_retries_per_request")
     # max_retries_per_doc (non-negative int; 0 = disable per-document retries) is the PER-DOCUMENT 429
-    # retry count, distinct from transport_max_retries (whole request). OPTIONAL: absent -> "" (leave the
+    # retry count, distinct from max_retries_per_request (whole request). OPTIONAL: absent -> "" (leave the
     # connector default of 3). Stored canonical string form, like the other tuning knobs.
     max_retries_per_doc = require_max_retries_per_doc(raw.get("max_retries_per_doc", ""), f"{source}: max_retries_per_doc")
+    # retry_backoff_initial / retry_backoff_max (non-negative seconds) set the wait between retries for
+    # both layers. OPTIONAL: absent -> "" (leave the connector defaults, 2s / 30s). Stored canonical
+    # string form, like the other tuning knobs.
+    retry_backoff_initial = require_retry_backoff_initial(raw.get("retry_backoff_initial", ""),
+                                                          f"{source}: retry_backoff_initial")
+    retry_backoff_max = require_retry_backoff_max(raw.get("retry_backoff_max", ""),
+                                                  f"{source}: retry_backoff_max")
     require_existing_index = require_es_flag(raw.get("require_existing_index", ""), f"{source}: require_existing_index")
     verify_certs = require_es_flag(raw.get("verify_certs", ""), f"{source}: verify_certs")
     # bulk_stats is the diagnostics knob. It now behaves EXACTLY like verify_certs: an absent value is ""
@@ -991,14 +1085,6 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # Stored canonical ("true"/"false"/"") like the other bool knobs, so it becomes a string job-parameter
     # default.
     bulk_stats = require_es_flag(raw.get("bulk_stats", ""), f"{source}: bulk_stats")
-    # retry_transport_timeout is the connector-owned-timeout-retry toggle. Behaves EXACTLY like bulk_stats:
-    # an absent value is "" (unset at the config level), deferring to the GLOBAL default (the generator
-    # bakes the omitted job-parameter default as the ${var.retry_transport_timeout} databricks.yml variable
-    # per target), and when that is empty too the connector's own default (OFF) stands. A config value here
-    # (`retry_transport_timeout: true|false`) OVERRIDES the global for this pipeline; the run-time job
-    # parameter overrides it per run. Stored canonical ("true"/"false"/"").
-    retry_transport_timeout = require_es_flag(raw.get("retry_transport_timeout", ""),
-                                              f"{source}: retry_transport_timeout")
     # op_type selects the _bulk action for index writes: "index" (default, an upsert-over-_id) or
     # "create" (append-only, plus the connector's create-409-is-a-no-op dedup so a resend of an
     # already-indexed doc is skipped instead of overwriting or failing the batch). OPTIONAL: absent -> ""
@@ -1179,12 +1265,13 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "chunk_size": chunk_size,
         "write_concurrency": write_concurrency,
         "request_timeout": request_timeout,
-        "transport_max_retries": transport_max_retries,
+        "max_retries_per_request": max_retries_per_request,
         "max_retries_per_doc": max_retries_per_doc,
+        "retry_backoff_initial": retry_backoff_initial,
+        "retry_backoff_max": retry_backoff_max,
         "require_existing_index": require_existing_index,
         "verify_certs": verify_certs,
         "bulk_stats": bulk_stats,
-        "retry_transport_timeout": retry_transport_timeout,
         "op_type": op_type,
         "bypass_fast_path": bypass_fast_path,
         "streaming_start": streaming_start,
@@ -1461,20 +1548,19 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         # verbatim (canonical string form), like filter_condition.
         "chunk_size": cfg["chunk_size"],
         "write_concurrency": cfg["write_concurrency"],
-        # request_timeout / transport_max_retries / max_retries_per_doc (connection/reliability tuning)
-        # are connector settings, not object names: passed through verbatim (canonical string form),
-        # like the tuning knobs.
+        # request_timeout / max_retries_per_request / max_retries_per_doc / retry_backoff_initial /
+        # retry_backoff_max (connection/reliability tuning) are connector settings, not object names:
+        # passed through verbatim (canonical string form), like the tuning knobs.
         "request_timeout": cfg["request_timeout"],
-        "transport_max_retries": cfg["transport_max_retries"],
+        "max_retries_per_request": cfg["max_retries_per_request"],
         "max_retries_per_doc": cfg["max_retries_per_doc"],
+        "retry_backoff_initial": cfg["retry_backoff_initial"],
+        "retry_backoff_max": cfg["retry_backoff_max"],
         "require_existing_index": cfg["require_existing_index"],
         "verify_certs": cfg["verify_certs"],
         # bulk_stats (diagnostics toggle) is a connector setting, not an object name: passed through
         # verbatim (canonical string form), like the tuning knobs.
         "bulk_stats": cfg["bulk_stats"],
-        # retry_transport_timeout (connector-owned timeout retry toggle): a connector setting, passed
-        # through verbatim (canonical string form), like bulk_stats.
-        "retry_transport_timeout": cfg["retry_transport_timeout"],
         # op_type (bulk-action selector): a connector setting, not an object name: passed through verbatim
         # (canonical string form), like bulk_stats. (Cleanup: the op_type PR added the field everywhere
         # else but missed this passthrough; harmless since the runner reads knobs from job-parameter
@@ -2035,12 +2121,13 @@ _RUNTIME_KNOBS = (
     _RuntimeKnob("write_concurrency", require_write_concurrency),
     _RuntimeKnob("op_type", require_op_type),
     _RuntimeKnob("request_timeout", require_request_timeout),
-    _RuntimeKnob("transport_max_retries", require_transport_max_retries),
+    _RuntimeKnob("max_retries_per_request", require_max_retries_per_request),
     _RuntimeKnob("max_retries_per_doc", require_max_retries_per_doc),
+    _RuntimeKnob("retry_backoff_initial", require_retry_backoff_initial),
+    _RuntimeKnob("retry_backoff_max", require_retry_backoff_max),
     _RuntimeKnob("require_existing_index", require_es_flag),
     _RuntimeKnob("verify_certs", require_es_flag),
     _RuntimeKnob("bulk_stats", require_es_flag),
-    _RuntimeKnob("retry_transport_timeout", require_es_flag),
     _RuntimeKnob("bypass_fast_path", require_es_flag),
     _RuntimeKnob("streaming_start", require_streaming_start),
     _RuntimeKnob("write_repartition", require_write_repartition),

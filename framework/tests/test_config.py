@@ -35,7 +35,9 @@ from pipeline_lib.config import (
     require_pipeline_mode,
     require_request_timeout,
     require_streaming_start,
-    require_transport_max_retries,
+    require_max_retries_per_request,
+    require_retry_backoff_initial,
+    require_retry_backoff_max,
     require_trigger_interval,
     require_write_concurrency,
     require_write_repartition,
@@ -1109,8 +1111,8 @@ def test_job_base_parameters_excludes_run_time_params():
     # per-run override.
     params = _job_base_parameters("x")
     for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "write_concurrency",
-                     "request_timeout", "transport_max_retries", "max_retries_per_doc",
-                     "require_existing_index",
+                     "request_timeout", "max_retries_per_request", "max_retries_per_doc",
+                     "retry_backoff_initial", "retry_backoff_max", "require_existing_index",
                      "verify_certs", "bulk_stats", "streaming_start", "write_repartition", "max_partition_bytes"):
         assert run_time not in params
 
@@ -1142,12 +1144,13 @@ def test_job_parameters_full_shape_and_order():
         {"name": "write_concurrency", "default": ""},
         {"name": "op_type", "default": ""},
         {"name": "request_timeout", "default": ""},
-        {"name": "transport_max_retries", "default": ""},
+        {"name": "max_retries_per_request", "default": ""},
         {"name": "max_retries_per_doc", "default": ""},
+        {"name": "retry_backoff_initial", "default": ""},
+        {"name": "retry_backoff_max", "default": ""},
         {"name": "require_existing_index", "default": ""},
         {"name": "verify_certs", "default": ""},
         {"name": "bulk_stats", "default": ""},
-        {"name": "retry_transport_timeout", "default": ""},
         {"name": "bypass_fast_path", "default": ""},
         {"name": "streaming_start", "default": ""},
         {"name": "write_repartition", "default": ""},
@@ -1227,11 +1230,11 @@ def test_monitoring_log_table_is_a_base_parameter_not_a_job_parameter():
 
 
 def test_job_parameters_reliability_knobs_default_empty_without_ref():
-    # With no refs supplied (the pure/unit-test call), omitted request_timeout / transport_max_retries /
+    # With no refs supplied (the pure/unit-test call), omitted request_timeout / max_retries_per_request /
     # max_retries_per_doc stay "" - the connector's own defaults stand.
     params = job_parameters(validate_config(_base()))
     assert {"name": "request_timeout", "default": ""} in params
-    assert {"name": "transport_max_retries", "default": ""} in params
+    assert {"name": "max_retries_per_request", "default": ""} in params
     assert {"name": "max_retries_per_doc", "default": ""} in params
 
 
@@ -1251,44 +1254,61 @@ def test_job_parameters_max_retries_per_doc_config_value_overrides_ref():
     assert {"name": "max_retries_per_doc", "default": "0"} in params
 
 
-def test_job_parameters_retry_transport_timeout_defaults_empty_without_ref():
-    # With no ref supplied (the pure/unit-test call), an omitted retry_transport_timeout stays "" - the
-    # connector's own default (off) stands.
-    params = job_parameters(validate_config(_base()))
-    assert {"name": "retry_transport_timeout", "default": ""} in params
-
-
-def test_job_parameters_retry_transport_timeout_omitted_uses_global_ref():
-    # When the config OMITS retry_transport_timeout, the generator's ref becomes the job-parameter
-    # default, so an omitted pipeline defers to ${var.retry_transport_timeout}.
-    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
-    assert {"name": "retry_transport_timeout", "default": "${var.retry_transport_timeout}"} in params
-
-
-@pytest.mark.parametrize("value,expected", [(True, "true"), (False, "false")])
-def test_job_parameters_retry_transport_timeout_config_value_overrides_ref(value, expected):
-    # A config that SETS retry_transport_timeout bakes its literal value, overriding the global ref.
-    cfg = _base()
-    cfg["retry_transport_timeout"] = value
-    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
-    assert {"name": "retry_transport_timeout", "default": expected} in params
-
-
-def test_validate_config_retry_transport_timeout_canonicalized_and_rejected():
-    # Stored canonical ("true"/"false"/"") like the other bool flags; a bad value fails closed.
-    assert validate_config({**_base(), "retry_transport_timeout": True})["retry_transport_timeout"] == "true"
-    assert validate_config({**_base(), "retry_transport_timeout": False})["retry_transport_timeout"] == "false"
-    assert validate_config(_base())["retry_transport_timeout"] == ""    # omitted => unset
+def test_retry_transport_timeout_is_no_longer_a_config_key():
+    # connector 1.0.0 removed retry_transport_timeout (the connector always owns retries), so the
+    # framework rejects it as an unknown key rather than silently ignoring it.
     with pytest.raises(PipelineConfigError, match="retry_transport_timeout"):
-        validate_config({**_base(), "retry_transport_timeout": "maybe"})
+        validate_config({**_base(), "retry_transport_timeout": True})
+    assert "retry_transport_timeout" not in RUNTIME_KNOB_NAMES
 
 
-def test_write_config_overrides_includes_retry_transport_timeout():
-    # The runner's override parser converts the effective flag to a typed bool kwarg, and omits it when
-    # unset (so the connector default stands).
-    assert write_config_overrides("", "", "", retry_transport_timeout="true")["retry_transport_timeout"] is True
-    assert write_config_overrides("", "", "", retry_transport_timeout="false")["retry_transport_timeout"] is False
-    assert "retry_transport_timeout" not in write_config_overrides("", "", "", retry_transport_timeout="")
+@pytest.mark.parametrize("value,expected", [
+    ("", ""), (None, ""), ("  ", ""),
+    (0, "0.0"), ("0", "0.0"), (2, "2.0"), ("2", "2.0"), (0.5, "0.5"), (" 1.5 ", "1.5"), ("30", "30.0"),
+])
+@pytest.mark.parametrize("validator", [require_retry_backoff_initial, require_retry_backoff_max])
+def test_require_retry_backoff_canonical(validator, value, expected):
+    # Non-negative seconds (int or decimal); 0 is meaningful (retry without waiting); unset stays "".
+    assert validator(value) == expected
+
+
+@pytest.mark.parametrize("bad", [-1, "-0.5", "abc", True, False, "nan", "inf", float("inf"), [], {}, 10**400])
+@pytest.mark.parametrize("validator,name", [(require_retry_backoff_initial, "retry_backoff_initial"),
+                                            (require_retry_backoff_max, "retry_backoff_max")])
+def test_require_retry_backoff_fails_closed(validator, name, bad):
+    with pytest.raises(PipelineConfigError, match=name):
+        validator(bad)
+
+
+def test_validate_config_retry_backoff_canonicalized_and_rejected():
+    out = validate_config({**_base(), "retry_backoff_initial": 5, "retry_backoff_max": "60"})
+    assert (out["retry_backoff_initial"], out["retry_backoff_max"]) == ("5.0", "60.0")
+    assert validate_config(_base())["retry_backoff_initial"] == ""    # omitted => unset
+    assert validate_config(_base())["retry_backoff_max"] == ""
+    with pytest.raises(PipelineConfigError, match="retry_backoff_max"):
+        validate_config({**_base(), "retry_backoff_max": -3})
+
+
+@pytest.mark.parametrize("name", ["retry_backoff_initial", "retry_backoff_max"])
+def test_job_parameters_retry_backoff_omitted_uses_global_ref(name):
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
+    assert {"name": name, "default": f"${{var.{name}}}"} in params
+
+
+@pytest.mark.parametrize("name", ["retry_backoff_initial", "retry_backoff_max"])
+def test_job_parameters_retry_backoff_config_value_overrides_ref(name):
+    # 0 is meaningful (canonical "0.0" is truthy), so a config that sets 0 beats the global ref.
+    params = job_parameters(validate_config({**_base(), name: 0}), runtime_knob_global_refs())
+    assert {"name": name, "default": "0.0"} in params
+
+
+def test_write_config_overrides_retry_backoff_parsed_as_floats():
+    assert write_config_overrides("", "", "", retry_backoff_initial="5", retry_backoff_max="60") == {
+        "retry_backoff_initial": 5.0, "retry_backoff_max": 60.0}
+    assert write_config_overrides("", "", "", retry_backoff_initial="0") == {"retry_backoff_initial": 0.0}
+    assert write_config_overrides("", "", "", retry_backoff_initial="", retry_backoff_max="") == {}
+    with pytest.raises(PipelineConfigError, match="retry_backoff_initial"):
+        write_config_overrides("", "", "", retry_backoff_initial="soon")
 
 
 def test_validate_config_bypass_fast_path_canonicalized_and_rejected():
@@ -1414,21 +1434,21 @@ def test_write_config_overrides_includes_op_type():
 
 def test_job_parameters_reliability_knobs_omitted_use_global_ref():
     # When the config OMITS them, the generator's refs become the job-parameter defaults, so an omitted
-    # pipeline defers to the target-wide ${var.request_timeout} / ${var.transport_max_retries} globals.
+    # pipeline defers to the target-wide ${var.request_timeout} / ${var.max_retries_per_request} globals.
     params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
     assert {"name": "request_timeout", "default": "${var.request_timeout}"} in params
-    assert {"name": "transport_max_retries", "default": "${var.transport_max_retries}"} in params
+    assert {"name": "max_retries_per_request", "default": "${var.max_retries_per_request}"} in params
 
 
 def test_job_parameters_reliability_knobs_config_value_overrides_ref():
     # A config that SETS the knob bakes its literal value, overriding the global ref (per-pipeline wins).
-    # transport_max_retries=0 is meaningful and stored canonical "0" (truthy), so it must beat the ref too.
+    # max_retries_per_request=0 is meaningful and stored canonical "0" (truthy), so it must beat the ref too.
     cfg = _base()
     cfg["request_timeout"] = 120
-    cfg["transport_max_retries"] = 0
+    cfg["max_retries_per_request"] = 0
     params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
     assert {"name": "request_timeout", "default": "120"} in params
-    assert {"name": "transport_max_retries", "default": "0"} in params
+    assert {"name": "max_retries_per_request", "default": "0"} in params
 
 
 def test_job_parameters_streaming_start_defaults_empty_without_ref():
@@ -1476,9 +1496,9 @@ def test_runtime_knob_registry_shape():
     # asserts the canonical set/order in one place.
     assert RUNTIME_KNOB_NAMES == (
         "pipeline_mode", "filter_condition", "chunk_size", "write_concurrency", "op_type",
-        "request_timeout", "transport_max_retries", "max_retries_per_doc", "require_existing_index",
-        "verify_certs",
-        "bulk_stats", "retry_transport_timeout", "bypass_fast_path", "streaming_start",
+        "request_timeout", "max_retries_per_request", "max_retries_per_doc", "retry_backoff_initial",
+        "retry_backoff_max", "require_existing_index", "verify_certs",
+        "bulk_stats", "bypass_fast_path", "streaming_start",
         "write_repartition", "max_partition_bytes", "max_files_per_trigger", "max_bytes_per_trigger",
         "monitoring_log_enabled", "log_monitor_source_lookback_seconds", "log_monitor_source_history_rows",
     )
@@ -1622,33 +1642,33 @@ def test_write_config_overrides_bad_request_timeout_fails_closed(bad):
         write_config_overrides("", "", "", request_timeout=bad)
 
 
-def test_write_config_overrides_transport_max_retries_parsed():
-    # transport_max_retries is a keyword-only override (a non-negative int).
-    assert write_config_overrides("", "", "", transport_max_retries="5") == {"transport_max_retries": 5}
-    assert write_config_overrides("", "", "", transport_max_retries=" 8 ") == {"transport_max_retries": 8}
+def test_write_config_overrides_max_retries_per_request_parsed():
+    # max_retries_per_request is a keyword-only override (a non-negative int).
+    assert write_config_overrides("", "", "", max_retries_per_request="5") == {"max_retries_per_request": 5}
+    assert write_config_overrides("", "", "", max_retries_per_request=" 8 ") == {"max_retries_per_request": 8}
 
 
-def test_write_config_overrides_transport_max_retries_zero_included():
+def test_write_config_overrides_max_retries_per_request_zero_included():
     # 0 is a MEANINGFUL value (disable transport retries), so it must be passed through, not dropped as
     # if unset - the distinction between "0 retries" and "leave the connector default (3)".
-    assert write_config_overrides("", "", "", transport_max_retries="0") == {"transport_max_retries": 0}
-    assert write_config_overrides("", "", "", transport_max_retries=0) == {"transport_max_retries": 0}
+    assert write_config_overrides("", "", "", max_retries_per_request="0") == {"max_retries_per_request": 0}
+    assert write_config_overrides("", "", "", max_retries_per_request=0) == {"max_retries_per_request": 0}
 
 
-def test_write_config_overrides_transport_max_retries_empty_omitted():
+def test_write_config_overrides_max_retries_per_request_empty_omitted():
     # Unset (empty) omits the knob, so the connector's own default (3) stands.
-    assert write_config_overrides("", "", "", transport_max_retries="") == {}
+    assert write_config_overrides("", "", "", max_retries_per_request="") == {}
 
 
 @pytest.mark.parametrize("bad", ["abc", "2.5", "-1", "1e2"])
-def test_write_config_overrides_bad_transport_max_retries_fails_closed(bad):
-    with pytest.raises(PipelineConfigError, match="transport_max_retries"):
-        write_config_overrides("", "", "", transport_max_retries=bad)
+def test_write_config_overrides_bad_max_retries_per_request_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="max_retries_per_request"):
+        write_config_overrides("", "", "", max_retries_per_request=bad)
 
 
 def test_write_config_overrides_max_retries_per_doc_parsed():
     # max_retries_per_doc is a keyword-only override (a non-negative int), the PER-DOCUMENT 429 retry
-    # count. Distinct from transport_max_retries; setting one must not touch the other.
+    # count. Distinct from max_retries_per_request; setting one must not touch the other.
     assert write_config_overrides("", "", "", max_retries_per_doc="5") == {"max_retries_per_doc": 5}
     assert write_config_overrides("", "", "", max_retries_per_doc=" 8 ") == {"max_retries_per_doc": 8}
 
@@ -1675,22 +1695,22 @@ def test_write_config_overrides_transport_and_per_doc_independent():
     # The two retry knobs are separate layers: both set at once are carried independently (neither
     # coerces the other), which is exactly why a feed can raise per-doc 429 retries without touching the
     # whole-request retry count.
-    assert write_config_overrides("", "", "", transport_max_retries="2", max_retries_per_doc="7") == {
-        "transport_max_retries": 2,
+    assert write_config_overrides("", "", "", max_retries_per_request="2", max_retries_per_doc="7") == {
+        "max_retries_per_request": 2,
         "max_retries_per_doc": 7,
     }
 
 
 def test_write_config_overrides_combined_with_reliability_knobs():
-    # All knobs together, including the two new reliability knobs (transport_max_retries=0 kept). The
+    # All knobs together, including the two new reliability knobs (max_retries_per_request=0 kept). The
     # positional args are (chunk_size, require_existing_index, verify_certs, write_concurrency,
     # bulk_stats), so bulk_stats=False is included here too.
     assert write_config_overrides("500", "true", "true", "4", "false",
-                                  request_timeout="120", transport_max_retries="0") == {
+                                  request_timeout="120", max_retries_per_request="0") == {
         "chunk_size": 500,
         "write_concurrency": 4,
         "request_timeout": 120,
-        "transport_max_retries": 0,
+        "max_retries_per_request": 0,
         "require_existing_index": True,
         "verify_certs": True,
         "bulk_stats": False,
@@ -1753,17 +1773,17 @@ def test_require_request_timeout_fails_closed(bad):
     (0, "0"), ("0", "0"),                            # 0 is valid (disable transport retries)
     (3, "3"), ("5", "5"), (" 8 ", "8"),              # YAML int OR string -> canonical string
 ])
-def test_require_transport_max_retries_canonical(value, expected):
-    # transport_max_retries is a NON-negative int: 0 is accepted, and unset stays "" (defer to connector
+def test_require_max_retries_per_request_canonical(value, expected):
+    # max_retries_per_request is a NON-negative int: 0 is accepted, and unset stays "" (defer to connector
     # default) rather than being coerced to a value like require_write_repartition does.
-    assert require_transport_max_retries(value) == expected
+    assert require_max_retries_per_request(value) == expected
 
 
 @pytest.mark.parametrize("bad", ["abc", "2.5", "-1", "1e2", -5, 2.5, True, False])
-def test_require_transport_max_retries_fails_closed(bad):
+def test_require_max_retries_per_request_fails_closed(bad):
     # A negative int, a float, a non-numeric string, or a bool (int subclass) must fail closed.
-    with pytest.raises(PipelineConfigError, match="transport_max_retries"):
-        require_transport_max_retries(bad)
+    with pytest.raises(PipelineConfigError, match="max_retries_per_request"):
+        require_max_retries_per_request(bad)
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -1772,7 +1792,7 @@ def test_require_transport_max_retries_fails_closed(bad):
     (3, "3"), ("5", "5"), (" 8 ", "8"),              # YAML int OR string -> canonical string
 ])
 def test_require_max_retries_per_doc_canonical(value, expected):
-    # max_retries_per_doc is a NON-negative int with the same shape as transport_max_retries: 0 is
+    # max_retries_per_doc is a NON-negative int with the same shape as max_retries_per_request: 0 is
     # accepted (disable per-doc retries), and unset stays "" (defer to the connector default).
     assert require_max_retries_per_doc(value) == expected
 
@@ -1813,7 +1833,7 @@ def test_tuning_knobs_from_yaml_string_values():
 @pytest.mark.parametrize("key,bad", [
     ("chunk_size", "abc"), ("chunk_size", 0), ("chunk_size", -5), ("chunk_size", 12.5),
     ("request_timeout", "abc"), ("request_timeout", 0), ("request_timeout", -5), ("request_timeout", 12.5),
-    ("transport_max_retries", "abc"), ("transport_max_retries", -1), ("transport_max_retries", 2.5),
+    ("max_retries_per_request", "abc"), ("max_retries_per_request", -1), ("max_retries_per_request", 2.5),
     ("max_retries_per_doc", "abc"), ("max_retries_per_doc", -1), ("max_retries_per_doc", 2.5),
     ("require_existing_index", "maybe"), ("require_existing_index", 1),
     ("verify_certs", "yes"),
@@ -1826,16 +1846,16 @@ def test_tuning_knobs_bad_config_value_fails_closed(key, bad):
 
 
 def test_reliability_knobs_from_config_canonicalized():
-    # request_timeout / transport_max_retries / max_retries_per_doc accept YAML int or string; stored as
-    # canonical strings. transport_max_retries=0 (disable transport retries) and max_retries_per_doc=0
+    # request_timeout / max_retries_per_request / max_retries_per_doc accept YAML int or string; stored as
+    # canonical strings. max_retries_per_request=0 (disable transport retries) and max_retries_per_doc=0
     # (disable per-doc retries) are valid config values, kept as "0".
     cfg = _base()
     cfg["request_timeout"] = 120
-    cfg["transport_max_retries"] = 0
+    cfg["max_retries_per_request"] = 0
     cfg["max_retries_per_doc"] = 0
     out = validate_config(cfg)
     assert out["request_timeout"] == "120"
-    assert out["transport_max_retries"] == "0"
+    assert out["max_retries_per_request"] == "0"
     assert out["max_retries_per_doc"] == "0"
 
 
@@ -1845,14 +1865,18 @@ def test_tuning_knobs_carried_through_resolve():
     cfg["chunk_size"] = 800
     cfg["verify_certs"] = False
     cfg["request_timeout"] = 90
-    cfg["transport_max_retries"] = 5
+    cfg["max_retries_per_request"] = 5
     cfg["max_retries_per_doc"] = 7
+    cfg["retry_backoff_initial"] = 1.5
+    cfg["retry_backoff_max"] = 45
     out = resolve_config(validate_config(cfg), environment="prod")
+    assert out["retry_backoff_initial"] == "1.5"
+    assert out["retry_backoff_max"] == "45.0"
     assert out["chunk_size"] == "800"
     assert out["verify_certs"] == "false"
     assert out["require_existing_index"] == ""  # omitted -> unset
     assert out["request_timeout"] == "90"
-    assert out["transport_max_retries"] == "5"
+    assert out["max_retries_per_request"] == "5"
     assert out["max_retries_per_doc"] == "7"
 
 
@@ -1860,8 +1884,10 @@ def test_reliability_knobs_omitted_carry_through_resolve_as_unset():
     # Omitted reliability knobs stay "" through resolve (defer to the connector's own defaults).
     out = resolve_config(validate_config(_with_env()), environment="prod")
     assert out["request_timeout"] == ""
-    assert out["transport_max_retries"] == ""
+    assert out["max_retries_per_request"] == ""
     assert out["max_retries_per_doc"] == ""
+    assert out["retry_backoff_initial"] == ""
+    assert out["retry_backoff_max"] == ""
 
 
 def test_job_parameters_tuning_defaults_from_config():
@@ -1871,13 +1897,13 @@ def test_job_parameters_tuning_defaults_from_config():
     cfg["chunk_size"] = 1000
     cfg["verify_certs"] = False
     cfg["request_timeout"] = 120
-    cfg["transport_max_retries"] = 0
+    cfg["max_retries_per_request"] = 0
     params = job_parameters(validate_config(cfg))
     assert {"name": "chunk_size", "default": "1000"} in params
     assert {"name": "verify_certs", "default": "false"} in params
     assert {"name": "require_existing_index", "default": ""} in params
     assert {"name": "request_timeout", "default": "120"} in params
-    assert {"name": "transport_max_retries", "default": "0"} in params
+    assert {"name": "max_retries_per_request", "default": "0"} in params
 
 
 # --------------------------------------------------------------------------- write_repartition
@@ -2689,23 +2715,23 @@ def test_job_group_and_postfix_carried_through_resolve():
 # The runner calls require_connector_version once on the installed wheel's __version__. Allow-list: a
 # release at or above the minimum passes; anything older, a pre-release of the minimum itself, or an
 # unrecognized/missing version fails closed.
-def test_min_connector_version_is_0_10_0():
-    assert MIN_CONNECTOR_VERSION == (0, 10, 0)
+def test_min_connector_version_is_1_0_0():
+    assert MIN_CONNECTOR_VERSION == (1, 0, 0)
 
 
-@pytest.mark.parametrize("version", ["0.10.0", "0.10.1", "0.11.0", "1.0.0", " 0.10.0 ", "0.10.0.post1",
-                                     "0.10.0+local.1", "0.11.0.dev0", "0.11.0rc1", "0.10.0.1",
-                                     "0.10.0.0", "0.11.0rc1.dev1", "0.10.0.post1.dev0", "0.10.1a1",
-                                     "0.10.1rc1.post1", "0.10.0+ubuntu.2"])
+@pytest.mark.parametrize("version", ["1.0.0", "1.0.1", "1.1.0", "2.0.0", " 1.0.0 ", "1.0.0.post1",
+                                     "1.0.0+local.1", "1.1.0.dev0", "1.1.0rc1", "1.0.0.1",
+                                     "1.0.0.0", "1.1.0rc1.dev1", "1.0.0.post1.dev0", "1.0.1a1",
+                                     "1.0.1rc1.post1", "1.0.0+ubuntu.2", "10.0.0"])
 def test_require_connector_version_accepts_supported(version):
     assert require_connector_version(version) == version
 
 
-@pytest.mark.parametrize("version", ["0.9.7", "0.9.99", "0.1.0", "0.10.0rc1", "0.10.0.dev1", "0.10.0a1",
-                                     "0.10.0rc1.dev1", "0.10.0.0rc1", "0.9.7.1", "0.10.0.dev1+local",
-                                     "0.10.0rc1.post1", "0.10.0a1.post1.dev0"])
+@pytest.mark.parametrize("version", ["0.10.0", "0.10.0.post1", "0.99.99", "0.9.7", "0.1.0", "1.0.0rc1",
+                                     "1.0.0.dev1", "1.0.0a1", "1.0.0rc1.dev1", "1.0.0.0rc1", "0.10.0.1",
+                                     "1.0.0.dev1+local", "1.0.0rc1.post1", "1.0.0a1.post1.dev0"])
 def test_require_connector_version_rejects_older(version):
-    with pytest.raises(PipelineConfigError, match=r"older than the framework's minimum 0\.10\.0"):
+    with pytest.raises(PipelineConfigError, match=r"older than the framework's minimum 1\.0\.0"):
         require_connector_version(version, "wheel_path")
 
 
@@ -2732,3 +2758,58 @@ def test_runner_checks_connector_version_once_before_config_load():
     assert names_import and config_load
     assert calls[0] < names_import.start() and calls[0] < config_load.start()
     assert "_VERSION_GATED_KNOBS" not in src
+
+
+# The connector backoff defaults the generator relies on are pinned in the framework; the runner checks the
+# installed connector still has them.
+def test_connector_retry_backoff_defaults_are_canonical():
+    from pipeline_lib.config import CONNECTOR_RETRY_BACKOFF_DEFAULTS
+    assert CONNECTOR_RETRY_BACKOFF_DEFAULTS == {"retry_backoff_initial": "2.0", "retry_backoff_max": "30.0"}
+
+
+def test_require_connector_retry_defaults_accepts_the_pinned_values():
+    from pipeline_lib.config import require_connector_retry_defaults
+    require_connector_retry_defaults({"retry_backoff_initial": 2.0, "retry_backoff_max": 30.0, "other": 1}, 86400)
+    require_connector_retry_defaults({"retry_backoff_initial": 2, "retry_backoff_max": 30}, 86400.0)
+
+
+@pytest.mark.parametrize("installed, match", [
+    ({"retry_backoff_initial": 3.0, "retry_backoff_max": 30.0}, "retry_backoff_initial default is 3.0"),
+    ({"retry_backoff_initial": 2.0, "retry_backoff_max": 60.0}, "retry_backoff_max default is 60.0"),
+    ({"retry_backoff_max": 30.0}, "no retry_backoff_initial default"),
+    ({}, "no retry_backoff_initial default"),
+    # A field whose default was removed: dataclasses reports the MISSING sentinel, not a number.
+    ({"retry_backoff_initial": __import__("dataclasses").MISSING, "retry_backoff_max": 30.0}, "retry_backoff_initial"),
+    ({"retry_backoff_initial": "fast", "retry_backoff_max": 30.0}, "retry_backoff_initial"),
+])
+def test_require_connector_retry_defaults_fails_closed_on_drift(installed, match):
+    from pipeline_lib.config import require_connector_retry_defaults
+    with pytest.raises(PipelineConfigError, match=match):
+        require_connector_retry_defaults(installed, 86400, "wheel_path")
+
+
+@pytest.mark.parametrize("max_backoff", [3600, 86401, None, "86400", True])
+def test_require_connector_retry_defaults_checks_the_backoff_ceiling(max_backoff):
+    from pipeline_lib.config import require_connector_retry_defaults
+    with pytest.raises(PipelineConfigError, match="MAX_RETRY_BACKOFF_SECONDS"):
+        require_connector_retry_defaults({"retry_backoff_initial": 2.0, "retry_backoff_max": 30.0}, max_backoff)
+
+
+@pytest.mark.parametrize("validator", [require_retry_backoff_initial, require_retry_backoff_max])
+def test_require_retry_backoff_enforces_the_connector_ceiling(validator):
+    assert validator(86400) == "86400.0"
+    with pytest.raises(PipelineConfigError, match="from 0 to 86400"):
+        validator(86401)
+
+
+def test_runner_checks_connector_retry_defaults_after_the_version_check():
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks",
+                        "run_index_pipeline.py")
+    src = open(path).read()
+    check = [m.start() for m in re.finditer(r"^require_connector_retry_defaults\(", src, re.M)]
+    version = re.search(r"^require_connector_version\(_connector_version\b", src, re.M)
+    config_load = re.search(r"^cfg = .*\bload_config\(", src, re.M)
+    assert len(check) == 1 and version and config_load
+    assert version.start() < check[0] < config_load.start()
+    assert "_dataclasses.fields(_EsConnection)" in src[check[0]:check[0] + 200]
+    assert "_MAX_RETRY_BACKOFF_SECONDS" in src[check[0]:check[0] + 250]

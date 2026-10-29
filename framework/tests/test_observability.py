@@ -248,8 +248,43 @@ def test_format_bulk_stats_never_raises_on_bad_input(bad):
     assert BULK_STATS_TAG in out
 
 
+# Two partitions under whole-request pushback: part0 had indexing-pressure 429s that the connector retried
+# with backoff, part1 a dropped connection. part0 is the slowest (wall 500 > 300).
+_PUSHBACK_BULK_STATS = [
+    {"n_sends": 4, "docs_sent": 400, "bytes_sent": 40000, "send_busy_ms": 100.0, "partition_wall_ms": 500.0,
+     "timeout_sends": 0, "timeout_wait_ms": 0.0, "connection_error_sends": 0, "connection_error_wait_ms": 0.0,
+     "retry_status_sends": 3, "retry_status_wait_ms": 30.0, "error_sends": 0, "error_wait_ms": 0.0,
+     "backoff_sleep_ms": 14000.0},
+    {"n_sends": 2, "docs_sent": 200, "bytes_sent": 20000, "send_busy_ms": 50.0, "partition_wall_ms": 300.0,
+     "timeout_sends": 0, "timeout_wait_ms": 0.0, "connection_error_sends": 1, "connection_error_wait_ms": 5.0,
+     "retry_status_sends": 0, "retry_status_wait_ms": 0.0, "error_sends": 1, "error_wait_ms": 2.0,
+     "backoff_sleep_ms": 2000.0},
+]
+
+
+def test_bulk_stats_failure_kinds_and_backoff_rendered():
+    # The connector splits failed sends by kind and reports the time it waited between retries; the
+    # overall line sums them, each partition line shows its own, and the tail calls them out on the
+    # slowest partition (so a tail caused by indexing-pressure backoff is visible).
+    lines = format_bulk_stats(_PUSHBACK_BULK_STATS).splitlines()
+    assert "conn_errors(sends=1 wait_ms=5.00)" in lines[0]
+    assert "retry_status(sends=3 wait_ms=30.00)" in lines[0]
+    assert "errors(sends=1 wait_ms=2.00)" in lines[0]
+    assert "backoff_ms=16000.00" in lines[0]
+    assert "retry_status(sends=3 wait_ms=30.00)" in lines[1] and "backoff_ms=14000.00" in lines[1]
+    assert "conn_errors(sends=1 wait_ms=5.00)" in lines[2] and "backoff_ms=2000.00" in lines[2]
+    tail = format_tail_summary({"bulk_stats": _PUSHBACK_BULK_STATS})
+    assert "retry_status_sends=3" in tail and "backoff_ms=14000.00" in tail
+
+
+def test_bulk_stats_failure_kinds_na_when_absent():
+    # A partition without the newer fields renders n/a, never a bogus 0, and never raises.
+    overall = format_bulk_stats(_BULK_STATS, oneline=True)
+    assert "retry_status(sends=n/a" in overall and "backoff_ms=n/a" in overall
+
+
 def test_format_bulk_stats_all_sends_timed_out_partition():
-    # With retry_transport_timeout, a partition whose EVERY send timed out yields n_sends=0 AND
+    # A partition whose EVERY send timed out yields n_sends=0 AND
     # docs_sent=0 while timeout_sends>0. The per-send ratios (docs/send, bytes/send, conc) must guard the
     # zero divisor (n/a or 0, never a crash), and the timeout counters must still render. Previously
     # n_sends=0 only meant an empty partition; now it can mean "all sends failed".
@@ -482,7 +517,7 @@ def test_bulk_stats_cpu_and_gil_render_na_when_absent():
 
 def test_bulk_stats_partial_cpu_gil_presence_renders_na_not_partial_total():
     # A field present on SOME partitions but not all (a connector-version mix) must NOT be summed into
-    # a total that looks cluster-wide -- that would understate contention. It reads n/a until uniform.
+    # a total that looks cluster-wide - that would understate contention. It reads n/a until uniform.
     # part0 carries cpu+gil, part1 does not.
     mixed = [
         {"n_sends": 5, "docs_sent": 100, "send_busy_ms": 50.0, "partition_wall_ms": 50.0,

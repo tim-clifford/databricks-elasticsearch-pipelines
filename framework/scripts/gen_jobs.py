@@ -33,11 +33,14 @@ _REPO_ROOT = os.path.dirname(_FRAMEWORK_ROOT)
 sys.path.insert(0, _FRAMEWORK_ROOT)
 from pipeline_lib.config import (  # noqa: E402
     _RUNTIME_KNOBS,
+    CONNECTOR_RETRY_BACKOFF_DEFAULTS,
     PipelineConfigError,
     _require_identifier,
     job_base_parameters,
     job_parameters,
     load_config,
+    require_retry_backoff_initial,
+    require_retry_backoff_max,
     runtime_knob_global_refs,
 )
 
@@ -399,7 +402,7 @@ def _require_global_var_declared(name: str, validator, path: str | None = None,
     """Fail closed at GENERATION if databricks.yml declares no `<name>` variable, or its static default
     fails `validator` (the SAME require_* helper the runner applies to the effective value).
 
-    A config that OMITS a globally-defaulted knob (bulk_stats, request_timeout, transport_max_retries)
+    A config that OMITS a globally-defaulted knob (bulk_stats, request_timeout, max_retries_per_request)
     has its job-parameter default baked as ${var.<name>}. If the variable is not declared that reference
     would fail only at deploy with a confusing error, so require its declaration here (mirrors
     require_job_name_prefix_declared). Validating the declared default with the runner's own validator
@@ -445,6 +448,40 @@ def require_runtime_knobs_declared(path: str | None = None, doc: dict | None = N
     bundle_doc = doc if doc is not None else _read_bundle_doc(path)
     for knob in _RUNTIME_KNOBS:
         _require_global_var_declared(knob.name, knob.validator, path, bundle_doc)
+
+
+def _global_default(name: str, doc: dict) -> str:
+    """The static default databricks.yml declares for variable `name` (either DAB shape), as a string; ""
+    when absent. Only called after require_runtime_knobs_declared has validated the declaration."""
+    spec = (doc.get("variables") or {}).get(name)
+    default = spec.get("default") if isinstance(spec, dict) else spec
+    return "" if default is None else str(default)
+
+
+def require_retry_backoff_pair(cfg: dict, doc: dict, where: str) -> None:
+    """Fail closed at GENERATION when a pipeline's effective retry_backoff_max is below its effective
+    retry_backoff_initial, wherever each side comes from (the pipeline's own config value, else the
+    databricks.yml global default, else the connector's own default from CONNECTOR_RETRY_BACKOFF_DEFAULTS,
+    which the runner verifies against the installed connector). The connector would reject the pair when
+    the run builds its config, so every run of that pipeline would fail; catching it here keeps it from
+    deploying.
+
+    The top-level globals are checked as the default every target inherits, even when each target
+    overrides one side: the same rule require_runtime_knobs_declared applies to each global on its own.
+    Per-target and --var values are deploy-time and checked at run."""
+    initial = (cfg.get("retry_backoff_initial")
+               or require_retry_backoff_initial(_global_default("retry_backoff_initial", doc),
+                                                "retry_backoff_initial (databricks.yml) default")
+               or CONNECTOR_RETRY_BACKOFF_DEFAULTS["retry_backoff_initial"])
+    maximum = (cfg.get("retry_backoff_max")
+               or require_retry_backoff_max(_global_default("retry_backoff_max", doc),
+                                            "retry_backoff_max (databricks.yml) default")
+               or CONNECTOR_RETRY_BACKOFF_DEFAULTS["retry_backoff_max"])
+    if float(maximum) < float(initial):
+        raise ValueError(
+            f"{where}: effective retry_backoff_max ({maximum}) is below retry_backoff_initial ({initial}); "
+            "the connector rejects that pair, so every run would fail. Set retry_backoff_max >= "
+            "retry_backoff_initial (in the pipeline config or the databricks.yml globals).")
 
 
 def require_support_email_declared(path: str | None = None, doc: dict | None = None) -> None:
@@ -1242,6 +1279,7 @@ def main(argv: list[str] | None = None) -> int:
     for path in config_paths:
         name = _config_name(path)
         cfg = load_config(path)  # raises on any invalid config (fail closed)
+        require_retry_backoff_pair(cfg, bundle_doc, os.path.basename(path))
         # Resolve the host config (pipeline's own, else the bundle default, already checked above) and
         # validate it is declared.
         hc = cfg["es_host_config"] or default_es_host_config

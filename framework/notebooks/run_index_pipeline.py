@@ -39,11 +39,13 @@
 # MAGIC - `pipeline_mode`: `batch` | `streaming` (default from config). Clearing a stale streaming
 # MAGIC   checkpoint is handled by the dedicated `_checkpoint clear` job, not a pipeline_mode.
 # MAGIC - `filter_condition`: optional Spark SQL predicate applied before the write (default from config).
-# MAGIC - `chunk_size`, `write_concurrency`, `request_timeout`, `transport_max_retries`, `max_retries_per_doc`,
-# MAGIC   `require_existing_index`, `verify_certs`: EsWriteConfig tuning (default from config; omitted there and
-# MAGIC   unset per run => connector default). `request_timeout` (seconds) and `transport_max_retries` (0 disables)
-# MAGIC   tune a write that times out mid-send; `max_retries_per_doc` (0 disables) is the PER-DOCUMENT retry count
-# MAGIC   for rows ES rejects with a 429 (write queue full), distinct from the whole-request `transport_max_retries`.
+# MAGIC - `chunk_size`, `write_concurrency`, `request_timeout`, `max_retries_per_request`, `max_retries_per_doc`,
+# MAGIC   `retry_backoff_initial`, `retry_backoff_max`, `require_existing_index`, `verify_certs`: EsWriteConfig
+# MAGIC   tuning (default from config; omitted there and unset per run => connector default). The connector runs
+# MAGIC   every retry with backoff: `max_retries_per_request` (0 disables) re-sends a whole request that timed out,
+# MAGIC   could not connect, or got a 429/502/503/504 (e.g. ES indexing pressure); `max_retries_per_doc` (0
+# MAGIC   disables) is the PER-DOCUMENT retry count for rows ES rejects with a 429 (write queue full). Retry n waits
+# MAGIC   `min(retry_backoff_initial * 2**(n-1), retry_backoff_max)` seconds (connector defaults 2 and 30).
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
 # MAGIC   streaming only, honored on the first run before a checkpoint exists. `new` establishes the
 # MAGIC   checkpoint at the current source position via a no-op availableNow seed (drains the initial
@@ -132,12 +134,13 @@ dbutils.widgets.text("filter_condition", "", "Optional row filter, a Spark SQL p
 dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty => connector default)")
 dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
 dbutils.widgets.text("request_timeout", "", "EsWriteConfig request_timeout: per-request ES client timeout in seconds (empty => connector default 60)")
-dbutils.widgets.text("transport_max_retries", "", "EsWriteConfig transport_max_retries: whole-request retries on a transport failure; 0 disables (empty => connector default 3)")
+dbutils.widgets.text("max_retries_per_request", "", "EsWriteConfig max_retries_per_request: whole-request retries on a timeout, connection error, or 429/502/503/504; 0 disables (empty => connector default 3)")
 dbutils.widgets.text("max_retries_per_doc", "", "EsWriteConfig max_retries_per_doc: PER-DOCUMENT retries for rows ES rejects with a 429 (write queue full); 0 disables (empty => connector default 3)")
+dbutils.widgets.text("retry_backoff_initial", "", "EsWriteConfig retry_backoff_initial: seconds before the first retry, doubling each later retry (empty => connector default 2)")
+dbutils.widgets.text("retry_backoff_max", "", "EsWriteConfig retry_backoff_max: cap in seconds on any single retry wait (empty => connector default 30)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
 dbutils.widgets.text("verify_certs", "", "EsWriteConfig verify_certs: true|false (empty => default)")
 dbutils.widgets.text("bulk_stats", "", "EsWriteConfig bulk_stats: true|false; per-partition ES bulk-send diagnostics in the run log (default from ${var.bulk_stats}/config; empty => connector default off)")
-dbutils.widgets.text("retry_transport_timeout", "", "EsWriteConfig retry_transport_timeout: true|false; connector OWNS whole-request timeout retry (re-send with backoff instead of failing the batch) (default from ${var.retry_transport_timeout}/config; empty => connector default off)")
 dbutils.widgets.text("op_type", "", "EsWriteConfig op_type: index (default) | create; 'create' is append-only (a resend of an already-indexed doc is a 409 no-op, deduped not overwritten) (default from config; empty => connector default 'index')")
 dbutils.widgets.text("bypass_fast_path", "", "EsWriteConfig bypass_fast_path: true|false; skip the errors-probe fast path and classify every chunk per-item (exact docs_deduped/written counts for op_type=create, at the cost of fast-path throughput) (default from ${var.bypass_fast_path}/config; empty => connector default off)")
 dbutils.widgets.text("write_repartition", "", "Repartition the write input to N partitions before bulk_write (0 disables; empty => default)")
@@ -179,12 +182,13 @@ FILTER_CONDITION = dbutils.widgets.get("filter_condition").strip()
 CHUNK_SIZE = dbutils.widgets.get("chunk_size").strip()
 WRITE_CONCURRENCY = dbutils.widgets.get("write_concurrency").strip()
 REQUEST_TIMEOUT = dbutils.widgets.get("request_timeout").strip()
-TRANSPORT_MAX_RETRIES = dbutils.widgets.get("transport_max_retries").strip()
+MAX_RETRIES_PER_REQUEST = dbutils.widgets.get("max_retries_per_request").strip()
 MAX_RETRIES_PER_DOC = dbutils.widgets.get("max_retries_per_doc").strip()
+RETRY_BACKOFF_INITIAL = dbutils.widgets.get("retry_backoff_initial").strip()
+RETRY_BACKOFF_MAX = dbutils.widgets.get("retry_backoff_max").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
 VERIFY_CERTS = dbutils.widgets.get("verify_certs").strip()
 BULK_STATS = dbutils.widgets.get("bulk_stats").strip()
-RETRY_TRANSPORT_TIMEOUT = dbutils.widgets.get("retry_transport_timeout").strip()
 OP_TYPE = dbutils.widgets.get("op_type").strip()
 BYPASS_FAST_PATH = dbutils.widgets.get("bypass_fast_path").strip()
 WRITE_REPARTITION = dbutils.widgets.get("write_repartition").strip()
@@ -223,6 +227,7 @@ from pipeline_lib.config import (  # noqa: E402
     apply_view_schema_user,
     load_config,
     render_view_sql,
+    require_connector_retry_defaults,
     require_connector_version,
     require_es_flag,
     require_filter_condition,
@@ -259,9 +264,16 @@ from pipeline_lib.checkpoint import EMPTY, HAS_OFFSET, checkpoint_offsets_state 
 # The streaming wait loop (pure, duck-typed query; unit-tested off-cluster with a fake query).
 from pipeline_lib.stream_wait import await_stream as _await_stream  # noqa: E402
 
-# The framework supports connector 0.10.0 and later (MIN_CONNECTOR_VERSION). Checked once here, before any
+# The framework supports connector 1.0.0 and later (MIN_CONNECTOR_VERSION). Checked once here, before any
 # config load or export work, so an older wheel fails the run with one clear message.
 require_connector_version(_connector_version, "wheel_path")
+# The generator checks each feed's retry backoff pair against the connector defaults pinned in the framework;
+# confirm the installed connector still has those defaults.
+import dataclasses as _dataclasses  # noqa: E402
+from databricks_es_connector import EsConnection as _EsConnection  # noqa: E402
+from databricks_es_connector.config import MAX_RETRY_BACKOFF_SECONDS as _MAX_RETRY_BACKOFF_SECONDS  # noqa: E402
+require_connector_retry_defaults({f.name: f.default for f in _dataclasses.fields(_EsConnection)},
+                                 _MAX_RETRY_BACKOFF_SECONDS, "wheel_path")
 
 # The write surface used by the export cells below. Imported after the version check, so an older wheel
 # missing one of these names fails with the check's message rather than an ImportError, and here so the
@@ -313,9 +325,10 @@ if STREAMING_TRIGGER_INTERVAL:
     )
 FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition job parameter")
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS,
-                                         request_timeout=REQUEST_TIMEOUT, transport_max_retries=TRANSPORT_MAX_RETRIES,
+                                         request_timeout=REQUEST_TIMEOUT, max_retries_per_request=MAX_RETRIES_PER_REQUEST,
                                          max_retries_per_doc=MAX_RETRIES_PER_DOC,
-                                         retry_transport_timeout=RETRY_TRANSPORT_TIMEOUT, op_type=OP_TYPE,
+                                         retry_backoff_initial=RETRY_BACKOFF_INITIAL,
+                                         retry_backoff_max=RETRY_BACKOFF_MAX, op_type=OP_TYPE,
                                          bypass_fast_path=BYPASS_FAST_PATH)
 STREAMING_START = require_streaming_start(STREAMING_START or "new", "streaming_start job parameter")
 WRITE_REPARTITION = int(require_write_repartition(WRITE_REPARTITION, "write_repartition job parameter"))
