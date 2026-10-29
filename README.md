@@ -39,7 +39,7 @@ The bundle deploys:
 | Configure a feed fully: streaming, compute, schedule, job groups, shared views, etc. | [Feed Configuration Guide](docs/feed-configuration.md) |
 | Look up any setting: what it does, where it's set, what to set it to | [Parameters Reference](docs/parameters.md) |
 | Deploy the bundle and run feeds | [Deployment](docs/deployment.md) |
-| Our internal documentation about our own feeds, environments, infrastructure, and processes. (We maintain these docs.) | [Internal Documentation](docs/_pipelines/README.md) |
+| Our internal documentation about our own feeds, environments, infrastructure, and processes. (We maintain these docs. The framework doesn't ship this file: create it in your repo, see [Layout](#layout).) | [Internal Documentation](docs/_pipelines/README.md) |
 | Run a maintenance job: views, checkpoints, the connector wheel, the ES host check, the log table | [Maintenance Jobs](docs/maintenance-jobs.md) |
 | Read a feed's run output, the monitoring log, or cluster logs | [Logging and Monitoring](docs/monitoring.md) |
 | Keep feeds caught up without overloading Elasticsearch, at the lowest cluster cost | [Throughput Tuning](docs/throughput.md) |
@@ -54,6 +54,9 @@ The repo has two halves. `_pipelines/` holds what you edit for your own feeds, p
 generated from it; `framework/` holds the shared code that runs them and is not edited per feed.
 `databricks.yml` at the root carries your environment's variables and targets. The docs split the same
 way: `docs/_pipelines/` holds your own documentation, and the rest of `docs/` documents the framework.
+The framework doesn't include `docs/_pipelines/`, so a release never overwrites it: create the folder
+and a `README.md` index in it yourself (the Internal Documentation link above points there), for
+example listing your feeds, environments, infrastructure, and runbooks.
 
 ```
 databricks.yml                  Bundle definition: variables + targets (edit for your environment)
