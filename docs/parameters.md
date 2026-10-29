@@ -431,6 +431,25 @@ group name). Cosmetic only: it never changes a resource or task key. In a group,
 or the same value on several; different values fail generation. See
 [Job naming](feed-configuration.md#job-naming).
 
+### `triggered_task_max_retries`
+
+Optional. How many times Databricks re-runs a failed task within the same run, for a feed whose job
+has no continuous trigger (scheduled, on demand, or started by hand). An integer from `0` (no retry)
+to `10`. Omit it to use the `triggered_task_max_retries` variable in `databricks.yml` (shipped `2`),
+which you can also set per target. The run fails only when the last attempt fails. Rejected on a
+continuous feed, and on a job group member whose group is continuous: a continuous job recovers
+through its pinned `task_retry_mode` instead. These are part of the job definition, so `--params`
+can't change them for one run. See [Retrying a failed task](feed-configuration.md#retrying-a-failed-task).
+
+### `triggered_task_min_retry_interval_millis`
+
+Optional. The minimum milliseconds from the **start** of a failed attempt to the start of its retry,
+for the same jobs as [`triggered_task_max_retries`](#triggered_task_max_retries). An integer from `0`
+to `3600000`. Omit it to use the `triggered_task_min_retry_interval_millis` variable in
+`databricks.yml` (shipped `60000`), which you can also set per target. Because the wait counts from
+the attempt's start, an attempt that runs longer than the interval is retried as soon as it fails. The
+same continuous rejection applies.
+
 ## Run-time knobs
 
 Each knob below can be set three ways, by the [precedence rule](#run-time-knobs-one-precedence-rule):
@@ -761,6 +780,8 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`pause_status`](#pause_status) | Config | feed config | this job's pause state, overriding `schedule_pause_status` |
 | [`job_group`](#job_group) | Config | feed config | merges feeds into one job, with a task per feed |
 | [`job_name_postfix`](#job_name_postfix) | Config | feed config | replaces the last part of the job's display name |
+| [`triggered_task_max_retries`](#triggered_task_max_retries) | Config | global, feed config | times a failed task is re-run in the same run (triggered jobs only; shipped `2`) |
+| [`triggered_task_min_retry_interval_millis`](#triggered_task_min_retry_interval_millis) | Config | global, feed config | minimum ms from a failed attempt's start to its retry (triggered jobs only; shipped `60000`) |
 | [`pipeline_mode`](#pipeline_mode) | Knob | global, config, `--params` | `batch` (re-export the whole view) or `streaming` (only new source commits) |
 | [`filter_condition`](#filter_condition) | Knob | global, config, `--params` | a SQL predicate that filters rows before they are written |
 | [`streaming_start`](#streaming_start) | Knob | global, config, `--params` | where a streaming feed's first run starts: `new` or `full` |

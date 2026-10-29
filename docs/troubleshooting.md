@@ -18,14 +18,14 @@ there is one (`...` marks the parts that vary), the cause, and the fix.
 
 | Where it fails | Entries |
 |---|---|
-| [Generating jobs](#generation-fails) | unknown key, undeclared host config, `es_host_configs_json`, cluster configs, tags, job groups, root `resources/` folder, `--check` |
+| [Generating jobs](#generation-fails) | unknown key, undeclared host config, `es_host_configs_json`, cluster configs, tags, job groups, task retries on a continuous feed, root `resources/` folder, `--check` |
 | [Deploying](#deploy-fails) | cluster policy, cluster id, cluster log path, policy conflicts |
 | [Starting a run](#run-fails-at-start) | wheel, host config, `${environment}`, checkpoint path, TLS settings, monitoring table, missing index |
 | [Writing](#writes-fail-or-are-slow) | timeouts, 429s, slow writes, reading the signals |
 | [Falling behind](#falling-behind) | growing backlog, skipped runs, stale index |
 | [Data issues](#data-issues) | fewer documents, duplicates, a stream that writes nothing, source updates missing |
 | [Streaming](#streaming-failures) | schema changes, continuous retry limit |
-| [Schedules](#a-scheduled-job-didnt-run) | paused, skipped |
+| [Schedules](#a-scheduled-job-didnt-run) | paused, skipped, failure emails from a successful run |
 | [Settings](#a-committed-value-seems-ignored) | a committed value seems ignored |
 | [The monitoring log](#gaps-in-the-monitoring-log) | start rows with no end row |
 
@@ -93,6 +93,16 @@ Members of a group share one job, so they must agree. Set the trigger, `pause_st
 A continuous feed must set `pipeline_mode: streaming` in its own config, run on `job_cluster` or
 `existing_cluster` compute, and have no `schedule`
 ([Continuous streaming](feed-configuration.md#continuous-streaming)).
+
+### Task retries on a continuous feed
+
+`triggered_task_max_retries applies only to triggered (scheduled or on-demand) jobs, not a continuous one`,
+or `'<member>' sets triggered_task_max_retries, but its job is continuous`
+
+The `triggered_task_*` keys set a task retry policy, which the Jobs API doesn't allow on a continuous job.
+Remove the key from that feed (a continuous feed recovers through `task_retry_mode`), or from the job group
+member: a member with no trigger of its own inherits a continuous group's trigger
+([Retrying a failed task](feed-configuration.md#retrying-a-failed-task)).
 
 ### Bad config name
 
@@ -427,6 +437,15 @@ or the feed and redeploy, or unpause the job in the UI
 The previous run was still going, and overlapping runs are skipped rather than queued. No work is lost:
 the next run catches up. If it happens often, the feed takes longer than its schedule interval: lengthen
 the interval or make the feed faster ([Overlapping runs skipped](feed-configuration.md#overlapping-runs-skipped)).
+Task retries count toward the run's length: a run that is still retrying a failed task holds the slot
+([Retrying a failed task](feed-configuration.md#retrying-a-failed-task)).
+
+### Failure emails from a successful run
+
+A task failed and its retry succeeded, so the run ended `SUCCESS` after emailing for the failed attempt.
+Open the run and look at the task's attempts to see what failed. If the same task fails often before
+recovering, fix the cause rather than raising the retries
+([Retrying a failed task](feed-configuration.md#retrying-a-failed-task)).
 
 ## A committed value seems ignored
 

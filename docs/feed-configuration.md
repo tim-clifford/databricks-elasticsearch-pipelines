@@ -161,7 +161,7 @@ A feed job runs in one of three ways, set in its config:
 | CRON schedule | a `schedule` block | at each tick of a Quartz cron |
 | Continuous | a `continuous` block (streaming only) | always on: one run that never ends, restarted if it stops |
 
-`schedule` and `continuous` are mutually exclusive. A scheduled feed can also be started by hand between ticks. The pause state and the skipping of overlapping runs apply to both scheduled and continuous triggers: see [Pausing triggers](#pausing-triggers) and [Overlapping runs skipped](#overlapping-runs-skipped).
+`schedule` and `continuous` are mutually exclusive. A scheduled feed can also be started by hand between ticks. The pause state and the skipping of overlapping runs apply to both scheduled and continuous triggers: see [Pausing triggers](#pausing-triggers) and [Overlapping runs skipped](#overlapping-runs-skipped). A failed task is retried in both, by different settings: see [Retrying a failed task](#retrying-a-failed-task).
 
 ### On demand
 
@@ -225,6 +225,38 @@ For a one-off test, unpause a single job in the Jobs UI or API, or deploy with `
 ### Overlapping runs skipped
 
 Every job except `checkpoint_clear` (which allows up to 20 concurrent runs, so several feeds' checkpoints can be cleared at once) sets `max_concurrent_runs: 1` and `queue: {enabled: false}`, so a scheduled tick that comes while the previous run is still going is skipped (`MAX_CONCURRENT_RUNS_EXCEEDED`) rather than overlapping or queueing up. Skipping loses no work: a streaming job's next tick drains the full backlog since its last checkpoint, and a batch job's next tick re-exports the whole view. Without `queue: {enabled: false}` the tick would wait in a queue instead (see [technical details](technical-details.md#queue-disabled)).
+
+### Retrying a failed task
+
+A feed job without a continuous trigger (scheduled, on demand, or started by hand) re-runs a failed task within the same run, up to [`triggered_task_max_retries`](parameters.md#triggered_task_max_retries) times (shipped `2`), each retry starting at least [`triggered_task_min_retry_interval_millis`](parameters.md#triggered_task_min_retry_interval_millis) after the failed attempt **started** (shipped `60000`, one minute). Set either in `databricks.yml` for every feed in a target, or in a feed's config for that feed:
+
+```yaml
+triggered_task_max_retries: 3                   # 0 turns retries off for this feed
+triggered_task_min_retry_interval_millis: 120000
+```
+
+What a retry does:
+
+- **Batch:** re-exports the whole view. With [`es_id_field`](parameters.md#es_id_field) set this overwrites the same documents; without it, documents the failed attempt already sent are written again as duplicates.
+- **Streaming:** resumes from the checkpoint, so it re-sends at most the micro-batch that was in flight and then carries on. The same `es_id_field` point applies.
+- **Job group:** each task retries on its own; the other members are not stopped or re-run. The run fails if any member's last attempt fails, and succeeds if every member ends successful.
+
+Every failed attempt emails [`support_email`](parameters.md#support_email), including one that a later retry recovers. A run whose task failed and then succeeded on retry ends `SUCCESS`, so an alert is not the same as a failed run: look at the task's attempts in the run.
+
+Size the two settings against the schedule. A run that is still retrying when the next tick comes makes that tick skip ([Overlapping runs skipped](#overlapping-runs-skipped)), so keep `(retries + 1) x (attempt time, or the interval if longer)` under the schedule's interval.
+
+A continuous feed doesn't use these settings: it recovers through the pinned `task_retry_mode` ([Failure recovery](#failure-recovery)), and setting either key on a continuous feed, or on a member of a continuous job group, fails generation (the Jobs API rejects a task retry policy on a continuous job). The [maintenance jobs](maintenance-jobs.md) never retry.
+
+The connector also retries inside a task, before the task fails. The layers, from innermost:
+
+| Layer | Setting | Retries |
+|---|---|---|
+| Document | [`max_retries_per_doc`](parameters.md#max_retries_per_doc) | one document ES rejects with a 429 |
+| Request | [`max_retries_per_request`](parameters.md#max_retries_per_request) | a whole bulk request that timed out, lost its connection, or got a 429/502/503/504 |
+| Task (triggered jobs) | `triggered_task_max_retries` | the whole task, after the connector's retries are used up or anything else fails it |
+| Task (continuous jobs) | `task_retry_mode: ON_FAILURE` (pinned) | the whole task, or the whole run at the retry limit |
+
+See [technical details](technical-details.md#triggered-task-retries) for what was measured.
 
 ## Job groups
 
