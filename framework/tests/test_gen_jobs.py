@@ -2096,3 +2096,180 @@ def test_global_default_absent_or_null_falls_back_to_connector_defaults(doc):
         gen_jobs.require_retry_backoff_pair({**_cfg(), "retry_backoff_initial": "60.0"}, doc, "x.yml")
     # ...and an unset pair is the legal default pair.
     gen_jobs.require_retry_backoff_pair(_cfg(), doc, "x.yml")
+
+
+# --------------------------------------------------------------------------- triggered-task retries
+
+
+_RETRY_REFS = {
+    "max_retries": "${var.triggered_task_max_retries}",
+    "min_retry_interval_millis": "${var.triggered_task_min_retry_interval_millis}",
+}
+_JOBS_RETRY_KEYS = ("max_retries", "min_retry_interval_millis", "retry_on_timeout")
+
+
+def _retry_fields(task):
+    return {k: task[k] for k in _JOBS_RETRY_KEYS if k in task}
+
+
+def test_render_on_demand_task_bakes_triggered_retry_global_refs():
+    # A feed that omits both keys inherits the target-wide globals, so a target can change them.
+    (task,) = _render_job(_cfg())["tasks"]
+    assert _retry_fields(task) == _RETRY_REFS
+
+
+def test_render_scheduled_task_bakes_triggered_retry_global_refs():
+    (task,) = _render_job(_cfg(schedule={"quartz_cron_expression": "0 */10 * * * ?"}))["tasks"]
+    assert _retry_fields(task) == _RETRY_REFS
+
+
+def test_render_task_set_triggered_retry_bakes_int_literals():
+    cfg = _cfg(schedule={"quartz_cron_expression": "0 */10 * * * ?"})
+    cfg["triggered_task_max_retries"] = "0"
+    cfg["triggered_task_min_retry_interval_millis"] = "5000"
+    (task,) = _render_job(cfg)["tasks"]
+    assert _retry_fields(task) == {"max_retries": 0, "min_retry_interval_millis": 5000}
+
+
+def test_render_continuous_task_never_carries_retry_fields():
+    # The Jobs API rejects a task retry policy on a continuous job; its recovery is task_retry_mode.
+    (task,) = _render_job(_continuous_cfg(), _JC_SPEC)["tasks"]
+    assert _retry_fields(task) == {}
+
+
+def test_render_continuous_with_triggered_retry_set_fails_closed():
+    # Defense in depth: validate_config rejects this at load; the renderer re-checks so it can never emit.
+    cfg = _continuous_cfg()
+    cfg["triggered_task_max_retries"] = "1"
+    with pytest.raises(ValueError, match="triggered_task_max_retries.*continuous"):
+        _render_job(cfg, _JC_SPEC)
+
+
+def test_group_triggered_tasks_carry_per_member_retry_fields():
+    # Retries are a task field, so each member keeps its own value; a member that omits a key inherits
+    # the global.
+    a = _member("a.yml", "a", "idx-a", mode="batch", schedule="0 0 * * * ?")
+    a[2]["triggered_task_max_retries"] = "4"
+    b = _member("b.yml", "b", "idx-b", mode="batch")
+    job = _render_group("g1", [a, b])
+    by_key = {t["task_key"]: t for t in job["tasks"]}
+    assert _retry_fields(by_key["index_pipeline_a"]) == {
+        "max_retries": 4, "min_retry_interval_millis": _RETRY_REFS["min_retry_interval_millis"]}
+    assert _retry_fields(by_key["index_pipeline_b"]) == _RETRY_REFS
+
+
+def test_group_on_demand_tasks_carry_retry_fields():
+    job = _render_group("g1", [_member("a.yml", "a", "idx-a", mode="batch"),
+                               _member("b.yml", "b", "idx-b", mode="batch")])
+    assert all(_retry_fields(t) == _RETRY_REFS for t in job["tasks"])
+
+
+def test_group_continuous_tasks_never_carry_retry_fields():
+    job = _render_group("g", [
+        _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="shared"),
+        _member("b.yml", "b", "idx-b", job_cluster_config="shared"),
+    ])
+    assert all(_retry_fields(t) == {} for t in job["tasks"])
+
+
+@pytest.mark.parametrize("key", ["triggered_task_max_retries", "triggered_task_min_retry_interval_millis"])
+def test_group_continuous_member_setting_triggered_retry_fails_closed(key):
+    # Member b has no trigger of its own, so config load accepts it; it inherits the group's continuous
+    # trigger, where a task retry policy is not allowed, so generation must reject it by name.
+    b = _member("b.yml", "b", "idx-b", job_cluster_config="shared")
+    b[2][key] = "1"
+    with pytest.raises(ValueError, match=f"'b'.*{key}.*continuous"):
+        _render_group("g", [
+            _member("a.yml", "a", "idx-a", continuous="30 seconds", job_cluster_config="shared"), b])
+
+
+def test_shipped_databricks_yml_triggered_retry_defaults():
+    # The agreed target-wide defaults: 2 retries, at least 60 s between attempt starts.
+    with open(os.path.join(_REPO_ROOT, "databricks.yml")) as fh:
+        variables = yaml.safe_load(fh)["variables"]
+    assert str(variables["triggered_task_max_retries"]["default"]) == "2"
+    assert str(variables["triggered_task_min_retry_interval_millis"]["default"]) == "60000"
+
+
+def test_require_triggered_retry_globals_declared_shipped_passes():
+    gen_jobs.require_triggered_task_retry_globals_declared()
+
+
+@pytest.mark.parametrize("name", ["triggered_task_max_retries", "triggered_task_min_retry_interval_millis"])
+@pytest.mark.parametrize("bad", ["", "-1", "abc", "1.5"])
+def test_require_triggered_retry_globals_bad_default_fails_closed(tmp_path, name, bad):
+    # An empty default is rejected too: the reference fills an integer job field.
+    good = {"triggered_task_max_retries": "2", "triggered_task_min_retry_interval_millis": "60000"}
+    good[name] = bad
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(yaml.safe_dump({"variables": {k: {"default": v} for k, v in good.items()}}))
+    with pytest.raises(ValueError, match=name):
+        gen_jobs.require_triggered_task_retry_globals_declared(str(yml))
+
+
+@pytest.mark.parametrize("name", ["triggered_task_max_retries", "triggered_task_min_retry_interval_millis"])
+def test_require_triggered_retry_globals_missing_fails_closed(tmp_path, name):
+    variables = {"triggered_task_max_retries": {"default": "2"},
+                 "triggered_task_min_retry_interval_millis": {"default": "60000"}}
+    del variables[name]
+    yml = tmp_path / "databricks.yml"
+    yml.write_text(yaml.safe_dump({"variables": variables}))
+    with pytest.raises(ValueError, match=f"{name} is not declared"):
+        gen_jobs.require_triggered_task_retry_globals_declared(str(yml))
+
+
+def test_main_fails_closed_without_triggered_retry_global(tmp_path, monkeypatch, capsys):
+    # main() runs the gate: a bundle missing a triggered-retry global aborts generation.
+    monkeypatch.chdir(tmp_path)
+    config_dir = tmp_path / "_pipelines" / "pipeline_configs"
+    config_dir.mkdir(parents=True)
+    (config_dir / "feed.yml").write_text(
+        "es_index_name: test-index\npipeline_mode: batch\n"
+        "view: {catalog: c, schema: s, name: v}\nsource: {catalog: c, schema: s, table: t}\n")
+    resources_dir = tmp_path / "_pipelines" / "resources"
+    resources_dir.mkdir()
+    dab_yml = _write_bundle_variables(tmp_path)
+    doc = yaml.safe_load(dab_yml.read_text())
+    del doc["variables"]["triggered_task_max_retries"]
+    dab_yml.write_text(yaml.safe_dump(doc))
+    monkeypatch.setattr(gen_jobs, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(gen_jobs, "_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gen_jobs, "_RESOURCES_DIR", str(resources_dir))
+    monkeypatch.setattr(gen_jobs, "_DATABRICKS_YML", str(dab_yml))
+    with pytest.raises(ValueError, match="triggered_task_max_retries is not declared"):
+        gen_jobs.main([])
+    assert list(resources_dir.iterdir()) == []
+
+
+def test_shipped_generated_jobs_retry_fields_match_trigger():
+    # Every shipped generated job: a triggered job's tasks all carry both retry fields, a continuous job's
+    # tasks carry none. Fails if a regenerated file drifts either way.
+    paths = gen_jobs.existing_generated_files()
+    assert paths, "no generated job files found"
+    seen = {"triggered": 0, "continuous": 0}
+    for path in paths:
+        with open(path) as fh:
+            (job,) = yaml.safe_load(fh)["resources"]["jobs"].values()
+        kind = "continuous" if "continuous" in job else "triggered"
+        seen[kind] += 1
+        for task in job["tasks"]:
+            fields = set(_retry_fields(task))
+            expected = set() if kind == "continuous" else {"max_retries", "min_retry_interval_millis"}
+            assert fields == expected, f"{os.path.basename(path)} task {task['task_key']}: {fields}"
+    assert seen["triggered"] and seen["continuous"], seen
+
+
+def test_shipped_hand_authored_jobs_never_retry():
+    # The maintenance jobs are fixed at no retries: a task failure fails the run and emails at once.
+    # Allow-list: every task must carry exactly max_retries: 0 and no other retry field, and no job may
+    # reference the feed retry globals.
+    paths = sorted(glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml")))
+    assert len(paths) == 7, [os.path.basename(p) for p in paths]
+    for path in paths:
+        with open(path) as fh:
+            text = fh.read()
+        assert "triggered_task_" not in text, os.path.basename(path)
+        for job in yaml.safe_load(text)["resources"]["jobs"].values():
+            assert job["tasks"], os.path.basename(path)
+            for task in job["tasks"]:
+                assert _retry_fields(task) == {"max_retries": 0}, f"{os.path.basename(path)}: {task['task_key']}"

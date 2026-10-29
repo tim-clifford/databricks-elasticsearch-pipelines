@@ -39,6 +39,9 @@ from pipeline_lib.config import (
     require_retry_backoff_initial,
     require_retry_backoff_max,
     require_trigger_interval,
+    require_triggered_task_max_retries,
+    require_triggered_task_min_retry_interval_millis,
+    TRIGGERED_TASK_RETRY_FIELDS,
     require_write_concurrency,
     require_write_repartition,
     resolve_config,
@@ -2813,3 +2816,107 @@ def test_runner_checks_connector_retry_defaults_after_the_version_check():
     assert version.start() < check[0] < config_load.start()
     assert "_dataclasses.fields(_EsConnection)" in src[check[0]:check[0] + 200]
     assert "_MAX_RETRY_BACKOFF_SECONDS" in src[check[0]:check[0] + 250]
+
+
+# --------------------------------------------------------------------------- triggered-task retries
+
+
+_TRIGGERED_KEYS = ("triggered_task_max_retries", "triggered_task_min_retry_interval_millis")
+
+
+@pytest.mark.parametrize("key", _TRIGGERED_KEYS)
+def test_triggered_task_retry_absent_defaults_empty(key):
+    # Omitted => "" so the generator bakes the target-wide ${var.<key>} global instead.
+    assert validate_config(_base())[key] == ""
+
+
+@pytest.mark.parametrize("key,value,expected", [
+    ("triggered_task_max_retries", 0, "0"),
+    ("triggered_task_max_retries", 2, "2"),
+    ("triggered_task_max_retries", "10", "10"),
+    ("triggered_task_min_retry_interval_millis", 0, "0"),
+    ("triggered_task_min_retry_interval_millis", 60000, "60000"),
+    ("triggered_task_min_retry_interval_millis", "3600000", "3600000"),
+])
+def test_triggered_task_retry_valid_accepted(key, value, expected):
+    cfg = _base()
+    cfg[key] = value
+    assert validate_config(cfg)[key] == expected
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("triggered_task_max_retries", -1),
+    ("triggered_task_max_retries", 11),
+    ("triggered_task_max_retries", True),
+    ("triggered_task_max_retries", 1.5),
+    ("triggered_task_max_retries", "two"),
+    ("triggered_task_min_retry_interval_millis", -1),
+    ("triggered_task_min_retry_interval_millis", 3600001),
+    ("triggered_task_min_retry_interval_millis", False),
+    ("triggered_task_min_retry_interval_millis", 60.5),
+    ("triggered_task_min_retry_interval_millis", "60s"),
+])
+def test_triggered_task_retry_invalid_rejected(key, bad):
+    cfg = _base()
+    cfg[key] = bad
+    with pytest.raises(PipelineConfigError, match=key):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("key", _TRIGGERED_KEYS)
+def test_triggered_task_retry_rejected_on_continuous(key):
+    # A continuous job recovers through task_retry_mode; the Jobs API rejects a task retry policy on it
+    # ("retryPolicy is not allowed in continuous job"), so fail at config load with a clear message.
+    cfg = _continuous_ready()
+    cfg["continuous"] = {"trigger_interval": "30 seconds"}
+    cfg[key] = 1
+    with pytest.raises(PipelineConfigError, match=f"{key}.*continuous"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("key", _TRIGGERED_KEYS)
+def test_triggered_task_retry_allowed_on_schedule_and_on_demand(key):
+    on_demand = _base()
+    on_demand[key] = 1
+    assert validate_config(on_demand)[key] == "1"
+    scheduled = _base()
+    scheduled["schedule"] = {"quartz_cron_expression": "0 0 * * * ?"}
+    scheduled[key] = 1
+    assert validate_config(scheduled)[key] == "1"
+
+
+@pytest.mark.parametrize("key", _TRIGGERED_KEYS)
+def test_triggered_task_retry_allowed_on_grouped_member_without_own_trigger(key):
+    # The group's effective trigger is known only at generation, so a member is checked there, not here.
+    cfg = _base()
+    cfg["job_group"] = "g"
+    cfg[key] = 1
+    assert validate_config(cfg)[key] == "1"
+
+
+@pytest.mark.parametrize("key", _TRIGGERED_KEYS)
+def test_triggered_task_retry_carried_through_resolve(key):
+    cfg = _base()
+    cfg[key] = 3
+    assert resolve_config(validate_config(cfg), "dev")[key] == "3"
+    assert resolve_config(validate_config(_base()), "dev")[key] == ""
+
+
+@pytest.mark.parametrize("fn", [require_triggered_task_max_retries,
+                                require_triggered_task_min_retry_interval_millis])
+def test_require_triggered_task_retry_empty_is_unset_unless_required(fn):
+    # Empty means "inherit the global" at the config layer, but a global default itself must be set: it
+    # is baked into an integer job field, which an empty value can't fill.
+    assert fn("") == ""
+    assert fn(None) == ""
+    with pytest.raises(PipelineConfigError):
+        fn("", allow_empty=False)
+    assert fn("0", allow_empty=False) == "0"
+
+
+def test_triggered_task_retry_fields_map_to_jobs_api_fields():
+    # The single source of truth for which Jobs task field each key fills.
+    assert TRIGGERED_TASK_RETRY_FIELDS == {
+        "triggered_task_max_retries": "max_retries",
+        "triggered_task_min_retry_interval_millis": "min_retry_interval_millis",
+    }
