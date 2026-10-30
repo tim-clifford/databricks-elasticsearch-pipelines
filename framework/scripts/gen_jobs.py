@@ -34,6 +34,7 @@ sys.path.insert(0, _FRAMEWORK_ROOT)
 from pipeline_lib.config import (  # noqa: E402
     _RUNTIME_KNOBS,
     CONNECTOR_RETRY_BACKOFF_DEFAULTS,
+    TRIGGERED_TASK_RETRY_FIELDS,
     PipelineConfigError,
     _require_identifier,
     job_base_parameters,
@@ -41,6 +42,8 @@ from pipeline_lib.config import (  # noqa: E402
     load_config,
     require_retry_backoff_initial,
     require_retry_backoff_max,
+    require_triggered_task_max_retries,
+    require_triggered_task_min_retry_interval_millis,
     runtime_knob_global_refs,
 )
 
@@ -450,6 +453,27 @@ def require_runtime_knobs_declared(path: str | None = None, doc: dict | None = N
         _require_global_var_declared(knob.name, knob.validator, path, bundle_doc)
 
 
+# Each triggered-task retry key's validator, keyed like TRIGGERED_TASK_RETRY_FIELDS.
+_TRIGGERED_TASK_RETRY_VALIDATORS = {
+    "triggered_task_max_retries": require_triggered_task_max_retries,
+    "triggered_task_min_retry_interval_millis": require_triggered_task_min_retry_interval_millis,
+}
+
+
+def require_triggered_task_retry_globals_declared(path: str | None = None, doc: dict | None = None) -> None:
+    """Fail closed at generation unless databricks.yml declares a legal, NON-EMPTY global default for each
+    triggered-task retry key (TRIGGERED_TASK_RETRY_FIELDS). A triggered feed that omits a key gets
+    ${var.<key>} baked into an integer Jobs task field, so the bundle must declare the variable and its
+    static default must be an integer the validator accepts; an empty default would leave that field empty
+    at deploy. Per-target/--var overrides are deploy-time and not visible here; the Jobs API rejects a
+    non-integer one at deploy."""
+    bundle_doc = doc if doc is not None else _read_bundle_doc(path)
+    for name in TRIGGERED_TASK_RETRY_FIELDS:
+        validator = _TRIGGERED_TASK_RETRY_VALIDATORS[name]
+        _require_global_var_declared(
+            name, lambda value, where, v=validator: v(value, where, allow_empty=False), path, bundle_doc)
+
+
 def _global_default(name: str, doc: dict) -> str:
     """The static default databricks.yml declares for variable `name` (either DAB shape), as a string; ""
     when absent. Only called after require_runtime_knobs_declared has validated the declaration."""
@@ -725,7 +749,8 @@ def _trigger_block(schedule: dict | None, continuous: dict | None, pause_status:
     return None
 
 
-def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_run_time_knobs: bool) -> dict:
+def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_run_time_knobs: bool,
+                triggered: bool) -> dict:
     """Build the notebook-task dict for one config/member. Shared by singleton and grouped rendering.
 
     `streaming_trigger_interval` is the EFFECTIVE ProcessingTime cadence for THIS task ("" => the notebook
@@ -742,6 +767,11 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
       them as the same widget names either way, so this needs no notebook change; the only difference is
       grouped knobs are not per-run --params-overridable. Defaults come from job_parameters (the single
       source of truth for the knob set), so the grouped knob set can never drift from the singleton one.
+
+    triggered is True when the task's job has no continuous trigger (scheduled, Run now, on-demand). Such a
+    task carries the Jobs retry fields (TRIGGERED_TASK_RETRY_FIELDS): the config's own value as an integer,
+    else the ${var.<key>} global. A continuous job's task carries neither, because the Jobs API rejects a
+    task retry policy there; a config that set one for a continuous job fails closed.
 
     The ES connection references the pipeline's es_host_config complex variable's fields
     (${var.<hc>.es_host_url} etc.), resolved per target at deploy. main() has already resolved an omitted
@@ -796,6 +826,16 @@ def _build_task(name: str, cfg: dict, streaming_trigger_interval: str, include_r
         "notebook_path": "../../framework/notebooks/run_index_pipeline.py",
         "base_parameters": base_parameters,
     }
+    # Task retries for a triggered job. validate_config rejects the keys on a continuous config, but a
+    # grouped member with no trigger of its own inherits the group's, so re-check on the EFFECTIVE trigger.
+    for key, field in TRIGGERED_TASK_RETRY_FIELDS.items():
+        if triggered:
+            task[field] = int(cfg[key]) if cfg[key] else f"${{var.{key}}}"
+        elif cfg[key]:
+            raise ValueError(
+                f"'{name}' sets {key}, but its job is continuous, which recovers through task_retry_mode "
+                f"(the Jobs API rejects a task retry policy there); remove {key}"
+            )
     # Per-TASK failure notifications. The job-level email_notifications (see _assemble_job) fires only
     # when the whole run reaches terminal FAILED, so it MISSES a task that fails and is retried: a task
     # that fails-then-succeeds leaves the run SUCCESSFUL, and in a continuous group a crashed task is
@@ -913,7 +953,8 @@ def render_job_yaml(config_filename: str, name: str, cfg: dict, job_cluster_spec
     closed.
     """
     streaming_trigger_interval = cfg["continuous"]["trigger_interval"] if cfg["continuous"] else ""
-    task = _build_task(name, cfg, streaming_trigger_interval, include_run_time_knobs=False)
+    task = _build_task(name, cfg, streaming_trigger_interval, include_run_time_knobs=False,
+                       triggered=cfg["continuous"] is None)
     description = (
         f"Export pipeline for the {cfg['es_index_name']} Elasticsearch index. Runs the shared "
         f"notebook framework/notebooks/run_index_pipeline.py with this index's config. {_compute_desc(cfg)}"
@@ -1090,7 +1131,8 @@ def render_group_job_yaml(group_name: str, members: list, global_job_tags: dict 
             file=sys.stderr,
         )
     tasks = [
-        _build_task(name, cfg, effective_interval, include_run_time_knobs=True)
+        _build_task(name, cfg, effective_interval, include_run_time_knobs=True,
+                    triggered=not (trigger and "continuous" in trigger))
         for _, name, cfg, _ in ordered
     ]
     job_clusters = _job_clusters_for([(name, cfg, spec) for _, name, cfg, spec in ordered])
@@ -1263,6 +1305,7 @@ def main(argv: list[str] | None = None) -> int:
     require_support_email_declared(doc=bundle_doc)
     require_global_job_tags_declared(doc=bundle_doc)
     require_runtime_knobs_declared(doc=bundle_doc)
+    require_triggered_task_retry_globals_declared(doc=bundle_doc)
     es_host_configs = load_es_host_configs(doc=bundle_doc)
     require_es_host_configs_json(es_host_configs, doc=bundle_doc)
     default_es_host_config = load_default_es_host_config(doc=bundle_doc)

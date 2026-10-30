@@ -46,3 +46,8 @@ schedule:                         # OPTIONAL: run this job on a Quartz cron (UTC
   quartz_cron_expression: "0 */10 * * * ?"   # every 10 minutes (paused under dev + stg; fires under prd)
 # pause_status: UNPAUSED          # OPTIONAL: override the target-wide schedule_pause_status for THIS
 #                                 # job's trigger (PAUSED|UNPAUSED). Omit to inherit the target default.
+# triggered_task_max_retries: 2   # OPTIONAL: re-runs of a failed task in the same run (0 to 10). 0 stops
+#                                 # them on classic compute; serverless still retries once on its own.
+#                                 # Omit to inherit ${var.triggered_task_max_retries}. Not for continuous.
+# triggered_task_min_retry_interval_millis: 60000   # OPTIONAL: min ms from a failed attempt's START to
+#                                 # its retry. Omit to inherit the global. Not for continuous.

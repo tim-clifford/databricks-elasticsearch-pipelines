@@ -27,7 +27,8 @@ An always-on (continuous) run never prints a summary line, because it never ends
 
 Every job, generated or fixed, emails the [`support_email`](parameters.md#support_email) list when a job
 or task run fails. Skipped and canceled runs don't email. Set the list per target; an empty list sends
-nothing.
+nothing. Every failed task attempt emails, so a feed task that fails and then succeeds on a
+[retry](feed-configuration.md#retrying-a-failed-task) sends an email although its run ends `SUCCESS`.
 
 ## Reading the `BULK_STATS` output
 

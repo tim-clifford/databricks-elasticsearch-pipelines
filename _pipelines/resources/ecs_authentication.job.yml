@@ -81,6 +81,8 @@ resources:
             view_schema_user_name: ${workspace.current_user.short_name}
             job_run_id: '{{job.run_id}}'
             task_run_id: '{{task.run_id}}'
+        max_retries: ${var.triggered_task_max_retries}
+        min_retry_interval_millis: ${var.triggered_task_min_retry_interval_millis}
         email_notifications:
           on_failure: ${var.support_email}
         notification_settings:
