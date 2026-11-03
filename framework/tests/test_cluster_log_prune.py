@@ -731,9 +731,11 @@ def test_triage_reports_unknown_entries_of_a_young_cluster():
     assert "skipped=1" in summary
 
 
-def test_triage_records_an_unlistable_cluster():
+def test_triage_sends_an_unlistable_cluster_to_the_walk():
+    # Triage's listing isn't the one of record: an unlistable cluster is not young and carries no error;
+    # the walk lists it again and fails the run only if that fails too (see the end-to-end tests below).
     t = triage_cluster(f"{ROOT}/{CID}", None, _fs({CID: PermissionError("denied")}), CUTOFF)
-    assert not t.young and t.kinds == [] and t.list_errors[0][0] == f"{ROOT}/{CID}"
+    assert not t.young and t.kinds == [] and t.list_errors == []
 
 
 def test_driver_newest_exactly_at_the_cutoff_is_young():
@@ -1081,10 +1083,10 @@ def test_an_unexpected_triage_error_is_that_clusters_failure(monkeypatch):
     import pipeline_lib.cluster_log_prune as m
     real = m.triage_cluster
 
-    def flaky(path, entry, ls, cutoff):
+    def flaky(path, *args):
         if path.endswith("-c2"):
             raise KeyError("bug")
-        return real(path, entry, ls, cutoff)
+        return real(path, *args)
 
     monkeypatch.setattr(m, "triage_cluster", flaky)
     tree = {f"0{i}01-000000-c{i}": _terminated(OLD) for i in (1, 2, 3)}
@@ -1301,3 +1303,33 @@ def test_notebook_measures_the_spent_budget_right_before_the_prune():
     measure = cell.find("SPENT_SECONDS, _ = spent_before_seconds(")
     assert 0 <= measure < cell.find("SUMMARY = run_prune(")
     assert "spent_seconds=SPENT_SECONDS" in cell
+
+
+# --------------------------------------------------------------------------- Isaac round 6 fixes
+
+def test_a_triage_listing_failure_through_the_mount_falls_back_to_the_walk():
+    # The fast triage listing (FUSE) can't list a cluster: it goes to the walk, which lists it through ls,
+    # and the run doesn't fail.
+    base = _fs({CID: _terminated(OLD)})
+
+    def fuse(path):
+        if path == f"{ROOT}/{CID}":
+            raise OSError(5, "Input/output error")
+        return base(path)
+
+    rm = _Rm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, base, rm, log=lambda l: None, triage_ls=fuse)
+    assert "failures=0" in summary and "clusters_walked=1" in summary and rm.calls
+
+
+def test_a_triage_listing_failure_through_ls_itself_is_still_a_failure():
+    # Without a separate triage listing, a cluster that can't be listed is a recorded failure, as before.
+    base = _fs({CID: _terminated(OLD)})
+
+    def ls(path):
+        if path == f"{ROOT}/{CID}":
+            raise PermissionError("denied")
+        return base(path)
+
+    with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
+        run_prune(ROOT, 30, CUTOFF, False, ls, _Rm(), log=lambda l: None)

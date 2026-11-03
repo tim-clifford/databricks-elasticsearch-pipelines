@@ -677,7 +677,8 @@ def require_op_type(value: object, where: str = "op_type") -> str:
 
 # The oldest connector release the framework supports: the first with every EsWriteConfig field the runner
 # can pass (max_retries_per_request, retry_backoff_initial, retry_backoff_max, and connector-managed
-# retries for every ES call).
+# retries for every ES call). retry_on_doc_status, which the shipped global default 429,400 passes on every
+# run, is older still: the connector has had it since 0.6.0.
 MIN_CONNECTOR_VERSION = (1, 0, 0)
 # PEP 440 public version (no epoch), group by group: release (X.Y.Z, optionally more segments), pre, post,
 # dev, local.

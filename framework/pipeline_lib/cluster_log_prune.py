@@ -381,11 +381,20 @@ def triage_cluster(path: str, entry, ls, cutoff: int) -> ClusterTriage:
     logs then go together). Everything else (still running, no driver/, an unreadable or empty driver/, or
     any driver log past retention) is walked with the full per-file rules of plan_prune. So a running
     cluster, or one restarted after a termination (it keeps its old eventlog/ but its old rolled driver
-    logs are past retention), is walked and its old logs are still deleted."""
+    logs are past retention), is walked and its old logs are still deleted. One boundary: a cluster
+    restarted after a termination whose old driver logs have already been pruned looks young again while it
+    runs, so its old executor logs wait until it stops. The framework delivers logs only from job clusters,
+    which never restart; telling a restarted cluster apart would mean listing eventlog/'s nested
+    directories for every cluster.
+
+    A cluster triage can't list is sent to the walk, never recorded as a failure here: the walk's own
+    listing is the one of record."""
     try:
         kinds = list(ls(path))
-    except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
-        return ClusterTriage(path, entry, [], False, [], [(path, f"{type(exc).__name__}: {exc}")])
+    except Exception:  # noqa: BLE001 - not young: the walk lists it again and records an error if that fails
+        # Triage's listing is never the one of record (it may go through the FUSE mount, whose view can be
+        # stale): a cluster it can't list goes to the walk, which lists it through ls and fails only then.
+        return ClusterTriage(path, entry, [], False, [], [])
     dirs = {_name(k) for k in kinds if _is_dir(k)}
     if "eventlog" in dirs and "driver" in dirs:
         try:

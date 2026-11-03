@@ -278,12 +278,16 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
      cluster is kept without listing anything else: those logs keep it from being removed, so skipping
      the rest can only keep files. Its older files go together once its driver logs age out. A driver log
      past retention sends the cluster to the walk instead, which covers a cluster restarted after a
-     termination: it keeps its old `eventlog/`, but its old rolled driver logs still get it walked. Triage lists through the `/Volumes` mount, measured at about 20 ms a call against about 270 ms
-     for `dbutils.fs.ls`.
+     termination: it keeps its old `eventlog/`, but its old rolled driver logs still get it walked. Once
+     those are pruned, such a cluster looks young again while it runs, so its old executor logs wait until
+     it stops; this only matters for an all-purpose cluster pointed at this path, since the framework
+     delivers logs only from job clusters, which never restart. Triage lists through the `/Volumes` mount,
+     measured at about 20 ms a call against about 270 ms for `dbutils.fs.ls`. A cluster the mount can't
+     list goes to the walk, which lists it again through `dbutils.fs`.
   2. **Prune.** Every other cluster (one past retention, one still running, or one without a readable
      `driver/`) is listed again and walked with the per-file rules above, oldest cluster id first, and
-     its old files and emptied directories are deleted. A running cluster is always walked, so a
-     long-running cluster's old rolled logs are still deleted.
+     its old files and emptied directories are deleted. A cluster still running (no `eventlog/` yet) is
+     always walked, so a long-running job cluster's old rolled logs are still deleted.
 
   Both phases run on [`cluster_log_prune_workers`](parameters.md#cluster_log_prune_workers) threads
   (default 16). Measured on serverless (2026-11-03, 300 synthetic clusters), 16 threads cut a listing to
