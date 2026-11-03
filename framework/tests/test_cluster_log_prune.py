@@ -651,3 +651,232 @@ def test_a_same_named_file_with_an_unreadable_parent_is_not_called_a_file_root()
         raise PermissionError("denied")
     plan = plan_prune(ROOT, ls, CUTOFF)
     assert plan.list_errors == [] and plan.delete_files == [] and [p for p, _ in plan.skipped] == [f"{ROOT}/cluster_logs"]
+
+
+# --------------------------------------------------------------------------- triage, threads, time budget
+from pipeline_lib.cluster_log_prune import (  # noqa: E402
+    MAX_MINUTES_LIMIT, MAX_WORKERS, _bounded_map, parse_max_minutes, parse_workers, triage_cluster,
+)
+
+
+class _Counting:
+    """Wraps an ls and records every listed path."""
+    def __init__(self, ls):
+        self.ls, self.paths = ls, []
+
+    def __call__(self, path):
+        self.paths.append(path)
+        return self.ls(path)
+
+
+def _terminated(driver_mtime, **extra):
+    """A terminated job cluster: driver/ (newest file at driver_mtime), an old executor file, eventlog/."""
+    tree = {"driver": {"stdout": driver_mtime, "log4j-old.log.gz": OLD},
+            "executor": {"app-1": {"0": {"stderr": OLD}}}, "eventlog": {"x": {"y": {"eventlog": OLD}}}}
+    tree.update(extra)
+    return tree
+
+
+def test_young_terminated_cluster_is_kept_after_two_listings():
+    # Terminated (eventlog/) with a driver log inside retention: kept without walking, even though older
+    # files sit in it. Only the cluster dir and driver/ are listed.
+    ls = _Counting(_fs({CID: _terminated(NEW)}))
+    summary = run_prune(ROOT, 30, CUTOFF, False, ls, _never, log=lambda l: None)
+    assert ls.paths == [ROOT, f"{ROOT}/{CID}", f"{ROOT}/{CID}/driver"]
+    assert "clusters=1 clusters_young=1 clusters_walked=0" in summary and "planned_files=0" in summary
+
+
+def test_terminated_cluster_past_retention_is_walked_and_removed_whole():
+    rm = _Rm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs({CID: _terminated(OLD)}), rm, log=lambda l: None)
+    assert "clusters_young=0 clusters_walked=1" in summary and "deleted_files=4" in summary
+    assert rm.calls[-1] == (f"{ROOT}/{CID}", False)   # removed whole, non-recursively, last
+
+
+def test_running_cluster_is_always_walked_so_old_rolled_logs_go():
+    # No eventlog/: still running (for example a continuous feed's cluster). Its fresh driver log must not
+    # stop the walk, or a long-running cluster's old rolled logs would never be deleted.
+    tree = {CID: {"driver": {"log4j-active.log": NEW, "log4j-old.log.gz": OLD}}}
+    rm = _Rm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lambda l: None)
+    assert "clusters_young=0 clusters_walked=1" in summary
+    assert [p for p, _ in rm.calls] == [f"{ROOT}/{CID}/driver/log4j-old.log.gz"]
+
+
+@pytest.mark.parametrize("cluster", [
+    {"eventlog": {"x": {"eventlog": OLD}}, "executor": {"app": {"0": {"stderr": OLD}}}},   # no driver/
+    {"eventlog": {"x": {"eventlog": OLD}}, "driver": {"stdout": 0}},                       # unreadable age
+    {"eventlog": {"x": {"eventlog": OLD}}, "driver": {"sub": {"f": NEW}}},                 # no file in driver/
+])
+def test_a_terminated_cluster_without_driver_age_evidence_is_walked(cluster):
+    summary = run_prune(ROOT, 30, CUTOFF, True, _fs({CID: cluster}), _never, log=lambda l: None)
+    assert "clusters_young=0 clusters_walked=1" in summary
+
+
+def test_an_unreadable_driver_dir_is_walked_and_fails_the_run():
+    tree = {CID: {"eventlog": {"x": {"eventlog": OLD}}, "driver": PermissionError("denied")}}
+    with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
+        run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _Rm(), log=lambda l: None)
+
+
+def test_triage_reports_unknown_entries_of_a_young_cluster():
+    tree = {CID: _terminated(NEW, stray={"f": OLD})}
+    t = triage_cluster(f"{ROOT}/{CID}", None, _fs(tree), CUTOFF)
+    assert t.young and t.skipped == [(f"{ROOT}/{CID}/stray", "not a known log kind")]
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _never, log=lambda l: None)
+    assert "skipped=1" in summary
+
+
+def test_triage_records_an_unlistable_cluster():
+    t = triage_cluster(f"{ROOT}/{CID}", None, _fs({CID: PermissionError("denied")}), CUTOFF)
+    assert not t.young and t.kinds == [] and t.list_errors[0][0] == f"{ROOT}/{CID}"
+
+
+def test_driver_newest_exactly_at_the_cutoff_is_young():
+    # At the cutoff a file is kept (strictly older is deleted), so the cluster can't be removed whole yet.
+    assert triage_cluster(f"{ROOT}/{CID}", None, _fs({CID: _terminated(CUTOFF)}), CUTOFF).young
+    assert not triage_cluster(f"{ROOT}/{CID}", None, _fs({CID: _terminated(CUTOFF - 1)}), CUTOFF).young
+
+
+def _many(n, driver_mtime=OLD, month="10"):
+    return {f"{month}23-{i:06d}-c{i}": _terminated(driver_mtime) for i in range(n)}
+
+
+def test_threads_give_the_same_result_as_one_thread():
+    tree = {**_many(30), **_many(20, NEW, month="11"), "stray.txt": OLD}
+    one = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _Rm(), log=lambda l: None, workers=1)
+    rm8 = _Rm()
+    eight = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm8, log=lambda l: None, workers=8)
+    strip = lambda s: s.replace("workers=1", "").replace("workers=8", "")
+    assert strip(one) == strip(eight)
+    assert "clusters=50 clusters_young=20 clusters_walked=30" in eight and "deleted_files=120" in eight
+    # 4 files and 8 directories per walked cluster (driver, executor, app-1, 0, eventlog, x, y, the cluster)
+    assert len(rm8.calls) == 30 * (4 + 8)
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_the_budget_stops_the_prune_green_and_oldest_clusters_go_first():
+    # Each delete takes a simulated minute; the budget is 30 minutes, so the run stops partway, green, with
+    # the newest cluster ids left for the next run.
+    clock = _Clock()
+
+    class _SlowRm(_Rm):
+        def __call__(self, path, recurse=None):
+            clock.t += 60
+            return super().__call__(path, recurse)
+
+    tree = {f"{m:02d}01-000000-c{m}": _terminated(OLD) for m in range(6, 0, -1)}   # listed newest first
+    rm, lines = _SlowRm(), []
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lines.append, workers=1, max_minutes=30,
+                        clock=clock)
+    assert "incomplete=True" in summary
+    started = sorted({p[len(ROOT) + 1:].split("/")[0] for p, _ in rm.calls})
+    remaining = int(summary.split("remaining_clusters=")[1].split()[0])
+    assert remaining > 0 and len(started) == 6 - remaining
+    assert started == sorted(tree)[:len(started)]   # oldest first
+    assert any("not yet walked" in l for l in lines)
+
+
+def test_without_running_out_the_run_is_complete():
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs(_many(3)), _Rm(), log=lambda l: None, workers=2,
+                        max_minutes=10, clock=_Clock())
+    assert "incomplete=False remaining_clusters=0" in summary
+
+
+def test_triage_that_runs_out_of_time_fails_and_deletes_nothing():
+    clock = _Clock()
+    base = _fs(_many(20))
+
+    def ls(path):
+        clock.t += 120   # every listing takes two simulated minutes
+        return base(path)
+
+    with pytest.raises(RuntimeError, match=r"triage classified only \d+ of 20 cluster\(s\) within max_minutes=5"):
+        run_prune(ROOT, 30, CUTOFF, False, ls, _never, log=lambda l: None, workers=1, max_minutes=5, clock=clock)
+
+
+def test_progress_is_logged_about_every_interval():
+    clock = _Clock()
+    base = _fs(_many(6, NEW))
+
+    def ls(path):
+        clock.t += 30
+        return base(path)
+
+    lines = []
+    run_prune(ROOT, 30, CUTOFF, False, ls, _never, log=lines.append, workers=1, clock=clock, progress_seconds=60,
+              poll=0.01)
+    progress = [l for l in lines if "progress: triage" in l]
+    assert len(progress) >= 2 and all("cluster(s)" in l and "s elapsed" in l for l in progress)
+
+
+def test_bounded_map_starts_nothing_once_stopped_and_keeps_order():
+    results, started = _bounded_map([1, 2, 3], lambda x: x * 10, 2, lambda: False, lambda c: None, poll=0.01)
+    assert results == [10, 20, 30] and started == 3
+    results, started = _bounded_map([1, 2, 3], _never, 2, lambda: True, lambda c: None, poll=0.01)
+    assert results == [None, None, None] and started == 0
+
+
+def test_bounded_map_propagates_a_worker_exception():
+    def boom(x):
+        raise ValueError("bug")
+    with pytest.raises(ValueError, match="bug"):
+        _bounded_map([1], boom, 1, lambda: False, lambda c: None, poll=0.01)
+
+
+def test_bounded_map_runs_at_most_workers_at_once():
+    import threading
+    peak, live, lock = [0], [0], threading.Lock()
+
+    def fn(x):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        threading.Event().wait(0.005)
+        with lock:
+            live[0] -= 1
+        return x
+
+    results, _ = _bounded_map(list(range(40)), fn, 4, lambda: False, lambda c: None, poll=0.01)
+    assert results == list(range(40)) and 1 < peak[0] <= 4
+
+
+@pytest.mark.parametrize("raw,expected", [(1, 1), ("16", 16), (" 8 ", 8), (MAX_WORKERS, MAX_WORKERS)])
+def test_parse_workers_accepts(raw, expected):
+    assert parse_workers(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [0, MAX_WORKERS + 1, "", "1.5", "-1", "+2", True, 2.0, None, "8 threads"])
+def test_parse_workers_rejects(raw):
+    with pytest.raises(PipelineConfigError, match="cluster_log_prune_workers"):
+        parse_workers(raw)
+
+
+@pytest.mark.parametrize("raw,expected", [(1, 1), ("200", 200), (MAX_MINUTES_LIMIT, MAX_MINUTES_LIMIT)])
+def test_parse_max_minutes_accepts(raw, expected):
+    assert parse_max_minutes(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [0, MAX_MINUTES_LIMIT + 1, "240", "", "1e2", False, None])
+def test_parse_max_minutes_rejects(raw):
+    with pytest.raises(PipelineConfigError, match="cluster_log_prune_max_minutes"):
+        parse_max_minutes(raw)
+
+
+def test_a_cluster_that_cannot_be_listed_is_never_touched():
+    # Its own timestamp is old, but with no listing there is no evidence it is empty or finished: no rm at all.
+    def ls(path):
+        if path == ROOT:
+            return [SimpleNamespace(name=CID + "/", size=0, modificationTime=OLD)]
+        raise PermissionError("denied")
+    rm = _Rm()
+    with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
+        run_prune(ROOT, 30, CUTOFF, False, ls, rm, log=lambda l: None)
+    assert rm.calls == []
