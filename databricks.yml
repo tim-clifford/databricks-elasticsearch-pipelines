@@ -53,7 +53,7 @@ variables:
 
   # GLOBAL job tags applied to EVERY job this bundle deploys: the 6 fixed maintenance jobs in
   # framework/resources/ AND every gen_jobs-generated index/group job. A `type: complex` map of tag key -> tag value. Ships EMPTY ({}) on main: an empty complex var is
-  # OMITTED by DAB, so jobs deploy tagless until you configure this (the same "empty on main" convention as
+  # OMITTED by the bundle, so jobs deploy tagless until you configure this (the same "empty on main" convention as
   # wheel_path and the host configs). Databricks allows at most 25 tags per job.
   #
   # HOW IT REACHES JOBS (two paths, one source):
@@ -561,7 +561,7 @@ variables:
 # .databricks/bundle/<target>/variable-overrides.json instead. (ES api_key
 # VALUES are never here; they live in the referenced Databricks secret scopes.)
 #
-# dev vs stg/prd differ by DEPLOYMENT MODE, which is the DAB best practice:
+# dev vs stg/prd differ by DEPLOYMENT MODE, the recommended practice for bundles:
 # - dev uses `mode: development`: it isolates per user (root_path defaults to the deploying user's
 #   home, resource names are prefixed with the username, schedules/triggers are paused), so its
 #   root_path is deliberately NOT set here - the per-user default is the point.
@@ -583,7 +583,7 @@ targets:
       # checkpoint_base_path: append ${workspace.current_user.short_name} to give each developer their own
       # streaming checkpoints under a shared dev volume. `mode: development` isolates workspace files and
       # resource NAMES per user, but NOT UC Volume data paths, so without this two developers streaming the
-      # same pipeline would collide on one checkpoint. DAB resolves the token to the deploying user at
+      # same pipeline would collide on one checkpoint. The bundle resolves the token to the deploying user at
       # deploy time; the runner then appends /<config_name>. e.g.
       #   checkpoint_base_path: /Volumes/<catalog>/<schema>/<volume>/checkpoints/${workspace.current_user.short_name}
       checkpoint_base_path: ""

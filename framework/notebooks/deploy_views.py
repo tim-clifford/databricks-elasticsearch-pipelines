@@ -8,7 +8,7 @@
 # MAGIC component). This
 # MAGIC notebook renders each view's `${...}` parameters from its config and runs it with `spark.sql`.
 # MAGIC
-# MAGIC Parameter (set by the DAB job as a widget):
+# MAGIC Parameter (set by the bundle job as a widget):
 # MAGIC - `environment`: folded into any config name that contains `${environment}` (e.g.
 # MAGIC   `ocsf_${environment}` -> `ocsf_prd`). May be empty when no config name uses the token.
 # MAGIC - `view_schema_per_user`, `view_schema_user_name` (deploy-time): when the first is true, every view is

@@ -421,7 +421,7 @@ def _require_global_var_declared(name: str, validator, path: str | None = None,
             f"{name} job parameter for any pipeline that omits {name}, so the bundle needs the "
             f"variable to resolve it at deploy."
         )
-    # DAB accepts BOTH the full form (<name>: {default: <v>}) and the scalar shorthand (<name>: <v>,
+    # Bundles accept BOTH the full form (<name>: {default: <v>}) and the scalar shorthand (<name>: <v>,
     # which IS the default). Read the default from whichever shape was used, so a bad shorthand default
     # is validated too rather than silently treated as "".
     spec = variables[name]
@@ -475,7 +475,7 @@ def require_triggered_task_retry_globals_declared(path: str | None = None, doc: 
 
 
 def _global_default(name: str, doc: dict) -> str:
-    """The static default databricks.yml declares for variable `name` (either DAB shape), as a string; ""
+    """The static default databricks.yml declares for variable `name` (either bundle shape), as a string; ""
     when absent. Only called after require_runtime_knobs_declared has validated the declaration."""
     spec = (doc.get("variables") or {}).get(name)
     default = spec.get("default") if isinstance(spec, dict) else spec

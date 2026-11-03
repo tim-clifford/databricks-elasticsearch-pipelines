@@ -2193,7 +2193,7 @@ def job_base_parameters(
     These are notebook-task base_parameters: fixed at deploy, not meant to change per run. The
     generator runs OFFLINE and cannot know the deploy-time values, so it passes the config's NAME
     (the notebook loads/resolves that config at runtime, so object names come from the config) plus
-    DAB variable references threaded through unchanged, all resolved by the bundle at deploy:
+    Bundle variable references threaded through unchanged, all resolved by the bundle at deploy:
     - `environment_ref` (e.g. "${var.environment}"): folded into ${environment} in the config names.
     - `wheel_path_ref` (e.g. "${var.wheel_path}"): the ONE global connector wheel every job installs.
     - `es_host_url_ref`, `secret_scope_name_ref`, `secret_key_name_ref`: the ES connection settings
@@ -2319,7 +2319,7 @@ def runtime_knob_global_refs() -> dict:
     """Map each run-time knob name to its `${var.<name>}` bundle-variable reference.
 
     This is the target-wide global DEFAULT the generator bakes for a config that OMITS the knob, so the
-    knob inherits that target's `${var.<name>}` value (resolved by DAB at deploy). One entry per
+    knob inherits that target's `${var.<name>}` value (resolved by the bundle at deploy). One entry per
     _RUNTIME_KNOBS knob, derived from the name, so the `${var.*}` convention lives in exactly one place and
     a knob added to the registry is wired automatically. framework/scripts/gen_jobs.py passes the result to
     job_parameters; unit tests may pass {} (or a subset) to bake literal "" defaults instead."""
@@ -2344,7 +2344,7 @@ def job_parameters(cfg: dict, global_refs: dict | None = None) -> list:
     runtime_knob_global_refs(). A knob missing from the dict bakes a literal "" default (so a test can
     pass {} to assert the pure config-value shape, or a subset to assert one knob's layering).
 
-    Returns the list shape DAB expects under a job's `parameters:` key, in _RUNTIME_KNOBS order.
+    Returns the list shape the bundle expects under a job's `parameters:` key, in _RUNTIME_KNOBS order.
     """
     refs = global_refs or {}
     return [

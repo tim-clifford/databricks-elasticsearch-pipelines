@@ -932,7 +932,7 @@ if PIPELINE_MODE == "streaming":
         # `continuous` block), which is the SINGLE signal that keeps the job's shape and this trigger in step:
         # - EMPTY => Trigger.availableNow: drain every currently-available source commit in one or more
         #   micro-batches, then STOP. The supported serverless trigger, and it fits the scheduled/on-demand
-        #   DAB job model - each RUN exports the new data since the last run and terminates. availableNow
+        #   bundle job model - each RUN exports the new data since the last run and terminates. availableNow
         #   still honors the rate-limits above (multiple batches) and startingVersion (first-run seed).
         # - NON-EMPTY => Trigger.ProcessingTime(interval): an ALWAYS-ON micro-batch stream that never
         #   terminates. Set only by a continuous pipeline, which config restricts to CLASSIC compute
