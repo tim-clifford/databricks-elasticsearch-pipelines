@@ -95,6 +95,8 @@ print(f"  max_minutes = {MAX_MINUTES} ({SPENT_NOTE})")
 # See pipeline_lib.cluster_log_prune.run_prune.
 # Triage lists through the /Volumes FUSE mount (volume_ls, about 12x faster per call); the walks and deletes
 # use dbutils.fs, whose non-recursive remove the race handling relies on.
+# Measured again right before the run, so nothing between cell 1 and here goes uncharged to the budget.
+SPENT_SECONDS, _ = spent_before_seconds(JOB_START_MS_RAW, int(time.time() * 1000))
 SUMMARY = run_prune(ROOT, RETENTION_DAYS, CUTOFF_MS, DRY_RUN, dbutils.fs.ls, dbutils.fs.rm, workers=WORKERS,
                     max_minutes=MAX_MINUTES, spent_seconds=SPENT_SECONDS, triage_ls=volume_ls)
 print(f"CLUSTER LOGS PRUNE COMPLETE: {SUMMARY}")

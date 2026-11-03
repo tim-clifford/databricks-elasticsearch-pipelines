@@ -359,7 +359,7 @@ class ClusterTriage(NamedTuple):
     path: str
     entry: object
     kinds: list         # the cluster directory's listing ([] when it couldn't be listed)
-    young: bool         # kept without a walk: terminated, and its newest driver log is inside retention
+    young: bool         # kept without a walk: terminated, and every driver log is inside retention
     skipped: list       # unknown entries under a young cluster (a walked cluster reports its own)
     list_errors: list   # the cluster directory couldn't be listed
 
@@ -369,12 +369,6 @@ def _all_files_inside_retention(entries, cutoff: int) -> bool:
     at or past the cutoff. A file of unknown age, or none at all, is not evidence of youth."""
     times = [getattr(e, "modificationTime", None) for e in entries if not _is_dir(e)]
     return bool(times) and all(isinstance(t, int) and not isinstance(t, bool) and t >= cutoff for t in times)
-
-
-def _newest_file_mtime(entries):
-    """The newest positive integer modificationTime among the files in a listing, or None."""
-    times = [getattr(e, "modificationTime", None) for e in entries if not _is_dir(e)]
-    return max((t for t in times if isinstance(t, int) and not isinstance(t, bool) and t > 0), default=None)
 
 
 def triage_cluster(path: str, entry, ls, cutoff: int) -> ClusterTriage:
@@ -431,8 +425,13 @@ def volume_ls(path: str) -> list:
     out = []
     with os.scandir(path) as it:
         for e in it:
-            is_dir = e.is_dir(follow_symlinks=False)
-            st = e.stat(follow_symlinks=False)
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+                st = e.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                # Removed or renamed after scandir yielded it (rotation, a concurrent prune). Skipping it can only
+                # make triage send the cluster to the walk, which lists it again through dbutils.
+                continue
             out.append(SimpleNamespace(name=e.name + ("/" if is_dir else ""), size=0 if is_dir else st.st_size,
                                        modificationTime=0 if is_dir else int(st.st_mtime * 1000)))
     return out
@@ -646,7 +645,7 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
     md = _today_mmdd() if today_mmdd is None else today_mmdd
     to_walk = sorted((t for t in triaged if not t.young and not t.list_errors),
                      key=lambda t: _oldest_first_key(t.path, md))
-    log(f"  triage: {len(young)} cluster(s) kept without a walk (newest driver log inside retention), "
+    log(f"  triage: {len(young)} cluster(s) kept without a walk (every driver log inside retention), "
         f"{len(to_walk)} to walk, {int(clock() - start)} s elapsed")
 
     def prune_one(t: ClusterTriage):
@@ -654,7 +653,7 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
             kinds = list(ls(t.path))   # fresh, through the same ls the walk and deletes use
         except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
             error = (t.path, f"{type(exc).__name__}: {exc}")
-            return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"]), False
+            return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"]), "failed"
         def planning_ls(path):
             if over():
                 raise _DeadlineReached()
@@ -670,11 +669,14 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
 
     results, started_walks = _bounded_map(to_walk, prune_one, workers, over, ticker("prune", len(to_walk)), poll)
     errors = [(t, r) for t, r in zip(to_walk, results) if isinstance(r, ItemError)]
-    done = [(p, c) for p, c, _ in (r for r in results if r is not None and not isinstance(r, ItemError))]
-    stopped_walks = sum(1 for r in results if r is not None and not isinstance(r, ItemError) and r[2])
+    finished = [r for r in results if r is not None and not isinstance(r, ItemError)]
+    done = [(p, c) for p, c, _ in finished]
+    # r[2]: False = walked to the end, True = stopped at the deadline, "failed" = its relisting failed.
+    stopped_walks = sum(1 for r in finished if r[2] is True)
+    failed_walks = sum(1 for r in finished if r[2] == "failed")
     # Walked = pruned to the end: a cluster stopped at the deadline counts as remaining, and one that hit an
     # unexpected error is a failure, neither as walked.
-    walked = started_walks - stopped_walks - len(errors)
+    walked = started_walks - stopped_walks - failed_walks - len(errors)
     plan = _merge([p for p, _ in done], root_skipped + [s for t in young for s in t.skipped],
                   root_errors + [e for t in triaged for e in t.list_errors], root_missing)
     failures = [f"list {p}: {e}" for p, e in root_errors + [e for t in triaged for e in t.list_errors]]
@@ -683,7 +685,7 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
         deleted_files, deleted_dirs, raced_dirs = deleted_files + f_count, deleted_dirs + d_count, raced_dirs + r_count
         failures += fails
     failures += [f"prune {t.path}: {type(r.exc).__name__}: {r.exc}" for t, r in errors]
-    remaining = len(to_walk) - walked - len(errors)
+    remaining = len(to_walk) - walked - failed_walks - len(errors)
     delete_bytes = sum(size for _, size in plan.delete_files)
     log(f"  plan: delete {len(plan.delete_files)} file(s) ({delete_bytes} bytes) and {len(plan.delete_dirs)} "
         f"empty dir(s); keep {plan.kept_files} file(s) ({plan.kept_bytes} bytes) in the walked clusters")

@@ -302,7 +302,8 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
   deleted). The run ends green with `incomplete=True` and
   `remaining_clusters=<n>` in the summary (and a `WARNING` line), counting a cluster it stopped partway
   through as remaining (`clusters_stopped` says how many; `planned_files` and `planned_dirs` include
-  their whole plans, the rest of which is left for the next run); the next run carries on, oldest first. Stopping partway is safe: only old files
+  the whole plan of one stopped while deleting, the rest of which is left for the next run, and nothing
+  for one stopped while still being listed, which has no plan yet); the next run carries on, oldest first. Stopping partway is safe: only old files
   were deleted, every directory is left in place, and the next run lists that cluster again. So a large
   backlog (the first run after turning the job on, or after lowering the retention) drains over several
   nights instead of timing out. Oldest first goes by the cluster id's month and day, with dates later in

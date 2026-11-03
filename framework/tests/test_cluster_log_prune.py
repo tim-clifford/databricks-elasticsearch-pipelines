@@ -1241,3 +1241,63 @@ def test_a_walk_still_listing_at_the_deadline_is_abandoned_with_nothing_deleted(
     after = listed[listed.index(f"{ROOT}/{CID}/executor") + 1:]
     assert after == [], after
     assert "clusters_stopped=1" in summary and "remaining_clusters=1" in summary and "failures=0" in summary
+
+
+# --------------------------------------------------------------------------- Isaac round 5 fixes
+
+def test_volume_ls_skips_an_entry_that_vanishes_mid_listing(tmp_path, monkeypatch):
+    # An entry removed between scandir yielding it and its stat (log rotation) is skipped, not raised.
+    (tmp_path / "keep").write_text("x")
+    (tmp_path / "gone").write_text("x")
+    import pipeline_lib.cluster_log_prune as m
+    real_scandir = m.os.scandir
+
+    class _Entry:
+        def __init__(self, e):
+            self._e, self.name = e, e.name
+
+        def is_dir(self, follow_symlinks=False):
+            return self._e.is_dir(follow_symlinks=follow_symlinks)
+
+        def stat(self, follow_symlinks=False):
+            if self.name == "gone":
+                raise FileNotFoundError("gone")
+            return self._e.stat(follow_symlinks=follow_symlinks)
+
+    class _It:
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __enter__(self):
+            return (_Entry(e) for e in self._it.__enter__())
+
+        def __exit__(self, *a):
+            return self._it.__exit__(*a)
+
+    monkeypatch.setattr(m.os, "scandir", _It)
+    assert [e.name for e in volume_ls(str(tmp_path))] == ["keep"]
+
+
+def test_a_cluster_whose_relist_fails_is_not_counted_as_walked():
+    base = _fs({CID: _terminated(OLD)})
+
+    def ls(path):
+        if path == f"{ROOT}/{CID}":
+            raise PermissionError("denied on the walk")
+        return base(path)
+
+    with pytest.raises(RuntimeError) as err:
+        run_prune(ROOT, 30, CUTOFF, False, ls, _Rm(), log=lambda l: None, triage_ls=base)
+    assert "clusters_walked=0" in str(err.value) and "remaining_clusters=0" in str(err.value)
+
+
+def test_notebook_measures_the_spent_budget_right_before_the_prune():
+    # The run's budget is charged from the job run start up to run_prune's own clock: spent_before_seconds
+    # must be computed in the same cell as the run_prune call, just before it, not only in cell 1.
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "notebooks", "cluster_log_prune.py")
+    with open(path) as fh:
+        cells = fh.read().split("# COMMAND ----------")
+    (cell,) = [c for c in cells if "SUMMARY = run_prune(" in c]
+    measure = cell.find("SPENT_SECONDS, _ = spent_before_seconds(")
+    assert 0 <= measure < cell.find("SUMMARY = run_prune(")
+    assert "spent_seconds=SPENT_SECONDS" in cell
