@@ -1,5 +1,6 @@
 """Offline unit tests for pipeline_lib.cluster_log_prune: the allow-listed delete plan the `_cluster logs prune`
 job executes. A fake directory tree stands in for dbutils.fs.ls."""
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -879,4 +880,67 @@ def test_a_cluster_that_cannot_be_listed_is_never_touched():
     rm = _Rm()
     with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
         run_prune(ROOT, 30, CUTOFF, False, ls, rm, log=lambda l: None)
+    assert rm.calls == []
+
+
+# --------------------------------------------------------------------------- volume_ls and the triage_ls split
+from pipeline_lib.cluster_log_prune import volume_ls  # noqa: E402
+
+
+def test_volume_ls_has_dbutils_entry_semantics(tmp_path):
+    (tmp_path / "driver").mkdir()
+    f = tmp_path / "stdout"
+    f.write_text("x" * 42)
+    os.utime(f, (1_700_000_000.123, 1_700_000_000.123))
+    entries = {e.name: e for e in volume_ls(str(tmp_path))}
+    assert set(entries) == {"driver/", "stdout"}
+    assert entries["driver/"].size == 0 and entries["driver/"].modificationTime == 0
+    assert entries["stdout"].size == 42 and entries["stdout"].modificationTime == 1_700_000_000_123
+
+
+def test_volume_ls_raises_on_a_missing_directory(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        volume_ls(str(tmp_path / "absent"))
+
+
+def test_volume_ls_drives_a_real_prune(tmp_path):
+    # The adapter's entries work with the planner end to end on a real directory tree.
+    root = tmp_path / "cluster_logs"
+    for rel in ("driver/stdout", "eventlog/x/y/eventlog", "executor/app/0/stderr"):
+        p = root / CID / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+    now_ms = int(os.path.getmtime(root / CID / "driver/stdout") * 1000)
+    young = triage_cluster(f"{root}/{CID}", None, volume_ls, now_ms)
+    old = triage_cluster(f"{root}/{CID}", None, volume_ls, now_ms + DAY)
+    assert young.young and not old.young
+
+
+def test_triage_ls_is_used_for_triage_only_and_walks_relist_with_ls():
+    tree = {CID: _terminated(OLD), CID2: _terminated(NEW)}
+    fresh = _Counting(_fs(tree))
+    # A stale triage view: CID's eventlog/ hasn't shown up yet. CID2 is young in it.
+    stale = _Counting(_fs({CID: {"driver": {"stdout": OLD}}, CID2: _terminated(NEW)}))
+    rm = _Rm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, fresh, rm, log=lambda l: None, triage_ls=stale)
+    assert set(stale.paths) == {f"{ROOT}/{CID}", f"{ROOT}/{CID2}", f"{ROOT}/{CID2}/driver"}
+    assert fresh.paths[0] == ROOT and f"{ROOT}/{CID2}" not in fresh.paths   # the young cluster isn't walked
+    # The walk went by the fresh listing: eventlog/ (missing from the stale view) was walked and deleted too,
+    # and the cluster was removed whole.
+    assert f"{ROOT}/{CID}/eventlog/x/y/eventlog" in [p for p, _ in rm.calls] and rm.calls[-1][0] == f"{ROOT}/{CID}"
+    assert "clusters_young=1 clusters_walked=1" in summary
+
+
+def test_a_walked_cluster_that_cannot_be_relisted_fails_without_any_delete():
+    calls = {"n": 0}
+    base = _fs({CID: _terminated(OLD)})
+
+    def ls(path):
+        if path == f"{ROOT}/{CID}":
+            raise PermissionError("denied on the walk")
+        return base(path)
+
+    rm = _Rm()
+    with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
+        run_prune(ROOT, 30, CUTOFF, False, ls, rm, log=lambda l: None, triage_ls=base)
     assert rm.calls == []

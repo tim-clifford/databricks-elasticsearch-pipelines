@@ -14,9 +14,11 @@ other entry is reported as skipped and never touched. A file whose age cannot be
 Pure and dependency-injected (the listing function is passed in, with dbutils.fs.ls semantics) so the
 classification is unit-tested off-cluster; the notebook performs the deletes.
 """
+import os
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from types import SimpleNamespace
 from typing import NamedTuple
 
 from pipeline_lib.config import PipelineConfigError
@@ -367,6 +369,24 @@ def triage_cluster(path: str, entry, ls, cutoff: int) -> ClusterTriage:
     return ClusterTriage(path, entry, kinds, False, [], [])
 
 
+def volume_ls(path: str) -> list:
+    """List a UC Volume directory through the /Volumes FUSE mount (os.scandir), with dbutils.fs.ls entry
+    semantics: `.name` (a directory's ends in '/'), `.size`, `.modificationTime` (epoch ms). Measured on a
+    serverless notebook (2026-11-03) at 21.5 ms per call against 270 ms for dbutils.fs.ls, with identical
+    names, sizes and file times. Used for triage only: FUSE can show a stale view of changes made through
+    dbutils (seen live after deletes), and a stale view can only make a cluster look less young, which means
+    a walk. Walks and deletes go through dbutils.fs. A directory's time is reported as 0, as the prune
+    already assumes for directories."""
+    out = []
+    with os.scandir(path) as it:
+        for e in it:
+            is_dir = e.is_dir(follow_symlinks=False)
+            st = e.stat(follow_symlinks=False)
+            out.append(SimpleNamespace(name=e.name + ("/" if is_dir else ""), size=0 if is_dir else st.st_size,
+                                       modificationTime=0 if is_dir else int(st.st_mtime * 1000)))
+    return out
+
+
 def _bounded_map(items, fn, workers: int, stop, tick, poll: float = 1.0) -> tuple:
     """Run fn over items on `workers` threads with at most 2 * workers in flight. `stop()` is checked
     before each item starts; once it is true nothing new starts and the items in flight finish. Returns
@@ -469,7 +489,8 @@ def _print_capped(log, items, fmt, what, cap=200):
 
 
 def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log=print, *, workers: int = 1,
-              max_minutes=None, clock=time.monotonic, progress_seconds: float = 60, poll: float = 1.0) -> str:
+              max_minutes=None, triage_ls=None, clock=time.monotonic, progress_seconds: float = 60,
+              poll: float = 1.0) -> str:
     """The whole prune run: returns the summary line, or raises RuntimeError when anything failed.
 
     - root unset ("") or retention disabled (cutoff None): nothing to do; a skipped-run summary.
@@ -482,6 +503,9 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
          directories (execute_plan, every rm non-recursive; no rm at all on a dry run). Once `max_minutes`
          has passed, no new cluster starts and the ones in flight finish; the run then reports
          incomplete=True and remaining_clusters, and stays green: the next run carries on from a fresh listing.
+    - `triage_ls` (default `ls`) does the triage listings only; the notebook passes volume_ls, which is much
+      faster than dbutils.fs.ls. The root listing, every walk and every delete use `ls` and `rm`, and a
+      walked cluster is listed again with `ls`, so triage_ls never decides a delete.
     - Progress is logged about every `progress_seconds`. Any listing or delete failure raises after every
       started item has been tried, so a partial prune never reports green.
     """
@@ -503,7 +527,8 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
 
     clusters, root_skipped, root_errors, root_missing = _list_root(root, ls)
     log(f"  {len(clusters)} cluster directory(ies) under the path; triaging on {workers} thread(s)")
-    triaged, started = _bounded_map(clusters, lambda c: triage_cluster(c[0], c[1], ls, cutoff), workers, over,
+    tls = ls if triage_ls is None else triage_ls
+    triaged, started = _bounded_map(clusters, lambda c: triage_cluster(c[0], c[1], tls, cutoff), workers, over,
                                     ticker("triage", len(clusters)), poll)
     if started < len(clusters):
         raise RuntimeError(
@@ -516,7 +541,12 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
         f"{len(to_walk)} to walk, {int(clock() - start)} s elapsed")
 
     def prune_one(t: ClusterTriage):
-        plan = _plan_cluster(t.path, t.entry, t.kinds, ls, cutoff)
+        try:
+            kinds = list(ls(t.path))   # fresh, through the same ls the walk and deletes use
+        except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
+            error = (t.path, f"{type(exc).__name__}: {exc}")
+            return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"])
+        plan = _plan_cluster(t.path, t.entry, kinds, ls, cutoff)
         return plan, execute_plan(plan, rm, dry_run, ls, root)
 
     results, walked = _bounded_map(to_walk, prune_one, workers, over, ticker("prune", len(to_walk)), poll)

@@ -238,7 +238,8 @@ def test_cluster_log_prune_passes_its_parameters_through():
     assert names == ["ROOT", "RETENTION_DAYS", "CUTOFF_MS", "DRY_RUN"]
     assert [ast.unparse(a) for a in call.args[4:6]] == ["dbutils.fs.ls", "dbutils.fs.rm"]
     # The thread count and budget must reach it too: without them the run is serial and unbounded again.
-    assert {k.arg: ast.unparse(k.value) for k in call.keywords} == {"workers": "WORKERS", "max_minutes": "MAX_MINUTES"}
+    assert {k.arg: ast.unparse(k.value) for k in call.keywords} == {"workers": "WORKERS", "max_minutes": "MAX_MINUTES",
+                                                                "triage_ls": "volume_ls"}
     assigns = {t.id: ast.unparse(n.value) for n in ast.walk(_file_ast(nb)) if isinstance(n, ast.Assign)
                for t in n.targets if isinstance(t, ast.Name) and t.id in ("WORKERS", "MAX_MINUTES")}
     assert assigns == {"WORKERS": "parse_workers(WORKERS_RAW)", "MAX_MINUTES": "parse_max_minutes(MAX_MINUTES_RAW)"}

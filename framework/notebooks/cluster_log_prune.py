@@ -61,6 +61,7 @@ from pipeline_lib.cluster_log_prune import (  # noqa: E402
     parse_workers,
     run_prune,
     validate_log_root,
+    volume_ls,
 )
 from pipeline_lib.config import require_es_flag  # noqa: E402
 
@@ -87,8 +88,10 @@ print(f"  max_minutes = {MAX_MINUTES}")
 # collected and fails the run at the end, after every started item has been tried, so a partial prune never
 # reports green; running out of budget in the delete phase ends green with incomplete=True.
 # See pipeline_lib.cluster_log_prune.run_prune.
+# Triage lists through the /Volumes FUSE mount (volume_ls, about 12x faster per call); the walks and deletes
+# use dbutils.fs, whose non-recursive remove the race handling relies on.
 SUMMARY = run_prune(ROOT, RETENTION_DAYS, CUTOFF_MS, DRY_RUN, dbutils.fs.ls, dbutils.fs.rm, workers=WORKERS,
-                    max_minutes=MAX_MINUTES)
+                    max_minutes=MAX_MINUTES, triage_ls=volume_ls)
 print(f"CLUSTER LOGS PRUNE COMPLETE: {SUMMARY}")
 
 # COMMAND ----------
