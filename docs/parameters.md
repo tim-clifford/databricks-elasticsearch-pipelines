@@ -551,7 +551,9 @@ inside a successful bulk response, which `max_retries_per_request` never sees, s
 The per-document statuses that [`max_retries_per_doc`](#max_retries_per_doc) retries: when ES rejects a
 document inside a bulk response with one of these, the connector re-sends just that document, with
 backoff, instead of counting it as an error. Comma-separated HTTP statuses, for example `429,400`. Default
-`429,400` (the `databricks.yml` global). Empty means the connector's own default, `429` only.
+`429,400` (the `databricks.yml` global). A feed config that omits it, or leaves it empty, inherits that
+global; to retry 429s only, set `429`. Only an empty global (or `--var retry_on_doc_status=`) falls back
+to the connector's own default, which is also `429` only.
 
 - **`429`** is ES's write queue being full, and is always in the list: a value without it is rejected,
   since dropping it would remove the retry for backpressure.

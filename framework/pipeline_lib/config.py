@@ -570,8 +570,8 @@ def require_retry_on_doc_status(value: object, where: str = "retry_on_doc_status
             fail("a boolean is not a status")
         if isinstance(entry, int):
             status = entry
-        elif isinstance(entry, str) and re.fullmatch(r"[0-9]{3}", entry):
-            status = int(entry)
+        elif isinstance(entry, str) and re.fullmatch(r"[0-9]{3}", entry.strip()):
+            status = int(entry.strip())
         else:
             fail(f"{entry!r} is not a three-digit status")
         if not 400 <= status <= 599:

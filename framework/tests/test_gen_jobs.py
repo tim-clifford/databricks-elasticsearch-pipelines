@@ -734,6 +734,7 @@ def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
     ("monitoring_log_enabled", "maybe"), ("log_monitor_source_lookback_seconds", "-1"),
     ("log_monitor_source_history_rows", "0"), ("log_monitor_source_history_rows", "10001"),
     ("log_monitor_source_lookback_seconds", "86401"),
+    ("retry_on_doc_status", "400"), ("retry_on_doc_status", "429,404"),
 ])
 def test_require_runtime_knobs_declared_bad_default_fails_closed(tmp_path, name, bad):
     # The registry wires each knob's OWN validator (the same require_* helper the runner applies to the
@@ -2191,6 +2192,13 @@ def test_shipped_databricks_yml_triggered_retry_defaults():
         variables = yaml.safe_load(fh)["variables"]
     assert str(variables["triggered_task_max_retries"]["default"]) == "2"
     assert str(variables["triggered_task_min_retry_interval_millis"]["default"]) == "60000"
+
+
+def test_shipped_databricks_yml_retry_on_doc_status_default():
+    # The agreed target-wide default: a document ES rejects with a 400 is retried, like a 429.
+    with open(os.path.join(_REPO_ROOT, "databricks.yml")) as fh:
+        variables = yaml.safe_load(fh)["variables"]
+    assert variables["retry_on_doc_status"]["default"] == "429,400"
 
 
 def test_require_triggered_retry_globals_declared_shipped_passes():
