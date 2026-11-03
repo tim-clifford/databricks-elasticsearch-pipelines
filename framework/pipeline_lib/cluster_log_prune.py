@@ -319,12 +319,12 @@ def _parse_bounded_int(raw: object, name: str, low: int, high: int) -> int:
 
 def parse_workers(raw: object) -> int:
     """cluster_log_prune_workers: threads listing and deleting in parallel, 1 to MAX_WORKERS."""
-    return _parse_bounded_int(raw, "cluster_log_prune_workers", 1, MAX_WORKERS)
+    return _parse_bounded_int(raw, "workers (cluster_log_prune_workers)", 1, MAX_WORKERS)
 
 
 def parse_max_minutes(raw: object) -> int:
     """cluster_log_prune_max_minutes: the run's time budget, 1 to MAX_MINUTES_LIMIT."""
-    return _parse_bounded_int(raw, "cluster_log_prune_max_minutes", 1, MAX_MINUTES_LIMIT)
+    return _parse_bounded_int(raw, "max_minutes (cluster_log_prune_max_minutes)", 1, MAX_MINUTES_LIMIT)
 
 
 class ClusterTriage(NamedTuple):
