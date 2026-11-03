@@ -34,6 +34,9 @@ Schema (see _pipelines/pipeline_configs/*.yml for a commented example):
                                          #   queue full), connector default 3. Distinct from
                                          #   max_retries_per_request (whole request): a 429'd document is
                                          #   only ever retried by this knob. 0 disables per-doc retries.
+    retry_on_doc_status: <statuses>      # OPTIONAL EsWriteConfig tuning: the per-item statuses that
+                                         #   max_retries_per_doc retries, comma-separated (e.g. "429,400"),
+                                         #   400-599, must include 429, never 404/409. Connector default 429.
     retry_backoff_initial: <non-neg num> # OPTIONAL EsWriteConfig tuning: seconds before the first retry,
                                          #   doubling each later retry (both retry layers), connector
                                          #   default 2. 0 retries immediately.
@@ -521,6 +524,68 @@ def require_max_retries_per_doc(value: object, where: str = "max_retries_per_doc
     return require_max_retries_per_request(value, where)
 
 
+# Per-item statuses retry_on_doc_status may never name: the connector treats a delete's 404 and a create's
+# 409 as terminal no-ops (IGNORED), and a 404/409 on an index write is never transient, so either entry
+# would only add backoff before the same outcome.
+_DOC_STATUS_NEVER_RETRIED = (404, 409)
+
+
+def require_retry_on_doc_status(value: object, where: str = "retry_on_doc_status") -> str:
+    """OPTIONAL EsWriteConfig retry_on_doc_status: the per-item HTTP statuses a rejected document is
+    retried on (by the per-document layer, up to max_retries_per_doc), as a comma-separated string such
+    as "429,400", or "" for unset (leave the connector default, 429 only). Returns the canonical form:
+    the statuses in the order given, comma-joined, no spaces.
+
+    Allow-listed, fail closed: every entry is a plain integer from 400 to 599, never 404 or 409, with no
+    duplicates, and 429 must be one of them (a list without it would silently drop the retry for ES
+    backpressure, which is what the per-document layer exists for). A YAML int (a single status) or a
+    YAML list of ints is accepted at the config layer as well as the string form. A bool, a float, an
+    empty entry ("429,,400") or anything else is rejected. There is no way to name an empty list: turn
+    the per-document layer off with max_retries_per_doc=0 instead."""
+    def fail(detail: str):
+        raise PipelineConfigError(
+            f"{where} must be comma-separated HTTP statuses from 400 to 599 that include 429 (e.g. "
+            f"\"429,400\"), not 404 or 409, without duplicates; {detail}, got {value!r}")
+
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        fail("a boolean is not a status")
+    if isinstance(value, int):
+        entries = [value]
+    elif isinstance(value, (list, tuple)):
+        if not value:
+            fail("an empty list is not allowed (use max_retries_per_doc=0 to turn per-document retries off)")
+        entries = list(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            return ""
+        entries = [part.strip() for part in text.split(",")]
+    else:
+        fail(f"a {type(value).__name__} is not a status list")
+    statuses = []
+    for entry in entries:
+        if isinstance(entry, bool):
+            fail("a boolean is not a status")
+        if isinstance(entry, int):
+            status = entry
+        elif isinstance(entry, str) and re.fullmatch(r"[0-9]{3}", entry.strip()):
+            status = int(entry.strip())
+        else:
+            fail(f"{entry!r} is not a three-digit status")
+        if not 400 <= status <= 599:
+            fail(f"{status} is not an HTTP error status")
+        if status in _DOC_STATUS_NEVER_RETRIED:
+            fail(f"{status} is never retried")
+        if status in statuses:
+            fail(f"{status} is listed twice")
+        statuses.append(status)
+    if 429 not in statuses:
+        fail("429 is missing")
+    return ",".join(str(s) for s in statuses)
+
+
 # The connector's upper bound on any retry backoff value (MAX_RETRY_BACKOFF_SECONDS, 1.0.0): one day. Pinned
 # with CONNECTOR_RETRY_BACKOFF_DEFAULTS below and verified against the installed connector by the runner.
 CONNECTOR_MAX_RETRY_BACKOFF_SECONDS = 86400
@@ -612,7 +677,8 @@ def require_op_type(value: object, where: str = "op_type") -> str:
 
 # The oldest connector release the framework supports: the first with every EsWriteConfig field the runner
 # can pass (max_retries_per_request, retry_backoff_initial, retry_backoff_max, and connector-managed
-# retries for every ES call).
+# retries for every ES call). retry_on_doc_status, which the shipped global default 429,400 passes on every
+# run, is older still: the connector has had it since 0.6.0.
 MIN_CONNECTOR_VERSION = (1, 0, 0)
 # PEP 440 public version (no epoch), group by group: release (X.Y.Z, optionally more segments), pre, post,
 # dev, local.
@@ -694,7 +760,7 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
                            request_timeout: object = "", max_retries_per_request: object = "",
                            max_retries_per_doc: object = "", retry_backoff_initial: object = "",
                            retry_backoff_max: object = "", op_type: object = "",
-                           bypass_fast_path: object = "") -> dict:
+                           bypass_fast_path: object = "", retry_on_doc_status: object = "") -> dict:
     """Convert the effective EsWriteConfig tuning values into a typed kwargs dict, fail closed.
 
     Called by the runner on the effective (config-default or --params override) widget values. Each
@@ -730,6 +796,10 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     retry count (a 429'd document is retried only by this knob, never by max_retries_per_request). Unset
     by default (omitted => the connector's own default of 3 stands).
 
+    retry_on_doc_status (comma-separated per-item statuses, see require_retry_on_doc_status) is the set of
+    statuses that per-document layer retries, passed as a tuple of ints. Unset => omitted, so the
+    connector's own default (429 only) stands.
+
     retry_backoff_initial / retry_backoff_max (non-negative seconds, floats) set the wait between retries
     for both layers. Unset by default (omitted => the connector's own 2s / 30s stand).
 
@@ -762,6 +832,12 @@ def write_config_overrides(chunk_size: object, require_existing_index: object, v
     canonical_max_retries_per_doc = require_max_retries_per_doc(max_retries_per_doc)
     if canonical_max_retries_per_doc:
         overrides["max_retries_per_doc"] = int(canonical_max_retries_per_doc)
+
+    # retry_on_doc_status: a set value is never empty (the validator requires 429), so the tuple is always
+    # a real status list; unset "" is omitted so the connector default (429,) stands.
+    canonical_retry_on_doc_status = require_retry_on_doc_status(retry_on_doc_status)
+    if canonical_retry_on_doc_status:
+        overrides["retry_on_doc_status"] = tuple(int(s) for s in canonical_retry_on_doc_status.split(","))
 
     # The backoff seconds: a canonical "0.0" (retry without waiting) is truthy and included; unset "" is
     # omitted so the connector defaults (2s / 30s) stand.
@@ -1057,7 +1133,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     allowed_top = {
         "es_index_name", "es_id_field", "es_host_config", "pipeline_mode", "filter_condition",
         "chunk_size", "write_concurrency", "request_timeout", "max_retries_per_request",
-        "max_retries_per_doc", "retry_backoff_initial", "retry_backoff_max",
+        "max_retries_per_doc", "retry_on_doc_status", "retry_backoff_initial", "retry_backoff_max",
         "require_existing_index", "verify_certs", "bulk_stats",
         "op_type", "bypass_fast_path",
         "streaming_start",
@@ -1130,6 +1206,11 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
     # retry count, distinct from max_retries_per_request (whole request). OPTIONAL: absent -> "" (leave the
     # connector default of 3). Stored canonical string form, like the other tuning knobs.
     max_retries_per_doc = require_max_retries_per_doc(raw.get("max_retries_per_doc", ""), f"{source}: max_retries_per_doc")
+    # retry_on_doc_status (comma-separated per-item statuses, 429 required) is the set of statuses that
+    # per-document layer retries. OPTIONAL: absent -> "" (leave the connector default, 429 only). Stored
+    # canonical string form, like the other tuning knobs.
+    retry_on_doc_status = require_retry_on_doc_status(raw.get("retry_on_doc_status", ""),
+                                                      f"{source}: retry_on_doc_status")
     # retry_backoff_initial / retry_backoff_max (non-negative seconds) set the wait between retries for
     # both layers. OPTIONAL: absent -> "" (leave the connector defaults, 2s / 30s). Stored canonical
     # string form, like the other tuning knobs.
@@ -1345,6 +1426,7 @@ def validate_config(raw: object, source: str = "<config>") -> dict:
         "request_timeout": request_timeout,
         "max_retries_per_request": max_retries_per_request,
         "max_retries_per_doc": max_retries_per_doc,
+        "retry_on_doc_status": retry_on_doc_status,
         "retry_backoff_initial": retry_backoff_initial,
         "retry_backoff_max": retry_backoff_max,
         "require_existing_index": require_existing_index,
@@ -1634,6 +1716,7 @@ def resolve_config(cfg: dict, environment: str) -> dict:
         "request_timeout": cfg["request_timeout"],
         "max_retries_per_request": cfg["max_retries_per_request"],
         "max_retries_per_doc": cfg["max_retries_per_doc"],
+        "retry_on_doc_status": cfg["retry_on_doc_status"],
         "retry_backoff_initial": cfg["retry_backoff_initial"],
         "retry_backoff_max": cfg["retry_backoff_max"],
         "require_existing_index": cfg["require_existing_index"],
@@ -2111,7 +2194,7 @@ def job_base_parameters(
     These are notebook-task base_parameters: fixed at deploy, not meant to change per run. The
     generator runs OFFLINE and cannot know the deploy-time values, so it passes the config's NAME
     (the notebook loads/resolves that config at runtime, so object names come from the config) plus
-    DAB variable references threaded through unchanged, all resolved by the bundle at deploy:
+    Bundle variable references threaded through unchanged, all resolved by the bundle at deploy:
     - `environment_ref` (e.g. "${var.environment}"): folded into ${environment} in the config names.
     - `wheel_path_ref` (e.g. "${var.wheel_path}"): the ONE global connector wheel every job installs.
     - `es_host_url_ref`, `secret_scope_name_ref`, `secret_key_name_ref`: the ES connection settings
@@ -2206,6 +2289,7 @@ _RUNTIME_KNOBS = (
     _RuntimeKnob("request_timeout", require_request_timeout),
     _RuntimeKnob("max_retries_per_request", require_max_retries_per_request),
     _RuntimeKnob("max_retries_per_doc", require_max_retries_per_doc),
+    _RuntimeKnob("retry_on_doc_status", require_retry_on_doc_status),
     _RuntimeKnob("retry_backoff_initial", require_retry_backoff_initial),
     _RuntimeKnob("retry_backoff_max", require_retry_backoff_max),
     _RuntimeKnob("require_existing_index", require_es_flag),
@@ -2236,7 +2320,7 @@ def runtime_knob_global_refs() -> dict:
     """Map each run-time knob name to its `${var.<name>}` bundle-variable reference.
 
     This is the target-wide global DEFAULT the generator bakes for a config that OMITS the knob, so the
-    knob inherits that target's `${var.<name>}` value (resolved by DAB at deploy). One entry per
+    knob inherits that target's `${var.<name>}` value (resolved by the bundle at deploy). One entry per
     _RUNTIME_KNOBS knob, derived from the name, so the `${var.*}` convention lives in exactly one place and
     a knob added to the registry is wired automatically. framework/scripts/gen_jobs.py passes the result to
     job_parameters; unit tests may pass {} (or a subset) to bake literal "" defaults instead."""
@@ -2261,7 +2345,7 @@ def job_parameters(cfg: dict, global_refs: dict | None = None) -> list:
     runtime_knob_global_refs(). A knob missing from the dict bakes a literal "" default (so a test can
     pass {} to assert the pure config-value shape, or a subset to assert one knob's layering).
 
-    Returns the list shape DAB expects under a job's `parameters:` key, in _RUNTIME_KNOBS order.
+    Returns the list shape the bundle expects under a job's `parameters:` key, in _RUNTIME_KNOBS order.
     """
     refs = global_refs or {}
     return [

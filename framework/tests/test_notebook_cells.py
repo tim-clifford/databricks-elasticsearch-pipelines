@@ -161,7 +161,8 @@ def test_job_notebook_params_found():
     names = {(os.path.basename(nb), n) for _, nb, n in params}
     for expected in [("run_index_pipeline.py", "view_schema_per_user"), ("run_index_pipeline.py", "view_schema_user_name"),
                      ("deploy_views.py", "view_schema_per_user"), ("deploy_views.py", "views"),
-                     ("cluster_log_prune.py", "dry_run"), ("cluster_log_prune.py", "cluster_log_retention_days")]:
+                     ("cluster_log_prune.py", "dry_run"), ("cluster_log_prune.py", "cluster_log_retention_days"),
+                     ("cluster_log_prune.py", "workers"), ("cluster_log_prune.py", "max_minutes")]:
         assert expected in names
     # Every shipped job file contributes (a renamed glob or a skipped task type would drop one), and the total
     # is pinned so a job or task that stops being collected fails here. Update the count when a job, task or
@@ -171,7 +172,7 @@ def test_job_notebook_params_found():
                  glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml"))
                  + glob.glob(os.path.join(repo_root, "_pipelines", "resources", "*.job.yml"))}
     assert len(job_files) == 12 and {j for j, _, _ in params} == job_files
-    assert len(params) == 238
+    assert len(params) == 247
 
 
 
@@ -236,6 +237,20 @@ def test_cluster_log_prune_passes_its_parameters_through():
     names = [getattr(a, "id", None) for a in call.args[:4]]
     assert names == ["ROOT", "RETENTION_DAYS", "CUTOFF_MS", "DRY_RUN"]
     assert [ast.unparse(a) for a in call.args[4:6]] == ["dbutils.fs.ls", "dbutils.fs.rm"]
+    # The thread count and budget must reach it too: without them the run is serial and unbounded again.
+    assert {k.arg: ast.unparse(k.value) for k in call.keywords} == {"workers": "WORKERS", "max_minutes": "MAX_MINUTES",
+                                                                "spent_seconds": "SPENT_SECONDS",
+                                                                "triage_ls": "volume_ls"}
+    assigns = {t.id: ast.unparse(n.value) for n in ast.walk(_file_ast(nb)) if isinstance(n, ast.Assign)
+               for t in n.targets if isinstance(t, ast.Name) and t.id in ("WORKERS", "MAX_MINUTES")}
+    assert assigns == {"WORKERS": "parse_workers(WORKERS_RAW)", "MAX_MINUTES": "parse_max_minutes(MAX_MINUTES_RAW)"}
+    spent = [ast.unparse(n.value) for n in ast.walk(_file_ast(nb)) if isinstance(n, ast.Assign)
+             and isinstance(n.targets[0], ast.Tuple)
+             and [ast.unparse(e) for e in n.targets[0].elts] == ["SPENT_SECONDS", "SPENT_NOTE"]]
+    assert spent == ["spent_before_seconds(JOB_START_MS_RAW, int(time.time() * 1000))"]
+    reads = [ast.unparse(n.value) for n in ast.walk(_file_ast(nb)) if isinstance(n, ast.Assign)
+             and getattr(n.targets[0], "id", None) == "JOB_START_MS_RAW"]
+    assert reads == ["dbutils.widgets.get('job_start_ms')"]
 
 
 def test_cluster_log_prune_derives_dry_run_from_its_widget():

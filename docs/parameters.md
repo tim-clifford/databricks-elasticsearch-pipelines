@@ -179,6 +179,32 @@ leaves empty ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)).
 - **Recommendation:** long enough to cover a post-mortem on any job cluster's logs; the value shipped
   out of the box is `30`.
 
+### `cluster_log_prune_workers`
+
+How many threads the `cluster_log_prune` job lists and deletes with. Every listing and delete is one round
+trip to the Volume, so the run spends its time waiting, and threads overlap those waits
+([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs) has the measured speedup).
+
+- **Set:** top level, per target, or `--var`; one run can override it with `--params workers=<n>`.
+- **Takes effect:** at deploy (the variable), or for one run (the job parameter).
+- **Values:** an integer from `1` to `64`; anything else fails the run before anything is listed.
+- **Recommendation:** the shipped default, `16`.
+
+### `cluster_log_prune_max_minutes`
+
+The time budget of one `cluster_log_prune` run, in minutes, counted from the start of the job run, so an
+attempt retried after a failure shares the same budget. Every cluster directory must be triaged within
+it, or the run fails without deleting anything (a run that can't even classify the clusters can't keep
+up). The delete phase stops starting new clusters once the budget has passed, a cluster in progress stops
+before its next delete (and counts as remaining), and the run ends green with `incomplete=True` and
+`remaining_clusters=<n>` in the summary; the next run carries on from a fresh listing.
+
+- **Set:** top level, per target, or `--var`; one run can override it with `--params max_minutes=<n>`.
+- **Takes effect:** at deploy (the variable), or for one run (the job parameter).
+- **Values:** an integer from `1` to `230`, so the budget always ends the run before the job's 240-minute
+  timeout; anything else fails the run before anything is listed.
+- **Recommendation:** the shipped default, `200`.
+
 ### `job_name_prefix`
 
 The prefix in every job's display name, `[<target>] <prefix>: <postfix>` (see
@@ -528,14 +554,16 @@ up the whole budget in milliseconds. A request that still fails after the last r
 chunk as errors, which fails the batch. ([Why the connector manages retries](technical-details.md#connector-managed-retries).)
 
 It retries only whole requests that fail. When a request succeeds but ES rejects some of the documents
-in it (per-document 429s in the response), those documents are retried by
+in it (per-document 429s or 400s in the response), those documents are retried by
 [`max_retries_per_doc`](#max_retries_per_doc) instead.
 
 ### `max_retries_per_doc`
 
-How many times the connector re-sends an individual document that ES rejects with a 429 (the write
-queue is full). A non-negative integer; `0` disables. Connector default `3`. It waits between attempts
-with the same backoff as [`max_retries_per_request`](#max_retries_per_request).
+How many times the connector re-sends an individual document that ES rejects with a status in
+[`retry_on_doc_status`](#retry_on_doc_status) (by default a 429, the write queue is full, or a 400). Only
+the rejected documents are re-sent, not the rest of the request. A non-negative integer; `0` disables.
+Connector default `3`. It waits between attempts with the same backoff as
+[`max_retries_per_request`](#max_retries_per_request).
 
 Reach for this, not `max_retries_per_request`, when a feed sees per-document 429s under load. Raising it
 far multiplies backoff time within the partition; the real ceiling is ES's write capacity. The connector
@@ -543,6 +571,35 @@ warns if this is `0` while `max_retries_per_request` is raised above its connect
 combination looks like an attempt to ride out backpressure, but it can't: ES returns per-document 429s
 inside a successful bulk response, which `max_retries_per_request` never sees, so with this at `0` a
 429'd document gets no retry at all, whatever `max_retries_per_request` is set to.
+
+### `retry_on_doc_status`
+
+The per-document statuses that [`max_retries_per_doc`](#max_retries_per_doc) retries: when ES rejects a
+document inside a bulk response with one of these, the connector re-sends just that document, with
+backoff, instead of counting it as an error. Comma-separated HTTP statuses, for example `429,400`. Default
+`429,400` (the `databricks.yml` global). A feed config that omits it, or leaves it empty, inherits that
+global; to retry 429s only, set `429`. Only an empty global (or `--var retry_on_doc_status=`) falls back
+to the connector's own default, which is also `429` only.
+
+- **`429`** is ES's write queue being full, and is always in the list: a value without it is rejected,
+  since dropping it would remove the retry for backpressure.
+- **`400`** is in the default because Elasticsearch occasionally rejects a document with a 400 that
+  succeeds when sent again. Without the retry, that one document fails the batch, and the task retry
+  re-sends every row of the run. With it, only that document is re-sent, and the run carries on.
+- Most 400s are not transient: a document that conflicts with the index mapping
+  (`mapper_parsing_exception`, `document_parsing_exception`) is rejected the same way every time. With
+  `400` in the list such a document is retried `max_retries_per_doc` times first (with the default
+  backoff, about 14 seconds), then fails the batch as it would without the retry. Nothing is skipped
+  either way; the failure just arrives later. Set `429` alone to fail those on the first attempt.
+
+Allowed values: statuses from 400 to 599, without duplicates, never `404` or `409` (the connector treats
+a delete's 404 and a create's 409 as final, and neither is transient). In a feed config it can also be a
+YAML list, `[429, 400]`. There is no empty list: to turn per-document retries off, set
+`max_retries_per_doc` to `0`.
+
+A retried document that then succeeds still shows in `BULK_STATS` (with
+[`bulk_stats`](#bulk_stats) on): each rejected attempt counts under `retried=` and under its status in
+`rejected(...)` (a 400 under `4xx=`), even though the run succeeded.
 
 ### `retry_backoff_initial`
 
@@ -737,6 +794,8 @@ never a typed-out list; a list long enough to hit the limit has to be split acro
 | Parameter | Default | What it does |
 |---|---|---|
 | `dry_run` | `false` | `true` lists what the run would delete (files, bytes, directories) and deletes nothing |
+| `workers` | [`cluster_log_prune_workers`](#cluster_log_prune_workers) | threads listing and deleting in parallel for this run, 1 to 64 |
+| `max_minutes` | [`cluster_log_prune_max_minutes`](#cluster_log_prune_max_minutes) | this run's time budget in minutes, 1 to 230 |
 
 `log_table_create` and `log_table_prune` take no run-time parameters.
 
@@ -757,6 +816,8 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`ca_certs`](#ca_certs) | Bundle | per target | a CA bundle for verifying the ES server's TLS certificate |
 | [`cluster_log_volume_path`](#cluster_log_volume_path) | Bundle | per target | where job-cluster logs are delivered, for cluster configs that opt in |
 | [`cluster_log_retention_days`](#cluster_log_retention_days) | Bundle | per target | how many days of delivered cluster logs `cluster_log_prune` keeps |
+| [`cluster_log_prune_workers`](#cluster_log_prune_workers) | Bundle | top level, per target, `--var`, `--params workers` | threads `cluster_log_prune` lists and deletes with |
+| [`cluster_log_prune_max_minutes`](#cluster_log_prune_max_minutes) | Bundle | top level, per target, `--var`, `--params max_minutes` | time budget of one `cluster_log_prune` run |
 | [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | the prefix in every job's display name |
 | [`global_job_tags`](#global_job_tags) | Bundle | top level (keys), values may vary | tags applied to every job and its job clusters |
 | [`schedule_pause_status`](#schedule_pause_status) | Bundle | top level and per target | the target-wide pause state of scheduled and continuous triggers |
@@ -791,7 +852,8 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`write_concurrency`](#write_concurrency) | Knob | global, config, `--params` | bulk requests in flight at once per write partition |
 | [`request_timeout`](#request_timeout) | Knob | global, config, `--params` | the per-request ES client timeout, in seconds |
 | [`max_retries_per_request`](#max_retries_per_request) | Knob | global, config, `--params` | retries of a whole bulk request that timed out, lost its connection, or got a 429/502/503/504 |
-| [`max_retries_per_doc`](#max_retries_per_doc) | Knob | global, config, `--params` | retries of a single document ES rejects with a 429 |
+| [`max_retries_per_doc`](#max_retries_per_doc) | Knob | global, config, `--params` | retries of a single document ES rejects with a status in `retry_on_doc_status` |
+| [`retry_on_doc_status`](#retry_on_doc_status) | Knob | global, config, `--params` | the per-document statuses that are retried (default `429,400`) |
 | [`retry_backoff_initial`](#retry_backoff_initial) | Knob | global, config, `--params` | seconds before the first retry, doubling each retry |
 | [`retry_backoff_max`](#retry_backoff_max) | Knob | global, config, `--params` | cap in seconds on any single retry wait |
 | [`op_type`](#op_type) | Knob | global, config, `--params` | `index` (overwrite by `_id`) or `create` (append only) |

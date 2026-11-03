@@ -21,9 +21,9 @@ there is one (`...` marks the parts that vary), the cause, and the fix.
 | [Generating jobs](#generation-fails) | unknown key, undeclared host config, `es_host_configs_json`, cluster configs, tags, job groups, task retries on a continuous feed, root `resources/` folder, `--check` |
 | [Deploying](#deploy-fails) | cluster policy, cluster id, cluster log path, policy conflicts |
 | [Starting a run](#run-fails-at-start) | wheel, host config, `${environment}`, checkpoint path, TLS settings, monitoring table, missing index |
-| [Writing](#writes-fail-or-are-slow) | timeouts, 429s, slow writes, reading the signals |
+| [Writing](#writes-fail-or-are-slow) | timeouts, 429s, 400s, slow writes, reading the signals |
 | [Falling behind](#falling-behind) | growing backlog, skipped runs, stale index |
-| [Data issues](#data-issues) | fewer documents, duplicates, a stream that writes nothing, source updates missing |
+| [Data issues](#data-issues) | fewer documents, missing data with a healthy feed, rows excluded by a filter, duplicates, a stream that writes nothing, source updates missing |
 | [Streaming](#streaming-failures) | schema changes, continuous retry limit |
 | [Schedules](#a-scheduled-job-didnt-run) | paused, skipped, a serverless retry with retries at 0, failure emails from a successful run |
 | [Settings](#a-committed-value-seems-ignored) | a committed value seems ignored |
@@ -265,6 +265,19 @@ put less data in flight at once), the partition count, or cores
 ([Reading the signals](#reading-the-signals)). To ride out longer bursts instead, give the retries more
 time with [`retry_backoff_initial`](parameters.md#retry_backoff_initial) or `max_retries_per_request`.
 
+### 400 rejections
+
+A document rejected with a 400 is retried by default
+([`retry_on_doc_status`](parameters.md#retry_on_doc_status) is `429,400`), because ES occasionally
+returns a 400 that succeeds when the document is sent again. Those show as `rejected(4xx=...)` and
+`retried=` in the `BULK_STATS` output of a run that still succeeded, and need no action.
+
+A run that fails on a 400 after [`max_retries_per_doc`](parameters.md#max_retries_per_doc) retries has a
+document ES won't accept as sent, usually a field that conflicts with the index mapping
+(`mapper_parsing_exception` or `document_parsing_exception`). The error sample carries ES's reason, which
+names the field. Fix the view or the mapping; retrying again won't help. To fail such runs on the first
+attempt instead of after the retries, set `retry_on_doc_status` to `429`.
+
 ### Slow writes with no errors
 
 Turn on [`bulk_stats`](parameters.md#bulk_stats), if it isn't already on, and use [Reading the signals](#reading-the-signals)
@@ -325,7 +338,53 @@ the feed sends less per interval than the source receives.
 ### Fewer documents than source rows
 
 No error. Rows that share an [`es_id_field`](parameters.md#es_id_field) value become one document. Check
-the column is unique across the view's output. (A `filter_condition` also removes rows by design.)
+the column is unique across the view's output. A filter also removes rows by design: see
+[Rows excluded by a filter](#rows-excluded-by-a-filter).
+
+### Expected data is missing, but the feed looks healthy
+
+No error. The feed's runs succeed and, with the monitoring log on, its batches are
+[caught up](monitoring.md#caught-up-or-behind), yet documents you expect aren't in the index. A feed can
+only send what is in its source table, so a gap upstream of that table never shows up as a problem in
+these jobs. For example:
+
+- the job that loads the source table is behind, failing, or paused;
+- the data provider hasn't delivered the data to the landing location the source table is loaded from.
+
+First check whether the missing rows are in the source table at all: `DESCRIBE HISTORY <source table>`
+shows when it last received data, and a query on the source for the expected time range or keys shows
+whether those rows exist. If they don't, the gap is upstream of these jobs: check with the team
+responsible for the source table and its loading.
+
+Once the rows land in the source, the feed picks them up on its own: a streaming feed sends them as new
+commits on its next run, and a batch feed's next run re-exports the view. If the gap is filled by
+rewriting data already in the table (an `UPDATE`, a `MERGE` or an overwrite) instead of appending, a
+streaming feed skips those commits: see
+[Updates or deletes on the source are missing](#updates-or-deletes-on-the-source-are-missing).
+
+If the rows are in the source but not in the index, see
+[Rows excluded by a filter](#rows-excluded-by-a-filter), then the run's output for write errors.
+
+### Rows excluded by a filter
+
+No error. Rows can be excluded on purpose in two places, and a predicate that is wider than intended
+silently drops rows that should be sent:
+
+- **[`filter_condition`](parameters.md#filter_condition)**, applied to the view's rows before the write.
+  It can come from the feed config, from the target-wide global when the config omits it, or from a
+  per-run `--params` override, so check the value the run actually used (the run's job parameters in the
+  Jobs UI).
+- **The view's SQL**: a `WHERE` clause, or a join. An inner join to a
+  [reference table](feed-configuration.md#reference-tables) drops every source row with no
+  match there, for example rows whose lookup entry hasn't been loaded yet. A streaming feed doesn't come
+  back for those rows when the lookup arrives (it has already processed those commits): re-send them
+  with a batch run.
+
+To find which one is dropping rows, count the missing time range or keys at each step: in the source
+table, in the view (`SELECT count(*) FROM <view> WHERE ...`), and in the view with the feed's filter
+added (`... AND (<filter_condition>)`). The step where the count drops is the one excluding them. Query
+the view after a fresh `deploy_views`, so it matches the view `.sql` that a streaming feed applies to
+each micro-batch ([how](technical-details.md#streaming-runs-the-view-per-micro-batch)).
 
 ### Duplicate documents
 
