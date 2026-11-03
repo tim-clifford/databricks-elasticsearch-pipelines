@@ -1,7 +1,8 @@
 # databricks-elasticsearch-pipelines
 
-A framework for exporting data from Databricks Delta tables into Elasticsearch, packaged as
-[Databricks Asset Bundles](https://docs.databricks.com/dev-tools/bundles/). It uses the
+A framework for exporting data from Databricks Delta tables into Elasticsearch, packaged as a
+[Declarative Automation Bundle](https://docs.databricks.com/dev-tools/bundles/) (formerly Databricks
+Asset Bundles). It uses the
 [**databricks-es-connector**](/../../../databricks-es-connector) library for the
 transfer.
 

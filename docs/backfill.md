@@ -52,8 +52,9 @@ fits:
   its job and trigger with the other members, so pausing or changing that job stops or changes all of
   them: use Option 2 for a group member.
 
-1. **Take the job out of bundle control.** In the Jobs UI, use **Disconnect from source** on the job, so
-   it can be edited there (a bundle-deployed job is locked to its bundle definition until then).
+1. **Take the job out of bundle control.** On the job's page in the Jobs UI, open the menu next to
+   "Managed by Declarative Automation Bundles" and choose **Enable edits**, so the job can be edited
+   there (a bundle-deployed job is locked to its bundle definition until then).
 2. **Pause its regular runs.** Pause the job's schedule or continuous trigger, and wait for a running
    run to finish (or cancel it). Keep it paused until the backfill has started, so no scheduled run
    can start in between. To backfill a continuous feed with batch runs (Method 2), also take the job out

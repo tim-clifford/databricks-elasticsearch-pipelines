@@ -1,4 +1,4 @@
-# Databricks Asset Bundle: databricks-elasticsearch-pipelines
+# Declarative Automation Bundle (formerly Databricks Asset Bundle): databricks-elasticsearch-pipelines
 #
 # A self-contained framework for exporting Databricks Delta tables to Elasticsearch, deployable to a
 # fresh workspace with `databricks bundle deploy`.
