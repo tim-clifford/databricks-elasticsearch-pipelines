@@ -656,7 +656,7 @@ def test_a_same_named_file_with_an_unreadable_parent_is_not_called_a_file_root()
 
 # --------------------------------------------------------------------------- triage, threads, time budget
 from pipeline_lib.cluster_log_prune import (  # noqa: E402
-    MAX_MINUTES_LIMIT, MAX_WORKERS, _bounded_map, parse_max_minutes, parse_workers, triage_cluster,
+    MAX_MINUTES_LIMIT, MAX_WORKERS, ItemError, _bounded_map, _oldest_first_key, execute_plan_until, parse_max_minutes, parse_workers, triage_cluster,
 )
 
 
@@ -765,7 +765,8 @@ class _Clock:
 
 def test_the_budget_stops_the_prune_green_and_oldest_clusters_go_first():
     # Each delete takes a simulated minute; the budget is 30 minutes, so the run stops partway, green, with
-    # the newest cluster ids left for the next run.
+    # the newest cluster ids left for the next run. The cluster in flight at the deadline stops before its
+    # next delete and counts as remaining, so at most one remaining cluster has been partly pruned.
     clock = _Clock()
 
     class _SlowRm(_Rm):
@@ -776,11 +777,12 @@ def test_the_budget_stops_the_prune_green_and_oldest_clusters_go_first():
     tree = {f"{m:02d}01-000000-c{m}": _terminated(OLD) for m in range(6, 0, -1)}   # listed newest first
     rm, lines = _SlowRm(), []
     summary = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lines.append, workers=1, max_minutes=30,
-                        clock=clock)
+                        clock=clock, today_mmdd=1231)
     assert "incomplete=True" in summary
     started = sorted({p[len(ROOT) + 1:].split("/")[0] for p, _ in rm.calls})
     remaining = int(summary.split("remaining_clusters=")[1].split()[0])
-    assert remaining > 0 and len(started) == 6 - remaining
+    assert remaining > 0 and len(started) in (6 - remaining, 6 - remaining + 1)
+    assert clock.t <= 30 * 60 + 60   # no delete starts after the deadline: at most the one in progress
     assert started == sorted(tree)[:len(started)]   # oldest first
     assert any("not yet walked" in l for l in lines)
 
@@ -825,11 +827,15 @@ def test_bounded_map_starts_nothing_once_stopped_and_keeps_order():
     assert results == [None, None, None] and started == 0
 
 
-def test_bounded_map_propagates_a_worker_exception():
-    def boom(x):
-        raise ValueError("bug")
-    with pytest.raises(ValueError, match="bug"):
-        _bounded_map([1], boom, 1, lambda: False, lambda c: None, poll=0.01)
+def test_bounded_map_returns_a_worker_exception_in_its_slot():
+    # One item's unexpected error doesn't discard the others' results.
+    def fn(x):
+        if x == 2:
+            raise ValueError("bug")
+        return x * 10
+    results, started = _bounded_map([1, 2, 3], fn, 2, lambda: False, lambda c: None, poll=0.01)
+    assert started == 3 and results[0] == 10 and results[2] == 30
+    assert isinstance(results[1], ItemError) and str(results[1].exc) == "bug"
 
 
 def test_bounded_map_runs_at_most_workers_at_once():
@@ -1011,3 +1017,100 @@ def test_a_queued_item_does_not_start_after_the_deadline():
 
     results, started = _bounded_map([1, 2, 3], fn, 1, lambda: clock.t >= 10, lambda c: None, poll=0.01)
     assert results == [1, None, None] and started == 1
+
+
+# --------------------------------------------------------------------------- Isaac round 2 fixes
+
+def test_a_cluster_in_flight_stops_before_its_next_delete_at_the_deadline():
+    # One cluster with many old files, and a deadline that passes after its third delete: the rest are left
+    # for the next run, nothing is removed after the deadline, and the run stays green with the cluster
+    # counted as remaining.
+    clock = _Clock()
+
+    class _SlowRm(_Rm):
+        def __call__(self, path, recurse=None):
+            clock.t += 60
+            return super().__call__(path, recurse)
+
+    tree = {CID: _terminated(OLD)}   # four old files, so the deadline (after three deletes) falls inside it
+    rm = _SlowRm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lambda l: None, workers=1, max_minutes=3,
+                        clock=clock)
+    assert len(rm.calls) == 3
+    assert "incomplete=True remaining_clusters=1" in summary and "clusters_walked=0" in summary
+    assert "failures=0" in summary
+
+
+def test_execute_plan_until_stops_and_reports_it():
+    plan = PrunePlan([(f"{ROOT}/{CID}/driver/f{i}", 1) for i in range(5)], [f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}"],
+                     0, 0, [], [])
+    rm = _Rm()
+    stop = lambda: len(rm.calls) >= 2
+    files, dirs, raced, failures, stopped = execute_plan_until(plan, rm, False, None, ROOT, stop=stop)
+    assert (files, dirs, raced, failures, stopped) == (2, 0, 0, [], True)
+    assert execute_plan_until(plan, _Rm(), False, None, ROOT)[4] is False
+    assert len(execute_plan(plan, _Rm(), False, None, ROOT)) == 4
+
+
+def test_an_unexpected_prune_error_is_recorded_and_the_rest_still_count(monkeypatch):
+    # A bug-shaped exception while planning one cluster fails the run, but the other clusters' deletes are
+    # still done and reported, not lost.
+    import pipeline_lib.cluster_log_prune as m
+    real = m._plan_cluster
+
+    def flaky(path, *args):
+        if path.endswith("-c2"):
+            raise KeyError("bug")
+        return real(path, *args)
+
+    monkeypatch.setattr(m, "_plan_cluster", flaky)
+    tree = {f"0{i}01-000000-c{i}": _terminated(OLD) for i in (1, 2, 3)}
+    rm, lines = _Rm(), []
+    with pytest.raises(RuntimeError, match=r"FAILED \(1 failure") as err:
+        run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lines.append, workers=2)
+    pruned = {p[len(ROOT) + 1:].split("/")[0] for p, _ in rm.calls}
+    assert pruned == {"0101-000000-c1", "0301-000000-c3"}
+    assert "deleted_files=8" in str(err.value)   # the other two clusters' deletes are in the summary
+    assert any("KeyError" in l and "-c2" in l for l in lines)
+
+
+def test_an_unexpected_triage_error_is_that_clusters_failure(monkeypatch):
+    import pipeline_lib.cluster_log_prune as m
+    real = m.triage_cluster
+
+    def flaky(path, entry, ls, cutoff):
+        if path.endswith("-c2"):
+            raise KeyError("bug")
+        return real(path, entry, ls, cutoff)
+
+    monkeypatch.setattr(m, "triage_cluster", flaky)
+    tree = {f"0{i}01-000000-c{i}": _terminated(OLD) for i in (1, 2, 3)}
+    rm, lines = _Rm(), []
+    with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
+        run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lines.append, workers=2)
+    pruned = {p[len(ROOT) + 1:].split("/")[0] for p, _ in rm.calls}
+    assert pruned == {"0101-000000-c1", "0301-000000-c3"}   # the other two were still pruned
+    assert any("KeyError" in l and "-c2" in l for l in lines)
+
+
+@pytest.mark.parametrize("today,expected", [
+    (1231, ["0101-000000-a", "0601-000000-b", "1201-000000-c"]),   # all this year: plain order
+    (115, ["0601-000000-b", "1201-000000-c", "0101-000000-a"]),    # mid January: June and December are last year
+    (601, ["1201-000000-c", "0101-000000-a", "0601-000000-b"]),    # June 1: December is last year; today is this year
+])
+def test_oldest_first_key_across_new_year(today, expected):
+    names = ["0101-000000-a", "0601-000000-b", "1201-000000-c"]
+    assert sorted(names, key=lambda n: _oldest_first_key(f"{ROOT}/{n}", today)) == expected
+
+
+@pytest.mark.parametrize("skew_ms,expected_spent", [(-1000, 0), (-299_000, 0), (0, 0), (5000, 5)])
+def test_small_clock_skew_counts_from_the_run_start(skew_ms, expected_spent):
+    now = 1_800_000_000_000
+    spent, note = spent_before_seconds(str(now - skew_ms), now)
+    assert spent == expected_spent and "counts from the run start" in note
+
+
+def test_large_negative_skew_is_still_implausible():
+    now = 1_800_000_000_000
+    spent, note = spent_before_seconds(str(now + 301_000), now)
+    assert spent == 0 and "implausible" in note

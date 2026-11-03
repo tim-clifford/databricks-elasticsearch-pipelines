@@ -296,11 +296,16 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
   (default 200) bounds a run, below the job's 4-hour timeout. Triage must finish within it, or the run
   fails without deleting anything, because a run that can't even classify the clusters can't keep up:
   raise the workers or the budget. In the prune phase no new cluster starts once the budget has passed,
-  the clusters in progress finish, and the run ends green with `incomplete=True` and
-  `remaining_clusters=<n>` in the summary (and a `WARNING` line); the next run carries on, oldest first.
-  So a large backlog (the first run after turning the job on, or after lowering the retention) drains over
-  several nights instead of timing out. A run that stops at the budget stops between clusters, never
-  partway through one. The run output has a progress line about every minute.
+  and a cluster in progress stops before its next delete, so even a cluster with a long backlog of logs
+  can't carry the run past the budget. The run ends green with `incomplete=True` and
+  `remaining_clusters=<n>` in the summary (and a `WARNING` line), counting a cluster it stopped partway
+  through as remaining; the next run carries on, oldest first. Stopping partway is safe: only old files
+  were deleted, every directory is left in place, and the next run lists that cluster again. So a large
+  backlog (the first run after turning the job on, or after lowering the retention) drains over several
+  nights instead of timing out. Oldest first goes by the cluster id's month and day, with dates later in
+  the year than today counted as last year's, so the order holds across New Year. If one cluster hits an
+  unexpected error, the others are still pruned and reported, and the run then fails. The run output has
+  a progress line about every minute.
 
   The budget belongs to the job run, not to one attempt. The job passes the run's start time
   (`{{job.start_time.timestamp_ms}}`, the same on every attempt) and the budget counts from it, so an

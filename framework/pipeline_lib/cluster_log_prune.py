@@ -329,6 +329,10 @@ def parse_max_minutes(raw: object) -> int:
     return _parse_bounded_int(raw, "max_minutes (cluster_log_prune_max_minutes)", 1, MAX_MINUTES_LIMIT)
 
 
+# How far the driver's clock may lag the Jobs service's before a run start "in the future" is implausible.
+_CLOCK_SKEW_TOLERANCE_S = 300
+
+
 def spent_before_seconds(job_start_ms: object, now_ms: int) -> tuple:
     """Seconds this job run had already used before this attempt started, and a note for the run output.
 
@@ -342,6 +346,10 @@ def spent_before_seconds(job_start_ms: object, now_ms: int) -> tuple:
     if not re.fullmatch(r"[0-9]+", raw):   # "0" passes here and is rejected below as over a day old
         return 0, f"job run start unknown ({job_start_ms!r}): the budget counts from this attempt"
     spent = (now_ms - int(raw)) / 1000
+    if -_CLOCK_SKEW_TOLERANCE_S <= spent < 0:
+        # The driver's clock a little behind the Jobs service's: the run started just now.
+        return 0, (f"the job run started {spent:.0f} s before this attempt (clock skew); the budget counts "
+                   f"from the run start")
     if spent < 0 or spent > 86_400:
         return 0, f"job run start {raw} is implausible ({spent:.0f} s ago): the budget counts from this attempt"
     return spent, f"the job run started {spent:.0f} s before this attempt; the budget counts from the run start"
@@ -387,6 +395,20 @@ def triage_cluster(path: str, entry, ls, cutoff: int) -> ClusterTriage:
     return ClusterTriage(path, entry, kinds, False, [], [])
 
 
+def _today_mmdd() -> int:
+    t = time.gmtime()
+    return t.tm_mon * 100 + t.tm_mday
+
+
+def _oldest_first_key(path: str, today_mmdd: int) -> tuple:
+    """Sort key for the prune order: a cluster id's MMDD-HHMMSS prefix, with a month-day after today's
+    counted as last year's (the id has no year), so December's clusters still come before January's after New
+    Year. Ordering only: it never decides a delete."""
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    mmdd = int(name[:4]) if name[:4].isdigit() else 0
+    return (0 if mmdd > today_mmdd else 1, name)
+
+
 def volume_ls(path: str) -> list:
     """List a UC Volume directory through the /Volumes FUSE mount (os.scandir), with dbutils.fs.ls entry
     semantics: `.name` (a directory's ends in '/'), `.size`, `.modificationTime` (epoch ms). Measured on a
@@ -405,19 +427,31 @@ def volume_ls(path: str) -> list:
     return out
 
 
+class ItemError(NamedTuple):
+    """An unexpected exception from one item of _bounded_map, returned in place of its result."""
+    exc: Exception
+
+
 def _bounded_map(items, fn, workers: int, stop, tick, poll: float = 1.0) -> tuple:
     """Run fn over items on `workers` threads with at most 2 * workers in flight. `stop()` is checked
     before each item is queued and again when it actually starts; once it is true nothing new starts and the
     items already running finish. Returns (results, started): results in item order (None for an item never
     started) and how many items ran. `tick(completed)` is
-    called at least every `poll` seconds while items are in flight. An exception in fn propagates."""
+    called at least every `poll` seconds while items are in flight. An exception in fn doesn't stop the
+    map: it is returned in that item's slot as an ItemError, so the caller can record it as a failure and
+    still report every other item's result."""
     results, pending, submitted, completed = [None] * len(items), {}, 0, 0
     skipped = object()
 
     def run(item):
         # Checked again when the item actually starts: one queued behind busy threads must not start after the
         # deadline (measured live: without this, a run overshot a 4-minute budget by about 45 s).
-        return skipped if stop() else fn(item)
+        if stop():
+            return skipped
+        try:
+            return fn(item)
+        except Exception as exc:  # noqa: BLE001 - returned for the caller to record; the run still fails
+            return ItemError(exc)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         def fill():
@@ -440,8 +474,18 @@ def _bounded_map(items, fn, workers: int, stop, tick, poll: float = 1.0) -> tupl
 
 
 def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") -> tuple:
+    """execute_plan_until with no deadline: returns (deleted_files, deleted_dirs, raced_dirs, failures)."""
+    return execute_plan_until(plan, rm, dry_run, ls, root)[:4]
+
+
+def execute_plan_until(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "", stop=None) -> tuple:
     """Carry out `plan` with `rm(path, recurse=False)` (dbutils.fs.rm, which returns True on success).
-    Returns (deleted_files, deleted_dirs, raced_dirs, failures), failures a list of messages.
+    Returns (deleted_files, deleted_dirs, raced_dirs, failures, stopped), failures a list of messages.
+
+    - stop (optional): checked before every rm. Once it is true nothing more is removed and `stopped` is
+      True: the files already deleted were old, every directory is left in place (some may not be empty),
+      and the next run walks the cluster again from a fresh listing. So a cluster with a long backlog can't
+      carry the run past its deadline.
 
     - dry_run: no rm call at all; the counts are 0 and failures only carry the plan's listing errors.
     - Files first, then directories in plan order (deepest first). Every rm is non-recursive, so a
@@ -456,8 +500,9 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") ->
     """
     failures = [f"list {p}: {e}" for p, e in plan.list_errors]
     if dry_run:
-        return 0, 0, 0, failures
+        return 0, 0, 0, failures, False
     deleted_files = deleted_dirs = raced_dirs = 0
+    stopping = (lambda: False) if stop is None else stop
     blocked = set()  # every ancestor of a path that is still there: those directories can't be empty
 
     def _block(path):
@@ -471,6 +516,8 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") ->
             raise OSError("rm returned False (nothing deleted)")
 
     for path, _ in plan.delete_files:
+        if stopping():
+            return deleted_files, deleted_dirs, raced_dirs, failures, True
         try:
             _rm(path)
             deleted_files += 1
@@ -485,6 +532,8 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") ->
     for path in plan.delete_dirs:
         if path in blocked:
             continue
+        if stopping():
+            return deleted_files, deleted_dirs, raced_dirs, failures, True
         try:
             _rm(path)
             deleted_dirs += 1
@@ -507,7 +556,7 @@ def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") ->
                 raced_dirs += 1
             else:
                 failures.append(f"remove dir {path}: {type(exc).__name__}: {exc}")
-    return deleted_files, deleted_dirs, raced_dirs, failures
+    return deleted_files, deleted_dirs, raced_dirs, failures, False
 
 
 def _print_capped(log, items, fmt, what, cap=200):
@@ -519,7 +568,7 @@ def _print_capped(log, items, fmt, what, cap=200):
 
 def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log=print, *, workers: int = 1,
               max_minutes=None, spent_seconds: float = 0, triage_ls=None, clock=time.monotonic,
-              progress_seconds: float = 60, poll: float = 1.0) -> str:
+              progress_seconds: float = 60, poll: float = 1.0, today_mmdd: int | None = None) -> str:
     """The whole prune run: returns the summary line, or raises RuntimeError when anything failed.
 
     - root unset ("") or retention disabled (cutoff None): nothing to do; a skipped-run summary.
@@ -530,8 +579,12 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
       2. PRUNE the rest, oldest cluster id first (the id's MMDD-HHMMSS prefix; ordering only, it never
          decides a delete): walk each with the plan_prune rules and delete its old files and emptied
          directories (execute_plan, every rm non-recursive; no rm at all on a dry run). Once `max_minutes`
-         has passed, no new cluster starts and the ones in flight finish; the run then reports
-         incomplete=True and remaining_clusters, and stays green: the next run carries on from a fresh listing.
+         has passed, no new cluster starts, and a cluster in flight stops before its next delete (it counts
+         as remaining); the run then reports incomplete=True and remaining_clusters, and stays green: the
+         next run carries on from a fresh listing. The order treats a month-day after `today_mmdd` (default:
+         today, UTC) as last year's, so it stays oldest first across New Year.
+    - An unexpected exception for one cluster (in triage or the prune) is recorded as that cluster's
+      failure; every other cluster's result is still counted and reported, and the run then fails.
     - `spent_seconds` (see spent_before_seconds) is the part of the budget an earlier attempt of the same job
       run already used: the deadline is `max_minutes` after the RUN started, not after this attempt did.
     - `triage_ls` (default `ls`) does the triage listings only; the notebook passes volume_ls, which is much
@@ -566,8 +619,13 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
             f"cluster_logs_prune FAILED: triage classified only {started} of {len(clusters)} cluster(s) within "
             f"max_minutes={max_minutes} ({int(spent_seconds)} s of it used before this attempt), so nothing was "
             f"deleted; raise cluster_log_prune_workers or cluster_log_prune_max_minutes")
+    # An unexpected triage error is that cluster's listing error: it is left alone and fails the run.
+    triaged = [ClusterTriage(c[0], c[1], [], False, [], [(c[0], f"{type(t.exc).__name__}: {t.exc}")])
+               if isinstance(t, ItemError) else t for c, t in zip(clusters, triaged)]
     young = [t for t in triaged if t.young]
-    to_walk = sorted((t for t in triaged if not t.young and not t.list_errors), key=lambda t: t.path)
+    md = _today_mmdd() if today_mmdd is None else today_mmdd
+    to_walk = sorted((t for t in triaged if not t.young and not t.list_errors),
+                     key=lambda t: _oldest_first_key(t.path, md))
     log(f"  triage: {len(young)} cluster(s) kept without a walk (newest driver log inside retention), "
         f"{len(to_walk)} to walk, {int(clock() - start)} s elapsed")
 
@@ -576,12 +634,16 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
             kinds = list(ls(t.path))   # fresh, through the same ls the walk and deletes use
         except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
             error = (t.path, f"{type(exc).__name__}: {exc}")
-            return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"])
+            return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"]), False
         plan = _plan_cluster(t.path, t.entry, kinds, ls, cutoff)
-        return plan, execute_plan(plan, rm, dry_run, ls, root)
+        f_count, d_count, r_count, fails, stopped = execute_plan_until(plan, rm, dry_run, ls, root, stop=over)
+        return plan, (f_count, d_count, r_count, fails), stopped
 
-    results, walked = _bounded_map(to_walk, prune_one, workers, over, ticker("prune", len(to_walk)), poll)
-    done = [r for r in results if r is not None]
+    results, started_walks = _bounded_map(to_walk, prune_one, workers, over, ticker("prune", len(to_walk)), poll)
+    errors = [(t, r) for t, r in zip(to_walk, results) if isinstance(r, ItemError)]
+    done = [(p, c) for p, c, _ in (r for r in results if r is not None and not isinstance(r, ItemError))]
+    stopped_walks = sum(1 for r in results if r is not None and not isinstance(r, ItemError) and r[2])
+    walked = started_walks - stopped_walks
     plan = _merge([p for p, _ in done], root_skipped + [s for t in young for s in t.skipped],
                   root_errors + [e for t in triaged for e in t.list_errors], root_missing)
     failures = [f"list {p}: {e}" for p, e in root_errors + [e for t in triaged for e in t.list_errors]]
@@ -589,6 +651,7 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
     for _, (f_count, d_count, r_count, fails) in done:
         deleted_files, deleted_dirs, raced_dirs = deleted_files + f_count, deleted_dirs + d_count, raced_dirs + r_count
         failures += fails
+    failures += [f"prune {t.path}: {type(r.exc).__name__}: {r.exc}" for t, r in errors]
     remaining = len(to_walk) - walked
     delete_bytes = sum(size for _, size in plan.delete_files)
     log(f"  plan: delete {len(plan.delete_files)} file(s) ({delete_bytes} bytes) and {len(plan.delete_dirs)} "
