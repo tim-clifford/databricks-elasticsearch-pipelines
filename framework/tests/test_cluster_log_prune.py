@@ -997,3 +997,17 @@ def test_a_retry_with_the_budget_already_used_fails_before_deleting():
     with pytest.raises(RuntimeError, match=r"triage classified only 0 of 3 .* \(1800 s of it used before this attempt\)"):
         run_prune(ROOT, 30, CUTOFF, False, _fs(_many(3)), _never, log=lambda l: None, workers=1, max_minutes=30,
                   spent_seconds=30 * 60, clock=_Clock())
+
+
+def test_a_queued_item_does_not_start_after_the_deadline():
+    # Item 2 is queued (2 x workers in flight) while item 1 runs past the deadline: it must not start then.
+    clock = _Clock()
+
+    def fn(x):
+        import threading
+        threading.Event().wait(0.05)   # let the main thread queue item 2 before the clock passes the deadline
+        clock.t += 20
+        return x
+
+    results, started = _bounded_map([1, 2, 3], fn, 1, lambda: clock.t >= 10, lambda c: None, poll=0.01)
+    assert results == [1, None, None] and started == 1

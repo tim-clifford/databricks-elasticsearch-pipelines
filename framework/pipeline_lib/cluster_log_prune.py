@@ -407,25 +407,36 @@ def volume_ls(path: str) -> list:
 
 def _bounded_map(items, fn, workers: int, stop, tick, poll: float = 1.0) -> tuple:
     """Run fn over items on `workers` threads with at most 2 * workers in flight. `stop()` is checked
-    before each item starts; once it is true nothing new starts and the items in flight finish. Returns
-    (results, started): results in item order (None for an item never started). `tick(completed)` is
+    before each item is queued and again when it actually starts; once it is true nothing new starts and the
+    items already running finish. Returns (results, started): results in item order (None for an item never
+    started) and how many items ran. `tick(completed)` is
     called at least every `poll` seconds while items are in flight. An exception in fn propagates."""
-    results, pending, started, completed = [None] * len(items), {}, 0, 0
+    results, pending, submitted, completed = [None] * len(items), {}, 0, 0
+    skipped = object()
+
+    def run(item):
+        # Checked again when the item actually starts: one queued behind busy threads must not start after the
+        # deadline (measured live: without this, a run overshot a 4-minute budget by about 45 s).
+        return skipped if stop() else fn(item)
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
         def fill():
-            nonlocal started
-            while started < len(items) and len(pending) < 2 * workers and not stop():
-                pending[ex.submit(fn, items[started])] = started
-                started += 1
+            nonlocal submitted
+            while submitted < len(items) and len(pending) < 2 * workers and not stop():
+                pending[ex.submit(run, items[submitted])] = submitted
+                submitted += 1
         fill()
         while pending:
             done, _ = wait(pending, timeout=poll, return_when=FIRST_COMPLETED)
             for f in done:
-                results[pending.pop(f)] = f.result()
-                completed += 1
+                result = f.result()
+                index = pending.pop(f)
+                if result is not skipped:
+                    results[index] = result
+                    completed += 1
             tick(completed)
             fill()
-    return results, started
+    return results, completed
 
 
 def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") -> tuple:
