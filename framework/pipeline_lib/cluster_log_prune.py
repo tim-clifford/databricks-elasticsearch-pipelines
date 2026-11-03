@@ -109,6 +109,122 @@ def _parent(path: str) -> str:
     return path.rstrip("/").rsplit("/", 1)[0]
 
 
+def _walk_log_tree(path: str, ls, cutoff: int, acc: dict) -> tuple:
+    """Classify everything under a log directory into `acc` (delete_files, kept counts, list_errors).
+    Returns (clean, has_old, dirs): clean when nothing under it is kept or unreadable, has_old when an old
+    file under it is being deleted, and dirs the descendant directories post-order as
+    (path, clean, has_old, own_old)."""
+    try:
+        entries = list(ls(path))
+    except Exception as exc:  # noqa: BLE001 - recorded; the subtree is left alone
+        acc["list_errors"].append((path, f"{type(exc).__name__}: {exc}"))
+        return False, False, []
+    clean, has_old, dirs = True, False, []
+    for e in entries:
+        child = _join(path, e)
+        if _is_dir(e):
+            c_clean, c_old, c_dirs = _walk_log_tree(child, ls, cutoff, acc)
+            dirs += c_dirs + [(child, c_clean, c_old, _old(e, cutoff))]
+            clean, has_old = clean and c_clean, has_old or c_old
+            continue
+        size = getattr(e, "size", 0) or 0
+        if _old(e, cutoff):
+            acc["delete_files"].append((child, size))
+            has_old = True
+        else:
+            acc["kept_files"] += 1
+            acc["kept_bytes"] += size
+            clean = False
+    return clean, has_old, dirs
+
+
+def _list_root(root: str, ls) -> tuple:
+    """List the prune root. Returns (clusters, skipped, list_errors, root_missing): clusters the
+    (path, entry) of every cluster id directory directly under it, in listing order; everything else at the
+    top level is skipped. A root that doesn't exist yet is root_missing, but only when it is deeper than
+    the volume and the parent's listing positively shows it absent; any other listing problem is an error."""
+    skipped, list_errors = [], []
+    try:
+        top = list(ls(root))
+    except Exception as exc:  # noqa: BLE001
+        # A volume can't be created by log delivery, so a missing volume is a misconfiguration, not "no logs yet".
+        deeper_than_volume = len(root.rstrip("/").split("/")) > 5
+        volume = "/".join(root.rstrip("/").split("/")[:5])
+        if deeper_than_volume and _is_not_found(exc) and _absent_from_parent(root, ls, floor=volume):
+            # Configured but not created yet: no cluster has delivered logs, so there is nothing to prune.
+            return [], [], [], True
+        list_errors.append((root, f"{type(exc).__name__}: {exc}"))
+        top = []
+    # Listing a FILE returns just that file: a log path that points at a file is a misconfiguration, not an
+    # empty volume, so fail instead of reporting a green run that pruned nothing.
+    # A single same-named file is ambiguous (a directory can hold a file named like itself), so confirm from the
+    # parent's listing that the root itself is a file.
+    root_name = root.rstrip("/").rsplit("/", 1)[-1]
+    if len(top) == 1 and not _is_dir(top[0]) and _name(top[0]) == root_name and _listed_as_file(root, ls):
+        list_errors.append((root, "the path is a file, not a directory"))
+        top = []
+    clusters = []
+    for e in top:
+        path = _join(root, e)
+        if not (_is_dir(e) and CLUSTER_ID.fullmatch(_name(e))):
+            skipped.append((path, "not a cluster id directory"))
+            continue
+        clusters.append((path, e))
+    return clusters, skipped, list_errors, False
+
+
+def _unknown_kinds(path: str, kinds) -> list:
+    """(path, reason) of every entry directly under a cluster directory that isn't a known log kind directory."""
+    return [(_join(path, k), "not a known log kind") for k in kinds if not (_is_dir(k) and _name(k) in LOG_KINDS)]
+
+
+def _plan_cluster(path: str, entry, kinds, ls, cutoff: int) -> PrunePlan:
+    """The plan for one cluster directory, given its listing `kinds` (see plan_prune for the rules)."""
+    acc = {"delete_files": [], "kept_files": 0, "kept_bytes": 0, "list_errors": []}
+    delete_dirs = []
+    skipped = _unknown_kinds(path, kinds)
+    cluster_clean, cluster_old, cluster_dirs = not skipped, False, []
+    for k in kinds:
+        if not (_is_dir(k) and _name(k) in LOG_KINDS):
+            continue
+        kpath = _join(path, k)
+        k_clean, k_old, k_dirs = _walk_log_tree(kpath, ls, cutoff, acc)
+        cluster_dirs += k_dirs + [(kpath, k_clean, k_old, _old(k, cutoff))]
+        cluster_clean, cluster_old = cluster_clean and k_clean, cluster_old or k_old
+    # eventlog/ is delivered only at termination, so a clean cluster holding it has terminated. That covers
+    # the one case with no age evidence at all: a file-less tree left by an earlier run that stopped partway.
+    terminated = any(_is_dir(k) and _name(k) == "eventlog" for k in kinds)
+    if cluster_clean and (cluster_old or _old(entry, cutoff) or terminated):
+        delete_dirs += [d for d, *_ in cluster_dirs] + [path]
+    else:
+        # Post-order, so each directory's children are decided first; one is removed only when it is
+        # clean, has age evidence, and every child directory is being removed too (a kept child means it
+        # won't be empty).
+        children = {}
+        for c, *_ in cluster_dirs:
+            children.setdefault(_parent(c), []).append(c)
+        removable = set()
+        for d, d_clean, d_old, d_own_old in cluster_dirs:
+            if d_clean and (d_old or d_own_old) and all(c in removable for c in children.get(d, ())):
+                removable.add(d)
+                delete_dirs.append(d)
+    return PrunePlan(acc["delete_files"], delete_dirs, acc["kept_files"], acc["kept_bytes"], skipped,
+                     acc["list_errors"])
+
+
+def _merge(plans, skipped=(), list_errors=(), root_missing=False) -> PrunePlan:
+    """One PrunePlan from per-cluster plans (in the given order) plus the root-level skipped and errors."""
+    files, dirs, kept_files, kept_bytes, skips, errors = [], [], 0, 0, list(skipped), list(list_errors)
+    for p in plans:
+        files += p.delete_files
+        dirs += p.delete_dirs
+        kept_files += p.kept_files
+        kept_bytes += p.kept_bytes
+        skips += p.skipped
+        errors += p.list_errors
+    return PrunePlan(files, dirs, kept_files, kept_bytes, skips, errors, root_missing)
+
+
 def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
     """Walk `root` and classify every entry. `ls(path)` returns entries with `.name` (a directory's name
     ends in '/'), `.size` and `.modificationTime` (epoch ms), and raises if the path can't be listed.
@@ -121,94 +237,22 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
     - Otherwise (a cluster still delivering) only directories that old-file deletes leave empty go (or
       whose own timestamp is old), so a running cluster's fresh empty directories stay.
     The root itself is never removed. A root that doesn't exist yet is an empty plan with root_missing set,
-    but only when it is deeper than the volume and the parent's listing positively shows it absent."""
-    delete_files, delete_dirs, skipped, list_errors = [], [], [], []
-    kept = {"files": 0, "bytes": 0}
+    but only when it is deeper than the volume and the parent's listing positively shows it absent.
 
-    def walk_log_tree(path: str) -> tuple:
-        """Classify everything under a log directory. Returns (clean, has_old, dirs): clean when nothing under
-        it is kept or unreadable, has_old when an old file under it is being deleted, and dirs the
-        descendant directories post-order as (path, clean, has_old, own_old)."""
-        try:
-            entries = list(ls(path))
-        except Exception as exc:  # noqa: BLE001 - recorded; the subtree is left alone
-            list_errors.append((path, f"{type(exc).__name__}: {exc}"))
-            return False, False, []
-        clean, has_old, dirs = True, False, []
-        for e in entries:
-            child = _join(path, e)
-            if _is_dir(e):
-                c_clean, c_old, c_dirs = walk_log_tree(child)
-                dirs += c_dirs + [(child, c_clean, c_old, _old(e, cutoff))]
-                clean, has_old = clean and c_clean, has_old or c_old
-                continue
-            size = getattr(e, "size", 0) or 0
-            if _old(e, cutoff):
-                delete_files.append((child, size))
-                has_old = True
-            else:
-                kept["files"] += 1
-                kept["bytes"] += size
-                clean = False
-        return clean, has_old, dirs
-
-    try:
-        top = list(ls(root))
-    except Exception as exc:  # noqa: BLE001
-        # A volume can't be created by log delivery, so a missing volume is a misconfiguration, not "no logs yet".
-        deeper_than_volume = len(root.rstrip("/").split("/")) > 5
-        volume = "/".join(root.rstrip("/").split("/")[:5])
-        if deeper_than_volume and _is_not_found(exc) and _absent_from_parent(root, ls, floor=volume):
-            # Configured but not created yet: no cluster has delivered logs, so there is nothing to prune.
-            return PrunePlan([], [], 0, 0, [], [], root_missing=True)
-        list_errors.append((root, f"{type(exc).__name__}: {exc}"))
-        top = []
-    # Listing a FILE returns just that file: a log path that points at a file is a misconfiguration, not an
-    # empty volume, so fail instead of reporting a green run that pruned nothing.
-    # A single same-named file is ambiguous (a directory can hold a file named like itself), so confirm from the
-    # parent's listing that the root itself is a file.
-    root_name = root.rstrip("/").rsplit("/", 1)[-1]
-    if len(top) == 1 and not _is_dir(top[0]) and _name(top[0]) == root_name and _listed_as_file(root, ls):
-        list_errors.append((root, "the path is a file, not a directory"))
-        top = []
-    for e in top:
-        path = _join(root, e)
-        if not (_is_dir(e) and CLUSTER_ID.fullmatch(_name(e))):
-            skipped.append((path, "not a cluster id directory"))
-            continue
+    This is the full, serial walk of every cluster. run_prune uses the same per-cluster rules but first
+    triages each cluster cheaply (see triage_cluster) and walks only the ones that can hold old files."""
+    clusters, skipped, list_errors, root_missing = _list_root(root, ls)
+    if root_missing:
+        return PrunePlan([], [], 0, 0, [], [], root_missing=True)
+    plans = []
+    for path, e in clusters:
         try:
             kinds = list(ls(path))
         except Exception as exc:  # noqa: BLE001
             list_errors.append((path, f"{type(exc).__name__}: {exc}"))
             continue
-        cluster_clean, cluster_old, cluster_dirs = True, False, []
-        for k in kinds:
-            kpath = _join(path, k)
-            if not (_is_dir(k) and _name(k) in LOG_KINDS):
-                skipped.append((kpath, "not a known log kind"))
-                cluster_clean = False
-                continue
-            k_clean, k_old, k_dirs = walk_log_tree(kpath)
-            cluster_dirs += k_dirs + [(kpath, k_clean, k_old, _old(k, cutoff))]
-            cluster_clean, cluster_old = cluster_clean and k_clean, cluster_old or k_old
-        # eventlog/ is delivered only at termination, so a clean cluster holding it has terminated. That covers
-        # the one case with no age evidence at all: a file-less tree left by an earlier run that stopped partway.
-        terminated = any(_is_dir(k) and _name(k) == "eventlog" for k in kinds)
-        if cluster_clean and (cluster_old or _old(e, cutoff) or terminated):
-            delete_dirs += [d for d, *_ in cluster_dirs] + [path]
-        else:
-            # Post-order, so each directory's children are decided first; one is removed only when it is
-            # clean, has age evidence, and every child directory is being removed too (a kept child means it
-            # won't be empty).
-            children = {}
-            for c, *_ in cluster_dirs:
-                children.setdefault(_parent(c), []).append(c)
-            removable = set()
-            for d, d_clean, d_old, d_own_old in cluster_dirs:
-                if d_clean and (d_old or d_own_old) and all(c in removable for c in children.get(d, ())):
-                    removable.add(d)
-                    delete_dirs.append(d)
-    return PrunePlan(delete_files, delete_dirs, kept["files"], kept["bytes"], skipped, list_errors)
+        plans.append(_plan_cluster(path, e, kinds, ls, cutoff))
+    return _merge(plans, skipped, list_errors)
 
 
 def _listed_as_file(path: str, ls) -> bool:
