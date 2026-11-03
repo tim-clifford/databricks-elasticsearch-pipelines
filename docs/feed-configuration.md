@@ -263,7 +263,7 @@ The connector also retries inside a task, before the task fails. The layers, fro
 
 | Layer | Setting | Retries |
 |---|---|---|
-| Document | [`max_retries_per_doc`](parameters.md#max_retries_per_doc) | one document ES rejects with a 429 |
+| Document | [`max_retries_per_doc`](parameters.md#max_retries_per_doc) | one document ES rejects with a status in [`retry_on_doc_status`](parameters.md#retry_on_doc_status) (by default 429 or 400) |
 | Request | [`max_retries_per_request`](parameters.md#max_retries_per_request) | a whole bulk request that timed out, lost its connection, or got a 429/502/503/504 |
 | Task (triggered jobs) | `triggered_task_max_retries` | the whole task, after the connector's retries are used up or anything else fails it |
 | Task (continuous jobs) | `task_retry_mode: ON_FAILURE` (pinned) | the whole task, or the whole run at the retry limit |

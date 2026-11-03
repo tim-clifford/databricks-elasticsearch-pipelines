@@ -21,7 +21,7 @@ there is one (`...` marks the parts that vary), the cause, and the fix.
 | [Generating jobs](#generation-fails) | unknown key, undeclared host config, `es_host_configs_json`, cluster configs, tags, job groups, task retries on a continuous feed, root `resources/` folder, `--check` |
 | [Deploying](#deploy-fails) | cluster policy, cluster id, cluster log path, policy conflicts |
 | [Starting a run](#run-fails-at-start) | wheel, host config, `${environment}`, checkpoint path, TLS settings, monitoring table, missing index |
-| [Writing](#writes-fail-or-are-slow) | timeouts, 429s, slow writes, reading the signals |
+| [Writing](#writes-fail-or-are-slow) | timeouts, 429s, 400s, slow writes, reading the signals |
 | [Falling behind](#falling-behind) | growing backlog, skipped runs, stale index |
 | [Data issues](#data-issues) | fewer documents, duplicates, a stream that writes nothing, source updates missing |
 | [Streaming](#streaming-failures) | schema changes, continuous retry limit |
@@ -264,6 +264,19 @@ Either way, if 429s are steady, lower the pressure: `write_concurrency`, `chunk_
 put less data in flight at once), the partition count, or cores
 ([Reading the signals](#reading-the-signals)). To ride out longer bursts instead, give the retries more
 time with [`retry_backoff_initial`](parameters.md#retry_backoff_initial) or `max_retries_per_request`.
+
+### 400 rejections
+
+A document rejected with a 400 is retried by default
+([`retry_on_doc_status`](parameters.md#retry_on_doc_status) is `429,400`), because ES occasionally
+returns a 400 that succeeds when the document is sent again. Those show as `rejected(4xx=...)` and
+`retried=` in the `BULK_STATS` output of a run that still succeeded, and need no action.
+
+A run that fails on a 400 after [`max_retries_per_doc`](parameters.md#max_retries_per_doc) retries has a
+document ES won't accept as sent, usually a field that conflicts with the index mapping
+(`mapper_parsing_exception` or `document_parsing_exception`). The error sample carries ES's reason, which
+names the field. Fix the view or the mapping; retrying again won't help. To fail such runs on the first
+attempt instead of after the retries, set `retry_on_doc_status` to `429`.
 
 ### Slow writes with no errors
 
