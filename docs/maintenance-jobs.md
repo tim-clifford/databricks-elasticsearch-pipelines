@@ -95,7 +95,11 @@ checkpoint is left where it was, unused.
   [backfill](backfill.md) in size, and without [`es_id_field`](parameters.md#es_id_field) every document
   already in the index is written again as a duplicate.
 
-To rename a streaming feed:
+There are two ways to rename a streaming feed: stop the old feed and close the gap it leaves (the steps
+below), or [run the old and new feeds side by side](#renaming-with-an-overlap) until they overlap, so
+there is no gap to close.
+
+To rename a streaming feed by stopping the old one:
 
 1. **Stop the old feed once it is caught up.** Check that its last batch was caught up, not behind
    ([Caught up or behind](monitoring.md#caught-up-or-behind), if the monitoring log is on), so the gap
@@ -125,6 +129,8 @@ To rename a streaming feed:
      ([Method 1](backfill.md#method-1-streaming-from-the-start-of-the-table-streaming-feeds-only)).
    - **Backfill only the gap:** leave `streaming_start` at `new`, and fill the gap after the new feed's
      first run (step 5).
+   - **Leave no gap at all:** that means not stopping the old feed in step 1. Follow
+     [Renaming with an overlap](#renaming-with-an-overlap) instead of these steps; it needs no backfill.
 4. **Rename the config file**, put `pause_status` back to what it was before step 1 (on every config you
    changed), regenerate, and deploy. Then run the new feed, or let its trigger start it.
 5. **After the new feed starts:**
@@ -147,6 +153,40 @@ To rename a streaming feed:
    current config has the old name: the job deletes that name's checkpoint either way, and if a feed uses
    the name, that checkpoint is live. (With no such config, the job warns and clears it anyway.) Left in place, it would be picked up by any future feed
    given the old name, which would resume from the old position and send everything since.
+
+### Renaming with an overlap
+
+Instead of stopping the old feed, keep it running while the new feed starts, and remove it only once the
+two have overlapped: the new feed starts (with `streaming_start: new`) from the source's version at its
+first run, and the old one keeps sending from its own checkpoint, so once the old feed has passed that
+point every row has been sent by one feed or the other. Nothing is skipped and nothing needs a backfill.
+The cost is that, for as long as both run, the rows they both read are sent twice:
+
+- **Load:** Elasticsearch takes both feeds' writes to the same index while they overlap. Size that like
+  a backfill that runs alongside the feed ([Plan the volume first](backfill.md#plan-the-volume-first)),
+  and keep the overlap short.
+- **Duplicates:** with [`es_id_field`](parameters.md#es_id_field) set, the second write of a row is an
+  idempotent upsert. Without it, every row both feeds send is written twice, as two documents.
+
+1. **Copy the config file, don't rename it.** Renaming it would remove the old job at the next deploy.
+   Add the new config next to the old one, with the same settings and `streaming_start` left at `new`
+   (not `full`, which would re-send the whole table). The copy carries the old config's schedule or continuous
+   trigger, if it declares one, so the new feed runs on the same trigger (in a job group, an identical
+   declaration [agrees](feed-configuration.md#what-members-must-agree-on)). Generate and deploy: the old job keeps
+   running from its checkpoint, and the new job is added beside it. A
+   [job group](feed-configuration.md#job-groups) member's copy joins the same group's job as a second
+   task.
+2. **Let the new feed start.** Run it, or let its trigger start it, and wait until its first run has
+   succeeded (for a continuous feed, its first successful batch).
+3. **Wait for the old feed to pass the new feed's start.** With the monitoring log on, compare the two
+   feeds' `batch_summary` rows ([how to read them](monitoring.md#caught-up-or-behind)): the overlap is
+   complete once a batch of the old feed has ended at or past where the new feed's first batch ended (a
+   higher `source_end_version`, or the same version with an equal or higher `source_end_index`). Without
+   the monitoring log, wait until the old feed has a successful run that started after the new feed's
+   first run succeeded, and was caught up (not behind) when it did.
+4. **Remove the old feed.** Delete the old config file, regenerate, and deploy. The deploy removes the
+   old job (for a group member, its task).
+5. **Clear the old checkpoint**, as in step 6 above.
 
 ## Diagnosing an Elasticsearch host
 
