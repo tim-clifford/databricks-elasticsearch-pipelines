@@ -745,7 +745,7 @@ def test_require_runtime_knobs_declared_bad_default_fails_closed(tmp_path, name,
 
 
 def test_require_runtime_knobs_declared_accepts_scalar_shorthand(tmp_path):
-    # DAB's scalar shorthand (<name>: <v>, no `default:` key) IS the default; a legal shorthand for every
+    # The bundle's scalar shorthand (<name>: <v>, no `default:` key) IS the default; a legal shorthand for every
     # knob passes (the gate reads the default from whichever shape was used).
     lines = ["variables:"]
     for name in RUNTIME_KNOB_NAMES:
