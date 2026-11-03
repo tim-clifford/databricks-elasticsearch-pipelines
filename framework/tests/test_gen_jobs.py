@@ -912,6 +912,8 @@ def test_shipped_log_table_prune_job_shape():
     assert job["max_concurrent_runs"] == 1
     assert job["queue"] == {"enabled": False}
     assert job["tags"] == "${var.global_job_tags}"
+    # It retries a failed attempt (default serverless retries), so the run needs a bound: 2 hours.
+    assert job["timeout_seconds"] == 7200
     # Daily schedule, paused by default (dev/stg deploy but never fire; prd unpauses).
     assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
     assert job["schedule"]["quartz_cron_expression"]

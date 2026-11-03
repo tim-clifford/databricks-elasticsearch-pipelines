@@ -614,9 +614,11 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
     tls = ls if triage_ls is None else triage_ls
     triaged, started = _bounded_map(clusters, lambda c: triage_cluster(c[0], c[1], tls, cutoff), workers, over,
                                     ticker("triage", len(clusters)), poll)
-    if started < len(clusters):
+    # Triage must FINISH within the budget, not just start: one that ran past it leaves no time to prune,
+    # so the run would end green with nothing done.
+    if started < len(clusters) or over():
         raise RuntimeError(
-            f"cluster_logs_prune FAILED: triage classified only {started} of {len(clusters)} cluster(s) within "
+            f"cluster_logs_prune FAILED: triage classified {started} of {len(clusters)} cluster(s) and did not finish within "
             f"max_minutes={max_minutes} ({int(spent_seconds)} s of it used before this attempt), so nothing was "
             f"deleted; raise cluster_log_prune_workers or cluster_log_prune_max_minutes")
     # An unexpected triage error is that cluster's listing error: it is left alone and fails the run.
@@ -643,7 +645,9 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
     errors = [(t, r) for t, r in zip(to_walk, results) if isinstance(r, ItemError)]
     done = [(p, c) for p, c, _ in (r for r in results if r is not None and not isinstance(r, ItemError))]
     stopped_walks = sum(1 for r in results if r is not None and not isinstance(r, ItemError) and r[2])
-    walked = started_walks - stopped_walks
+    # Walked = pruned to the end: a cluster stopped at the deadline counts as remaining, and one that hit an
+    # unexpected error is a failure, neither as walked.
+    walked = started_walks - stopped_walks - len(errors)
     plan = _merge([p for p, _ in done], root_skipped + [s for t in young for s in t.skipped],
                   root_errors + [e for t in triaged for e in t.list_errors], root_missing)
     failures = [f"list {p}: {e}" for p, e in root_errors + [e for t in triaged for e in t.list_errors]]
@@ -652,7 +656,7 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
         deleted_files, deleted_dirs, raced_dirs = deleted_files + f_count, deleted_dirs + d_count, raced_dirs + r_count
         failures += fails
     failures += [f"prune {t.path}: {type(r.exc).__name__}: {r.exc}" for t, r in errors]
-    remaining = len(to_walk) - walked
+    remaining = len(to_walk) - walked - len(errors)
     delete_bytes = sum(size for _, size in plan.delete_files)
     log(f"  plan: delete {len(plan.delete_files)} file(s) ({delete_bytes} bytes) and {len(plan.delete_dirs)} "
         f"empty dir(s); keep {plan.kept_files} file(s) ({plan.kept_bytes} bytes) in the walked clusters")
@@ -673,7 +677,8 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
         f"deleted_files={deleted_files} deleted_dirs={deleted_dirs} raced_dirs={raced_dirs} "
         f"kept_files={plan.kept_files} skipped={len(plan.skipped)} root_missing={plan.root_missing} "
         f"clusters={len(clusters)} clusters_young={len(young)} clusters_walked={walked} "
-        f"incomplete={remaining > 0} remaining_clusters={remaining} workers={workers} "
+        f"incomplete={remaining > 0} remaining_clusters={remaining} clusters_stopped={stopped_walks} "
+        f"workers={workers} "
         f"elapsed_s={int(clock() - start)} spent_before_s={int(spent_seconds)} failures={len(failures)}"
     )
     if failures:

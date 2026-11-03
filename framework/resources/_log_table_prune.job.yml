@@ -16,6 +16,11 @@ resources:
       # log_table_create.
       max_concurrent_runs: 1
 
+      # A backstop for the whole run, the retry included: a DELETE, OPTIMIZE or VACUUM that hangs fails the
+      # run (and emails) after 2 hours instead of running unnoticed. The monitoring log is small, so a normal
+      # run takes minutes. A timeout is never retried.
+      timeout_seconds: 7200
+
       # Skip, don't queue: a trigger landing while a run is active is dropped (MAX_CONCURRENT_RUNS_EXCEEDED)
       # rather than queued, matching every generated job and the other maintenance jobs.
       queue:

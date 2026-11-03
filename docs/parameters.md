@@ -195,9 +195,9 @@ trip to the Volume, so the run spends its time waiting, and threads overlap thos
 The time budget of one `cluster_log_prune` run, in minutes, counted from the start of the job run, so an
 attempt retried after a failure shares the same budget. Every cluster directory must be triaged within
 it, or the run fails without deleting anything (a run that can't even classify the clusters can't keep
-up). The delete phase stops starting new clusters once the budget has passed, lets the ones in progress
-finish, and ends the run green with `incomplete=True` and `remaining_clusters=<n>` in the summary; the next
-run carries on from a fresh listing.
+up). The delete phase stops starting new clusters once the budget has passed, a cluster in progress stops
+before its next delete (and counts as remaining), and the run ends green with `incomplete=True` and
+`remaining_clusters=<n>` in the summary; the next run carries on from a fresh listing.
 
 - **Set:** top level, per target, or `--var`; one run can override it with `--params max_minutes=<n>`.
 - **Takes effect:** at deploy (the variable), or for one run (the job parameter).

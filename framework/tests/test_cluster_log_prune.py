@@ -3,6 +3,8 @@ job executes. A fake directory tree stands in for dbutils.fs.ls."""
 import os
 from types import SimpleNamespace
 
+import time
+
 import pytest
 
 from pipeline_lib.cluster_log_prune import (
@@ -801,7 +803,7 @@ def test_triage_that_runs_out_of_time_fails_and_deletes_nothing():
         clock.t += 120   # every listing takes two simulated minutes
         return base(path)
 
-    with pytest.raises(RuntimeError, match=r"triage classified only \d+ of 20 cluster\(s\) within max_minutes=5"):
+    with pytest.raises(RuntimeError, match=r"triage classified \d+ of 20 cluster\(s\) and did not finish within max_minutes=5"):
         run_prune(ROOT, 30, CUTOFF, False, ls, _never, log=lambda l: None, workers=1, max_minutes=5, clock=clock)
 
 
@@ -1000,7 +1002,7 @@ def test_a_retry_gets_only_the_rest_of_the_runs_budget():
 
 
 def test_a_retry_with_the_budget_already_used_fails_before_deleting():
-    with pytest.raises(RuntimeError, match=r"triage classified only 0 of 3 .* \(1800 s of it used before this attempt\)"):
+    with pytest.raises(RuntimeError, match=r"triage classified 0 of 3 .* \(1800 s of it used before this attempt\)"):
         run_prune(ROOT, 30, CUTOFF, False, _fs(_many(3)), _never, log=lambda l: None, workers=1, max_minutes=30,
                   spent_seconds=30 * 60, clock=_Clock())
 
@@ -1114,3 +1116,68 @@ def test_large_negative_skew_is_still_implausible():
     now = 1_800_000_000_000
     spent, note = spent_before_seconds(str(now + 301_000), now)
     assert spent == 0 and "implausible" in note
+
+
+# --------------------------------------------------------------------------- Isaac round 3 fixes
+
+def test_execute_plan_until_stops_inside_the_directory_loop():
+    # The deadline passes after the one file and the first directory: nothing more is removed.
+    plan = PrunePlan([(f"{ROOT}/{CID}/driver/f", 1)],
+                     [f"{ROOT}/{CID}/driver", f"{ROOT}/{CID}/executor", f"{ROOT}/{CID}"], 0, 0, [], [])
+    rm = _Rm()
+    result = execute_plan_until(plan, rm, False, None, ROOT, stop=lambda: len(rm.calls) >= 2)
+    assert result == (1, 1, 0, [], True)
+    assert [p for p, _ in rm.calls] == [f"{ROOT}/{CID}/driver/f", f"{ROOT}/{CID}/driver"]
+
+
+def test_today_mmdd_default_is_month_then_day(monkeypatch):
+    import pipeline_lib.cluster_log_prune as m
+    monkeypatch.setattr(m.time, "gmtime", lambda *a: time.struct_time((2026, 1, 15, 0, 0, 0, 3, 15, 0)))
+    assert m._today_mmdd() == 115
+
+
+def test_an_errored_cluster_is_not_counted_as_walked(monkeypatch):
+    import pipeline_lib.cluster_log_prune as m
+    real = m._plan_cluster
+
+    def flaky(path, *args):
+        if path.endswith("-c2"):
+            raise KeyError("bug")
+        return real(path, *args)
+
+    monkeypatch.setattr(m, "_plan_cluster", flaky)
+    tree = {f"0{i}01-000000-c{i}": _terminated(OLD) for i in (1, 2, 3)}
+    with pytest.raises(RuntimeError) as err:
+        run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _Rm(), log=lambda l: None, workers=1)
+    assert "clusters_walked=2" in str(err.value) and "remaining_clusters=0" in str(err.value)
+
+
+def test_a_stopped_cluster_is_reported_as_stopped():
+    clock = _Clock()
+
+    class _SlowRm(_Rm):
+        def __call__(self, path, recurse=None):
+            clock.t += 60
+            return super().__call__(path, recurse)
+
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs({CID: _terminated(OLD)}), _SlowRm(), log=lambda l: None,
+                        workers=1, max_minutes=3, clock=clock)
+    assert "clusters_stopped=1" in summary and "remaining_clusters=1" in summary
+
+
+def test_triage_that_finishes_after_the_budget_fails_without_deleting():
+    # Every triage item started before the deadline but the last finished after it: no time is left to prune,
+    # so the run fails closed instead of ending green with nothing done.
+    clock = _Clock()
+    base = _fs(_many(3))
+
+    def slow_ls(path):
+        if path.endswith("/driver"):
+            clock.t += 61   # each cluster's triage listing takes over a minute
+        return base(path)
+
+    rm = _Rm()
+    with pytest.raises(RuntimeError, match="did not finish within"):
+        run_prune(ROOT, 30, CUTOFF, False, base, rm, log=lambda l: None, workers=1, max_minutes=3, clock=clock,
+                  triage_ls=slow_ls)
+    assert rm.calls == []
