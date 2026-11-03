@@ -31,6 +31,7 @@ from pipeline_lib.config import (
     require_max_files_per_trigger,
     require_max_partition_bytes,
     require_max_retries_per_doc,
+    require_retry_on_doc_status,
     require_pause_status,
     require_pipeline_mode,
     require_request_timeout,
@@ -1115,7 +1116,7 @@ def test_job_base_parameters_excludes_run_time_params():
     params = _job_base_parameters("x")
     for run_time in ("pipeline_mode", "filter_condition", "chunk_size", "write_concurrency",
                      "request_timeout", "max_retries_per_request", "max_retries_per_doc",
-                     "retry_backoff_initial", "retry_backoff_max", "require_existing_index",
+                     "retry_on_doc_status", "retry_backoff_initial", "retry_backoff_max", "require_existing_index",
                      "verify_certs", "bulk_stats", "streaming_start", "write_repartition", "max_partition_bytes"):
         assert run_time not in params
 
@@ -1149,6 +1150,7 @@ def test_job_parameters_full_shape_and_order():
         {"name": "request_timeout", "default": ""},
         {"name": "max_retries_per_request", "default": ""},
         {"name": "max_retries_per_doc", "default": ""},
+        {"name": "retry_on_doc_status", "default": ""},
         {"name": "retry_backoff_initial", "default": ""},
         {"name": "retry_backoff_max", "default": ""},
         {"name": "require_existing_index", "default": ""},
@@ -1499,8 +1501,8 @@ def test_runtime_knob_registry_shape():
     # asserts the canonical set/order in one place.
     assert RUNTIME_KNOB_NAMES == (
         "pipeline_mode", "filter_condition", "chunk_size", "write_concurrency", "op_type",
-        "request_timeout", "max_retries_per_request", "max_retries_per_doc", "retry_backoff_initial",
-        "retry_backoff_max", "require_existing_index", "verify_certs",
+        "request_timeout", "max_retries_per_request", "max_retries_per_doc", "retry_on_doc_status",
+        "retry_backoff_initial", "retry_backoff_max", "require_existing_index", "verify_certs",
         "bulk_stats", "bypass_fast_path", "streaming_start",
         "write_repartition", "max_partition_bytes", "max_files_per_trigger", "max_bytes_per_trigger",
         "monitoring_log_enabled", "log_monitor_source_lookback_seconds", "log_monitor_source_history_rows",
@@ -1838,6 +1840,8 @@ def test_tuning_knobs_from_yaml_string_values():
     ("request_timeout", "abc"), ("request_timeout", 0), ("request_timeout", -5), ("request_timeout", 12.5),
     ("max_retries_per_request", "abc"), ("max_retries_per_request", -1), ("max_retries_per_request", 2.5),
     ("max_retries_per_doc", "abc"), ("max_retries_per_doc", -1), ("max_retries_per_doc", 2.5),
+    ("retry_on_doc_status", "400"), ("retry_on_doc_status", "429,404"), ("retry_on_doc_status", [429, 429]),
+    ("retry_on_doc_status", True), ("retry_on_doc_status", []),
     ("require_existing_index", "maybe"), ("require_existing_index", 1),
     ("verify_certs", "yes"),
 ])
@@ -1870,6 +1874,7 @@ def test_tuning_knobs_carried_through_resolve():
     cfg["request_timeout"] = 90
     cfg["max_retries_per_request"] = 5
     cfg["max_retries_per_doc"] = 7
+    cfg["retry_on_doc_status"] = [429, 400]
     cfg["retry_backoff_initial"] = 1.5
     cfg["retry_backoff_max"] = 45
     out = resolve_config(validate_config(cfg), environment="prod")
@@ -1881,6 +1886,7 @@ def test_tuning_knobs_carried_through_resolve():
     assert out["request_timeout"] == "90"
     assert out["max_retries_per_request"] == "5"
     assert out["max_retries_per_doc"] == "7"
+    assert out["retry_on_doc_status"] == "429,400"
 
 
 def test_reliability_knobs_omitted_carry_through_resolve_as_unset():
@@ -1889,6 +1895,7 @@ def test_reliability_knobs_omitted_carry_through_resolve_as_unset():
     assert out["request_timeout"] == ""
     assert out["max_retries_per_request"] == ""
     assert out["max_retries_per_doc"] == ""
+    assert out["retry_on_doc_status"] == ""
     assert out["retry_backoff_initial"] == ""
     assert out["retry_backoff_max"] == ""
 
@@ -2922,3 +2929,80 @@ def test_triggered_task_retry_fields_map_to_jobs_api_fields():
         "triggered_task_max_retries": "max_retries",
         "triggered_task_min_retry_interval_millis": "min_retry_interval_millis",
     }
+
+
+# --- retry_on_doc_status: the per-item statuses the per-document retry layer re-sends ---
+
+@pytest.mark.parametrize("value,expected", [
+    ("", ""), (None, ""), ("  ", ""),                      # unset -> "" (connector default, 429 only)
+    ("429", "429"), (429, "429"), ([429], "429"),          # string, YAML int, YAML list
+    ("429,400", "429,400"), (" 400 , 429 ", "400,429"),    # order kept, spaces dropped
+    ([429, 400], "429,400"), ((429, "503"), "429,503"),
+    ("429,400,502,503,504", "429,400,502,503,504"),
+    ("429,599", "429,599"),                                # 599 is the top of the allowed range
+])
+def test_require_retry_on_doc_status_canonical(value, expected):
+    assert require_retry_on_doc_status(value) == expected
+
+
+@pytest.mark.parametrize("bad", [
+    "400",                  # 429 missing: would silently drop the backpressure retry
+    "429,404", "409,429",   # terminal no-op statuses, never retried
+    "429,399", "429,600", "429,200", "429,100",   # not an HTTP error status
+    "429,400,400", [429, 429],                     # duplicates
+    "429,,400", "429,", ",429",                    # empty entry
+    "429;400", "429 400", "429,4o0", "429,40", "429,0400", "429,4000",   # not a three-digit status
+    "429,+400", "429,-400", "429,400.0",
+    True, False, [True], [429, True], 429.0, [429.0], {"429": 1}, [], (),
+])
+def test_require_retry_on_doc_status_fails_closed(bad):
+    with pytest.raises(PipelineConfigError, match="retry_on_doc_status"):
+        require_retry_on_doc_status(bad)
+
+
+def test_require_retry_on_doc_status_where_labels_error():
+    with pytest.raises(PipelineConfigError, match="cfg.yml: retry_on_doc_status"):
+        require_retry_on_doc_status("400", "cfg.yml: retry_on_doc_status")
+
+
+def test_write_config_overrides_retry_on_doc_status_tuple():
+    # The connector takes a tuple of ints; order is kept.
+    assert write_config_overrides("", "", "", retry_on_doc_status="429,400") == {"retry_on_doc_status": (429, 400)}
+    assert write_config_overrides("", "", "", retry_on_doc_status=" 429 ") == {"retry_on_doc_status": (429,)}
+
+
+def test_write_config_overrides_retry_on_doc_status_empty_omitted():
+    # Unset => omitted, so the connector default (429,) stands.
+    assert write_config_overrides("", "", "", retry_on_doc_status="") == {}
+    assert write_config_overrides("", "", "") == {}
+
+
+@pytest.mark.parametrize("bad", ["400", "429,404", "abc", "429,,400"])
+def test_write_config_overrides_bad_retry_on_doc_status_fails_closed(bad):
+    # A bad --params value fails before any write.
+    with pytest.raises(PipelineConfigError, match="retry_on_doc_status"):
+        write_config_overrides("", "", "", retry_on_doc_status=bad)
+
+
+def test_job_parameters_retry_on_doc_status_omitted_uses_global_ref():
+    params = job_parameters(validate_config(_base()), runtime_knob_global_refs())
+    assert {"name": "retry_on_doc_status", "default": "${var.retry_on_doc_status}"} in params
+
+
+def test_job_parameters_retry_on_doc_status_config_value_overrides_ref():
+    cfg = _base()
+    cfg["retry_on_doc_status"] = "429"
+    params = job_parameters(validate_config(cfg), runtime_knob_global_refs())
+    assert {"name": "retry_on_doc_status", "default": "429"} in params
+
+
+@pytest.mark.parametrize("bad,reason", [
+    ([], "empty list"), ((), "empty list"),
+    (True, "boolean"), ([429, True], "boolean"), ([True], "boolean"),
+    ("400", "429 is missing"), ("429,404", "404 is never retried"), ("429,400,400", "400 is listed twice"),
+    ("429,600", "600 is not an HTTP error status"), ("429,,400", "is not a three-digit status"),
+])
+def test_require_retry_on_doc_status_names_the_reason(bad, reason):
+    # Each rejection says why, so an operator can fix the value without reading the code.
+    with pytest.raises(PipelineConfigError, match=re.escape(reason)):
+        require_retry_on_doc_status(bad)

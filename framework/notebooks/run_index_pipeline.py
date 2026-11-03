@@ -44,7 +44,8 @@
 # MAGIC   tuning (default from config; omitted there and unset per run => connector default). The connector runs
 # MAGIC   every retry with backoff: `max_retries_per_request` (0 disables) re-sends a whole request that timed out,
 # MAGIC   could not connect, or got a 429/502/503/504 (e.g. ES indexing pressure); `max_retries_per_doc` (0
-# MAGIC   disables) is the PER-DOCUMENT retry count for rows ES rejects with a 429 (write queue full). Retry n waits
+# MAGIC   disables) is the PER-DOCUMENT retry count for rows ES rejects with a status in `retry_on_doc_status`
+# MAGIC   (comma-separated, must include 429; connector default 429 only). Retry n waits
 # MAGIC   `min(retry_backoff_initial * 2**(n-1), retry_backoff_max)` seconds (connector defaults 2 and 30).
 # MAGIC - `streaming_start`: `new` (default; only new commits) | `full` (backfill the whole table);
 # MAGIC   streaming only, honored on the first run before a checkpoint exists. `new` establishes the
@@ -135,7 +136,8 @@ dbutils.widgets.text("chunk_size", "", "EsWriteConfig chunk_size override (empty
 dbutils.widgets.text("write_concurrency", "", "EsWriteConfig write_concurrency: parallel bulk streams per partition (empty => connector default 1)")
 dbutils.widgets.text("request_timeout", "", "EsWriteConfig request_timeout: per-request ES client timeout in seconds (empty => connector default 60)")
 dbutils.widgets.text("max_retries_per_request", "", "EsWriteConfig max_retries_per_request: whole-request retries on a timeout, connection error, or 429/502/503/504; 0 disables (empty => connector default 3)")
-dbutils.widgets.text("max_retries_per_doc", "", "EsWriteConfig max_retries_per_doc: PER-DOCUMENT retries for rows ES rejects with a 429 (write queue full); 0 disables (empty => connector default 3)")
+dbutils.widgets.text("max_retries_per_doc", "", "EsWriteConfig max_retries_per_doc: PER-DOCUMENT retries for rows ES rejects with a status in retry_on_doc_status; 0 disables (empty => connector default 3)")
+dbutils.widgets.text("retry_on_doc_status", "", "EsWriteConfig retry_on_doc_status: comma-separated per-document statuses to retry, must include 429, e.g. 429,400 (empty => connector default 429)")
 dbutils.widgets.text("retry_backoff_initial", "", "EsWriteConfig retry_backoff_initial: seconds before the first retry, doubling each later retry (empty => connector default 2)")
 dbutils.widgets.text("retry_backoff_max", "", "EsWriteConfig retry_backoff_max: cap in seconds on any single retry wait (empty => connector default 30)")
 dbutils.widgets.text("require_existing_index", "", "EsWriteConfig require_existing_index: true|false (empty => default)")
@@ -184,6 +186,7 @@ WRITE_CONCURRENCY = dbutils.widgets.get("write_concurrency").strip()
 REQUEST_TIMEOUT = dbutils.widgets.get("request_timeout").strip()
 MAX_RETRIES_PER_REQUEST = dbutils.widgets.get("max_retries_per_request").strip()
 MAX_RETRIES_PER_DOC = dbutils.widgets.get("max_retries_per_doc").strip()
+RETRY_ON_DOC_STATUS = dbutils.widgets.get("retry_on_doc_status").strip()
 RETRY_BACKOFF_INITIAL = dbutils.widgets.get("retry_backoff_initial").strip()
 RETRY_BACKOFF_MAX = dbutils.widgets.get("retry_backoff_max").strip()
 REQUIRE_EXISTING_INDEX = dbutils.widgets.get("require_existing_index").strip()
@@ -327,6 +330,7 @@ FILTER_CONDITION = require_filter_condition(FILTER_CONDITION, "filter_condition 
 write_overrides = write_config_overrides(CHUNK_SIZE, REQUIRE_EXISTING_INDEX, VERIFY_CERTS, WRITE_CONCURRENCY, BULK_STATS,
                                          request_timeout=REQUEST_TIMEOUT, max_retries_per_request=MAX_RETRIES_PER_REQUEST,
                                          max_retries_per_doc=MAX_RETRIES_PER_DOC,
+                                         retry_on_doc_status=RETRY_ON_DOC_STATUS,
                                          retry_backoff_initial=RETRY_BACKOFF_INITIAL,
                                          retry_backoff_max=RETRY_BACKOFF_MAX, op_type=OP_TYPE,
                                          bypass_fast_path=BYPASS_FAST_PATH)
