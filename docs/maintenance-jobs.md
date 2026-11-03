@@ -288,7 +288,10 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
   (default 16). Measured on serverless (2026-11-03, 300 synthetic clusters), 16 threads cut a listing to
   about 7 ms through the mount and about 60 ms through `dbutils.fs.ls`, and a delete from about 600 ms to
   about 120 ms. So at steady state a nightly run lists two directories per cluster and walks and deletes
-  only the clusters that aged out since the last run.
+  only the clusters that aged out since the last run. In live runs at 16 threads, triage took under a
+  minute for about 2,000 clusters, and the prune deleted about 30 finished clusters a minute (each the 7
+  files and 8 directories a job cluster delivers); the earlier, serial walk took about 2 seconds per
+  cluster just to list it.
 - **Time budget.** [`cluster_log_prune_max_minutes`](parameters.md#cluster_log_prune_max_minutes)
   (default 200) bounds a run, below the job's 4-hour timeout. Triage must finish within it, or the run
   fails without deleting anything, because a run that can't even classify the clusters can't keep up:
