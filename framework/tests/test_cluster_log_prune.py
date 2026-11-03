@@ -750,9 +750,9 @@ def _many(n, driver_mtime=OLD, month="10"):
 
 def test_threads_give_the_same_result_as_one_thread():
     tree = {**_many(30), **_many(20, NEW, month="11"), "stray.txt": OLD}
-    one = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _Rm(), log=lambda l: None, workers=1)
+    one = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _Rm(), log=lambda l: None, workers=1, clock=_Clock())
     rm8 = _Rm()
-    eight = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm8, log=lambda l: None, workers=8)
+    eight = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm8, log=lambda l: None, workers=8, clock=_Clock())
     strip = lambda s: s.replace("workers=1", "").replace("workers=8", "")
     assert strip(one) == strip(eight)
     assert "clusters=50 clusters_young=20 clusters_walked=30" in eight and "deleted_files=120" in eight
@@ -943,7 +943,6 @@ def test_triage_ls_is_used_for_triage_only_and_walks_relist_with_ls():
 
 
 def test_a_walked_cluster_that_cannot_be_relisted_fails_without_any_delete():
-    calls = {"n": 0}
     base = _fs({CID: _terminated(OLD)})
 
     def ls(path):
@@ -1002,12 +1001,6 @@ def test_a_retry_gets_only_the_rest_of_the_runs_budget():
     # 5-minute mark runs (at most the first two), where a fresh budget starts more.
     assert _clusters_started(25 * 60) <= 2
     assert _clusters_started(0) >= 3
-
-
-def test_a_retry_with_the_budget_already_used_fails_before_deleting():
-    with pytest.raises(RuntimeError, match=r"triage classified 0 of 3 .* \(1800 s of it used before this attempt\)"):
-        run_prune(ROOT, 30, CUTOFF, False, _fs(_many(3)), _never, log=lambda l: None, workers=1, max_minutes=30,
-                  spent_seconds=30 * 60, clock=_Clock())
 
 
 def test_a_queued_item_does_not_start_after_the_deadline():
@@ -1333,3 +1326,28 @@ def test_a_triage_listing_failure_through_ls_itself_is_still_a_failure():
 
     with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
         run_prune(ROOT, 30, CUTOFF, False, ls, _Rm(), log=lambda l: None)
+
+
+
+# --------------------------------------------------------------------------- Isaac round 7 fixes
+
+def test_a_triage_failure_on_driver_through_the_mount_falls_back_to_the_walk():
+    # The fast listing fails on driver/ only, the dbutils listing works: walked, green.
+    base = _fs({CID: _terminated(OLD)})
+
+    def fuse(path):
+        if path == f"{ROOT}/{CID}/driver":
+            raise OSError(5, "Input/output error")
+        return base(path)
+
+    rm = _Rm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, base, rm, log=lambda l: None, triage_ls=fuse)
+    assert "failures=0" in summary and "clusters_walked=1" in summary and rm.calls
+
+
+def test_a_retry_with_the_budget_used_says_so_and_lists_nothing():
+    ls = _Counting(_fs({CID: _terminated(OLD)}))
+    with pytest.raises(RuntimeError, match="already used by an earlier attempt of this job run"):
+        run_prune(ROOT, 30, CUTOFF, False, ls, _never, log=lambda l: None, max_minutes=30, spent_seconds=1800,
+                  clock=_Clock())
+    assert ls.paths == []

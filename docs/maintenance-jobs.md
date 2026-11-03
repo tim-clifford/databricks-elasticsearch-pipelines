@@ -319,8 +319,9 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
   (`{{job.start_time.timestamp_ms}}`, the same on every attempt) and the budget counts from it, so an
   attempt that auto-optimization retries after a failure (see the top of this page) gets only what is
   left of it, and ends at the budget instead of being cut off by the 4-hour timeout, which also covers
-  the whole run. A retry that starts with the budget already used up fails at once, before deleting
-  anything. The run output's `max_minutes` line says which start the budget counts from; when the run
+  the whole run. A retry that starts with the budget already used up fails at once, before listing
+  anything, with a message saying the budget was used by an earlier attempt. So a run whose triage
+  can't finish within the budget sends two failure emails, the second one expected. The run output's `max_minutes` line says which start the budget counts from; when the run
   start can't be read (an interactive run of the notebook), it counts from the attempt. A **repair** of a
   run keeps the original run's start time, so repairing a run that started more than `max_minutes` ago
   fails at once without deleting anything: start a new run instead.

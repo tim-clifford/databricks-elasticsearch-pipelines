@@ -428,8 +428,9 @@ def volume_ls(path: str) -> list:
     semantics: `.name` (a directory's ends in '/'), `.size`, `.modificationTime` (epoch ms). Measured on a
     serverless notebook (2026-11-03) at 21.5 ms per call against 270 ms for dbutils.fs.ls, with identical
     names, sizes and file times. Used for triage only: FUSE can show a stale view of changes made through
-    dbutils (seen live after deletes), and a stale view can only make a cluster look less young, which means
-    a walk. Walks and deletes go through dbutils.fs. A directory's time is reported as 0, as the prune
+    dbutils (seen live after deletes). A stale view never causes a delete: it can send a cluster to the
+    walk (which lists it again through dbutils), or, if it misses a fresh driver file, keep a cluster for
+    one more run, which only delays a delete. Walks and deletes go through dbutils.fs. A directory's time is reported as 0, as the prune
     already assumes for directories."""
     out = []
     with os.scandir(path) as it:
@@ -625,6 +626,13 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
     start = clock()
     deadline = None if max_minutes is None else start + max_minutes * 60 - max(0, spent_seconds)
     over = (lambda: False) if deadline is None else (lambda: clock() >= deadline)
+    if over():
+        # An earlier attempt of this job run (or the original run, for a repair) already used the budget, so
+        # there is nothing this attempt can do. Say so plainly, so this second failure email reads as expected.
+        raise RuntimeError(
+            f"cluster_logs_prune FAILED: the time budget (max_minutes={max_minutes}) was already used by an "
+            f"earlier attempt of this job run ({int(spent_seconds)} s since the run started), so nothing was "
+            f"listed or deleted. Expected right after an attempt that ran out of budget; start a new run.")
     last_progress = [start]
 
     def ticker(phase: str, total: int):
