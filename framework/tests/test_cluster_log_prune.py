@@ -1351,3 +1351,31 @@ def test_a_retry_with_the_budget_used_says_so_and_lists_nothing():
         run_prune(ROOT, 30, CUTOFF, False, ls, _never, log=lambda l: None, max_minutes=30, spent_seconds=1800,
                   clock=_Clock())
     assert ls.paths == []
+
+
+# --------------------------------------------------------------------------- Isaac round 8 fixes
+
+def test_triage_finishing_late_with_nothing_to_walk_stays_green():
+    # Every cluster is young: triage finishing after the budget lost nothing, so the run doesn't fail.
+    clock = _Clock()
+    base = _fs(_many(3, NEW))
+
+    def slow_ls(path):
+        if path.endswith("/driver"):
+            clock.t += 61
+        return base(path)
+
+    summary = run_prune(ROOT, 30, CUTOFF, False, base, _never, log=lambda l: None, workers=1, max_minutes=3,
+                        clock=clock, triage_ls=slow_ls)
+    assert "clusters_young=3" in summary and "failures=0" in summary
+
+
+def test_the_walk_relist_is_checked_against_the_deadline():
+    # Every listing a walk makes, its first relisting of the cluster included, goes through the
+    # deadline-checked planning_ls, inside the try that turns _DeadlineReached into a stopped result.
+    import inspect
+    import pipeline_lib.cluster_log_prune as m
+    src = inspect.getsource(m.run_prune)
+    body = src[src.index("    def prune_one("):src.index("    results, started_walks = ")]
+    assert "kinds = list(planning_ls(t.path))" in body and "list(ls(t.path))" not in body
+    assert body.index("except _DeadlineReached:") > body.index("kinds = list(planning_ls(t.path))")

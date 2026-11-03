@@ -324,7 +324,8 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
   can't finish within the budget sends two failure emails, the second one expected. The run output's `max_minutes` line says which start the budget counts from; when the run
   start can't be read (an interactive run of the notebook), it counts from the attempt. A **repair** of a
   run keeps the original run's start time, so repairing a run that started more than `max_minutes` ago
-  fails at once without deleting anything: start a new run instead.
+  (but less than a day ago) fails at once without deleting anything: start a new run instead. A start
+  over a day old is treated as unreadable, so a repair that late counts its budget from the attempt.
 - **Directories.** A finished cluster (every file under it past the cutoff, nothing else there) is
   removed whole, including empty directories it never used. "Finished" is judged by file age alone: a
   cluster that has delivered nothing for the whole retention window is assumed to have terminated. An

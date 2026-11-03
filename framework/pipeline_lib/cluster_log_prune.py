@@ -648,13 +648,14 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
     tls = ls if triage_ls is None else triage_ls
     triaged, started = _bounded_map(clusters, lambda c: triage_cluster(c[0], c[1], tls, cutoff), workers, over,
                                     ticker("triage", len(clusters)), poll)
-    # Triage must FINISH within the budget, not just start: one that ran past it leaves no time to prune,
-    # so the run would end green with nothing done.
-    if started < len(clusters) or over():
-        raise RuntimeError(
+    def triage_out_of_time():
+        return RuntimeError(
             f"cluster_logs_prune FAILED: triage classified {started} of {len(clusters)} cluster(s) and did not finish within "
             f"max_minutes={max_minutes} ({int(spent_seconds)} s of it used before this attempt), so nothing was "
             f"deleted; raise cluster_log_prune_workers or cluster_log_prune_max_minutes")
+
+    if started < len(clusters):
+        raise triage_out_of_time()
     # An unexpected triage error is that cluster's listing error: it is left alone and fails the run.
     triaged = [ClusterTriage(c[0], c[1], [], False, [], [(c[0], f"{type(t.exc).__name__}: {t.exc}")])
                if isinstance(t, ItemError) else t for c, t in zip(clusters, triaged)]
@@ -664,19 +665,24 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
                      key=lambda t: _oldest_first_key(t.path, md))
     log(f"  triage: {len(young)} cluster(s) kept without a walk (every driver log inside retention), "
         f"{len(to_walk)} to walk, {int(clock() - start)} s elapsed")
+    # Triage must FINISH within the budget, not just start: one that ran past it with clusters still to walk
+    # leaves no time to prune them, so the run would end green with nothing done. With nothing to walk,
+    # finishing late lost nothing.
+    if over() and to_walk:
+        raise triage_out_of_time()
 
     def prune_one(t: ClusterTriage):
-        try:
-            kinds = list(ls(t.path))   # fresh, through the same ls the walk and deletes use
-        except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
-            error = (t.path, f"{type(exc).__name__}: {exc}")
-            return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"]), "failed"
         def planning_ls(path):
             if over():
                 raise _DeadlineReached()
             return ls(path)
 
         try:
+            try:
+                kinds = list(planning_ls(t.path))   # fresh, through the same ls the walk and deletes use
+            except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
+                error = (t.path, f"{type(exc).__name__}: {exc}")
+                return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"]), "failed"
             plan = _plan_cluster(t.path, t.entry, kinds, planning_ls, cutoff)
         except _DeadlineReached:
             # Abandoned mid-walk at the deadline: nothing deleted from a partial plan; the cluster is remaining.
