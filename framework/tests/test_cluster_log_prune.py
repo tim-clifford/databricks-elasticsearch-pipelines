@@ -944,3 +944,56 @@ def test_a_walked_cluster_that_cannot_be_relisted_fails_without_any_delete():
     with pytest.raises(RuntimeError, match=r"FAILED \(1 failure"):
         run_prune(ROOT, 30, CUTOFF, False, ls, rm, log=lambda l: None, triage_ls=base)
     assert rm.calls == []
+
+
+# --------------------------------------------------------------------------- the budget counts from the job run start
+from pipeline_lib.cluster_log_prune import spent_before_seconds  # noqa: E402
+
+
+def test_spent_before_reads_the_job_run_start():
+    spent, note = spent_before_seconds("1700000000000", 1700000600000)
+    assert spent == 600 and "600 s before this attempt" in note
+
+
+@pytest.mark.parametrize("raw", ["", "{{job.start_time.timestamp_ms}}", " ", "0", "-5", "1.7e12", None, 1700000000000,
+                                 "17000000000001"])
+def test_spent_before_falls_back_to_this_attempt(raw):
+    # Unresolved, empty, non-integer, non-string, or in the future: counted from this attempt, with a note.
+    spent, note = spent_before_seconds(raw, 1700000600000)
+    assert spent == 0 and "counts from this attempt" in note
+
+
+def test_spent_before_rejects_a_start_over_a_day_old():
+    spent, note = spent_before_seconds("1700000000000", 1700000000000 + 86_401_000)
+    assert spent == 0 and "implausible" in note
+
+
+def _clusters_started(spent_seconds):
+    """Clusters a 30-minute run starts when each cluster's deletes take 12 simulated minutes. The fake clock
+    advances on the worker thread, so the first refill may race the deadline check: assert ranges, not counts."""
+    clock = _Clock()
+
+    class _SlowRm(_Rm):
+        def __call__(self, path, recurse=None):
+            clock.t += 60
+            return super().__call__(path, recurse)
+
+    tree = {f"{m:02d}01-000000-c{m}": _terminated(OLD) for m in range(1, 7)}
+    rm = _SlowRm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lambda l: None, workers=1, max_minutes=30,
+                        spent_seconds=spent_seconds, clock=clock)
+    assert "incomplete=True" in summary and f"spent_before_s={int(spent_seconds)}" in summary
+    return len({p[len(ROOT) + 1:].split("/")[0] for p, _ in rm.calls})
+
+
+def test_a_retry_gets_only_the_rest_of_the_runs_budget():
+    # An earlier attempt of the same run used 25 of the 30 minutes: only what was already in flight at the
+    # 5-minute mark runs (at most the first two), where a fresh budget starts more.
+    assert _clusters_started(25 * 60) <= 2
+    assert _clusters_started(0) >= 3
+
+
+def test_a_retry_with_the_budget_already_used_fails_before_deleting():
+    with pytest.raises(RuntimeError, match=r"triage classified only 0 of 3 .* \(1800 s of it used before this attempt\)"):
+        run_prune(ROOT, 30, CUTOFF, False, _fs(_many(3)), _never, log=lambda l: None, workers=1, max_minutes=30,
+                  spent_seconds=30 * 60, clock=_Clock())

@@ -69,6 +69,10 @@ resources:
             base_parameters:
               cluster_log_volume_path: ${var.cluster_log_volume_path}
               cluster_log_retention_days: ${var.cluster_log_retention_days}
+              # The job RUN's start time (a Jobs dynamic value reference, the same on every attempt), so a
+              # retried attempt gets only what is left of the run's max_minutes budget, not a fresh one that
+              # the job timeout would cut short.
+              job_start_ms: "{{job.start_time.timestamp_ms}}"
           # Default serverless retries, deliberately: no max_retries and auto-optimization left on, so a failed
           # attempt is retried once by serverless itself. Unlike the on-demand maintenance jobs (which never
           # retry, so whoever ran one decides), this one runs on a schedule with nobody watching, and a rerun

@@ -329,6 +329,24 @@ def parse_max_minutes(raw: object) -> int:
     return _parse_bounded_int(raw, "max_minutes (cluster_log_prune_max_minutes)", 1, MAX_MINUTES_LIMIT)
 
 
+def spent_before_seconds(job_start_ms: object, now_ms: int) -> tuple:
+    """Seconds this job run had already used before this attempt started, and a note for the run output.
+
+    The budget is for the whole job run, not one attempt: the job's timeout_seconds bounds every attempt
+    together, so a failed attempt that is retried must not hand the retry a fresh budget that the timeout
+    would then cut short (ending TIMEDOUT instead of at a clean budget stop). The job passes its run's start
+    time as `{{job.start_time.timestamp_ms}}`. A value that isn't a plain positive integer (an interactive
+    run, or the reference not resolved) or that is implausible (in the future, or over a day old: no run of
+    a 4-hour-timeout job is) falls back to 0, counting the budget from this attempt, with a note saying so."""
+    raw = job_start_ms.strip() if isinstance(job_start_ms, str) else ""
+    if not re.fullmatch(r"[0-9]+", raw):   # "0" passes here and is rejected below as over a day old
+        return 0, f"job run start unknown ({job_start_ms!r}): the budget counts from this attempt"
+    spent = (now_ms - int(raw)) / 1000
+    if spent < 0 or spent > 86_400:
+        return 0, f"job run start {raw} is implausible ({spent:.0f} s ago): the budget counts from this attempt"
+    return spent, f"the job run started {spent:.0f} s before this attempt; the budget counts from the run start"
+
+
 class ClusterTriage(NamedTuple):
     path: str
     entry: object
@@ -489,8 +507,8 @@ def _print_capped(log, items, fmt, what, cap=200):
 
 
 def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log=print, *, workers: int = 1,
-              max_minutes=None, triage_ls=None, clock=time.monotonic, progress_seconds: float = 60,
-              poll: float = 1.0) -> str:
+              max_minutes=None, spent_seconds: float = 0, triage_ls=None, clock=time.monotonic,
+              progress_seconds: float = 60, poll: float = 1.0) -> str:
     """The whole prune run: returns the summary line, or raises RuntimeError when anything failed.
 
     - root unset ("") or retention disabled (cutoff None): nothing to do; a skipped-run summary.
@@ -503,6 +521,8 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
          directories (execute_plan, every rm non-recursive; no rm at all on a dry run). Once `max_minutes`
          has passed, no new cluster starts and the ones in flight finish; the run then reports
          incomplete=True and remaining_clusters, and stays green: the next run carries on from a fresh listing.
+    - `spent_seconds` (see spent_before_seconds) is the part of the budget an earlier attempt of the same job
+      run already used: the deadline is `max_minutes` after the RUN started, not after this attempt did.
     - `triage_ls` (default `ls`) does the triage listings only; the notebook passes volume_ls, which is much
       faster than dbutils.fs.ls. The root listing, every walk and every delete use `ls` and `rm`, and a
       walked cluster is listed again with `ls`, so triage_ls never decides a delete.
@@ -513,7 +533,7 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
         return (f"cluster_logs_prune path={root!r} retention_days={retention_days} skipped_run=True "
                 f"reason={'path unset' if not root else 'retention disabled'}")
     start = clock()
-    deadline = None if max_minutes is None else start + max_minutes * 60
+    deadline = None if max_minutes is None else start + max_minutes * 60 - max(0, spent_seconds)
     over = (lambda: False) if deadline is None else (lambda: clock() >= deadline)
     last_progress = [start]
 
@@ -533,8 +553,8 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
     if started < len(clusters):
         raise RuntimeError(
             f"cluster_logs_prune FAILED: triage classified only {started} of {len(clusters)} cluster(s) within "
-            f"max_minutes={max_minutes}, so nothing was deleted; raise cluster_log_prune_workers or "
-            f"cluster_log_prune_max_minutes")
+            f"max_minutes={max_minutes} ({int(spent_seconds)} s of it used before this attempt), so nothing was "
+            f"deleted; raise cluster_log_prune_workers or cluster_log_prune_max_minutes")
     young = [t for t in triaged if t.young]
     to_walk = sorted((t for t in triaged if not t.young and not t.list_errors), key=lambda t: t.path)
     log(f"  triage: {len(young)} cluster(s) kept without a walk (newest driver log inside retention), "
@@ -580,7 +600,7 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
         f"kept_files={plan.kept_files} skipped={len(plan.skipped)} root_missing={plan.root_missing} "
         f"clusters={len(clusters)} clusters_young={len(young)} clusters_walked={walked} "
         f"incomplete={remaining > 0} remaining_clusters={remaining} workers={workers} "
-        f"elapsed_s={int(clock() - start)} failures={len(failures)}"
+        f"elapsed_s={int(clock() - start)} spent_before_s={int(spent_seconds)} failures={len(failures)}"
     )
     if failures:
         for f in failures[:50]:

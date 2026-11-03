@@ -298,6 +298,14 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
   So a large backlog (the first run after turning the job on, or after lowering the retention) drains over
   several nights instead of timing out. A run that stops at the budget stops between clusters, never
   partway through one. The run output has a progress line about every minute.
+
+  The budget belongs to the job run, not to one attempt. The job passes the run's start time
+  (`{{job.start_time.timestamp_ms}}`, the same on every attempt) and the budget counts from it, so an
+  attempt that auto-optimization retries after a failure (see the top of this page) gets only what is
+  left of it, and ends at the budget instead of being cut off by the 4-hour timeout, which also covers
+  the whole run. A retry that starts with the budget already used up fails at once, before deleting
+  anything. The run output's `max_minutes` line says which start the budget counts from; when the run
+  start can't be read (an interactive run of the notebook), it counts from the attempt.
 - **Directories.** A finished cluster (every file under it past the cutoff, nothing else there) is
   removed whole, including empty directories it never used. "Finished" is judged by file age alone: a
   cluster that has delivered nothing for the whole retention window is assumed to have terminated. An

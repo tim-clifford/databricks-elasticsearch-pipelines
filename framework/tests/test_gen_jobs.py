@@ -954,6 +954,7 @@ def test_shipped_cluster_log_prune_job_shape():
     assert task["notebook_task"]["base_parameters"] == {
         "cluster_log_volume_path": "${var.cluster_log_volume_path}",
         "cluster_log_retention_days": "${var.cluster_log_retention_days}",
+        "job_start_ms": "{{job.start_time.timestamp_ms}}",   # the run's start: a retried attempt shares the run's budget
     }
     assert "job_clusters" not in job and "existing_cluster_id" not in task and "job_cluster_key" not in task
 

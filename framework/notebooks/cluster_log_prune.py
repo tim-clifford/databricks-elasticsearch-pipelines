@@ -41,11 +41,13 @@ dbutils.widgets.text("cluster_log_retention_days", "30", "Days of cluster logs t
 dbutils.widgets.text("dry_run", "false", "true => list what would be deleted, delete nothing")
 dbutils.widgets.text("workers", "16", "Threads listing and deleting in parallel (1 to 64)")
 dbutils.widgets.text("max_minutes", "200", "Time budget in minutes (1 to 230)")
+dbutils.widgets.text("job_start_ms", "", "The job run's start in epoch ms (the job passes {{job.start_time.timestamp_ms}})")
 CLUSTER_LOG_VOLUME_PATH = dbutils.widgets.get("cluster_log_volume_path")
 CLUSTER_LOG_RETENTION_DAYS = dbutils.widgets.get("cluster_log_retention_days").strip()
 DRY_RUN_RAW = dbutils.widgets.get("dry_run")
 WORKERS_RAW = dbutils.widgets.get("workers")
 MAX_MINUTES_RAW = dbutils.widgets.get("max_minutes")
+JOB_START_MS_RAW = dbutils.widgets.get("job_start_ms")
 
 # Resolve the synced framework root and add it to sys.path so pipeline_lib imports, the same way
 # log_table_prune.py does. This notebook is synced to <bundle files>/framework/notebooks/.
@@ -60,6 +62,7 @@ from pipeline_lib.cluster_log_prune import (  # noqa: E402
     parse_retention_days,
     parse_workers,
     run_prune,
+    spent_before_seconds,
     validate_log_root,
     volume_ls,
 )
@@ -72,13 +75,15 @@ DRY_RUN = require_es_flag(DRY_RUN_RAW, "dry_run") == "true"
 CUTOFF_MS = cutoff_ms(int(time.time() * 1000), RETENTION_DAYS)
 WORKERS = parse_workers(WORKERS_RAW)
 MAX_MINUTES = parse_max_minutes(MAX_MINUTES_RAW)
+# The budget is the job run's, not this attempt's: an attempt retried after a failure gets only what is left.
+SPENT_SECONDS, SPENT_NOTE = spent_before_seconds(JOB_START_MS_RAW, int(time.time() * 1000))
 
 print("cluster logs prune - parameters:")
 print(f"  cluster_log_volume_path = {ROOT!r}" + ("" if ROOT else " (unset: nothing to prune)"))
 print(f"  cluster_log_retention_days = {RETENTION_DAYS}" + ("" if CUTOFF_MS else " (retention DISABLED: delete nothing)"))
 print(f"  dry_run = {DRY_RUN}")
 print(f"  workers = {WORKERS}")
-print(f"  max_minutes = {MAX_MINUTES}")
+print(f"  max_minutes = {MAX_MINUTES} ({SPENT_NOTE})")
 
 # COMMAND ----------
 # Cell 2 - TRIAGE + PRUNE + VERIFY. Triage every cluster directory (a terminated cluster whose newest driver
@@ -91,7 +96,7 @@ print(f"  max_minutes = {MAX_MINUTES}")
 # Triage lists through the /Volumes FUSE mount (volume_ls, about 12x faster per call); the walks and deletes
 # use dbutils.fs, whose non-recursive remove the race handling relies on.
 SUMMARY = run_prune(ROOT, RETENTION_DAYS, CUTOFF_MS, DRY_RUN, dbutils.fs.ls, dbutils.fs.rm, workers=WORKERS,
-                    max_minutes=MAX_MINUTES, triage_ls=volume_ls)
+                    max_minutes=MAX_MINUTES, spent_seconds=SPENT_SECONDS, triage_ls=volume_ls)
 print(f"CLUSTER LOGS PRUNE COMPLETE: {SUMMARY}")
 
 # COMMAND ----------
