@@ -265,6 +265,18 @@ variables:
   cluster_log_retention_days:
     description: "Days of delivered cluster logs the `_cluster logs prune` job keeps under cluster_log_volume_path (older files are deleted, then empty directories). 0 disables the delete. Default 30. Deploy-time; set per target or --var."
     default: "30"
+  # The `_cluster logs prune` job's thread count and time budget: the defaults of its `workers` and
+  # `max_minutes` job parameters, so a single run can override them with --params. Every listing and delete
+  # is a round trip to the Volume, so threads overlap the waits (see "Pruning cluster logs" in
+  # docs/maintenance-jobs.md for the measured speedup). The budget must stay below the job's 240-minute
+  # timeout (at most 230, validated): at the budget the run stops starting clusters and ends green with
+  # incomplete=True, and the next run carries on.
+  cluster_log_prune_workers:
+    description: "Threads the `_cluster logs prune` job lists and deletes with (1 to 64). Default of its `workers` job parameter; --params workers=<n> overrides one run. Default 16."
+    default: "16"
+  cluster_log_prune_max_minutes:
+    description: "Time budget of a `_cluster logs prune` run in minutes (1 to 230, below the 240-minute job timeout). Every cluster must be triaged within it or the run fails; the delete phase stops starting clusters at the budget and the run ends green with incomplete=True. Default of its `max_minutes` job parameter; --params max_minutes=<n> overrides one run. Default 200."
+    default: "200"
 
   # GLOBAL fully-qualified name (catalog.schema.table) of the shared monitoring Delta table every job
   # appends its metrics to when monitoring_log_enabled is on. Threaded exactly like checkpoint_base_path /

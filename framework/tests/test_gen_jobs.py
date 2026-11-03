@@ -938,13 +938,23 @@ def test_shipped_cluster_log_prune_job_shape():
     assert job["tags"] == "${var.global_job_tags}"
     assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
     assert job["schedule"]["quartz_cron_expression"]
-    assert job["parameters"] == [{"name": "dry_run", "default": "false"}]
-    assert job["timeout_seconds"] == 14400   # a run against a large backlog fails (and emails) after 4 hours
+    assert job["parameters"] == [{"name": "dry_run", "default": "false"},
+                                 {"name": "workers", "default": "${var.cluster_log_prune_workers}"},
+                                 {"name": "max_minutes", "default": "${var.cluster_log_prune_max_minutes}"}]
+    assert job["timeout_seconds"] == 14400   # a backstop: a run that stops making progress fails after 4 hours
+    # The run's own budget must always end it before the timeout, green and resumable.
+    from pipeline_lib.cluster_log_prune import MAX_MINUTES_LIMIT, parse_max_minutes, parse_workers
+    assert MAX_MINUTES_LIMIT * 60 < job["timeout_seconds"]
+    with open(os.path.join(os.path.dirname(_FRAMEWORK_ROOT), "databricks.yml")) as fh:
+        variables = yaml.safe_load(fh)["variables"]
+    parse_workers(variables["cluster_log_prune_workers"]["default"])
+    parse_max_minutes(variables["cluster_log_prune_max_minutes"]["default"])
     (task,) = job["tasks"]
     assert task["notebook_task"]["notebook_path"] == "../notebooks/cluster_log_prune.py"
     assert task["notebook_task"]["base_parameters"] == {
         "cluster_log_volume_path": "${var.cluster_log_volume_path}",
         "cluster_log_retention_days": "${var.cluster_log_retention_days}",
+        "job_start_ms": "{{job.start_time.timestamp_ms}}",   # the run's start: a retried attempt shares the run's budget
     }
     assert "job_clusters" not in job and "existing_cluster_id" not in task and "job_cluster_key" not in task
 

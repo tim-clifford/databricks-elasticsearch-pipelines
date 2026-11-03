@@ -179,6 +179,32 @@ leaves empty ([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs)).
 - **Recommendation:** long enough to cover a post-mortem on any job cluster's logs; the value shipped
   out of the box is `30`.
 
+### `cluster_log_prune_workers`
+
+How many threads the `cluster_log_prune` job lists and deletes with. Every listing and delete is one round
+trip to the Volume, so the run spends its time waiting, and threads overlap those waits
+([Pruning cluster logs](maintenance-jobs.md#pruning-cluster-logs) has the measured speedup).
+
+- **Set:** top level, per target, or `--var`; one run can override it with `--params workers=<n>`.
+- **Takes effect:** at deploy (the variable), or for one run (the job parameter).
+- **Values:** an integer from `1` to `64`; anything else fails the run before anything is listed.
+- **Recommendation:** the shipped default, `16`.
+
+### `cluster_log_prune_max_minutes`
+
+The time budget of one `cluster_log_prune` run, in minutes, counted from the start of the job run, so an
+attempt retried after a failure shares the same budget. Every cluster directory must be triaged within
+it, or the run fails without deleting anything (a run that can't even classify the clusters can't keep
+up). The delete phase stops starting new clusters once the budget has passed, lets the ones in progress
+finish, and ends the run green with `incomplete=True` and `remaining_clusters=<n>` in the summary; the next
+run carries on from a fresh listing.
+
+- **Set:** top level, per target, or `--var`; one run can override it with `--params max_minutes=<n>`.
+- **Takes effect:** at deploy (the variable), or for one run (the job parameter).
+- **Values:** an integer from `1` to `230`, so the budget always ends the run before the job's 240-minute
+  timeout; anything else fails the run before anything is listed.
+- **Recommendation:** the shipped default, `200`.
+
 ### `job_name_prefix`
 
 The prefix in every job's display name, `[<target>] <prefix>: <postfix>` (see
@@ -768,6 +794,8 @@ never a typed-out list; a list long enough to hit the limit has to be split acro
 | Parameter | Default | What it does |
 |---|---|---|
 | `dry_run` | `false` | `true` lists what the run would delete (files, bytes, directories) and deletes nothing |
+| `workers` | [`cluster_log_prune_workers`](#cluster_log_prune_workers) | threads listing and deleting in parallel for this run, 1 to 64 |
+| `max_minutes` | [`cluster_log_prune_max_minutes`](#cluster_log_prune_max_minutes) | this run's time budget in minutes, 1 to 230 |
 
 `log_table_create` and `log_table_prune` take no run-time parameters.
 
@@ -788,6 +816,8 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`ca_certs`](#ca_certs) | Bundle | per target | a CA bundle for verifying the ES server's TLS certificate |
 | [`cluster_log_volume_path`](#cluster_log_volume_path) | Bundle | per target | where job-cluster logs are delivered, for cluster configs that opt in |
 | [`cluster_log_retention_days`](#cluster_log_retention_days) | Bundle | per target | how many days of delivered cluster logs `cluster_log_prune` keeps |
+| [`cluster_log_prune_workers`](#cluster_log_prune_workers) | Bundle | top level, per target, `--var`, `--params workers` | threads `cluster_log_prune` lists and deletes with |
+| [`cluster_log_prune_max_minutes`](#cluster_log_prune_max_minutes) | Bundle | top level, per target, `--var`, `--params max_minutes` | time budget of one `cluster_log_prune` run |
 | [`job_name_prefix`](#job_name_prefix) | Bundle | top level or per target | the prefix in every job's display name |
 | [`global_job_tags`](#global_job_tags) | Bundle | top level (keys), values may vary | tags applied to every job and its job clusters |
 | [`schedule_pause_status`](#schedule_pause_status) | Bundle | top level and per target | the target-wide pause state of scheduled and continuous triggers |

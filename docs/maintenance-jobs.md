@@ -258,6 +258,7 @@ deletes log files older than [`cluster_log_retention_days`](parameters.md#cluste
 ```bash
 databricks bundle run cluster_log_prune -t <target>                         # delete
 databricks bundle run cluster_log_prune -t <target> --params dry_run=true   # list only
+databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a shorter budget for this run
 ```
 
 - **What it touches.** Only files under `<cluster_log_volume_path>/<cluster id>/<log kind>/`, where the
@@ -270,6 +271,44 @@ databricks bundle run cluster_log_prune -t <target> --params dry_run=true   # li
   logs, or after changing `cluster_log_volume_path`.
 - **Failures.** A file or directory that can't be deleted, or a directory that can't be listed, is
   reported and fails the run after everything else has been tried.
+- **How it scales.** Every listing and delete is a round trip to the Volume, so the run's time goes into
+  those round trips, not into deciding anything. The run keeps the number of them low and overlaps them:
+  1. **Triage.** Each cluster directory is listed, and if the cluster has terminated (it holds
+     `eventlog/`), so is its `driver/`. When the newest driver log is inside the retention window, the
+     cluster is kept without listing anything else: that log alone keeps it from being removed, so
+     skipping the rest can only keep files. Its older files go together once its newest driver log ages
+     out. Triage lists through the `/Volumes` mount, measured at about 20 ms a call against about 270 ms
+     for `dbutils.fs.ls`.
+  2. **Prune.** Every other cluster (one past retention, one still running, or one without a readable
+     `driver/`) is listed again and walked with the per-file rules above, oldest cluster id first, and
+     its old files and emptied directories are deleted. A running cluster is always walked, so a
+     long-running cluster's old rolled logs are still deleted.
+
+  Both phases run on [`cluster_log_prune_workers`](parameters.md#cluster_log_prune_workers) threads
+  (default 16). Measured on serverless (2026-11-03, 300 synthetic clusters), 16 threads cut a listing to
+  about 7 ms through the mount and about 60 ms through `dbutils.fs.ls`, and a delete from about 600 ms to
+  about 120 ms. So at steady state a nightly run lists two directories per cluster and walks and deletes
+  only the clusters that aged out since the last run. In live runs at 16 threads, triage took under a
+  minute for about 2,000 clusters, and the prune deleted about 30 finished clusters a minute (each the 7
+  files and 8 directories a job cluster delivers); the earlier, serial walk took about 2 seconds per
+  cluster just to list it.
+- **Time budget.** [`cluster_log_prune_max_minutes`](parameters.md#cluster_log_prune_max_minutes)
+  (default 200) bounds a run, below the job's 4-hour timeout. Triage must finish within it, or the run
+  fails without deleting anything, because a run that can't even classify the clusters can't keep up:
+  raise the workers or the budget. In the prune phase no new cluster starts once the budget has passed,
+  the clusters in progress finish, and the run ends green with `incomplete=True` and
+  `remaining_clusters=<n>` in the summary (and a `WARNING` line); the next run carries on, oldest first.
+  So a large backlog (the first run after turning the job on, or after lowering the retention) drains over
+  several nights instead of timing out. A run that stops at the budget stops between clusters, never
+  partway through one. The run output has a progress line about every minute.
+
+  The budget belongs to the job run, not to one attempt. The job passes the run's start time
+  (`{{job.start_time.timestamp_ms}}`, the same on every attempt) and the budget counts from it, so an
+  attempt that auto-optimization retries after a failure (see the top of this page) gets only what is
+  left of it, and ends at the budget instead of being cut off by the 4-hour timeout, which also covers
+  the whole run. A retry that starts with the budget already used up fails at once, before deleting
+  anything. The run output's `max_minutes` line says which start the budget counts from; when the run
+  start can't be read (an interactive run of the notebook), it counts from the attempt.
 - **Directories.** A finished cluster (every file under it past the cutoff, nothing else there) is
   removed whole, including empty directories it never used. "Finished" is judged by file age alone: a
   cluster that has delivered nothing for the whole retention window is assumed to have terminated. An

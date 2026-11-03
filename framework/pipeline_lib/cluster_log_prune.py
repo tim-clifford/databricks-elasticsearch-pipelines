@@ -14,7 +14,11 @@ other entry is reported as skipped and never touched. A file whose age cannot be
 Pure and dependency-injected (the listing function is passed in, with dbutils.fs.ls semantics) so the
 classification is unit-tested off-cluster; the notebook performs the deletes.
 """
+import os
 import re
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from types import SimpleNamespace
 from typing import NamedTuple
 
 from pipeline_lib.config import PipelineConfigError
@@ -109,6 +113,122 @@ def _parent(path: str) -> str:
     return path.rstrip("/").rsplit("/", 1)[0]
 
 
+def _walk_log_tree(path: str, ls, cutoff: int, acc: dict) -> tuple:
+    """Classify everything under a log directory into `acc` (delete_files, kept counts, list_errors).
+    Returns (clean, has_old, dirs): clean when nothing under it is kept or unreadable, has_old when an old
+    file under it is being deleted, and dirs the descendant directories post-order as
+    (path, clean, has_old, own_old)."""
+    try:
+        entries = list(ls(path))
+    except Exception as exc:  # noqa: BLE001 - recorded; the subtree is left alone
+        acc["list_errors"].append((path, f"{type(exc).__name__}: {exc}"))
+        return False, False, []
+    clean, has_old, dirs = True, False, []
+    for e in entries:
+        child = _join(path, e)
+        if _is_dir(e):
+            c_clean, c_old, c_dirs = _walk_log_tree(child, ls, cutoff, acc)
+            dirs += c_dirs + [(child, c_clean, c_old, _old(e, cutoff))]
+            clean, has_old = clean and c_clean, has_old or c_old
+            continue
+        size = getattr(e, "size", 0) or 0
+        if _old(e, cutoff):
+            acc["delete_files"].append((child, size))
+            has_old = True
+        else:
+            acc["kept_files"] += 1
+            acc["kept_bytes"] += size
+            clean = False
+    return clean, has_old, dirs
+
+
+def _list_root(root: str, ls) -> tuple:
+    """List the prune root. Returns (clusters, skipped, list_errors, root_missing): clusters the
+    (path, entry) of every cluster id directory directly under it, in listing order; everything else at the
+    top level is skipped. A root that doesn't exist yet is root_missing, but only when it is deeper than
+    the volume and the parent's listing positively shows it absent; any other listing problem is an error."""
+    skipped, list_errors = [], []
+    try:
+        top = list(ls(root))
+    except Exception as exc:  # noqa: BLE001
+        # A volume can't be created by log delivery, so a missing volume is a misconfiguration, not "no logs yet".
+        deeper_than_volume = len(root.rstrip("/").split("/")) > 5
+        volume = "/".join(root.rstrip("/").split("/")[:5])
+        if deeper_than_volume and _is_not_found(exc) and _absent_from_parent(root, ls, floor=volume):
+            # Configured but not created yet: no cluster has delivered logs, so there is nothing to prune.
+            return [], [], [], True
+        list_errors.append((root, f"{type(exc).__name__}: {exc}"))
+        top = []
+    # Listing a FILE returns just that file: a log path that points at a file is a misconfiguration, not an
+    # empty volume, so fail instead of reporting a green run that pruned nothing.
+    # A single same-named file is ambiguous (a directory can hold a file named like itself), so confirm from the
+    # parent's listing that the root itself is a file.
+    root_name = root.rstrip("/").rsplit("/", 1)[-1]
+    if len(top) == 1 and not _is_dir(top[0]) and _name(top[0]) == root_name and _listed_as_file(root, ls):
+        list_errors.append((root, "the path is a file, not a directory"))
+        top = []
+    clusters = []
+    for e in top:
+        path = _join(root, e)
+        if not (_is_dir(e) and CLUSTER_ID.fullmatch(_name(e))):
+            skipped.append((path, "not a cluster id directory"))
+            continue
+        clusters.append((path, e))
+    return clusters, skipped, list_errors, False
+
+
+def _unknown_kinds(path: str, kinds) -> list:
+    """(path, reason) of every entry directly under a cluster directory that isn't a known log kind directory."""
+    return [(_join(path, k), "not a known log kind") for k in kinds if not (_is_dir(k) and _name(k) in LOG_KINDS)]
+
+
+def _plan_cluster(path: str, entry, kinds, ls, cutoff: int) -> PrunePlan:
+    """The plan for one cluster directory, given its listing `kinds` (see plan_prune for the rules)."""
+    acc = {"delete_files": [], "kept_files": 0, "kept_bytes": 0, "list_errors": []}
+    delete_dirs = []
+    skipped = _unknown_kinds(path, kinds)
+    cluster_clean, cluster_old, cluster_dirs = not skipped, False, []
+    for k in kinds:
+        if not (_is_dir(k) and _name(k) in LOG_KINDS):
+            continue
+        kpath = _join(path, k)
+        k_clean, k_old, k_dirs = _walk_log_tree(kpath, ls, cutoff, acc)
+        cluster_dirs += k_dirs + [(kpath, k_clean, k_old, _old(k, cutoff))]
+        cluster_clean, cluster_old = cluster_clean and k_clean, cluster_old or k_old
+    # eventlog/ is delivered only at termination, so a clean cluster holding it has terminated. That covers
+    # the one case with no age evidence at all: a file-less tree left by an earlier run that stopped partway.
+    terminated = any(_is_dir(k) and _name(k) == "eventlog" for k in kinds)
+    if cluster_clean and (cluster_old or _old(entry, cutoff) or terminated):
+        delete_dirs += [d for d, *_ in cluster_dirs] + [path]
+    else:
+        # Post-order, so each directory's children are decided first; one is removed only when it is
+        # clean, has age evidence, and every child directory is being removed too (a kept child means it
+        # won't be empty).
+        children = {}
+        for c, *_ in cluster_dirs:
+            children.setdefault(_parent(c), []).append(c)
+        removable = set()
+        for d, d_clean, d_old, d_own_old in cluster_dirs:
+            if d_clean and (d_old or d_own_old) and all(c in removable for c in children.get(d, ())):
+                removable.add(d)
+                delete_dirs.append(d)
+    return PrunePlan(acc["delete_files"], delete_dirs, acc["kept_files"], acc["kept_bytes"], skipped,
+                     acc["list_errors"])
+
+
+def _merge(plans, skipped=(), list_errors=(), root_missing=False) -> PrunePlan:
+    """One PrunePlan from per-cluster plans (in the given order) plus the root-level skipped and errors."""
+    files, dirs, kept_files, kept_bytes, skips, errors = [], [], 0, 0, list(skipped), list(list_errors)
+    for p in plans:
+        files += p.delete_files
+        dirs += p.delete_dirs
+        kept_files += p.kept_files
+        kept_bytes += p.kept_bytes
+        skips += p.skipped
+        errors += p.list_errors
+    return PrunePlan(files, dirs, kept_files, kept_bytes, skips, errors, root_missing)
+
+
 def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
     """Walk `root` and classify every entry. `ls(path)` returns entries with `.name` (a directory's name
     ends in '/'), `.size` and `.modificationTime` (epoch ms), and raises if the path can't be listed.
@@ -121,94 +241,22 @@ def plan_prune(root: str, ls, cutoff: int) -> PrunePlan:
     - Otherwise (a cluster still delivering) only directories that old-file deletes leave empty go (or
       whose own timestamp is old), so a running cluster's fresh empty directories stay.
     The root itself is never removed. A root that doesn't exist yet is an empty plan with root_missing set,
-    but only when it is deeper than the volume and the parent's listing positively shows it absent."""
-    delete_files, delete_dirs, skipped, list_errors = [], [], [], []
-    kept = {"files": 0, "bytes": 0}
+    but only when it is deeper than the volume and the parent's listing positively shows it absent.
 
-    def walk_log_tree(path: str) -> tuple:
-        """Classify everything under a log directory. Returns (clean, has_old, dirs): clean when nothing under
-        it is kept or unreadable, has_old when an old file under it is being deleted, and dirs the
-        descendant directories post-order as (path, clean, has_old, own_old)."""
-        try:
-            entries = list(ls(path))
-        except Exception as exc:  # noqa: BLE001 - recorded; the subtree is left alone
-            list_errors.append((path, f"{type(exc).__name__}: {exc}"))
-            return False, False, []
-        clean, has_old, dirs = True, False, []
-        for e in entries:
-            child = _join(path, e)
-            if _is_dir(e):
-                c_clean, c_old, c_dirs = walk_log_tree(child)
-                dirs += c_dirs + [(child, c_clean, c_old, _old(e, cutoff))]
-                clean, has_old = clean and c_clean, has_old or c_old
-                continue
-            size = getattr(e, "size", 0) or 0
-            if _old(e, cutoff):
-                delete_files.append((child, size))
-                has_old = True
-            else:
-                kept["files"] += 1
-                kept["bytes"] += size
-                clean = False
-        return clean, has_old, dirs
-
-    try:
-        top = list(ls(root))
-    except Exception as exc:  # noqa: BLE001
-        # A volume can't be created by log delivery, so a missing volume is a misconfiguration, not "no logs yet".
-        deeper_than_volume = len(root.rstrip("/").split("/")) > 5
-        volume = "/".join(root.rstrip("/").split("/")[:5])
-        if deeper_than_volume and _is_not_found(exc) and _absent_from_parent(root, ls, floor=volume):
-            # Configured but not created yet: no cluster has delivered logs, so there is nothing to prune.
-            return PrunePlan([], [], 0, 0, [], [], root_missing=True)
-        list_errors.append((root, f"{type(exc).__name__}: {exc}"))
-        top = []
-    # Listing a FILE returns just that file: a log path that points at a file is a misconfiguration, not an
-    # empty volume, so fail instead of reporting a green run that pruned nothing.
-    # A single same-named file is ambiguous (a directory can hold a file named like itself), so confirm from the
-    # parent's listing that the root itself is a file.
-    root_name = root.rstrip("/").rsplit("/", 1)[-1]
-    if len(top) == 1 and not _is_dir(top[0]) and _name(top[0]) == root_name and _listed_as_file(root, ls):
-        list_errors.append((root, "the path is a file, not a directory"))
-        top = []
-    for e in top:
-        path = _join(root, e)
-        if not (_is_dir(e) and CLUSTER_ID.fullmatch(_name(e))):
-            skipped.append((path, "not a cluster id directory"))
-            continue
+    This is the full, serial walk of every cluster. run_prune uses the same per-cluster rules but first
+    triages each cluster cheaply (see triage_cluster) and walks only the ones that can hold old files."""
+    clusters, skipped, list_errors, root_missing = _list_root(root, ls)
+    if root_missing:
+        return PrunePlan([], [], 0, 0, [], [], root_missing=True)
+    plans = []
+    for path, e in clusters:
         try:
             kinds = list(ls(path))
         except Exception as exc:  # noqa: BLE001
             list_errors.append((path, f"{type(exc).__name__}: {exc}"))
             continue
-        cluster_clean, cluster_old, cluster_dirs = True, False, []
-        for k in kinds:
-            kpath = _join(path, k)
-            if not (_is_dir(k) and _name(k) in LOG_KINDS):
-                skipped.append((kpath, "not a known log kind"))
-                cluster_clean = False
-                continue
-            k_clean, k_old, k_dirs = walk_log_tree(kpath)
-            cluster_dirs += k_dirs + [(kpath, k_clean, k_old, _old(k, cutoff))]
-            cluster_clean, cluster_old = cluster_clean and k_clean, cluster_old or k_old
-        # eventlog/ is delivered only at termination, so a clean cluster holding it has terminated. That covers
-        # the one case with no age evidence at all: a file-less tree left by an earlier run that stopped partway.
-        terminated = any(_is_dir(k) and _name(k) == "eventlog" for k in kinds)
-        if cluster_clean and (cluster_old or _old(e, cutoff) or terminated):
-            delete_dirs += [d for d, *_ in cluster_dirs] + [path]
-        else:
-            # Post-order, so each directory's children are decided first; one is removed only when it is
-            # clean, has age evidence, and every child directory is being removed too (a kept child means it
-            # won't be empty).
-            children = {}
-            for c, *_ in cluster_dirs:
-                children.setdefault(_parent(c), []).append(c)
-            removable = set()
-            for d, d_clean, d_old, d_own_old in cluster_dirs:
-                if d_clean and (d_old or d_own_old) and all(c in removable for c in children.get(d, ())):
-                    removable.add(d)
-                    delete_dirs.append(d)
-    return PrunePlan(delete_files, delete_dirs, kept["files"], kept["bytes"], skipped, list_errors)
+        plans.append(_plan_cluster(path, e, kinds, ls, cutoff))
+    return _merge(plans, skipped, list_errors)
 
 
 def _listed_as_file(path: str, ls) -> bool:
@@ -249,6 +297,146 @@ def parse_retention_days(raw: object) -> int:
     raise PipelineConfigError(
         f"cluster_log_retention_days must be an integer, got {raw!r} (0 disables the delete)"
     )
+
+
+# Thread pool bounds for the prune. Every listing and delete is one round trip to the Volume, so the run is
+# latency-bound and threads overlap the waits; 64 is far past where the measured speedup flattens.
+MAX_WORKERS = 64
+# The run's time budget must end below the job's 240-minute timeout, so the budget (a green, resumable
+# stop) always comes before the timeout (a failed run with no summary).
+MAX_MINUTES_LIMIT = 230
+
+
+def _parse_bounded_int(raw: object, name: str, low: int, high: int) -> int:
+    """A plain integer (an int that isn't a bool, or a string of digits) in [low, high]. Fails closed otherwise."""
+    value = None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        value = raw
+    elif isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw.strip()):
+        value = int(raw.strip())
+    if value is None or not low <= value <= high:
+        raise PipelineConfigError(f"{name} must be an integer from {low} to {high}, got {raw!r}")
+    return value
+
+
+def parse_workers(raw: object) -> int:
+    """cluster_log_prune_workers: threads listing and deleting in parallel, 1 to MAX_WORKERS."""
+    return _parse_bounded_int(raw, "workers (cluster_log_prune_workers)", 1, MAX_WORKERS)
+
+
+def parse_max_minutes(raw: object) -> int:
+    """cluster_log_prune_max_minutes: the run's time budget, 1 to MAX_MINUTES_LIMIT."""
+    return _parse_bounded_int(raw, "max_minutes (cluster_log_prune_max_minutes)", 1, MAX_MINUTES_LIMIT)
+
+
+def spent_before_seconds(job_start_ms: object, now_ms: int) -> tuple:
+    """Seconds this job run had already used before this attempt started, and a note for the run output.
+
+    The budget is for the whole job run, not one attempt: the job's timeout_seconds bounds every attempt
+    together, so a failed attempt that is retried must not hand the retry a fresh budget that the timeout
+    would then cut short (ending TIMEDOUT instead of at a clean budget stop). The job passes its run's start
+    time as `{{job.start_time.timestamp_ms}}`. A value that isn't a plain positive integer (an interactive
+    run, or the reference not resolved) or that is implausible (in the future, or over a day old: no run of
+    a 4-hour-timeout job is) falls back to 0, counting the budget from this attempt, with a note saying so."""
+    raw = job_start_ms.strip() if isinstance(job_start_ms, str) else ""
+    if not re.fullmatch(r"[0-9]+", raw):   # "0" passes here and is rejected below as over a day old
+        return 0, f"job run start unknown ({job_start_ms!r}): the budget counts from this attempt"
+    spent = (now_ms - int(raw)) / 1000
+    if spent < 0 or spent > 86_400:
+        return 0, f"job run start {raw} is implausible ({spent:.0f} s ago): the budget counts from this attempt"
+    return spent, f"the job run started {spent:.0f} s before this attempt; the budget counts from the run start"
+
+
+class ClusterTriage(NamedTuple):
+    path: str
+    entry: object
+    kinds: list         # the cluster directory's listing ([] when it couldn't be listed)
+    young: bool         # kept without a walk: terminated, and its newest driver log is inside retention
+    skipped: list       # unknown entries under a young cluster (a walked cluster reports its own)
+    list_errors: list   # the cluster directory couldn't be listed
+
+
+def _newest_file_mtime(entries):
+    """The newest positive integer modificationTime among the files in a listing, or None."""
+    times = [getattr(e, "modificationTime", None) for e in entries if not _is_dir(e)]
+    return max((t for t in times if isinstance(t, int) and not isinstance(t, bool) and t > 0), default=None)
+
+
+def triage_cluster(path: str, entry, ls, cutoff: int) -> ClusterTriage:
+    """Decide with one or two listings whether a cluster needs the full walk.
+
+    A cluster is YOUNG, and kept without walking it, only when it has terminated (it holds eventlog/, which
+    Databricks delivers at termination) and the newest file directly in its driver/ is at or past the cutoff.
+    That file alone keeps the cluster from being removed whole, so skipping the walk can only keep files,
+    never delete one: older files in a young cluster stay until its newest driver log ages out (a job
+    cluster's logs then go together). Everything else (still running, no driver/, an unreadable driver/, or
+    a newest driver log past retention) is walked with the full per-file rules of plan_prune. A running
+    cluster is always walked, so a long-running cluster's old rolled logs are still deleted."""
+    try:
+        kinds = list(ls(path))
+    except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
+        return ClusterTriage(path, entry, [], False, [], [(path, f"{type(exc).__name__}: {exc}")])
+    dirs = {_name(k) for k in kinds if _is_dir(k)}
+    if "eventlog" in dirs and "driver" in dirs:
+        try:
+            newest = _newest_file_mtime(list(ls(f"{path}/driver")))
+        except Exception:  # noqa: BLE001 - not young; the walk lists driver/ again and records the error
+            newest = None
+        if newest is not None and newest >= cutoff:
+            return ClusterTriage(path, entry, kinds, True, _unknown_kinds(path, kinds), [])
+    return ClusterTriage(path, entry, kinds, False, [], [])
+
+
+def volume_ls(path: str) -> list:
+    """List a UC Volume directory through the /Volumes FUSE mount (os.scandir), with dbutils.fs.ls entry
+    semantics: `.name` (a directory's ends in '/'), `.size`, `.modificationTime` (epoch ms). Measured on a
+    serverless notebook (2026-11-03) at 21.5 ms per call against 270 ms for dbutils.fs.ls, with identical
+    names, sizes and file times. Used for triage only: FUSE can show a stale view of changes made through
+    dbutils (seen live after deletes), and a stale view can only make a cluster look less young, which means
+    a walk. Walks and deletes go through dbutils.fs. A directory's time is reported as 0, as the prune
+    already assumes for directories."""
+    out = []
+    with os.scandir(path) as it:
+        for e in it:
+            is_dir = e.is_dir(follow_symlinks=False)
+            st = e.stat(follow_symlinks=False)
+            out.append(SimpleNamespace(name=e.name + ("/" if is_dir else ""), size=0 if is_dir else st.st_size,
+                                       modificationTime=0 if is_dir else int(st.st_mtime * 1000)))
+    return out
+
+
+def _bounded_map(items, fn, workers: int, stop, tick, poll: float = 1.0) -> tuple:
+    """Run fn over items on `workers` threads with at most 2 * workers in flight. `stop()` is checked
+    before each item is queued and again when it actually starts; once it is true nothing new starts and the
+    items already running finish. Returns (results, started): results in item order (None for an item never
+    started) and how many items ran. `tick(completed)` is
+    called at least every `poll` seconds while items are in flight. An exception in fn propagates."""
+    results, pending, submitted, completed = [None] * len(items), {}, 0, 0
+    skipped = object()
+
+    def run(item):
+        # Checked again when the item actually starts: one queued behind busy threads must not start after the
+        # deadline (measured live: without this, a run overshot a 4-minute budget by about 45 s).
+        return skipped if stop() else fn(item)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        def fill():
+            nonlocal submitted
+            while submitted < len(items) and len(pending) < 2 * workers and not stop():
+                pending[ex.submit(run, items[submitted])] = submitted
+                submitted += 1
+        fill()
+        while pending:
+            done, _ = wait(pending, timeout=poll, return_when=FIRST_COMPLETED)
+            for f in done:
+                result = f.result()
+                index = pending.pop(f)
+                if result is not skipped:
+                    results[index] = result
+                    completed += 1
+            tick(completed)
+            fill()
+    return results, completed
 
 
 def execute_plan(plan: PrunePlan, rm, dry_run: bool, ls=None, root: str = "") -> tuple:
@@ -329,21 +517,82 @@ def _print_capped(log, items, fmt, what, cap=200):
         log(f"  ... and {len(items) - cap} more {what}")
 
 
-def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log=print) -> str:
+def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log=print, *, workers: int = 1,
+              max_minutes=None, spent_seconds: float = 0, triage_ls=None, clock=time.monotonic,
+              progress_seconds: float = 60, poll: float = 1.0) -> str:
     """The whole prune run: returns the summary line, or raises RuntimeError when anything failed.
 
     - root unset ("") or retention disabled (cutoff None): nothing to do; a skipped-run summary.
-    - Otherwise plan (plan_prune), print the plan (each list capped at 200 lines; counts stay complete), then
-      execute_plan (no rm call at all on a dry run). Any listing or delete failure raises after every item has
-      been tried, so a partial prune never reports green.
+    - Otherwise, on `workers` threads:
+      1. TRIAGE every cluster directory (triage_cluster: one or two listings each). A young cluster is kept
+         without a walk. Triage must finish within `max_minutes`: if it can't, nothing is deleted and the
+         run fails, because a run that can't even classify the clusters can't keep up.
+      2. PRUNE the rest, oldest cluster id first (the id's MMDD-HHMMSS prefix; ordering only, it never
+         decides a delete): walk each with the plan_prune rules and delete its old files and emptied
+         directories (execute_plan, every rm non-recursive; no rm at all on a dry run). Once `max_minutes`
+         has passed, no new cluster starts and the ones in flight finish; the run then reports
+         incomplete=True and remaining_clusters, and stays green: the next run carries on from a fresh listing.
+    - `spent_seconds` (see spent_before_seconds) is the part of the budget an earlier attempt of the same job
+      run already used: the deadline is `max_minutes` after the RUN started, not after this attempt did.
+    - `triage_ls` (default `ls`) does the triage listings only; the notebook passes volume_ls, which is much
+      faster than dbutils.fs.ls. The root listing, every walk and every delete use `ls` and `rm`, and a
+      walked cluster is listed again with `ls`, so triage_ls never decides a delete.
+    - Progress is logged about every `progress_seconds`. Any listing or delete failure raises after every
+      started item has been tried, so a partial prune never reports green.
     """
     if not root or cutoff is None:
         return (f"cluster_logs_prune path={root!r} retention_days={retention_days} skipped_run=True "
                 f"reason={'path unset' if not root else 'retention disabled'}")
-    plan = plan_prune(root, ls, cutoff)
+    start = clock()
+    deadline = None if max_minutes is None else start + max_minutes * 60 - max(0, spent_seconds)
+    over = (lambda: False) if deadline is None else (lambda: clock() >= deadline)
+    last_progress = [start]
+
+    def ticker(phase: str, total: int):
+        def tick(completed: int):
+            now = clock()
+            if now - last_progress[0] >= progress_seconds:
+                last_progress[0] = now
+                log(f"  progress: {phase} {completed}/{total} cluster(s), {int(now - start)} s elapsed")
+        return tick
+
+    clusters, root_skipped, root_errors, root_missing = _list_root(root, ls)
+    log(f"  {len(clusters)} cluster directory(ies) under the path; triaging on {workers} thread(s)")
+    tls = ls if triage_ls is None else triage_ls
+    triaged, started = _bounded_map(clusters, lambda c: triage_cluster(c[0], c[1], tls, cutoff), workers, over,
+                                    ticker("triage", len(clusters)), poll)
+    if started < len(clusters):
+        raise RuntimeError(
+            f"cluster_logs_prune FAILED: triage classified only {started} of {len(clusters)} cluster(s) within "
+            f"max_minutes={max_minutes} ({int(spent_seconds)} s of it used before this attempt), so nothing was "
+            f"deleted; raise cluster_log_prune_workers or cluster_log_prune_max_minutes")
+    young = [t for t in triaged if t.young]
+    to_walk = sorted((t for t in triaged if not t.young and not t.list_errors), key=lambda t: t.path)
+    log(f"  triage: {len(young)} cluster(s) kept without a walk (newest driver log inside retention), "
+        f"{len(to_walk)} to walk, {int(clock() - start)} s elapsed")
+
+    def prune_one(t: ClusterTriage):
+        try:
+            kinds = list(ls(t.path))   # fresh, through the same ls the walk and deletes use
+        except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
+            error = (t.path, f"{type(exc).__name__}: {exc}")
+            return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"])
+        plan = _plan_cluster(t.path, t.entry, kinds, ls, cutoff)
+        return plan, execute_plan(plan, rm, dry_run, ls, root)
+
+    results, walked = _bounded_map(to_walk, prune_one, workers, over, ticker("prune", len(to_walk)), poll)
+    done = [r for r in results if r is not None]
+    plan = _merge([p for p, _ in done], root_skipped + [s for t in young for s in t.skipped],
+                  root_errors + [e for t in triaged for e in t.list_errors], root_missing)
+    failures = [f"list {p}: {e}" for p, e in root_errors + [e for t in triaged for e in t.list_errors]]
+    deleted_files = deleted_dirs = raced_dirs = 0
+    for _, (f_count, d_count, r_count, fails) in done:
+        deleted_files, deleted_dirs, raced_dirs = deleted_files + f_count, deleted_dirs + d_count, raced_dirs + r_count
+        failures += fails
+    remaining = len(to_walk) - walked
     delete_bytes = sum(size for _, size in plan.delete_files)
     log(f"  plan: delete {len(plan.delete_files)} file(s) ({delete_bytes} bytes) and {len(plan.delete_dirs)} "
-        f"empty dir(s); keep {plan.kept_files} file(s) ({plan.kept_bytes} bytes)")
+        f"empty dir(s); keep {plan.kept_files} file(s) ({plan.kept_bytes} bytes) in the walked clusters")
     _print_capped(log, plan.skipped, lambda x: f"  SKIPPED (left untouched, {x[1]}): {x[0]}", "skipped")
     _print_capped(log, plan.list_errors, lambda x: f"  LIST FAILED (left untouched): {x[0]}: {x[1]}",
                   "listing failures")
@@ -352,15 +601,17 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
     if dry_run:
         _print_capped(log, plan.delete_files, lambda x: f"  would delete {x[0]} ({x[1]} bytes)", "file(s)")
         _print_capped(log, plan.delete_dirs, lambda x: f"  would remove directory {x}", "directories")
-    # Files, then directories deepest first, all non-recursive; a directory that gained a fresh log since the
-    # listing is kept and counted as raced, not a failure.
-    deleted_files, deleted_dirs, raced_dirs, failures = execute_plan(plan, rm, dry_run, ls, root)
+    if remaining:
+        log(f"  WARNING: max_minutes={max_minutes} reached with {remaining} cluster(s) not yet walked; the next "
+            f"run carries on")
     summary = (
         f"cluster_logs_prune path={root!r} retention_days={retention_days} dry_run={dry_run} "
         f"planned_files={len(plan.delete_files)} planned_bytes={delete_bytes} planned_dirs={len(plan.delete_dirs)} "
         f"deleted_files={deleted_files} deleted_dirs={deleted_dirs} raced_dirs={raced_dirs} "
         f"kept_files={plan.kept_files} skipped={len(plan.skipped)} root_missing={plan.root_missing} "
-        f"failures={len(failures)}"
+        f"clusters={len(clusters)} clusters_young={len(young)} clusters_walked={walked} "
+        f"incomplete={remaining > 0} remaining_clusters={remaining} workers={workers} "
+        f"elapsed_s={int(clock() - start)} spent_before_s={int(spent_seconds)} failures={len(failures)}"
     )
     if failures:
         for f in failures[:50]:
