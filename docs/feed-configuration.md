@@ -245,7 +245,7 @@ Every failed attempt emails [`support_email`](parameters.md#support_email), incl
 
 Size the two settings against the schedule. A run that is still retrying when the next tick comes makes that tick skip ([Overlapping runs skipped](#overlapping-runs-skipped)), so keep `(retries + 1) x (attempt time, or the interval if longer)` under the schedule's interval.
 
-A continuous feed doesn't use these settings: it recovers through the pinned `task_retry_mode` ([Failure recovery](#failure-recovery)), and setting either key on a continuous feed, or on a member of a continuous job group, fails generation (the Jobs API rejects a task retry policy on a continuous job). The [maintenance jobs](maintenance-jobs.md) never retry.
+A continuous feed doesn't use these settings: it recovers through the pinned `task_retry_mode` ([Failure recovery](#failure-recovery)), and setting either key on a continuous feed, or on a member of a continuous job group, fails generation (the Jobs API rejects a task retry policy on a continuous job). The [maintenance jobs](maintenance-jobs.md) you run by hand never retry; the two scheduled ones (the prune jobs) keep serverless's default single retry.
 
 #### Classic and serverless
 

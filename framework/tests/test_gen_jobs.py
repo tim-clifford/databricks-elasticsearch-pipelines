@@ -2270,19 +2270,33 @@ def test_shipped_generated_jobs_retry_fields_match_trigger():
     assert seen["triggered"] and seen["continuous"], seen
 
 
-def test_shipped_hand_authored_jobs_never_retry():
-    # The maintenance jobs are fixed at no retries: a task failure fails the run and emails at once.
-    # Allow-list: every task must carry exactly max_retries: 0 plus disable_auto_optimization: true (on
-    # serverless, auto-optimization retries a failed task even with max_retries: 0; proven live) and no
-    # other retry field, and no job may reference the feed retry globals.
+# The scheduled maintenance jobs: they keep the default serverless retry behavior (no retry fields at all, so
+# auto-optimization retries a failed attempt once), because nobody is watching a scheduled run and a rerun is
+# safe. Every other maintenance job is run by hand and never retries.
+_SCHEDULED_MAINTENANCE_JOB_FILES = ("_cluster_log_prune.job.yml", "_log_table_prune.job.yml")
+
+
+def test_shipped_hand_authored_jobs_retry_policy():
+    # Allow-list per file: an on-demand maintenance task carries exactly max_retries: 0 plus
+    # disable_auto_optimization: true (on serverless, auto-optimization retries a failed task even with
+    # max_retries: 0; proven live); a scheduled one (_SCHEDULED_MAINTENANCE_JOB_FILES) carries no retry
+    # field at all. A job with a schedule must be in that list and a job without one must not, so a new
+    # maintenance job has to choose. No job may reference the feed retry globals.
     paths = sorted(glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml")))
     assert len(paths) == 7, [os.path.basename(p) for p in paths]
+    seen_scheduled = set()
     for path in paths:
+        name = os.path.basename(path)
         with open(path) as fh:
             text = fh.read()
-        assert "${var.triggered_task_" not in text, os.path.basename(path)
+        assert "${var.triggered_task_" not in text, name
+        scheduled = name in _SCHEDULED_MAINTENANCE_JOB_FILES
         for job in yaml.safe_load(text)["resources"]["jobs"].values():
-            assert job["tasks"], os.path.basename(path)
+            assert job["tasks"], name
+            assert ("schedule" in job) == scheduled, f"{name}: schedule present={'schedule' in job}"
+            expected = {} if scheduled else {"max_retries": 0, "disable_auto_optimization": True}
             for task in job["tasks"]:
-                assert _retry_fields(task) == {"max_retries": 0, "disable_auto_optimization": True}, \
-                    f"{os.path.basename(path)}: {task['task_key']}"
+                assert _retry_fields(task) == expected, f"{name}: {task['task_key']}"
+        if scheduled:
+            seen_scheduled.add(name)
+    assert seen_scheduled == set(_SCHEDULED_MAINTENANCE_JOB_FILES)
