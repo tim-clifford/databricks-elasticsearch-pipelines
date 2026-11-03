@@ -231,7 +231,7 @@ When requests are slow rather than rejected, these decide what happens:
   30s by default). The wait is what gives an ES cluster under indexing pressure time to recover, and
   `bulk_stats` shows its total as `backoff_ms`.
 - [`max_retries_per_doc`](parameters.md#max_retries_per_doc) is the separate retry for documents ES
-  rejects with a 429. It buys time for a briefly full queue, with the same backoff. It is not a capacity
+  rejects with a 429 (or another status in [`retry_on_doc_status`](parameters.md#retry_on_doc_status)). It buys time for a briefly full queue, with the same backoff. It is not a capacity
   fix: if 429s are steady, lower the pressure instead.
 
 ### Fast path

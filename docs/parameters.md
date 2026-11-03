@@ -553,14 +553,16 @@ up the whole budget in milliseconds. A request that still fails after the last r
 chunk as errors, which fails the batch. ([Why the connector manages retries](technical-details.md#connector-managed-retries).)
 
 It retries only whole requests that fail. When a request succeeds but ES rejects some of the documents
-in it (per-document 429s in the response), those documents are retried by
+in it (per-document 429s or 400s in the response), those documents are retried by
 [`max_retries_per_doc`](#max_retries_per_doc) instead.
 
 ### `max_retries_per_doc`
 
-How many times the connector re-sends an individual document that ES rejects with a 429 (the write
-queue is full). A non-negative integer; `0` disables. Connector default `3`. It waits between attempts
-with the same backoff as [`max_retries_per_request`](#max_retries_per_request).
+How many times the connector re-sends an individual document that ES rejects with a status in
+[`retry_on_doc_status`](#retry_on_doc_status) (by default a 429, the write queue is full, or a 400). Only
+the rejected documents are re-sent, not the rest of the request. A non-negative integer; `0` disables.
+Connector default `3`. It waits between attempts with the same backoff as
+[`max_retries_per_request`](#max_retries_per_request).
 
 Reach for this, not `max_retries_per_request`, when a feed sees per-document 429s under load. Raising it
 far multiplies backoff time within the partition; the real ceiling is ES's write capacity. The connector
@@ -568,6 +570,35 @@ warns if this is `0` while `max_retries_per_request` is raised above its connect
 combination looks like an attempt to ride out backpressure, but it can't: ES returns per-document 429s
 inside a successful bulk response, which `max_retries_per_request` never sees, so with this at `0` a
 429'd document gets no retry at all, whatever `max_retries_per_request` is set to.
+
+### `retry_on_doc_status`
+
+The per-document statuses that [`max_retries_per_doc`](#max_retries_per_doc) retries: when ES rejects a
+document inside a bulk response with one of these, the connector re-sends just that document, with
+backoff, instead of counting it as an error. Comma-separated HTTP statuses, for example `429,400`. Default
+`429,400` (the `databricks.yml` global). A feed config that omits it, or leaves it empty, inherits that
+global; to retry 429s only, set `429`. Only an empty global (or `--var retry_on_doc_status=`) falls back
+to the connector's own default, which is also `429` only.
+
+- **`429`** is ES's write queue being full, and is always in the list: a value without it is rejected,
+  since dropping it would remove the retry for backpressure.
+- **`400`** is in the default because Elasticsearch occasionally rejects a document with a 400 that
+  succeeds when sent again. Without the retry, that one document fails the batch, and the task retry
+  re-sends every row of the run. With it, only that document is re-sent, and the run carries on.
+- Most 400s are not transient: a document that conflicts with the index mapping
+  (`mapper_parsing_exception`, `document_parsing_exception`) is rejected the same way every time. With
+  `400` in the list such a document is retried `max_retries_per_doc` times first (with the default
+  backoff, about 14 seconds), then fails the batch as it would without the retry. Nothing is skipped
+  either way; the failure just arrives later. Set `429` alone to fail those on the first attempt.
+
+Allowed values: statuses from 400 to 599, without duplicates, never `404` or `409` (the connector treats
+a delete's 404 and a create's 409 as final, and neither is transient). In a feed config it can also be a
+YAML list, `[429, 400]`. There is no empty list: to turn per-document retries off, set
+`max_retries_per_doc` to `0`.
+
+A retried document that then succeeds still shows in `BULK_STATS` (with
+[`bulk_stats`](#bulk_stats) on): each rejected attempt counts under `retried=` and under its status in
+`rejected(...)` (a 400 under `4xx=`), even though the run succeeded.
 
 ### `retry_backoff_initial`
 
@@ -820,7 +851,8 @@ feed config, or `--params`), and "Job" a maintenance job's `--params`.
 | [`write_concurrency`](#write_concurrency) | Knob | global, config, `--params` | bulk requests in flight at once per write partition |
 | [`request_timeout`](#request_timeout) | Knob | global, config, `--params` | the per-request ES client timeout, in seconds |
 | [`max_retries_per_request`](#max_retries_per_request) | Knob | global, config, `--params` | retries of a whole bulk request that timed out, lost its connection, or got a 429/502/503/504 |
-| [`max_retries_per_doc`](#max_retries_per_doc) | Knob | global, config, `--params` | retries of a single document ES rejects with a 429 |
+| [`max_retries_per_doc`](#max_retries_per_doc) | Knob | global, config, `--params` | retries of a single document ES rejects with a status in `retry_on_doc_status` |
+| [`retry_on_doc_status`](#retry_on_doc_status) | Knob | global, config, `--params` | the per-document statuses that are retried (default `429,400`) |
 | [`retry_backoff_initial`](#retry_backoff_initial) | Knob | global, config, `--params` | seconds before the first retry, doubling each retry |
 | [`retry_backoff_max`](#retry_backoff_max) | Knob | global, config, `--params` | cap in seconds on any single retry wait |
 | [`op_type`](#op_type) | Knob | global, config, `--params` | `index` (overwrite by `_id`) or `create` (append only) |

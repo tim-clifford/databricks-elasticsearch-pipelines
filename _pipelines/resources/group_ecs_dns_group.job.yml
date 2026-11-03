@@ -57,6 +57,7 @@ resources:
             request_timeout: ${var.request_timeout}
             max_retries_per_request: ${var.max_retries_per_request}
             max_retries_per_doc: ${var.max_retries_per_doc}
+            retry_on_doc_status: ${var.retry_on_doc_status}
             retry_backoff_initial: ${var.retry_backoff_initial}
             retry_backoff_max: ${var.retry_backoff_max}
             require_existing_index: ${var.require_existing_index}
@@ -106,6 +107,7 @@ resources:
             request_timeout: ${var.request_timeout}
             max_retries_per_request: ${var.max_retries_per_request}
             max_retries_per_doc: ${var.max_retries_per_doc}
+            retry_on_doc_status: ${var.retry_on_doc_status}
             retry_backoff_initial: ${var.retry_backoff_initial}
             retry_backoff_max: ${var.retry_backoff_max}
             require_existing_index: ${var.require_existing_index}

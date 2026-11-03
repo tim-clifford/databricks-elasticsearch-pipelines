@@ -1,4 +1,4 @@
-# Databricks Asset Bundle: databricks-elasticsearch-pipelines
+# Declarative Automation Bundle (formerly Databricks Asset Bundle): databricks-elasticsearch-pipelines
 #
 # A self-contained framework for exporting Databricks Delta tables to Elasticsearch, deployable to a
 # fresh workspace with `databricks bundle deploy`.
@@ -376,6 +376,16 @@ variables:
   max_retries_per_doc:
     description: "Global default for EsWriteConfig max_retries_per_doc (per-document retries for rows ES rejects with a 429, write queue full; distinct from max_retries_per_request; 0 disables). Empty default (connector default 3 applies). A pipeline's own max_retries_per_doc and a per-run --params override this. Set per target/--var to raise it target-wide."
     default: ""
+  # retry_on_doc_status is the one knob in this block with a NON-empty global default: the per-item
+  # statuses the per-document layer retries. "429,400" also retries a document ES rejects with a 400,
+  # because a rare transient 400 from Elasticsearch would otherwise fail the task and re-send every row
+  # of the run. A 400 that is NOT transient (a mapping conflict, a malformed document) then fails after
+  # max_retries_per_doc retries and their backoff, instead of on the first attempt; the run still fails
+  # and nothing is skipped. A legal value is "" (connector default, 429 only) or comma-separated statuses
+  # from 400 to 599 that include 429, never 404 or 409, without duplicates.
+  retry_on_doc_status:
+    description: "Global default for EsWriteConfig retry_on_doc_status (comma-separated per-document HTTP statuses that max_retries_per_doc retries; must include 429; 400-599, never 404/409). Default 429,400: a rare transient 400 from ES is retried instead of failing the task. Empty => connector default (429 only). A pipeline's own retry_on_doc_status and a per-run --params override this. Set per target/--var to change it target-wide."
+    default: "429,400"
   retry_backoff_initial:
     description: "Global default for EsWriteConfig retry_backoff_initial (seconds before the first retry, doubling each later retry, both retry layers; 0 retries immediately). Empty default (connector default 2 applies). A pipeline's own retry_backoff_initial and a per-run --params override this. Set per target/--var to change it target-wide."
     default: ""
@@ -614,6 +624,9 @@ targets:
                                    # write queue is full) for the whole dev target; distinct from
                                    # max_retries_per_request. A pipeline's own value or a --params override
                                    # still wins. Empty default (connector default 3) inherited when omitted.
+      # retry_on_doc_status: "429" # retry only 429'd documents for the whole dev target (the top-level
+                                   # default 429,400 also retries a 400). A pipeline's own value or a
+                                   # --params override still wins.
       # retry_backoff_initial: "5" # wait longer between retries for the whole dev target (seconds before
       # retry_backoff_max: "60"    # the first retry, doubling, capped at retry_backoff_max). A pipeline's
                                    # own value or a --params override still wins. Empty defaults inherit

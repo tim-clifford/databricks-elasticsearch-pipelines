@@ -245,7 +245,7 @@ Every failed attempt emails [`support_email`](parameters.md#support_email), incl
 
 Size the two settings against the schedule. A run that is still retrying when the next tick comes makes that tick skip ([Overlapping runs skipped](#overlapping-runs-skipped)), so keep `(retries + 1) x (attempt time, or the interval if longer)` under the schedule's interval.
 
-A continuous feed doesn't use these settings: it recovers through the pinned `task_retry_mode` ([Failure recovery](#failure-recovery)), and setting either key on a continuous feed, or on a member of a continuous job group, fails generation (the Jobs API rejects a task retry policy on a continuous job). The [maintenance jobs](maintenance-jobs.md) never retry.
+A continuous feed doesn't use these settings: it recovers through the pinned `task_retry_mode` ([Failure recovery](#failure-recovery)), and setting either key on a continuous feed, or on a member of a continuous job group, fails generation (the Jobs API rejects a task retry policy on a continuous job). The [maintenance jobs](maintenance-jobs.md) you run by hand never retry; the two scheduled ones (the prune jobs) keep serverless's default single retry.
 
 #### Classic and serverless
 
@@ -263,7 +263,7 @@ The connector also retries inside a task, before the task fails. The layers, fro
 
 | Layer | Setting | Retries |
 |---|---|---|
-| Document | [`max_retries_per_doc`](parameters.md#max_retries_per_doc) | one document ES rejects with a 429 |
+| Document | [`max_retries_per_doc`](parameters.md#max_retries_per_doc) | one document ES rejects with a status in [`retry_on_doc_status`](parameters.md#retry_on_doc_status) (by default 429 or 400) |
 | Request | [`max_retries_per_request`](parameters.md#max_retries_per_request) | a whole bulk request that timed out, lost its connection, or got a 429/502/503/504 |
 | Task (triggered jobs) | `triggered_task_max_retries` | the whole task, after the connector's retries are used up or anything else fails it |
 | Task (continuous jobs) | `task_retry_mode: ON_FAILURE` (pinned) | the whole task, or the whole run at the retry limit |
