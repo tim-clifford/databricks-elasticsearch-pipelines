@@ -24,7 +24,7 @@
 # MAGIC   1 to 230. Every cluster must be triaged within it or the run fails; the delete phase stops starting
 # MAGIC   clusters at the budget and the run ends green with `incomplete=True` (the next run carries on).
 # MAGIC
-# MAGIC How it scales: a terminated cluster whose newest driver log is inside retention is kept after two
+# MAGIC How it scales: a terminated cluster whose driver logs are all inside retention is kept after two
 # MAGIC listings, without walking its files; every other cluster is walked with the per-file rules, oldest first.
 # MAGIC
 # MAGIC Run identity needs READ VOLUME and WRITE VOLUME on the volume.
@@ -86,8 +86,8 @@ print(f"  workers = {WORKERS}")
 print(f"  max_minutes = {MAX_MINUTES} ({SPENT_NOTE})")
 
 # COMMAND ----------
-# Cell 2 - TRIAGE + PRUNE + VERIFY. Triage every cluster directory (a terminated cluster whose newest driver
-# log is inside retention is kept after two listings), then walk the rest oldest first with the per-file
+# Cell 2 - TRIAGE + PRUNE + VERIFY. Triage every cluster directory (a terminated cluster whose driver logs
+# are all inside retention is kept after two listings), then walk the rest oldest first with the per-file
 # rules (allow-listed to the delivery layout) and delete their old files and the directories that leaves
 # empty, deepest first, on WORKERS threads within MAX_MINUTES. A failed delete or an unlistable directory is
 # collected and fails the run at the end, after every started item has been tried, so a partial prune never

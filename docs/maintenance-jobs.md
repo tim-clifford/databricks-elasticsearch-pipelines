@@ -274,10 +274,11 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
 - **How it scales.** Every listing and delete is a round trip to the Volume, so the run's time goes into
   those round trips, not into deciding anything. The run keeps the number of them low and overlaps them:
   1. **Triage.** Each cluster directory is listed, and if the cluster has terminated (it holds
-     `eventlog/`), so is its `driver/`. When the newest driver log is inside the retention window, the
-     cluster is kept without listing anything else: that log alone keeps it from being removed, so
-     skipping the rest can only keep files. Its older files go together once its newest driver log ages
-     out. Triage lists through the `/Volumes` mount, measured at about 20 ms a call against about 270 ms
+     `eventlog/`), so is its `driver/`. When every driver log is inside the retention window, the
+     cluster is kept without listing anything else: those logs keep it from being removed, so skipping
+     the rest can only keep files. Its older files go together once its driver logs age out. A driver log
+     past retention sends the cluster to the walk instead, which covers a cluster restarted after a
+     termination: it keeps its old `eventlog/`, but its old rolled driver logs still get it walked. Triage lists through the `/Volumes` mount, measured at about 20 ms a call against about 270 ms
      for `dbutils.fs.ls`.
   2. **Prune.** Every other cluster (one past retention, one still running, or one without a readable
      `driver/`) is listed again and walked with the per-file rules above, oldest cluster id first, and
@@ -296,8 +297,9 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
   (default 200) bounds a run, below the job's 4-hour timeout. Triage must finish within it, or the run
   fails without deleting anything, because a run that can't even classify the clusters can't keep up:
   raise the workers or the budget. In the prune phase no new cluster starts once the budget has passed,
-  and a cluster in progress stops before its next delete, so even a cluster with a long backlog of logs
-  can't carry the run past the budget. The run ends green with `incomplete=True` and
+  and a cluster in progress stops before its next listing or delete, so even a cluster with a long
+  backlog of logs can't carry the run past the budget (one stopped while still being listed has nothing
+  deleted). The run ends green with `incomplete=True` and
   `remaining_clusters=<n>` in the summary (and a `WARNING` line), counting a cluster it stopped partway
   through as remaining (`clusters_stopped` says how many; `planned_files` and `planned_dirs` include
   their whole plans, the rest of which is left for the next run); the next run carries on, oldest first. Stopping partway is safe: only old files
@@ -314,7 +316,9 @@ databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a 
   left of it, and ends at the budget instead of being cut off by the 4-hour timeout, which also covers
   the whole run. A retry that starts with the budget already used up fails at once, before deleting
   anything. The run output's `max_minutes` line says which start the budget counts from; when the run
-  start can't be read (an interactive run of the notebook), it counts from the attempt.
+  start can't be read (an interactive run of the notebook), it counts from the attempt. A **repair** of a
+  run keeps the original run's start time, so repairing a run that started more than `max_minutes` ago
+  fails at once without deleting anything: start a new run instead.
 - **Directories.** A finished cluster (every file under it past the cutoff, nothing else there) is
   removed whole, including empty directories it never used. "Finished" is judged by file age alone: a
   cluster that has delivered nothing for the whole retention window is assumed to have terminated. An

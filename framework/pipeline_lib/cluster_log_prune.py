@@ -364,6 +364,13 @@ class ClusterTriage(NamedTuple):
     list_errors: list   # the cluster directory couldn't be listed
 
 
+def _all_files_inside_retention(entries, cutoff: int) -> bool:
+    """True when the listing holds at least one file and every file's modificationTime is a positive integer
+    at or past the cutoff. A file of unknown age, or none at all, is not evidence of youth."""
+    times = [getattr(e, "modificationTime", None) for e in entries if not _is_dir(e)]
+    return bool(times) and all(isinstance(t, int) and not isinstance(t, bool) and t >= cutoff for t in times)
+
+
 def _newest_file_mtime(entries):
     """The newest positive integer modificationTime among the files in a listing, or None."""
     times = [getattr(e, "modificationTime", None) for e in entries if not _is_dir(e)]
@@ -374,12 +381,13 @@ def triage_cluster(path: str, entry, ls, cutoff: int) -> ClusterTriage:
     """Decide with one or two listings whether a cluster needs the full walk.
 
     A cluster is YOUNG, and kept without walking it, only when it has terminated (it holds eventlog/, which
-    Databricks delivers at termination) and the newest file directly in its driver/ is at or past the cutoff.
-    That file alone keeps the cluster from being removed whole, so skipping the walk can only keep files,
-    never delete one: older files in a young cluster stay until its newest driver log ages out (a job
-    cluster's logs then go together). Everything else (still running, no driver/, an unreadable driver/, or
-    a newest driver log past retention) is walked with the full per-file rules of plan_prune. A running
-    cluster is always walked, so a long-running cluster's old rolled logs are still deleted."""
+    Databricks delivers at termination) and EVERY file directly in its driver/ is at or past the cutoff.
+    Those files keep the cluster from being removed whole, so skipping the walk can only keep files, never
+    delete one: older executor files in a young cluster stay until its driver logs age out (a job cluster's
+    logs then go together). Everything else (still running, no driver/, an unreadable or empty driver/, or
+    any driver log past retention) is walked with the full per-file rules of plan_prune. So a running
+    cluster, or one restarted after a termination (it keeps its old eventlog/ but its old rolled driver
+    logs are past retention), is walked and its old logs are still deleted."""
     try:
         kinds = list(ls(path))
     except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
@@ -387,10 +395,13 @@ def triage_cluster(path: str, entry, ls, cutoff: int) -> ClusterTriage:
     dirs = {_name(k) for k in kinds if _is_dir(k)}
     if "eventlog" in dirs and "driver" in dirs:
         try:
-            newest = _newest_file_mtime(list(ls(f"{path}/driver")))
+            driver = list(ls(f"{path}/driver"))
         except Exception:  # noqa: BLE001 - not young; the walk lists driver/ again and records the error
-            newest = None
-        if newest is not None and newest >= cutoff:
+            driver = None
+        # Young only when EVERY driver file is inside retention. eventlog/ proves the cluster terminated once,
+        # not that it is still down: a restarted cluster keeps its old eventlog/ and writes fresh driver logs,
+        # and its old rolled driver logs (older than the cutoff) send it to the walk, so they still go.
+        if driver is not None and _all_files_inside_retention(driver, cutoff):
             return ClusterTriage(path, entry, kinds, True, _unknown_kinds(path, kinds), [])
     return ClusterTriage(path, entry, kinds, False, [], [])
 
@@ -425,6 +436,11 @@ def volume_ls(path: str) -> list:
             out.append(SimpleNamespace(name=e.name + ("/" if is_dir else ""), size=0 if is_dir else st.st_size,
                                        modificationTime=0 if is_dir else int(st.st_mtime * 1000)))
     return out
+
+
+class _DeadlineReached(BaseException):
+    """Raised by a planning listing once the deadline has passed. A BaseException so the walk's own
+    per-directory error handling (which records an Exception as a listing error) lets it through."""
 
 
 class ItemError(NamedTuple):
@@ -581,8 +597,10 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
          directories (execute_plan, every rm non-recursive; no rm at all on a dry run). Once `max_minutes`
          has passed, no new cluster starts, and a cluster in flight stops before its next delete (it counts
          as remaining); the run then reports incomplete=True and remaining_clusters, and stays green: the
-         next run carries on from a fresh listing. The order treats a month-day after `today_mmdd` (default:
-         today, UTC) as last year's, so it stays oldest first across New Year.
+         next run carries on from a fresh listing. A cluster whose walk is still listing at the deadline is
+         abandoned with nothing deleted, and counts as remaining too. The order treats a month-day after
+         `today_mmdd` (default: today, UTC) as last year's, so it stays oldest first across New Year (a
+         cluster id over a year old can still sort late: ordering only, never a delete decision).
     - An unexpected exception for one cluster (in triage or the prune) is recorded as that cluster's
       failure; every other cluster's result is still counted and reported, and the run then fails.
     - `spent_seconds` (see spent_before_seconds) is the part of the budget an earlier attempt of the same job
@@ -637,7 +655,16 @@ def run_prune(root: str, retention_days: int, cutoff, dry_run: bool, ls, rm, log
         except Exception as exc:  # noqa: BLE001 - recorded; the cluster is left alone
             error = (t.path, f"{type(exc).__name__}: {exc}")
             return PrunePlan([], [], 0, 0, [], [error]), (0, 0, 0, [f"list {error[0]}: {error[1]}"]), False
-        plan = _plan_cluster(t.path, t.entry, kinds, ls, cutoff)
+        def planning_ls(path):
+            if over():
+                raise _DeadlineReached()
+            return ls(path)
+
+        try:
+            plan = _plan_cluster(t.path, t.entry, kinds, planning_ls, cutoff)
+        except _DeadlineReached:
+            # Abandoned mid-walk at the deadline: nothing deleted from a partial plan; the cluster is remaining.
+            return PrunePlan([], [], 0, 0, [], []), (0, 0, 0, []), True
         f_count, d_count, r_count, fails, stopped = execute_plan_until(plan, rm, dry_run, ls, root, stop=over)
         return plan, (f_count, d_count, r_count, fails), stopped
 

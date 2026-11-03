@@ -673,8 +673,9 @@ class _Counting:
 
 
 def _terminated(driver_mtime, **extra):
-    """A terminated job cluster: driver/ (newest file at driver_mtime), an old executor file, eventlog/."""
-    tree = {"driver": {"stdout": driver_mtime, "log4j-old.log.gz": OLD},
+    """A terminated job cluster: driver/ (every file at driver_mtime, as for a job that ran inside the retention
+    window), an old executor file, eventlog/."""
+    tree = {"driver": {"stdout": driver_mtime, "log4j-old.log.gz": driver_mtime},
             "executor": {"app-1": {"0": {"stderr": OLD}}}, "eventlog": {"x": {"y": {"eventlog": OLD}}}}
     tree.update(extra)
     return tree
@@ -1163,6 +1164,8 @@ def test_a_stopped_cluster_is_reported_as_stopped():
     summary = run_prune(ROOT, 30, CUTOFF, False, _fs({CID: _terminated(OLD)}), _SlowRm(), log=lambda l: None,
                         workers=1, max_minutes=3, clock=clock)
     assert "clusters_stopped=1" in summary and "remaining_clusters=1" in summary
+    # planned_* holds the stopped cluster's whole plan (4 files, 8 dirs); only 3 deletes happened.
+    assert "planned_files=4" in summary and "planned_dirs=8" in summary and "deleted_files=3" in summary
 
 
 def test_triage_that_finishes_after_the_budget_fails_without_deleting():
@@ -1181,3 +1184,60 @@ def test_triage_that_finishes_after_the_budget_fails_without_deleting():
         run_prune(ROOT, 30, CUTOFF, False, base, rm, log=lambda l: None, workers=1, max_minutes=3, clock=clock,
                   triage_ls=slow_ls)
     assert rm.calls == []
+
+
+# --------------------------------------------------------------------------- Isaac round 4 fixes
+
+def test_a_restarted_cluster_with_old_driver_logs_is_walked():
+    # Terminated once (eventlog/ present) and restarted: a fresh driver log plus old rolled ones. Triage must
+    # not call it young, so the walk deletes the old logs and keeps the fresh one (and the cluster).
+    tree = {CID: {"driver": {"stdout": NEW, "log4j-2026-01.log.gz": OLD},
+                  "executor": {"app-1": {"0": {"stderr": OLD}}}, "eventlog": {"x": {"y": {"eventlog": OLD}}}}}
+    rm = _Rm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), rm, log=lambda l: None)
+    deleted = {p for p, _ in rm.calls}
+    assert f"{ROOT}/{CID}/driver/log4j-2026-01.log.gz" in deleted and f"{ROOT}/{CID}/driver/stdout" not in deleted
+    assert f"{ROOT}/{CID}" not in deleted
+    assert "clusters_young=0 clusters_walked=1" in summary
+
+
+def test_a_job_that_ran_across_the_cutoff_is_walked_not_young():
+    # Every driver log must be inside retention for a cluster to be young: one old driver log means a walk.
+    tree = {CID: _terminated(NEW)}
+    tree[CID]["driver"]["log4j-older.log.gz"] = OLD
+    summary = run_prune(ROOT, 30, CUTOFF, False, _fs(tree), _Rm(), log=lambda l: None)
+    assert "clusters_young=0 clusters_walked=1" in summary
+
+
+@pytest.mark.parametrize("driver,young", [
+    ({"stdout": NEW}, True), ({"stdout": NEW, "a": NEW}, True),
+    ({"stdout": NEW, "a": OLD}, False), ({}, False), ({"stdout": 0}, False), ({"stdout": NEW, "sub": {"x": OLD}}, True),
+])
+def test_all_files_inside_retention(driver, young):
+    from pipeline_lib.cluster_log_prune import _all_files_inside_retention
+    entries = _fs({"d": driver})(f"{ROOT}/d") if driver else []
+    assert _all_files_inside_retention(entries, CUTOFF) is young
+
+
+def test_a_walk_still_listing_at_the_deadline_is_abandoned_with_nothing_deleted():
+    # The deadline passes while the walk is listing the cluster's directories: the walk stops, nothing is
+    # deleted from the partial plan, and the cluster counts as stopped and remaining. The run stays green.
+    clock = _Clock()
+    base = _fs({CID: _terminated(OLD)})
+
+    listed = []
+
+    def slow_ls(path):
+        listed.append(path)
+        if path == f"{ROOT}/{CID}/executor":
+            clock.t += 120   # listing the executor tree crosses the 1-minute budget
+        return base(path)
+
+    rm = _Rm()
+    summary = run_prune(ROOT, 30, CUTOFF, False, slow_ls, rm, log=lambda l: None, workers=1, max_minutes=1,
+                        clock=clock, triage_ls=base)
+    assert rm.calls == []
+    # The walk stopped listing at the deadline: nothing below executor/, and not eventlog/, was listed.
+    after = listed[listed.index(f"{ROOT}/{CID}/executor") + 1:]
+    assert after == [], after
+    assert "clusters_stopped=1" in summary and "remaining_clusters=1" in summary and "failures=0" in summary
