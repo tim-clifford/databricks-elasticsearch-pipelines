@@ -57,7 +57,7 @@ resources:
       # es_index_list tag too; this fixed job writes no index, so it carries only the globals.
       tags: ${var.global_job_tags}
 
-      # OPTIONAL compute. All three vars default to empty, which DAB omits, leaving the task SERVERLESS.
+      # OPTIONAL compute. All three vars default to empty, which the bundle omits, leaving the task SERVERLESS.
       # Set diagnostics_existing_cluster_id (an existing cluster) OR diagnostics_job_clusters +
       # diagnostics_job_cluster_key (a new job cluster, reusing a _pipelines/job_cluster_configs spec) to
       # run on a specific cluster. See the databricks.yml `es_diagnostics COMPUTE` block. Deploy-time only.

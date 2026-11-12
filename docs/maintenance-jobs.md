@@ -25,7 +25,7 @@ Seven fixed jobs handle setup and upkeep. Run any with `databricks bundle run <r
 | `log_table_prune` | Log table prune | Deletes rows older than `monitoring_log_retention_days`, then optimizes and vacuums. Runs daily, paused or unpaused by the target's `schedule_pause_status`. | Leave it scheduled where the log is in use; pause it in any target where triggers are unpaused but the log isn't used (it fails without a table). ([details](#the-monitoring-log-table)) |
 | `cluster_log_prune` | Cluster logs prune | Deletes delivered cluster log files older than `cluster_log_retention_days`, then the directories that leaves empty, touching only the cluster log layout (optional `--params dry_run=true` to list without deleting; [details](#pruning-cluster-logs)). Runs daily, paused or unpaused by `schedule_pause_status`. Does nothing when `cluster_log_volume_path` is empty. | Leave it scheduled where any job cluster delivers logs. |
 
-None of these jobs retries a failed task: every task sets `max_retries: 0` and turns off serverless auto-optimization (`disable_auto_optimization: true`), which would otherwise retry a failed serverless task by itself. A failure fails the run at once and emails [`support_email`](parameters.md#support_email). This differs from the feed jobs' [task retries](feed-configuration.md#retrying-a-failed-task).
+The jobs you run by hand never retry a failed task: every task sets `max_retries: 0` and turns off serverless auto-optimization (`disable_auto_optimization: true`), which would otherwise retry a failed serverless task by itself. A failure fails the run at once and emails [`support_email`](parameters.md#support_email), and whoever ran it decides what to do next. The two scheduled jobs, `log_table_prune` and `cluster_log_prune`, keep the default serverless behavior instead: no retry settings, so a failed attempt is retried once by auto-optimization, since nobody is watching a scheduled run and a rerun is safe (it starts again from the current state). The failed attempt still emails. A timeout is not retried: a run that reaches the job's `timeout_seconds` (4 hours for `cluster_log_prune`, 2 for `log_table_prune`) ends as timed out after that one attempt, and the timeout covers the whole run, retry included. This differs from the feed jobs' [task retries](feed-configuration.md#retrying-a-failed-task).
 
 Every maintenance job parameter is in [Parameters Reference](parameters.md#maintenance-job-parameters).
 
@@ -95,7 +95,11 @@ checkpoint is left where it was, unused.
   [backfill](backfill.md) in size, and without [`es_id_field`](parameters.md#es_id_field) every document
   already in the index is written again as a duplicate.
 
-To rename a streaming feed:
+There are two ways to rename a streaming feed: stop the old feed and close the gap it leaves (the steps
+below), or [run the old and new feeds side by side](#renaming-with-an-overlap) until they overlap, so
+there is no gap to close.
+
+To rename a streaming feed by stopping the old one:
 
 1. **Stop the old feed once it is caught up.** Check that its last batch was caught up, not behind
    ([Caught up or behind](monitoring.md#caught-up-or-behind), if the monitoring log is on), so the gap
@@ -125,6 +129,8 @@ To rename a streaming feed:
      ([Method 1](backfill.md#method-1-streaming-from-the-start-of-the-table-streaming-feeds-only)).
    - **Backfill only the gap:** leave `streaming_start` at `new`, and fill the gap after the new feed's
      first run (step 5).
+   - **Leave no gap at all:** that means not stopping the old feed in step 1. Follow
+     [Renaming with an overlap](#renaming-with-an-overlap) instead of these steps; it needs no backfill.
 4. **Rename the config file**, put `pause_status` back to what it was before step 1 (on every config you
    changed), regenerate, and deploy. Then run the new feed, or let its trigger start it.
 5. **After the new feed starts:**
@@ -147,6 +153,40 @@ To rename a streaming feed:
    current config has the old name: the job deletes that name's checkpoint either way, and if a feed uses
    the name, that checkpoint is live. (With no such config, the job warns and clears it anyway.) Left in place, it would be picked up by any future feed
    given the old name, which would resume from the old position and send everything since.
+
+### Renaming with an overlap
+
+Instead of stopping the old feed, keep it running while the new feed starts, and remove it only once the
+two have overlapped: the new feed starts (with `streaming_start: new`) from the source's version at its
+first run, and the old one keeps sending from its own checkpoint, so once the old feed has passed that
+point every row has been sent by one feed or the other. Nothing is skipped and nothing needs a backfill.
+The cost is that, for as long as both run, the rows they both read are sent twice:
+
+- **Load:** Elasticsearch takes both feeds' writes to the same index while they overlap. Size that like
+  a backfill that runs alongside the feed ([Plan the volume first](backfill.md#plan-the-volume-first)),
+  and keep the overlap short.
+- **Duplicates:** with [`es_id_field`](parameters.md#es_id_field) set, the second write of a row is an
+  idempotent upsert. Without it, every row both feeds send is written twice, as two documents.
+
+1. **Copy the config file, don't rename it.** Renaming it would remove the old job at the next deploy.
+   Add the new config next to the old one, with the same settings and `streaming_start` left at `new`
+   (not `full`, which would re-send the whole table). The copy carries the old config's schedule or continuous
+   trigger, if it declares one, so the new feed runs on the same trigger (in a job group, an identical
+   declaration [agrees](feed-configuration.md#what-members-must-agree-on)). Generate and deploy: the old job keeps
+   running from its checkpoint, and the new job is added beside it. A
+   [job group](feed-configuration.md#job-groups) member's copy joins the same group's job as a second
+   task.
+2. **Let the new feed start.** Run it, or let its trigger start it, and wait until its first run has
+   succeeded (for a continuous feed, its first successful batch).
+3. **Wait for the old feed to pass the new feed's start.** With the monitoring log on, compare the two
+   feeds' `batch_summary` rows ([how to read them](monitoring.md#caught-up-or-behind)): the overlap is
+   complete once a batch of the old feed has ended at or past where the new feed's first batch ended (a
+   higher `source_end_version`, or the same version with an equal or higher `source_end_index`). Without
+   the monitoring log, wait until the old feed has a successful run that started after the new feed's
+   first run succeeded, and was caught up (not behind) when it did.
+4. **Remove the old feed.** Delete the old config file, regenerate, and deploy. The deploy removes the
+   old job (for a group member, its task).
+5. **Clear the old checkpoint**, as in step 6 above.
 
 ## Diagnosing an Elasticsearch host
 
@@ -218,6 +258,7 @@ deletes log files older than [`cluster_log_retention_days`](parameters.md#cluste
 ```bash
 databricks bundle run cluster_log_prune -t <target>                         # delete
 databricks bundle run cluster_log_prune -t <target> --params dry_run=true   # list only
+databricks bundle run cluster_log_prune -t <target> --params max_minutes=60 # a shorter budget for this run
 ```
 
 - **What it touches.** Only files under `<cluster_log_volume_path>/<cluster id>/<log kind>/`, where the
@@ -230,6 +271,61 @@ databricks bundle run cluster_log_prune -t <target> --params dry_run=true   # li
   logs, or after changing `cluster_log_volume_path`.
 - **Failures.** A file or directory that can't be deleted, or a directory that can't be listed, is
   reported and fails the run after everything else has been tried.
+- **How it scales.** Every listing and delete is a round trip to the Volume, so the run's time goes into
+  those round trips, not into deciding anything. The run keeps the number of them low and overlaps them:
+  1. **Triage.** Each cluster directory is listed, and if the cluster has terminated (it holds
+     `eventlog/`), so is its `driver/`. When every driver log is inside the retention window, the
+     cluster is kept without listing anything else: those logs keep it from being removed, so skipping
+     the rest can only keep files. Its older files go together once its driver logs age out. A driver log
+     past retention sends the cluster to the walk instead, which covers a cluster restarted after a
+     termination: it keeps its old `eventlog/`, but its old rolled driver logs still get it walked. Once
+     those are pruned, such a cluster looks young again while it runs, so its old executor logs wait until
+     it stops; this only matters for an all-purpose cluster pointed at this path, since the framework
+     delivers logs only from job clusters, which never restart. Triage lists through the `/Volumes` mount,
+     measured at about 20 ms a call against about 270 ms for `dbutils.fs.ls`. A cluster the mount can't
+     list goes to the walk, which lists it again through `dbutils.fs`.
+  2. **Prune.** Every other cluster (one past retention, one still running, or one without a readable
+     `driver/`) is listed again and walked with the per-file rules above, oldest cluster id first, and
+     its old files and emptied directories are deleted. A cluster still running (no `eventlog/` yet) is
+     always walked, so a long-running job cluster's old rolled logs are still deleted.
+
+  Both phases run on [`cluster_log_prune_workers`](parameters.md#cluster_log_prune_workers) threads
+  (default 16). Measured on serverless (2026-11-03, 300 synthetic clusters), 16 threads cut a listing to
+  about 7 ms through the mount and about 60 ms through `dbutils.fs.ls`, and a delete from about 600 ms to
+  about 120 ms. So at steady state a nightly run lists two directories per cluster and walks and deletes
+  only the clusters that aged out since the last run. In live runs at 16 threads, triage took under a
+  minute for about 2,000 clusters, and the prune deleted about 30 finished clusters a minute (each the 7
+  files and 8 directories a job cluster delivers); the earlier, serial walk took about 2 seconds per
+  cluster just to list it.
+- **Time budget.** [`cluster_log_prune_max_minutes`](parameters.md#cluster_log_prune_max_minutes)
+  (default 200) bounds a run, below the job's 4-hour timeout. Triage must finish within it, or the run
+  fails without deleting anything, because a run that can't even classify the clusters can't keep up:
+  raise the workers or the budget. In the prune phase no new cluster starts once the budget has passed,
+  and a cluster in progress stops before its next listing or delete, so even a cluster with a long
+  backlog of logs can't carry the run past the budget (one stopped while still being listed has nothing
+  deleted). The run ends green with `incomplete=True` and
+  `remaining_clusters=<n>` in the summary (and a `WARNING` line), counting a cluster it stopped partway
+  through as remaining (`clusters_stopped` says how many; `planned_files` and `planned_dirs` include
+  the whole plan of one stopped while deleting, the rest of which is left for the next run, and nothing
+  for one stopped while still being listed, which has no plan yet); the next run carries on, oldest first. Stopping partway is safe: only old files
+  were deleted, every directory is left in place, and the next run lists that cluster again. So a large
+  backlog (the first run after turning the job on, or after lowering the retention) drains over several
+  nights instead of timing out. Oldest first goes by the cluster id's month and day, with dates later in
+  the year than today counted as last year's, so the order holds across New Year. If one cluster hits an
+  unexpected error, the others are still pruned and reported, and the run then fails. The run output has
+  a progress line about every minute.
+
+  The budget belongs to the job run, not to one attempt. The job passes the run's start time
+  (`{{job.start_time.timestamp_ms}}`, the same on every attempt) and the budget counts from it, so an
+  attempt that auto-optimization retries after a failure (see the top of this page) gets only what is
+  left of it, and ends at the budget instead of being cut off by the 4-hour timeout, which also covers
+  the whole run. A retry that starts with the budget already used up fails at once, before listing
+  anything, with a message saying the budget was used by an earlier attempt. So a run whose triage
+  can't finish within the budget sends two failure emails, the second one expected. The run output's `max_minutes` line says which start the budget counts from; when the run
+  start can't be read (an interactive run of the notebook), it counts from the attempt. A **repair** of a
+  run keeps the original run's start time, so repairing a run that started more than `max_minutes` ago
+  (but less than a day ago) fails at once without deleting anything: start a new run instead. A start
+  over a day old is treated as unreadable, so a repair that late counts its budget from the attempt.
 - **Directories.** A finished cluster (every file under it past the cutoff, nothing else there) is
   removed whole, including empty directories it never used. "Finished" is judged by file age alone: a
   cluster that has delivered nothing for the whole retention window is assumed to have terminated. An

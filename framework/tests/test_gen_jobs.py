@@ -734,6 +734,7 @@ def test_require_runtime_knobs_declared_missing_fails_closed(tmp_path, missing):
     ("monitoring_log_enabled", "maybe"), ("log_monitor_source_lookback_seconds", "-1"),
     ("log_monitor_source_history_rows", "0"), ("log_monitor_source_history_rows", "10001"),
     ("log_monitor_source_lookback_seconds", "86401"),
+    ("retry_on_doc_status", "400"), ("retry_on_doc_status", "429,404"),
 ])
 def test_require_runtime_knobs_declared_bad_default_fails_closed(tmp_path, name, bad):
     # The registry wires each knob's OWN validator (the same require_* helper the runner applies to the
@@ -744,7 +745,7 @@ def test_require_runtime_knobs_declared_bad_default_fails_closed(tmp_path, name,
 
 
 def test_require_runtime_knobs_declared_accepts_scalar_shorthand(tmp_path):
-    # DAB's scalar shorthand (<name>: <v>, no `default:` key) IS the default; a legal shorthand for every
+    # The bundle's scalar shorthand (<name>: <v>, no `default:` key) IS the default; a legal shorthand for every
     # knob passes (the gate reads the default from whichever shape was used).
     lines = ["variables:"]
     for name in RUNTIME_KNOB_NAMES:
@@ -911,6 +912,8 @@ def test_shipped_log_table_prune_job_shape():
     assert job["max_concurrent_runs"] == 1
     assert job["queue"] == {"enabled": False}
     assert job["tags"] == "${var.global_job_tags}"
+    # It retries a failed attempt (default serverless retries), so the run needs a bound: 2 hours.
+    assert job["timeout_seconds"] == 7200
     # Daily schedule, paused by default (dev/stg deploy but never fire; prd unpauses).
     assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
     assert job["schedule"]["quartz_cron_expression"]
@@ -937,13 +940,23 @@ def test_shipped_cluster_log_prune_job_shape():
     assert job["tags"] == "${var.global_job_tags}"
     assert job["schedule"]["pause_status"] == "${var.schedule_pause_status}"
     assert job["schedule"]["quartz_cron_expression"]
-    assert job["parameters"] == [{"name": "dry_run", "default": "false"}]
-    assert job["timeout_seconds"] == 14400   # a run against a large backlog fails (and emails) after 4 hours
+    assert job["parameters"] == [{"name": "dry_run", "default": "false"},
+                                 {"name": "workers", "default": "${var.cluster_log_prune_workers}"},
+                                 {"name": "max_minutes", "default": "${var.cluster_log_prune_max_minutes}"}]
+    assert job["timeout_seconds"] == 14400   # a backstop: a run that stops making progress fails after 4 hours
+    # The run's own budget must always end it before the timeout, green and resumable.
+    from pipeline_lib.cluster_log_prune import MAX_MINUTES_LIMIT, parse_max_minutes, parse_workers
+    assert MAX_MINUTES_LIMIT * 60 < job["timeout_seconds"]
+    with open(os.path.join(os.path.dirname(_FRAMEWORK_ROOT), "databricks.yml")) as fh:
+        variables = yaml.safe_load(fh)["variables"]
+    parse_workers(variables["cluster_log_prune_workers"]["default"])
+    parse_max_minutes(variables["cluster_log_prune_max_minutes"]["default"])
     (task,) = job["tasks"]
     assert task["notebook_task"]["notebook_path"] == "../notebooks/cluster_log_prune.py"
     assert task["notebook_task"]["base_parameters"] == {
         "cluster_log_volume_path": "${var.cluster_log_volume_path}",
         "cluster_log_retention_days": "${var.cluster_log_retention_days}",
+        "job_start_ms": "{{job.start_time.timestamp_ms}}",   # the run's start: a retried attempt shares the run's budget
     }
     assert "job_clusters" not in job and "existing_cluster_id" not in task and "job_cluster_key" not in task
 
@@ -2193,6 +2206,13 @@ def test_shipped_databricks_yml_triggered_retry_defaults():
     assert str(variables["triggered_task_min_retry_interval_millis"]["default"]) == "60000"
 
 
+def test_shipped_databricks_yml_retry_on_doc_status_default():
+    # The agreed target-wide default: a document ES rejects with a 400 is retried, like a 429.
+    with open(os.path.join(_REPO_ROOT, "databricks.yml")) as fh:
+        variables = yaml.safe_load(fh)["variables"]
+    assert variables["retry_on_doc_status"]["default"] == "429,400"
+
+
 def test_require_triggered_retry_globals_declared_shipped_passes():
     gen_jobs.require_triggered_task_retry_globals_declared()
 
@@ -2262,19 +2282,33 @@ def test_shipped_generated_jobs_retry_fields_match_trigger():
     assert seen["triggered"] and seen["continuous"], seen
 
 
-def test_shipped_hand_authored_jobs_never_retry():
-    # The maintenance jobs are fixed at no retries: a task failure fails the run and emails at once.
-    # Allow-list: every task must carry exactly max_retries: 0 plus disable_auto_optimization: true (on
-    # serverless, auto-optimization retries a failed task even with max_retries: 0; proven live) and no
-    # other retry field, and no job may reference the feed retry globals.
+# The scheduled maintenance jobs: they keep the default serverless retry behavior (no retry fields at all, so
+# auto-optimization retries a failed attempt once), because nobody is watching a scheduled run and a rerun is
+# safe. Every other maintenance job is run by hand and never retries.
+_SCHEDULED_MAINTENANCE_JOB_FILES = ("_cluster_log_prune.job.yml", "_log_table_prune.job.yml")
+
+
+def test_shipped_hand_authored_jobs_retry_policy():
+    # Allow-list per file: an on-demand maintenance task carries exactly max_retries: 0 plus
+    # disable_auto_optimization: true (on serverless, auto-optimization retries a failed task even with
+    # max_retries: 0; proven live); a scheduled one (_SCHEDULED_MAINTENANCE_JOB_FILES) carries no retry
+    # field at all. A job with a schedule must be in that list and a job without one must not, so a new
+    # maintenance job has to choose. No job may reference the feed retry globals.
     paths = sorted(glob.glob(os.path.join(_FRAMEWORK_ROOT, "resources", "*.job.yml")))
     assert len(paths) == 7, [os.path.basename(p) for p in paths]
+    seen_scheduled = set()
     for path in paths:
+        name = os.path.basename(path)
         with open(path) as fh:
             text = fh.read()
-        assert "${var.triggered_task_" not in text, os.path.basename(path)
+        assert "${var.triggered_task_" not in text, name
+        scheduled = name in _SCHEDULED_MAINTENANCE_JOB_FILES
         for job in yaml.safe_load(text)["resources"]["jobs"].values():
-            assert job["tasks"], os.path.basename(path)
+            assert job["tasks"], name
+            assert ("schedule" in job) == scheduled, f"{name}: schedule present={'schedule' in job}"
+            expected = {} if scheduled else {"max_retries": 0, "disable_auto_optimization": True}
             for task in job["tasks"]:
-                assert _retry_fields(task) == {"max_retries": 0, "disable_auto_optimization": True}, \
-                    f"{os.path.basename(path)}: {task['task_key']}"
+                assert _retry_fields(task) == expected, f"{name}: {task['task_key']}"
+        if scheduled:
+            seen_scheduled.add(name)
+    assert seen_scheduled == set(_SCHEDULED_MAINTENANCE_JOB_FILES)
