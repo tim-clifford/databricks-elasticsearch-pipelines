@@ -740,7 +740,10 @@ if PIPELINE_MODE == "streaming":
         # and failure handling are unit-tested.
         foreach_batch = make_foreach_batch(
             transform=_transform, bulk_write=bulk_write, write_config=es_write_config, log=MONITORING_LOG,
-            config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID, task_run_id=TASK_RUN_ID, write_metrics=_write_metrics,
+            config_name=CONFIG_NAME, job_run_id=JOB_RUN_ID, task_run_id=TASK_RUN_ID,
+            # Only the drain summary (availableNow) reads the metrics files; a continuous run never drains, so it
+            # writes none rather than one file per batch for the life of the run.
+            write_metrics=None if STREAMING_TRIGGER_INTERVAL else _write_metrics,
             write_print_relay=_write_print_relay if _BULK_STATS_ON else None,
             read_source_latest=_read_source_latest, write_source_relay=_write_source_relay)
         # Records each batch's Spark progress report (STREAM_PROGRESS line + batch_summary row) between the wait
