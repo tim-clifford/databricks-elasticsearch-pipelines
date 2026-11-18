@@ -24,7 +24,7 @@ there is one (`...` marks the parts that vary), the cause, and the fix.
 | [Writing](#writes-fail-or-are-slow) | timeouts, 429s, 400s, slow writes, reading the signals |
 | [Falling behind](#falling-behind) | growing backlog, skipped runs, stale index |
 | [Data issues](#data-issues) | fewer documents, missing data with a healthy feed, rows excluded by a filter, duplicates, a stream that writes nothing, source updates missing |
-| [Streaming](#streaming-failures) | schema changes, continuous retry limit |
+| [Streaming](#streaming-failures) | schema changes, continuous retry limit, driver killed after a day or two |
 | [Schedules](#a-scheduled-job-didnt-run) | paused, skipped, a serverless retry with retries at 0, failure emails from a successful run |
 | [Settings](#a-committed-value-seems-ignored) | a committed value seems ignored |
 | [The monitoring log](#gaps-in-the-monitoring-log) | start rows with no end row |
@@ -478,6 +478,42 @@ continuous trigger starts a fresh run. Look at the earlier failures in the run t
 ([Continuous streaming](feed-configuration.md#continuous-streaming)). If the same error ends run after run,
 the failure is permanent, for example [a renamed or dropped source column](#a-renamed-or-dropped-source-column).
 A job group member that keeps failing usually doesn't end the run at all: see the same section.
+
+### A continuous job's driver is killed every day or two
+
+`The driver has been killed unexpectedly and is restarting. This is likely because it ran out of memory or exhausted other resources.`
+
+Every task in the job fails at once, a day or two after the run started, and the run then carries on as
+normal until the same thing happens again. The cluster's driver memory climbs steadily over that time.
+A larger driver node makes little difference.
+
+This is usually not a leak. On a classic cluster the driver's Java heap is a fixed size set by Databricks
+(on an i3.xlarge, 20.3 GB of the 25.5 GB the driver sees), and the JVM takes that memory from the
+machine bit by bit as it uses more of the heap, never giving it back. The data the feed actually keeps
+in memory stays small (under 1 GB in a live test), but over hours of micro-batches the JVM ends up holding
+the whole heap. The same machine also runs other Databricks processes, one Python process per task, and
+the JVM's memory outside the heap. Once the heap is fully in use there is almost nothing left, and any
+spike gets the driver killed by the operating system. A triggered (scheduled) job never gets there because
+each run starts a fresh cluster. A larger node mostly gets a larger heap, so the spare room grows only a
+little.
+
+The fix is a smaller driver heap. Set `spark.driver.memory` in the job cluster spec's `spark_conf`
+([Job-cluster specs](feed-configuration.md#job-cluster-specs)):
+
+```yaml
+spark_conf:
+  spark.driver.memory: "12g"
+```
+
+Size it as the memory the driver sees minus about 3 GB for the JVM outside the heap, about 2.5 GB for the
+other Databricks processes, about 0.6 GB per task, and a few GB to spare. For an i3.xlarge driver with two
+tasks, `12g` was tested: memory levelled off at about 18.5 GB for over a day, leaving about 7 GB free,
+on both Standard and Dedicated access mode. Deploy, then restart the continuous run so it picks up the new
+cluster spec ([Continuous jobs need a restart](deployment.md#continuous-jobs-need-a-restart)).
+
+Switching the driver to the G1 garbage collector does not help: Databricks sets the heap's minimum size
+equal to its maximum, and G1 does not shrink the heap below its minimum. If a feed genuinely needs more
+heap than this leaves, use a larger driver node and size `spark.driver.memory` the same way.
 
 ## A scheduled job didn't run
 
