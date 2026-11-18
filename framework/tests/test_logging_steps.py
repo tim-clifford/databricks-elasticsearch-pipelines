@@ -360,6 +360,20 @@ def test_foreach_batch_without_write_metrics_skips_the_metrics_file():
     end, = rows_of(ev, "batch_end")
     assert end["status"] == "success" and end["docs_written"] == RESULT["written"]
 
+
+def test_foreach_batch_without_write_metrics_still_logs_a_malformed_result_as_an_error():
+    # With no metrics write, the result must still be read inside the write's error handling, so a bulk_write
+    # result that is not a dict is recorded as batch_end error (and raised), not left as a batch_start alone.
+    ev = Events()
+    fb = make_foreach_batch(
+        transform=lambda b, s: "T", bulk_write=lambda df, cfg, raise_on_error: None,
+        write_config=WriteConfig(), log=make_log(ev, ()), config_name="cfg", job_run_id="run1",
+        write_metrics=None, printer=lambda *_: None, clock=Clock())
+    with pytest.raises(AttributeError):
+        fb(FakeBatchDF(), 10)
+    end, = rows_of(ev, "batch_end")
+    assert end["status"] == "error"
+
 # --- stream_progress ---------------------------------------------------------------------------
 
 class P:

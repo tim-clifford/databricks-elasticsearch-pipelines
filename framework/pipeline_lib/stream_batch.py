@@ -144,8 +144,11 @@ def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name,
             t0 = timer()
             result = bulk_write(transformed, write_config, raise_on_error=True)
             wall_ms = (timer() - t0) * 1000.0
+            # Read the result here, inside the error handling, even with no metrics to write, so a malformed
+            # result is recorded as batch_end error rather than raising after it.
+            written = int(result.get("written", 0) or 0)
             if write_metrics is not None:
-                write_metrics(session, batch_id, int(result.get("written", 0) or 0))
+                write_metrics(session, batch_id, written)
         except Exception as exc:
             end = clock()
             log.append_failure([batch_end_row(config_name, job_run_id, task_run_id, batch_id, "error", {

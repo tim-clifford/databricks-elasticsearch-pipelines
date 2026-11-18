@@ -310,3 +310,13 @@ def test_deploy_views_deploys_only_the_selected_files():
                and getattr(n.value, "id", None) == "_selected"]
     loops = [n for n in ast.walk(tree) if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "sql_files"]
     assert len(assigns) == 1 and loops and sel.lineno < assigns[0].lineno < min(l.lineno for l in loops)
+
+
+def test_runner_skips_metrics_files_only_on_continuous_runs():
+    # Only the availableNow drain summary reads the per-batch metrics files, so the runner writes them on a
+    # drain-and-stop run and skips them on a continuous one. Inverting this would leave every drain summary
+    # reading no files (an under-report) while every library test still passed.
+    path = os.path.join(_FRAMEWORK_ROOT, "notebooks", "run_index_pipeline.py")
+    call, = _calls(path, "make_foreach_batch")
+    kw = {k.arg: k.value for k in call.keywords}
+    assert ast.unparse(kw["write_metrics"]) == "None if STREAMING_TRIGGER_INTERVAL else _write_metrics"
