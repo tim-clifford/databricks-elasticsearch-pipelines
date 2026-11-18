@@ -345,6 +345,21 @@ def test_foreach_batch_with_log_off_still_writes_and_records_metrics():
     assert ev.types() == ["metrics"]
 
 
+
+def test_foreach_batch_without_write_metrics_skips_the_metrics_file():
+    # A continuous (always-on) run passes write_metrics=None: only the drain-and-stop summary reads the per-batch
+    # metrics files, so writing one per batch on a stream that never drains only piles up files under the
+    # checkpoint. The batch still sends, and batch_end success still records the counts.
+    ev = Events()
+    fb = make_foreach_batch(
+        transform=lambda b, s: "T", bulk_write=lambda df, cfg, raise_on_error: ev.items.append(("send",)) or dict(RESULT),
+        write_config=WriteConfig(), log=make_log(ev, ()), config_name="cfg", job_run_id="run1",
+        write_metrics=None, printer=lambda *_: None, clock=Clock())
+    fb(FakeBatchDF(), 9)
+    assert ev.types() == ["batch_start", "send", "batch_end"]
+    end, = rows_of(ev, "batch_end")
+    assert end["status"] == "success" and end["docs_written"] == RESULT["written"]
+
 # --- stream_progress ---------------------------------------------------------------------------
 
 class P:

@@ -1,7 +1,7 @@
 """The streaming per-micro-batch step: the function handed to foreachBatch.
 
 make_foreach_batch builds it from injected pieces, so its ORDER and failure handling are unit-tested with fakes:
-  source version -> transform -> batch_start -> bulk_write -> metrics file -> batch_end
+  source version -> transform -> batch_start -> bulk_write -> metrics file (drain-and-stop runs) -> batch_end
   -> (best-effort) source version relay -> (best-effort) BULK_STATS print relay.
 - The source version (and its commit time) is read FIRST, as close as possible to when Spark planned the batch, and
   recorded on batch_start as `source_latest`: the newest commit made at least the configured look-back before the
@@ -109,7 +109,9 @@ def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name,
       optionally repartitioned).
     - bulk_write(df, write_config, raise_on_error=True) -> the connector's result dict.
     - log: a MonitoringLog. task_run_id: this attempt's {{task.run_id}} ("" on an interactive run).
-    - write_metrics(session, batch_id, written): persist the batch's written count (the drain summary reads it).
+    - write_metrics(session, batch_id, written), or None: persist the batch's written count (the drain summary reads
+      it). A continuous run passes None: it never drains, so nothing reads the files, and one per batch would pile
+      up under the checkpoint for the life of the run. batch_end success records the counts either way.
     - write_print_relay(session, batch_id, text) or None: hand the BULK_STATS line to the notebook's progress
       recorder; None when bulk_stats is off.
     - read_source_latest(session) -> (version, commit datetime): the source commit to record (the notebook binds
@@ -142,7 +144,8 @@ def make_foreach_batch(*, transform, bulk_write, write_config, log, config_name,
             t0 = timer()
             result = bulk_write(transformed, write_config, raise_on_error=True)
             wall_ms = (timer() - t0) * 1000.0
-            write_metrics(session, batch_id, int(result.get("written", 0) or 0))
+            if write_metrics is not None:
+                write_metrics(session, batch_id, int(result.get("written", 0) or 0))
         except Exception as exc:
             end = clock()
             log.append_failure([batch_end_row(config_name, job_run_id, task_run_id, batch_id, "error", {
