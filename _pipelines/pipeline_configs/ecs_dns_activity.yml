@@ -1,9 +1,9 @@
 # Pipeline definition for one Elasticsearch index. One file here => one deployed job (see
 # framework/scripts/gen_jobs.py) and one view (see _pipelines/pipeline_views/<view.name>.sql, deployed by the deploy_views job).
 #
-# Any catalog/schema/table/name may embed ${environment}, folded in at deploy time from the
+# Any catalog or schema value may embed ${environment}, folded in at deploy time from the
 # `environment` bundle variable (e.g. ocsf_${environment} -> ocsf_prd). A value with no token is
-# used as-is.
+# used as-is. Table and view names are plain identifiers (no token).
 es_index_name: ecs-dns-activity   # target Elasticsearch index (hyphens allowed)
 es_id_field: dsl_id               # OPTIONAL: view output column used as the ES document _id (idempotent upserts). Omit => ES auto-generates _ids, so replays may duplicate documents
 es_host_config: es_host_default   # which ES host config (endpoint + secret scope/key) to write to; declared in databricks.yml
@@ -23,24 +23,23 @@ pipeline_mode: batch              # default export mode: batch | streaming (over
 #                                 # shuffles (non-broadcast join / GROUP BY / window).
 
 view:                             # the view this pipeline creates and exports
-  catalog: tim_clifford_classic_dsl_lite_${environment}
+  catalog: grp_fde_cyber_sbx_stable_${environment}
   schema: es_poc
   name: ecs_dns_activity
 
 source:                           # the single source table the view reads from
-  catalog: tim_clifford_classic_dsl_lite_${environment}
-  schema: ocsf
-  table: dns_activity
+  catalog: grp_fde_cyber_sbx_stable_${environment}
+  schema: es_poc
+  table: ocsf_dns_activity
   primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column (not used at runtime today)
 
 reference_tables:                 # OPTIONAL: extra tables the view joins
   # The key (`validation`) is YOUR choice: it is the SQL alias the view joins against and must match
-  # the ${ref_validation} token used in _pipelines/pipeline_views/ecs_dns_activity.sql. This one uses an
-  # environment-specific schema to exercise ${environment} on a reference table.
+  # the ${ref_validation} token used in _pipelines/pipeline_views/ecs_dns_activity.sql.
   validation:
-    catalog: tim_clifford_classic_dsl_lite_${environment}
-    schema: ocsf_validation_${environment}
-    table: dns_activity
+    catalog: grp_fde_cyber_sbx_stable_${environment}
+    schema: es_poc
+    table: dns_activity_validation
 
 schedule:                         # OPTIONAL: run this job on a Quartz cron (UTC); omit for on-demand
   quartz_cron_expression: "0 */10 * * * ?"   # every 10 minutes (paused under dev + stg; fires under prd)
