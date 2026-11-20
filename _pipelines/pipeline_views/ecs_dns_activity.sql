@@ -60,6 +60,8 @@ SELECT
     -- Surfaced from the reference join: does a validation row exist for this event?
     (validation.dsl_id IS NOT NULL) AS validation_row_exists
 FROM ${source} base
--- dsl_id is a unique key in BOTH tables, so this join is 1:1 and cannot fan out (no duplicate
--- primary_key / ES _id). A reference join that is not 1:1 on the key would need de-duplication.
+-- dsl_id is unique in the reference table, so this join cannot fan out: it adds no rows. A reference
+-- join that is not unique on the key would need de-duplication. The join does not de-duplicate the
+-- source either: the sample source repeats some dsl_ids (103 rows, 98 ids), and each repeat lands
+-- on the same ES _id, so the index holds one doc per id.
 LEFT JOIN ${ref_validation} ON base.dsl_id = validation.dsl_id
