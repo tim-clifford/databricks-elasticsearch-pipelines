@@ -10,14 +10,14 @@ es_host_config: es_host_default              # ES host config (endpoint + secret
 pipeline_mode: batch                         # default export mode: batch | streaming
 
 view:                             # the view this pipeline creates and exports
-  catalog: tim_clifford_classic_dsl_lite_${environment}
+  catalog: grp_fde_cyber_sbx_stable_${environment}
   schema: es_poc
   name: ecs_dns_activity_jobcluster
 
 source:                           # the single source table the view reads from (same as the serverless pipeline)
-  catalog: tim_clifford_classic_dsl_lite_${environment}
-  schema: ocsf
-  table: dns_activity
+  catalog: grp_fde_cyber_sbx_stable_${environment}
+  schema: es_poc
+  table: ocsf_dns_activity
   primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column (not used at runtime today)
 
 # Internal testing note (not a customer concern): a job cluster reaches ES over classic-compute egress,

@@ -15,14 +15,14 @@ job_group: ecs_dns_group                     # same group as member A => merged 
 # job_name_postfix intentionally omitted: inherits member A's under the define-once rule.
 
 view:                             # the view this pipeline creates and exports
-  catalog: tim_clifford_classic_dsl_lite_${environment}
+  catalog: grp_fde_cyber_sbx_stable_${environment}
   schema: es_poc
   name: ecs_dns_group_b
 
 source:                           # the single source table the view reads from (same source as member A)
-  catalog: tim_clifford_classic_dsl_lite_${environment}
-  schema: ocsf
-  table: dns_activity
+  catalog: grp_fde_cyber_sbx_stable_${environment}
+  schema: es_poc
+  table: ocsf_dns_activity
   primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column
 
 compute:                          # run on a JOB CLUSTER; the SAME job_cluster_config as member A => ONE shared cluster

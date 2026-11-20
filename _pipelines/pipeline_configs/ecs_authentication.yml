@@ -1,23 +1,23 @@
 # Pipeline definition for one Elasticsearch index. One file here => one deployed job (see
 # framework/scripts/gen_jobs.py) and one view (see _pipelines/pipeline_views/<view.name>.sql, deployed by the deploy_views job).
 #
-# Any catalog/schema/table/name may embed ${environment}, folded in at deploy time from the
+# Any catalog or schema value may embed ${environment}, folded in at deploy time from the
 # `environment` bundle variable (e.g. ocsf_${environment} -> ocsf_prd). A value with no token is
-# used as-is.
+# used as-is. Table and view names are plain identifiers (no token).
 es_index_name: ecs-authentication   # target Elasticsearch index (hyphens allowed)
 es_id_field: dsl_id                 # OPTIONAL: view output column used as the ES document _id (idempotent upserts). Omit => ES auto-generates _ids, so replays may duplicate documents
 es_host_config: es_host_default     # ES host config (endpoint + secret scope/key); declared in databricks.yml
 pipeline_mode: streaming            # default export mode: batch | streaming (override per run with --params)
 
 view:                               # the view this pipeline creates and exports
-  catalog: tim_clifford_classic_dsl_lite_${environment}
+  catalog: grp_fde_cyber_sbx_stable_${environment}
   schema: es_poc
   name: ecs_authentication
 
 source:                             # the single source table the view reads from
-  catalog: tim_clifford_classic_dsl_lite_${environment}
-  schema: ocsf
-  table: authentication
+  catalog: grp_fde_cyber_sbx_stable_${environment}
+  schema: es_poc
+  table: ocsf_authentication
   primary_key: dsl_id               # OPTIONAL, informational only: the source's unique-row column (not used at runtime today)
 
 # No reference_tables: this view is a straight passthrough over its source table.
