@@ -19,14 +19,14 @@ job_group: ecs_dns_group                     # MERGE with every config sharing t
 job_name_postfix: "ECS DNS group (a+b, shared cluster)"  # cosmetic display-name segment for the merged job (member B inherits it)
 
 view:                             # the view this pipeline creates and exports
-  catalog: tim_clifford_classic_dsl_lite_${environment}
+  catalog: grp_fde_cyber_sbx_stable_${environment}
   schema: es_poc
   name: ecs_dns_group_a
 
 source:                           # the single source table the view reads from
-  catalog: tim_clifford_classic_dsl_lite_${environment}
-  schema: ocsf
-  table: dns_activity
+  catalog: grp_fde_cyber_sbx_stable_${environment}
+  schema: es_poc
+  table: ocsf_dns_activity
   primary_key: dsl_id             # OPTIONAL, informational only: the source's unique-row column
 
 compute:                          # run on a JOB CLUSTER; the SAME job_cluster_config as member B => ONE shared cluster
