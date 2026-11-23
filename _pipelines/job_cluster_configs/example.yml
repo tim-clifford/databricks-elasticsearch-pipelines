@@ -41,3 +41,8 @@ custom_tags:
 #   max_workers: 8
 # spark_conf:
 #   spark.databricks.delta.preview.enabled: "true"
+#   # For a CONTINUOUS feed, cap the driver's Java heap so it can't fill the driver's memory over a day or two
+#   # (docs/troubleshooting.md, "A continuous job's driver is killed every day or two"). Size it as the
+#   # driver's memory minus about 3 GB, 2.5 GB, 0.6 GB per task and a few GB to spare: 12g for an i3.xlarge
+#   # driver with two tasks.
+#   spark.driver.memory: "12g"

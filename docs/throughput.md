@@ -164,6 +164,10 @@ with enough memory and CPU for that overhead. A [job group](feed-configuration.m
 several tasks on one cluster runs each task's notebook and stream on the same driver, so it may need a
 larger driver than a single feed.
 
+A continuous feed needs its driver heap sized too, not only its node: left at the default, the heap grows to
+fill almost all the driver's memory over a day or two and the driver is killed. See
+[A continuous job's driver is killed every day or two](troubleshooting.md#a-continuous-jobs-driver-is-killed-every-day-or-two).
+
 ### `write_concurrency`
 
 The number of bulk requests each partition keeps in flight. While one request waits for ES, others are
